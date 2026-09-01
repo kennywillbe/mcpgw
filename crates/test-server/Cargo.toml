@@ -1,6 +1,6 @@
 [package]
 name = "mcpgw-test-server"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 description = "Scripted stdio MCP server used by mcpgw's test suites"
@@ -10,7 +10,7 @@ publish = false
 serde_json.workspace = true
 
 [dev-dependencies]
-mcpgw-core = { version = "0.1.0", path = "../core" }
+mcpgw-core = { version = "0.2.0", path = "../core" }
 tokio.workspace = true
 rmcp-client-http.workspace = true
 axum.workspace = true
