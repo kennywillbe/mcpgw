@@ -9,3 +9,7 @@ git-repository-url = "https://github.com/kennywillbe/mcpgw"
 edit-url-template = "https://github.com/kennywillbe/mcpgw/edit/main/book/{path}"
 site-url = "https://kennywillbe.github.io/mcpgw/"
 default-theme = "rust"
+# Single-theme site: OS dark preference also resolves to rust, and the
+# picker is hidden via custom.css so the theme cannot be switched at all.
+preferred-dark-theme = "rust"
+additional-css = ["theme/custom.css"]
