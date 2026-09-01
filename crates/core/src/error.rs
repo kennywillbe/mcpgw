@@ -34,10 +34,10 @@ pub enum Error {
     )]
     UnsupportedVersion { found: u32 },
 
-    #[error(
-        "invalid server name {name:?}: only lowercase letters, digits, '-' and '_' are allowed"
-    )]
-    InvalidName { name: String },
+    // `reason` carries the specific rule broken so the message can name it
+    // (character set vs. the reserved gateway separator).
+    #[error("invalid server name {name:?}: {reason}")]
+    InvalidName { name: String, reason: &'static str },
 
     #[error("server {name:?} already exists")]
     DuplicateName { name: String },

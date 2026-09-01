@@ -126,6 +126,11 @@ pub fn slugify(name: &str) -> String {
             pending_dash = true;
         }
     }
+    // `__` is reserved for the gateway's server__tool split, so a client
+    // name carrying it must not slugify into a still-invalid name.
+    while out.contains("__") {
+        out = out.replace("__", "_");
+    }
     if out.is_empty() {
         "imported-server".to_owned()
     } else {

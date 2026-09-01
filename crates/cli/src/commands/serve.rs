@@ -13,9 +13,10 @@ pub struct ServeArgs {
     /// Address to bind (loopback by default; anything else is unauthenticated!)
     #[arg(long, default_value = "127.0.0.1")]
     pub bind: String,
-    /// Which canonical server to pipe (optional when exactly one is enabled)
+    /// Serve only these servers (repeatable; default: every enabled stdio
+    /// server). Exactly one turns the gateway into an unprefixed pipe.
     #[arg(long, value_name = "NAME")]
-    pub server: Option<String>,
+    pub server: Vec<String>,
 }
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
@@ -28,8 +29,13 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         .filter(|(_, s)| s.enabled && matches!(s.transport, Transport::Stdio { .. }))
         .map(|(name, _)| name)
         .collect();
-    let upstream = match (&args.server, enabled.as_slice()) {
-        (Some(name), _) => {
+    let selected: Vec<String> = if args.server.is_empty() {
+        if enabled.is_empty() {
+            bail!("no enabled stdio servers in {}", config_path.display());
+        }
+        enabled.iter().map(|name| (*name).clone()).collect()
+    } else {
+        for name in &args.server {
             let Some(server) = config.servers.get(name) else {
                 bail!("no server named {name:?} in {}", config_path.display());
             };
@@ -39,17 +45,8 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             if !matches!(server.transport, Transport::Stdio { .. }) {
                 bail!("server {name:?} is http; http upstreams arrive in a later milestone");
             }
-            name.clone()
         }
-        (None, [single]) => (*single).clone(),
-        (None, []) => bail!("no enabled stdio servers in {}", config_path.display()),
-        (None, many) => bail!(
-            "multiple enabled servers ({}); pick one with --server until aggregation lands",
-            many.iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        args.server.clone()
     };
 
     if !is_loopback(&args.bind) {
@@ -62,7 +59,18 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     }
 
     let manager = Arc::new(UpstreamManager::new(config.servers));
-    let gateway = Gateway::new(Arc::clone(&manager), upstream.clone());
+    // One explicit --server keeps the M9 shape: a pure pipe with untouched
+    // tool names. Everything else aggregates under `server__tool`.
+    let (gateway, serving) = match selected.as_slice() {
+        [single] if !args.server.is_empty() => (
+            Gateway::new(Arc::clone(&manager), single.clone()),
+            format!("piping {single:?}"),
+        ),
+        many => (
+            Gateway::aggregate(Arc::clone(&manager), selected.clone()),
+            format!("aggregating {} server(s): {}", many.len(), many.join(", ")),
+        ),
+    };
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -70,7 +78,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("cannot bind {}:{}", args.bind, args.port))?;
         let addr = listener.local_addr()?;
-        println!("mcpgw gateway listening on http://{addr}/mcp — piping {upstream:?}");
+        println!("mcpgw gateway listening on http://{addr}/mcp — {serving}");
 
         let shutdown = async {
             let _ = tokio::signal::ctrl_c().await;

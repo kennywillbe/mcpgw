@@ -91,6 +91,25 @@ fn name_validation_cases() {
 }
 
 #[test]
+fn double_underscore_is_reserved_for_the_gateway_separator() {
+    for bad in ["a__b", "__x", "x__", "a__b__c"] {
+        let err = validate_name(bad).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("__"), "{bad:?}: {text}");
+        assert!(text.contains("reserved"), "{bad:?}: {text}");
+    }
+    // A single underscore stays legal.
+    assert!(validate_name("a_b").is_ok());
+}
+
+#[test]
+fn config_rejects_a_server_named_with_the_separator() {
+    let text = "version = 1\n\n[servers.a__b]\ntype = \"stdio\"\ncommand = \"x\"\n";
+    let err = Config::parse(text, Path::new("c.toml")).unwrap_err();
+    assert!(matches!(err, Error::InvalidName { .. }), "{err}");
+}
+
+#[test]
 fn load_distinguishes_missing_file() {
     let err = Config::load(Path::new("/nonexistent/mcpgw/config.toml")).unwrap_err();
     assert!(matches!(err, Error::NotFound { .. }));

@@ -71,7 +71,8 @@ impl Config {
     ///
     /// Returns [`Error::Parse`] for malformed TOML or schema violations,
     /// [`Error::UnsupportedVersion`] for a version this build does not know,
-    /// and [`Error::InvalidName`] for server names outside `[a-z0-9-_]`.
+    /// and [`Error::InvalidName`] for server names outside `[a-z0-9-_]` or
+    /// containing the reserved `__` separator.
     pub fn parse(text: &str, path: &Path) -> Result<Self, Error> {
         let parse_err = |source| Error::Parse {
             path: path.to_owned(),
@@ -126,25 +127,32 @@ impl Config {
     }
 }
 
-/// Validates a server name against `[a-z0-9-_]+`.
+/// Validates a server name against `[a-z0-9-_]+`, minus `__`.
 ///
-/// Names end up in the gateway's `server__tool` namespace later, so anything
-/// outside this set would break tool-name parsing there.
+/// Names end up in the gateway's `server__tool` namespace, so anything
+/// outside this set would break tool-name parsing there, and `__` inside a
+/// name would make the server/tool split ambiguous.
 ///
 /// # Errors
 ///
-/// Returns [`Error::InvalidName`] when the name is empty or contains other
-/// characters.
+/// Returns [`Error::InvalidName`] when the name is empty, contains other
+/// characters, or contains the reserved `__` separator.
 pub fn validate_name(name: &str) -> Result<(), Error> {
-    let valid = !name.is_empty()
+    let invalid = |reason| {
+        Err(Error::InvalidName {
+            name: name.to_owned(),
+            reason,
+        })
+    };
+    let charset_ok = !name.is_empty()
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
-    if valid {
-        Ok(())
-    } else {
-        Err(Error::InvalidName {
-            name: name.to_owned(),
-        })
+    if !charset_ok {
+        return invalid("only lowercase letters, digits, '-' and '_' are allowed");
     }
+    if name.contains(crate::gateway::SEPARATOR) {
+        return invalid("'__' is reserved as the gateway's server__tool separator");
+    }
+    Ok(())
 }
