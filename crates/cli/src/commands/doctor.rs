@@ -4,18 +4,22 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use mcpgw_core::doctor::{Finding, Severity, check_server, classify_problems};
-use mcpgw_core::probe::probe_stdio;
+use mcpgw_core::probe::probe_server;
 use mcpgw_core::{ClientKind, Config, Detection, Error, Server, Transport};
 use owo_colors::OwoColorize as _;
 
-/// Key = the exact process a probe would spawn; entries shared between the
-/// canonical config and clients (or several clients) probe once.
-type TargetKey = (String, Vec<String>, BTreeMap<String, String>);
+/// Key = the exact endpoint a probe would talk to; entries shared between
+/// the canonical config and clients (or several clients) probe once. The
+/// transport is part of the key so a stdio and an http entry never collapse.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum TargetKey {
+    Stdio(String, Vec<String>, BTreeMap<String, String>),
+    Http(String, BTreeMap<String, String>),
+}
 
 #[derive(Default)]
 struct ProbePlan {
-    targets: BTreeMap<TargetKey, Vec<String>>,
-    skipped_http: usize,
+    targets: BTreeMap<TargetKey, (Server, Vec<String>)>,
 }
 
 impl ProbePlan {
@@ -23,14 +27,17 @@ impl ProbePlan {
         if !server.enabled {
             return;
         }
-        match &server.transport {
-            Transport::Stdio { command, args, env } => self
-                .targets
-                .entry((command.clone(), args.clone(), env.clone()))
-                .or_default()
-                .push(format!("{name} ({source})")),
-            Transport::Http { .. } => self.skipped_http += 1,
-        }
+        let key = match &server.transport {
+            Transport::Stdio { command, args, env } => {
+                TargetKey::Stdio(command.clone(), args.clone(), env.clone())
+            }
+            Transport::Http { url, headers } => TargetKey::Http(url.clone(), headers.clone()),
+        };
+        self.targets
+            .entry(key)
+            .or_insert_with(|| (server.clone(), Vec::new()))
+            .1
+            .push(format!("{name} ({source})"));
     }
 }
 
@@ -176,10 +183,7 @@ fn emit_json(
                 }),
             })
             .collect();
-        out["probes"] = serde_json::json!({
-            "results": entries,
-            "skipped_http": probes.skipped_http,
-        });
+        out["probes"] = serde_json::json!({ "results": entries });
     }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
@@ -190,17 +194,15 @@ struct ProbeReport {
         String,
         Result<mcpgw_core::probe::ProbeSuccess, mcpgw_core::probe::ProbeError>,
     )>,
-    skipped_http: usize,
 }
 
 fn run_probes(plan: ProbePlan, timeout: Duration) -> anyhow::Result<ProbeReport> {
-    let skipped_http = plan.skipped_http;
     let runtime = tokio::runtime::Runtime::new()?;
     let mut results = runtime.block_on(async {
         let mut set = tokio::task::JoinSet::new();
-        for ((command, args, env), labels) in plan.targets {
+        for (server, labels) in plan.targets.into_values() {
             set.spawn(async move {
-                let outcome = probe_stdio(&command, &args, &env, timeout).await;
+                let outcome = probe_server(&server, timeout).await;
                 (labels.join(", "), outcome)
             });
         }
@@ -211,10 +213,7 @@ fn run_probes(plan: ProbePlan, timeout: Duration) -> anyhow::Result<ProbeReport>
         collected
     });
     results.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(ProbeReport {
-        results,
-        skipped_http,
-    })
+    Ok(ProbeReport { results })
 }
 
 fn render_probes(probes: &ProbeReport, color: bool) {
@@ -245,12 +244,6 @@ fn render_probes(probes: &ProbeReport, color: bool) {
                 }
             }
         }
-    }
-    if probes.skipped_http > 0 {
-        println!(
-            "  – {} http server(s) not probed yet (gateway milestones add this)",
-            probes.skipped_http
-        );
     }
 }
 

@@ -50,7 +50,7 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
-        /// Also spawn each stdio server and run a live MCP handshake
+        /// Also reach every server and run a live MCP handshake
         #[arg(long)]
         probe: bool,
         /// Per-server probe timeout in seconds

@@ -8,8 +8,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt as _;
 use rmcp::transport::TokioChildProcess;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
@@ -18,7 +20,11 @@ use crate::config::{Server, Transport};
 pub type UpstreamService = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 // Explicit cancellation and transport death (child exit) are reported by
-// different rmcp signals; either one means the slot is stale.
+// different rmcp signals; either one means the slot is stale. For http
+// upstreams the death signal only fires once the client worker gives up —
+// a server that vanishes between requests stays "alive" here until a call
+// fails, which the slot logic already handles by reconnecting on the next
+// demand.
 fn dead(service: &UpstreamService) -> bool {
     service.is_closed() || service.is_transport_closed()
 }
@@ -33,9 +39,6 @@ pub enum UpstreamError {
 
     #[error("upstream {name:?} is disabled")]
     Disabled { name: String },
-
-    #[error("upstream {name:?} uses http transport (supported from the gateway HTTP milestone)")]
-    UnsupportedTransport { name: String },
 
     #[error("upstream {name:?} failed after {attempts} attempt(s): {message}")]
     Failed {
@@ -131,7 +134,7 @@ impl UpstreamManager {
     ///
     /// # Errors
     ///
-    /// Returns [`UpstreamError`] for unknown/disabled/http upstreams and
+    /// Returns [`UpstreamError`] for unknown/disabled upstreams and
     /// exhausted connect attempts.
     pub async fn ready(&self, name: &str) -> Result<Arc<UpstreamService>, UpstreamError> {
         let upstream = self
@@ -198,10 +201,6 @@ impl UpstreamManager {
             }
             match self.connect_once(name, server).await {
                 Ok(service) => return Ok(service),
-                Err(UpstreamError::UnsupportedTransport { name }) => {
-                    // Retrying cannot change the transport type.
-                    return Err(UpstreamError::UnsupportedTransport { name });
-                }
                 Err(err) => last = err.to_string(),
             }
         }
@@ -217,31 +216,82 @@ impl UpstreamManager {
         name: &str,
         server: &Server,
     ) -> Result<UpstreamService, UpstreamError> {
-        let Transport::Stdio { command, args, env } = &server.transport else {
-            return Err(UpstreamError::UnsupportedTransport {
-                name: name.to_owned(),
-            });
-        };
         let failed = |message: String| UpstreamError::Failed {
             name: name.to_owned(),
             attempts: 1,
             message,
         };
+        let handshake =
+            |result: Result<Result<UpstreamService, _>, tokio::time::error::Elapsed>| {
+                result
+                    .map_err(|_| failed(format!("no handshake within {:?}", self.connect_timeout)))?
+                    .map_err(|err| failed(format!("handshake failed: {err}")))
+            };
 
-        let mut cmd = Command::new(command);
-        cmd.args(args);
-        for (key, value) in env {
-            cmd.env(key, value);
+        match &server.transport {
+            Transport::Stdio { command, args, env } => {
+                let mut cmd = Command::new(command);
+                cmd.args(args);
+                for (key, value) in env {
+                    cmd.env(key, value);
+                }
+                cmd.stderr(std::process::Stdio::null());
+                // Orphan prevention (learned the hard way in the probe milestone).
+                cmd.kill_on_drop(true);
+
+                let transport = TokioChildProcess::new(cmd)
+                    .map_err(|err| failed(format!("spawn failed: {err}")))?;
+                handshake(tokio::time::timeout(self.connect_timeout, ().serve(transport)).await)
+            }
+            Transport::Http { url, headers } => {
+                let config = http_config(url, headers).map_err(failed)?;
+                // Nothing is dialed until the handshake, so an unreachable
+                // host surfaces here as a normal connect failure and feeds
+                // the same backoff ladder as a stdio spawn failure.
+                let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
+                handshake(tokio::time::timeout(self.connect_timeout, ().serve(transport)).await)
+            }
         }
-        cmd.stderr(std::process::Stdio::null());
-        // Orphan prevention (learned the hard way in the probe milestone).
-        cmd.kill_on_drop(true);
+    }
+}
 
-        let transport =
-            TokioChildProcess::new(cmd).map_err(|err| failed(format!("spawn failed: {err}")))?;
-        tokio::time::timeout(self.connect_timeout, ().serve(transport))
-            .await
-            .map_err(|_| failed(format!("no handshake within {:?}", self.connect_timeout)))?
-            .map_err(|err| failed(format!("handshake failed: {err}")))
+/// Builds the streamable-http client config for `url`, passing the canonical
+/// `headers` (auth tokens and friends) on every request.
+pub(crate) fn http_config(
+    url: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<StreamableHttpClientTransportConfig, String> {
+    let mut custom = std::collections::HashMap::with_capacity(headers.len());
+    for (key, value) in headers {
+        let name = HeaderName::try_from(key).map_err(|_| format!("invalid header name {key:?}"))?;
+        let value = HeaderValue::try_from(value)
+            .map_err(|_| format!("invalid value for header {key:?}"))?;
+        custom.insert(name, value);
+    }
+    Ok(StreamableHttpClientTransportConfig::with_uri(url.to_owned()).custom_headers(custom))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::http_config;
+
+    #[test]
+    fn headers_land_in_the_transport_config() {
+        let headers = [("Authorization".to_owned(), "Bearer t0ken".to_owned())]
+            .into_iter()
+            .collect();
+        let config = http_config("https://mcp.example.com/mcp", &headers).unwrap();
+        assert_eq!(&*config.uri, "https://mcp.example.com/mcp");
+        let name = http::HeaderName::from_static("authorization");
+        assert_eq!(config.custom_headers[&name], "Bearer t0ken");
+    }
+
+    #[test]
+    fn broken_header_names_are_reported_not_dropped() {
+        let headers = [("not a header".to_owned(), "x".to_owned())]
+            .into_iter()
+            .collect();
+        let err = http_config("https://mcp.example.com/mcp", &headers).unwrap_err();
+        assert!(err.contains("invalid header name"), "{err}");
     }
 }

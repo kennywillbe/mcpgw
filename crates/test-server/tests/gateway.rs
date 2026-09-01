@@ -154,6 +154,60 @@ async fn one_broken_upstream_never_hides_the_healthy_ones() {
     manager.shutdown().await;
 }
 
+/// Chains a second gateway on top of `gateway`: gw1 is served over http and
+/// becomes gw2's upstream, so requests travel client → gw2 → http → gw1 →
+/// stdio fixture.
+async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<UpstreamManager>) {
+    let inner = manager(&[("fx", "healthy")]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let gw1 = Gateway::new(Arc::clone(&inner), "fx".to_owned());
+    tokio::spawn(serve_http(gw1, listener, std::future::pending()));
+
+    let remote = Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: Transport::Http {
+            url: format!("http://{addr}/mcp"),
+            headers: BTreeMap::new(),
+        },
+    };
+    let outer = Arc::new(
+        UpstreamManager::new([(upstream.to_owned(), remote)].into_iter().collect())
+            .with_connect_timeout(Duration::from_secs(5))
+            .with_backoff_base(Duration::from_millis(20)),
+    );
+    let client = connect(Gateway::aggregate(
+        Arc::clone(&outer),
+        vec![upstream.to_owned()],
+    ))
+    .await;
+    (client, outer, inner)
+}
+
+#[tokio::test]
+async fn http_upstream_lists_tools_through_the_chain() {
+    let (client, outer, inner) = chained_client("remote").await;
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["remote__echo", "remote__reverse"]);
+    outer.shutdown().await;
+    inner.shutdown().await;
+}
+
+#[tokio::test]
+async fn http_upstream_round_trips_a_tool_call() {
+    let (client, outer, inner) = chained_client("remote").await;
+    let result = client
+        .call_tool(call("remote__reverse", "mcpgw"))
+        .await
+        .unwrap();
+    let text = format!("{result:?}");
+    assert!(text.contains("wgpcm"), "{text}");
+    outer.shutdown().await;
+    inner.shutdown().await;
+}
+
 #[test]
 fn resolve_prefers_the_longest_known_server_name() {
     let servers = ["a".to_owned(), "a_b".to_owned()];

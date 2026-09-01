@@ -26,9 +26,11 @@ rmcp = { version = "3", features = [
     "transport-child-process",
     "server",
     "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
 ] }
 rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
 axum = "0.8"
+http = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "signal", "net"] }
 owo-colors = "4"
 insta = "1"

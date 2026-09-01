@@ -865,6 +865,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "fs4",
+ "http",
  "insta",
  "rmcp",
  "serde",
@@ -881,6 +882,7 @@ dependencies = [
 name = "mcpgw-test-server"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "mcpgw-core",
  "rmcp",
  "serde_json",

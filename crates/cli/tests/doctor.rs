@@ -129,17 +129,21 @@ fn probe_reports_handshake_failure_with_nonzero_exit() {
 }
 
 #[test]
-fn probe_skips_http_servers_with_a_note() {
+fn probe_reaches_http_servers_and_reports_failures() {
     let dir = tempfile::tempdir().unwrap();
+    // Port 1 on loopback refuses instantly: the static pass is green, the
+    // probe pass must reach out and fail loudly.
     let config = r#"
 version = 1
 [servers.remote]
 type = "http"
-url = "https://mcp.example.com/mcp"
+url = "http://127.0.0.1:1/mcp"
 "#;
-    let out = run_doctor(dir.path(), Some(config), &["--probe"]);
-    assert!(out.status.success(), "{}", stdout(&out));
-    assert!(stdout(&out).contains("not probed yet"));
+    let out = run_doctor(dir.path(), Some(config), &["--probe", "--timeout", "15"]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("remote (canonical)"), "{text}");
+    assert!(text.contains("1 errors"), "{text}");
 }
 
 #[test]
@@ -151,7 +155,9 @@ fn probe_json_carries_results() {
         &["--probe", "--timeout", "15", "--json"],
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let results = value["probes"]["results"].as_array().unwrap();
+    let probes = value["probes"].as_object().unwrap();
+    assert!(!probes.contains_key("skipped_http"));
+    let results = probes["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["ok"], false);
 }

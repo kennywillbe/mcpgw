@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
+use mcpgw_core::Config;
 use mcpgw_core::gateway::{Gateway, serve_http};
 use mcpgw_core::upstream::UpstreamManager;
-use mcpgw_core::{Config, Transport};
 
 #[derive(clap::Args)]
 pub struct ServeArgs {
@@ -13,7 +13,7 @@ pub struct ServeArgs {
     /// Address to bind (loopback by default; anything else is unauthenticated!)
     #[arg(long, default_value = "127.0.0.1")]
     pub bind: String,
-    /// Serve only these servers (repeatable; default: every enabled stdio
+    /// Serve only these servers (repeatable; default: every enabled
     /// server). Exactly one turns the gateway into an unprefixed pipe.
     #[arg(long, value_name = "NAME")]
     pub server: Vec<String>,
@@ -26,12 +26,12 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     let enabled: Vec<&String> = config
         .servers
         .iter()
-        .filter(|(_, s)| s.enabled && matches!(s.transport, Transport::Stdio { .. }))
+        .filter(|(_, s)| s.enabled)
         .map(|(name, _)| name)
         .collect();
     let selected: Vec<String> = if args.server.is_empty() {
         if enabled.is_empty() {
-            bail!("no enabled stdio servers in {}", config_path.display());
+            bail!("no enabled servers in {}", config_path.display());
         }
         enabled.iter().map(|name| (*name).clone()).collect()
     } else {
@@ -41,9 +41,6 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             };
             if !server.enabled {
                 bail!("server {name:?} is disabled");
-            }
-            if !matches!(server.transport, Transport::Stdio { .. }) {
-                bail!("server {name:?} is http; http upstreams arrive in a later milestone");
             }
         }
         args.server.clone()

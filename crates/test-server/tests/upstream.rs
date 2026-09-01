@@ -17,6 +17,20 @@ fn stdio_server(mode: &str) -> Server {
     }
 }
 
+fn http_server(url: &str, headers: &[(&str, &str)]) -> Server {
+    Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: Transport::Http {
+            url: url.to_owned(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        },
+    }
+}
+
 fn manager(entries: &[(&str, Server)]) -> UpstreamManager {
     let servers: BTreeMap<String, Server> = entries
         .iter()
@@ -91,18 +105,10 @@ async fn death_after_ready_reconnects_on_next_demand() {
 }
 
 #[tokio::test]
-async fn unknown_disabled_and_http_are_typed_errors() {
+async fn unknown_and_disabled_are_typed_errors() {
     let mut disabled = stdio_server("healthy");
     disabled.enabled = false;
-    let http = Server {
-        enabled: true,
-        tags: Vec::new(),
-        transport: Transport::Http {
-            url: "https://mcp.example.com/mcp".to_owned(),
-            headers: BTreeMap::new(),
-        },
-    };
-    let mgr = manager(&[("off", disabled), ("remote", http)]);
+    let mgr = manager(&[("off", disabled)]);
 
     assert!(matches!(
         mgr.ready("nope").await.unwrap_err(),
@@ -112,15 +118,53 @@ async fn unknown_disabled_and_http_are_typed_errors() {
         mgr.ready("off").await.unwrap_err(),
         UpstreamError::Disabled { .. }
     ));
+}
+
+#[tokio::test]
+async fn unreachable_http_upstream_latches_failed_after_the_ladder() {
+    // Port 1 on loopback refuses instantly, so the ladder is the only wait.
+    let mgr = manager(&[("remote", http_server("http://127.0.0.1:1/mcp", &[]))]);
+    let started = Instant::now();
+    let err = mgr.ready("remote").await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    let UpstreamError::Failed { attempts, .. } = &err else {
+        panic!("expected Failed, got {err}");
+    };
+    assert_eq!(*attempts, 3);
+    assert!(elapsed >= Duration::from_millis(150), "elapsed {elapsed:?}");
     assert!(matches!(
-        mgr.ready("remote").await.unwrap_err(),
-        UpstreamError::UnsupportedTransport { .. }
+        mgr.status("remote").await,
+        Some(UpstreamStatus::Failed(_))
     ));
-    // Unsupported transport must not burn the backoff ladder.
-    assert!(matches!(
-        mgr.ready("remote").await.unwrap_err(),
-        UpstreamError::UnsupportedTransport { .. }
-    ));
+}
+
+#[tokio::test]
+async fn configured_headers_reach_the_http_upstream() {
+    // A bare http server that records what it is asked for: the handshake
+    // fails, but the request it sent is what this test is about.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap| {
+        let tx = tx.clone();
+        async move {
+            let _ = tx.send(headers);
+            axum::http::StatusCode::NOT_FOUND
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let server = http_server(
+        &format!("http://{addr}/mcp"),
+        &[("Authorization", "Bearer t0ken"), ("X-Tenant", "acme")],
+    );
+    let mgr = manager(&[("remote", server)]);
+    let _ = mgr.ready("remote").await.unwrap_err();
+
+    let headers = rx.recv().await.expect("upstream was never contacted");
+    assert_eq!(headers["authorization"], "Bearer t0ken");
+    assert_eq!(headers["x-tenant"], "acme");
 }
 
 #[tokio::test]
