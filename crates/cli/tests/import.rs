@@ -142,6 +142,38 @@ fn identical_entry_is_adopted_not_duplicated() {
     assert!(!sync.contains("! github"), "{sync}");
 }
 
+/// Import writes two files and cannot make that atomic, so the order is
+/// chosen for which half is safe to lose. Losing the adoption record (a
+/// `state.save()` that fails after the canonical file landed) leaves the
+/// entries unmanaged: sync reports them and leaves them alone, and a second
+/// import adopts them. The other order would leave them claimed with no
+/// canonical entry behind them, which sync reads as a removal.
+#[test]
+fn a_lost_adoption_record_never_costs_the_client_entry() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+    );
+    sb.ok(&["import", "--from", "cursor"]);
+
+    // The state exactly as a failed second save would have left it: the
+    // canonical config has the server, nothing claims the client entry.
+    std::fs::remove_file(sb.home.join("state/managed.json")).unwrap();
+
+    let out = sb.ok(&["sync", "--client", "cursor"]);
+    assert!(out.contains("! github"), "{out}");
+    let text = std::fs::read_to_string(sb.home.join(".cursor/mcp.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(json["mcpServers"]["github"]["args"][0], "server-github");
+
+    // Re-running import is the whole repair.
+    let out = sb.ok(&["import", "--from", "cursor"]);
+    assert!(out.contains("= github already present (adopted)"), "{out}");
+    let out = sb.ok(&["sync", "--client", "cursor"]);
+    assert!(!out.contains("! github"), "{out}");
+}
+
 #[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();

@@ -19,6 +19,9 @@ const POLL: Duration = Duration::from_millis(500);
 /// stays in the file and in `--json`.
 const ERROR_CHARS: usize = 100;
 
+/// What a masked captured body renders as, matching `list --json`.
+const MASK: &str = "***";
+
 #[derive(clap::Args)]
 pub struct WatchArgs {
     /// Only show traffic for this server
@@ -27,9 +30,12 @@ pub struct WatchArgs {
     /// Only show traffic for this tool (bare name, without the server prefix)
     #[arg(long, value_name = "NAME")]
     pub tool: Option<String>,
-    /// Stream the raw JSONL lines instead of the rendered stream
+    /// Stream the JSONL lines instead of the rendered stream
     #[arg(long)]
     pub json: bool,
+    /// Print captured arguments and responses instead of masking them
+    #[arg(long)]
+    pub show_secrets: bool,
 }
 
 pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
@@ -58,7 +64,14 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
                 continue;
             }
             if args.json {
-                println!("{line}");
+                // The human stream renders age, outcome, target, latency and
+                // error only, so it has nothing to mask; `--json` is the path
+                // that puts captured bodies on stdout.
+                if args.show_secrets {
+                    println!("{line}");
+                } else {
+                    println!("{}", json_line(&record));
+                }
             } else {
                 println!("{}", render_line(&record, now_millis(), color));
             }
@@ -134,6 +147,32 @@ fn complete_lines(buffer: &[u8]) -> (Vec<String>, u64) {
         .map(str::to_owned)
         .collect();
     (lines, complete.len() as u64)
+}
+
+/// One line of the `--json` stream with the captured bodies masked.
+///
+/// `args` and `response` are whole truncated JSON blobs, and a secret can sit
+/// anywhere inside one — there is no key-level redaction that would hold for
+/// arbitrary tool schemas, so the value goes as a unit. Everything a reader
+/// actually filters and aggregates on (server, tool, timing, outcome, error)
+/// survives. `--show-secrets` is the opt-out, as in `list --json`.
+///
+/// An absent body stays absent rather than becoming a mask, so the shape of
+/// a `tools/list` record is unchanged and consumers can still tell "no
+/// arguments" from "arguments withheld".
+fn json_line(record: &CaptureRecord) -> String {
+    let mut record = record.clone();
+    if record.args.is_some() {
+        record.args = Some(MASK.to_owned());
+    }
+    if record.response.is_some() {
+        record.response = Some(MASK.to_owned());
+    }
+    // A record is plain owned scalars, so this cannot fail; the placeholder
+    // is here because reprinting the raw line instead would leak the bodies
+    // this function exists to hide.
+    serde_json::to_string(&record)
+        .unwrap_or_else(|err| format!(r#"{{"error":"unserializable capture record: {err}"}}"#))
 }
 
 /// Whether a record passes the `--server` / `--tool` filters. A tool filter
@@ -274,6 +313,46 @@ mod tests {
         // tools/list names no tool, so a tool filter hides it.
         assert!(matches(&list(), Some("linear"), None));
         assert!(!matches(&list(), None, Some("create_issue")));
+    }
+
+    #[test]
+    fn json_masks_both_captured_bodies() {
+        let record = call()
+            .with_args(r#"{"token":"ghp_realsecret"}"#.to_owned())
+            .with_response(r#"{"content":[{"text":"t0ken"}]}"#.to_owned());
+        let line = json_line(&record);
+        assert!(!line.contains("ghp_realsecret"), "{line}");
+        assert!(!line.contains("t0ken"), "{line}");
+        // Everything the stream is read for survives.
+        let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(json["args"], MASK);
+        assert_eq!(json["response"], MASK);
+        assert_eq!(json["server"], "github");
+        assert_eq!(json["tool"], "create_issue");
+        assert_eq!(json["duration_ms"], 87);
+        assert_eq!(json["ok"], true);
+    }
+
+    #[test]
+    fn json_leaves_records_without_bodies_alone() {
+        // tools/list carries neither body: masking must not invent them, so
+        // "no arguments" stays distinguishable from "arguments withheld".
+        let line = json_line(&list().with_error("refused"));
+        let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(json.get("args").is_none(), "{line}");
+        assert!(json.get("response").is_none(), "{line}");
+        // Errors are not bodies — they are the reason to be watching.
+        assert_eq!(json["error"], "refused");
+    }
+
+    #[test]
+    fn the_human_stream_never_prints_a_captured_body() {
+        let record = call()
+            .with_args("ghp_realsecret".to_owned())
+            .with_response("t0ken".to_owned());
+        let line = render_line(&record, NOW, false);
+        assert!(!line.contains("ghp_realsecret"), "{line}");
+        assert!(!line.contains("t0ken"), "{line}");
     }
 
     #[test]

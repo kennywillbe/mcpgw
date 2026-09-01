@@ -204,6 +204,82 @@ async fn status_and_shutdown_answer_while_a_connect_is_in_flight() {
     connecting.abort();
 }
 
+/// A `ready()` future dropped mid-ladder used to leave the slot `Connecting`
+/// with nobody left to settle it, wedging the upstream for the life of the
+/// process. The obvious trigger is a downstream client hanging up during a
+/// `tools/call`, which drops the whole request future.
+#[tokio::test]
+async fn a_dropped_connect_releases_the_upstream_instead_of_wedging_it() {
+    let mgr = manager(&[
+        ("fx", stdio_server("slow")),
+        ("ok", stdio_server("healthy")),
+    ]);
+
+    // The `slow` fixture never answers, so the timeout expiring is exactly
+    // the "future dropped mid-connect" case.
+    let dropped = tokio::time::timeout(Duration::from_millis(300), mgr.ready("fx")).await;
+    assert!(
+        dropped.is_err(),
+        "the fixture answered, so nothing was cancelled"
+    );
+
+    // The abandoned claim must not read as an in-flight connect any more.
+    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Idle));
+    // And the manager as a whole still works.
+    mgr.ready("ok").await.unwrap();
+    assert_eq!(mgr.status("ok").await, Some(UpstreamStatus::Ready));
+
+    // A second demand on the wedged upstream starts its own ladder rather
+    // than parking forever: it gets to run and time out on its own terms.
+    let retried = tokio::time::timeout(Duration::from_millis(300), mgr.ready("fx")).await;
+    assert!(retried.is_err());
+    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Idle));
+    mgr.shutdown().await;
+}
+
+/// The other half of the same bug: a caller already parked behind the ladder
+/// when it is abandoned has to be woken, not left on `settled` forever.
+#[tokio::test]
+async fn a_parked_caller_recovers_when_the_ladder_it_waits_on_is_dropped() {
+    // A ladder short enough that the woken caller can run a whole one of its
+    // own inside the test's patience.
+    let mgr = Arc::new(
+        UpstreamManager::new(
+            [("fx".to_owned(), stdio_server("slow"))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_millis(400))
+        .with_backoff_base(Duration::from_millis(20)),
+    );
+
+    let owner = tokio::spawn({
+        let mgr = Arc::clone(&mgr);
+        async move { tokio::time::timeout(Duration::from_millis(300), mgr.ready("fx")).await }
+    });
+    // Let the owner claim the slot before the second caller looks at it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Connecting));
+
+    let parked = tokio::spawn({
+        let mgr = Arc::clone(&mgr);
+        async move { tokio::time::timeout(Duration::from_secs(5), mgr.ready("fx")).await }
+    });
+
+    assert!(
+        owner.await.unwrap().is_err(),
+        "the owner should have timed out"
+    );
+    // Woken by the abandoned claim, the parked caller runs its own ladder
+    // against the same never-answering fixture and fails on the connect
+    // timeout — the point is that it is not still parked.
+    assert!(
+        matches!(parked.await.unwrap(), Ok(Err(UpstreamError::Failed { .. }))),
+        "the parked caller never recovered"
+    );
+    mgr.shutdown().await;
+}
+
 #[tokio::test]
 async fn concurrent_demands_coalesce_into_one_instance() {
     let mgr = Arc::new(manager(&[("fx", stdio_server("healthy"))]));

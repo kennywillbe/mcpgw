@@ -1,9 +1,11 @@
 name: Release
 
-# Tag a release with `git tag v0.1.0 && git push --tags`. This builds one
-# archive per target, hashes it, and attaches everything to a GitHub Release.
-# Deliberately hand-rolled instead of generated: four targets and a `gh`
-# invocation are easier to read than a generator's output.
+# Triggered by a `v*` tag — in practice the one release-please pushes when its
+# PR merges, though a hand-pushed tag works too. This builds one archive per
+# target, hashes it, and attaches everything to the GitHub Release, creating
+# that release only if release-please has not already. Deliberately
+# hand-rolled instead of generated: four targets and a `gh` invocation are
+# easier to read than a generator's output.
 
 on:
   push:
@@ -100,15 +102,29 @@ jobs:
           (cd dist && sha256sum mcpgw-* > SHA256SUMS && rm -f *.sha256)
           ls -l dist
 
-      - name: Create release
+      # Creating the release is conditional because release-please usually
+      # got there first: it pushes the tag *and* publishes a release with its
+      # generated notes, and this workflow then triggers on that same tag. An
+      # unconditional `gh release create` fails with "a release with the same
+      # tag name already exists" and the archives never get attached — which
+      # is exactly what happened to v0.1.0. Uploading is unconditional and
+      # clobbers, so a re-run replaces the assets instead of failing on them.
+      - name: Publish assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          notes="$(mktemp)"
-          printf 'See [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md) for what changed.\n' \
-            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > "$notes"
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file "$notes" \
-            --verify-tag \
-            dist/*
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            notes="$(mktemp)"
+            printf 'See [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md) for what changed.\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > "$notes"
+            # The `||` closes the window between the check and the create:
+            # a release that appeared in between is fine, anything else is
+            # still a failure.
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "$notes" \
+              --verify-tag \
+              || gh release view "$GITHUB_REF_NAME" >/dev/null
+          fi
+          gh release upload "$GITHUB_REF_NAME" --clobber dist/*

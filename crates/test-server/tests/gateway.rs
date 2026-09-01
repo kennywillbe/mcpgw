@@ -109,6 +109,44 @@ async fn dead_upstream_surfaces_as_loud_error() {
     manager.shutdown().await;
 }
 
+/// Without a deadline on the request path a client waits out the whole
+/// connect ladder (~93s at the defaults) and, for a call that reaches a hung
+/// server, forever. It now gets a named error instead.
+#[tokio::test]
+async fn a_hung_upstream_fails_the_request_on_the_deadline() {
+    // The `slow` fixture never answers the handshake, so the request can only
+    // end on the deadline.
+    let manager = Arc::new(
+        UpstreamManager::new(
+            [("fx".to_owned(), stdio_server("slow"))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let gateway = Gateway::new(Arc::clone(&manager), "fx".to_owned())
+        .with_request_timeout(Duration::from_millis(300));
+    let client = connect(gateway).await;
+
+    let started = std::time::Instant::now();
+    let err = client.call_tool(call("echo", "hi")).await.unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("fx"), "should name the upstream: {text}");
+    assert!(text.contains("deadline"), "should say why: {text}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited {:?}, so nothing bounded the request",
+        started.elapsed()
+    );
+
+    // tools/list is on the same clock.
+    let err = client.list_all_tools().await.unwrap_err();
+    assert!(err.to_string().contains("fx"), "{err}");
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
 #[tokio::test]
 async fn aggregate_merges_prefixed_tools_from_every_upstream() {
     let (client, manager) = aggregate_client(&[("fx1", "healthy"), ("fx2", "healthy")]).await;

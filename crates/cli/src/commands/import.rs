@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::IsTerminal as _;
 
 use anyhow::Context as _;
@@ -35,7 +36,7 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     // into a DuplicateName abort halfway through the reported progress. The
     // store now supplies both the planning input and the write handle, so
     // they cannot describe different files.
-    let mut store = ConfigStore::edit_or_create(&config_path)?;
+    let store = ConfigStore::edit_or_create(&config_path)?;
     let plan = plan_import(&sources, &store.config().servers);
 
     if plan.new.is_empty() && plan.already.is_empty() && plan.conflicts.is_empty() {
@@ -46,6 +47,32 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
         report_dry(&plan);
         return Ok(());
     }
+
+    // Conflicts need a human, and a human is arbitrary think-time. Locks are
+    // therefore dropped before asking and retaken afterwards: holding the
+    // config lock across the prompt stalls every concurrent `mcpgw add`, and
+    // holding the state lock — which this command only started taking with
+    // the adoption fix — stalls every concurrent `mcpgw sync` as well, for as
+    // long as the terminal goes unanswered.
+    //
+    // Reacquiring means re-planning: the answers are keyed by name and only
+    // honoured for a name that is *still* a conflict in the fresh plan, so
+    // the guarantee the plan-under-lock fix bought (plan and write describe
+    // the same file) survives, and a name that changed underneath us falls
+    // back to being skipped.
+    let (mut store, plan, overwrite) =
+        if plan.conflicts.is_empty() || !std::io::stdin().is_terminal() {
+            // Nothing to ask, so nothing to release: the plan already under
+            // the lock is the one that gets applied.
+            (store, plan, BTreeSet::new())
+        } else {
+            let questions: Vec<String> = plan.conflicts.iter().map(|c| c.name.clone()).collect();
+            drop(store);
+            let overwrite = ask(&questions)?;
+            let store = ConfigStore::edit_or_create(&config_path)?;
+            let plan = plan_import(&sources, &store.config().servers);
+            (store, plan, overwrite)
+        };
 
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
@@ -70,12 +97,7 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
         println!("= {} already present (adopted)", candidate.name);
     }
     for candidate in &plan.conflicts {
-        let overwrite = std::io::stdin().is_terminal()
-            && super::confirm(&format!(
-                "{:?} differs from the canonical entry — overwrite canonical?",
-                candidate.name
-            ))?;
-        if overwrite {
+        if overwrite.contains(&candidate.name) {
             store.upsert_server(&candidate.name, &candidate.server, true)?;
             adopt(&mut state, candidate);
             imported += 1;
@@ -89,13 +111,45 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Canonical file first, then the adoption record — deliberately the
+    // reverse of the intent-first order sync uses, because the two ledgers
+    // claim different things. Sync's state entry claims what that run is
+    // about to *write* into the client, so an over-claim self-heals: the next
+    // sync sees a managed name missing from the client and adds it. Import's
+    // state entry claims client entries that only the canonical config
+    // justifies. Claim them first and a failed `store.save()` leaves the
+    // state saying "mcpgw manages cursor's github" with no canonical github
+    // behind it — which the next sync reads as a removal and deletes the
+    // user's entry. This order fails the harmless way instead: the entries
+    // read as unmanaged and are left untouched, and re-running import adopts
+    // them.
     store.save()?;
-    state.save(&state_path)?;
+    state.save(&state_path).context(
+        "the canonical config was written but the adoption record was not; re-run \
+         `mcpgw import` to finish adopting — your client entries are untouched \
+         until it succeeds",
+    )?;
     println!(
         "imported {imported}, already present {}, skipped {skipped}",
         plan.already.len()
     );
     Ok(())
+}
+
+/// Asks about each conflicting name and returns the ones to overwrite.
+///
+/// Takes names rather than the plan so the caller cannot accidentally keep a
+/// lock alive across the prompt: this runs with none held.
+fn ask(names: &[String]) -> anyhow::Result<BTreeSet<String>> {
+    let mut overwrite = BTreeSet::new();
+    for name in names {
+        if super::confirm(&format!(
+            "{name:?} differs from the canonical entry — overwrite canonical?"
+        ))? {
+            overwrite.insert(name.clone());
+        }
+    }
+    Ok(overwrite)
 }
 
 fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
