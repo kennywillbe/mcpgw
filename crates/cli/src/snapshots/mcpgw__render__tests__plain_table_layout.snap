@@ -1,0 +1,7 @@
+---
+source: crates/cli/src/render.rs
+expression: "server_table(&sample(), false)"
+---
+NAME    TYPE   TARGET                                      ON   TAGS
+github  stdio  npx -y @modelcontextprotocol/server-github  on   work
+linear  http   https://mcp.linear.app/mcp                  off

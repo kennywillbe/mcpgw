@@ -1,0 +1,10 @@
+version = 1
+
+[servers.github]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"

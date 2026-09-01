@@ -1,0 +1,5 @@
+---
+source: crates/core/tests/config.rs
+expression: err.to_string()
+---
+invalid server name "Bad Name": only lowercase letters, digits, '-' and '_' are allowed

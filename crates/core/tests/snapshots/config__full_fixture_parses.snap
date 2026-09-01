@@ -1,0 +1,45 @@
+---
+source: crates/core/tests/config.rs
+expression: "parse_fixture(\"full.toml\").unwrap()"
+---
+Config {
+    version: 1,
+    servers: {
+        "fs": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "mcp-server-filesystem",
+                args: [],
+                env: {},
+            },
+        },
+        "github": Server {
+            enabled: true,
+            tags: [
+                "work",
+                "vcs",
+            ],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-github",
+                ],
+                env: {
+                    "GITHUB_TOKEN": "ghp_test",
+                },
+            },
+        },
+        "linear": Server {
+            enabled: false,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/mcp",
+                headers: {
+                    "Authorization": "Bearer test",
+                },
+            },
+        },
+    },
+}

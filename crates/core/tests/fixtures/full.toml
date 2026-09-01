@@ -1,0 +1,18 @@
+version = 1
+
+[servers.github]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "ghp_test" }
+tags = ["work", "vcs"]
+
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+headers = { Authorization = "Bearer test" }
+enabled = false
+
+[servers.fs]
+type = "stdio"
+command = "mcp-server-filesystem"
