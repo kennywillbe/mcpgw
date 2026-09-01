@@ -64,6 +64,10 @@ impl ManagedState {
             .map_err(std::io::Error::other)
             .map_err(io_err(path))?;
         tmp.write_all(text.as_bytes()).map_err(io_err(path))?;
+        // fsync before rename: a crash must yield the previous state file,
+        // never a truncated one that then fails to parse and takes every
+        // managed entry down to "foreign" with it.
+        tmp.as_file().sync_all().map_err(io_err(path))?;
         tmp.persist(path).map_err(|err| Error::Io {
             path: path.to_owned(),
             source: err.error,
@@ -73,6 +77,35 @@ impl ManagedState {
         // the same owner-only treatment rather than a second rule to
         // remember.
         crate::private::harden_file(path).map_err(io_err(path))?;
+        crate::private::sync_dir(parent).map_err(io_err(parent))?;
         Ok(())
     }
+
+    /// Takes the exclusive lock guarding `path`, blocking until any other
+    /// mcpgw process releases it.
+    ///
+    /// The state file is read, modified and written back over the course of a
+    /// whole sync or import run. Without a lock spanning that window two
+    /// concurrent runs are last-writer-wins: one client's managed-name set
+    /// disappears, its entries read as foreign, and every later sync reports
+    /// them as conflicts. Hold the returned guard for the entire cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the sidecar lock file cannot be created or
+    /// locked.
+    pub fn lock(path: &Path) -> Result<StateLock, Error> {
+        Ok(StateLock {
+            _file: crate::store::acquire_lock(path)?,
+        })
+    }
+}
+
+/// An held exclusive lock over a state file; released on drop.
+#[derive(Debug)]
+pub struct StateLock {
+    // Sidecar lock file (`managed.json.lock`), never the state file itself:
+    // saving renames a new inode over it, which would strand a lock held on
+    // the old one.
+    _file: std::fs::File,
 }

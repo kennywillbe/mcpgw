@@ -191,6 +191,57 @@ fn rollback_restores_previous_content() {
 }
 
 #[test]
+fn rollback_backs_up_what_it_overwrites_so_it_can_be_undone() {
+    let sb = Sandbox::new();
+    sb.install_cursor(Some(r#"{"mcpServers": {"mine": {"command": "deno"}}}"#));
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["sync", "--client", "cursor"]);
+
+    // Back to the pre-sync file...
+    sb.ok(&["sync", "--client", "cursor", "--rollback"]);
+    assert!(sb.cursor_json()["mcpServers"].get("github").is_none());
+
+    // ...and back again: the rollback stacked a backup of the synced file,
+    // so a rollback fired by mistake is not the end of the road.
+    sb.ok(&["sync", "--client", "cursor", "--rollback"]);
+    let json = sb.cursor_json();
+    assert_eq!(json["mcpServers"]["github"]["command"], "npx");
+    assert_eq!(json["mcpServers"]["mine"]["command"], "deno");
+}
+
+/// A failed client write must leave the entries *claimed* rather than
+/// orphaned: over-claiming reconciles on the next run, under-claiming makes
+/// them foreign forever.
+#[cfg(unix)]
+#[test]
+fn a_failed_client_write_leaves_state_the_next_sync_can_repair() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let sb = Sandbox::new();
+    sb.install_cursor(None);
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+
+    // Read-only parent: the atomic write cannot create its temp file there.
+    let dir = sb.home.join(".cursor");
+    let original = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let failed = sb.mcpgw(&["sync", "--client", "cursor"]);
+    std::fs::set_permissions(&dir, original).unwrap();
+    assert!(!failed.status.success());
+
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.state.join("managed.json")).unwrap())
+            .unwrap();
+    assert_eq!(state["clients"]["cursor"][0], "github");
+
+    // The claim without the entry reads as a plain add, not a conflict.
+    let out = sb.ok(&["sync", "--client", "cursor"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(!out.contains("! github"), "{out}");
+    assert_eq!(sb.cursor_json()["mcpServers"]["github"]["command"], "npx");
+}
+
+#[test]
 fn jsonc_file_is_skipped_untouched() {
     let sb = Sandbox::new();
     let path = sb.install_cursor(Some("// my comment\n{\"mcpServers\": {}}\n"));

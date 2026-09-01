@@ -169,6 +169,7 @@ impl ConfigStore {
             path: self.path.clone(),
             source: err.error,
         })?;
+        crate::private::sync_dir(parent).map_err(io_err(parent))?;
         Ok(())
     }
 
@@ -200,13 +201,17 @@ pub fn lock_path(config: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn acquire_lock(config: &Path) -> Result<File, Error> {
+/// Takes the exclusive advisory lock guarding `config`, blocking until any
+/// other mcpgw process releases it. The lock lives for as long as the
+/// returned handle. Shared with the state file, which needs the same
+/// read-modify-write protection around a different path.
+pub(crate) fn acquire_lock(config: &Path) -> Result<File, Error> {
     let io_err = |path: &Path| {
         let path = path.to_owned();
         move |source| Error::Io { path, source }
     };
     let parent = config.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+    crate::private::create_dir_all(parent).map_err(io_err(parent))?;
     let path = lock_path(config);
     let file = OpenOptions::new()
         .create(true)

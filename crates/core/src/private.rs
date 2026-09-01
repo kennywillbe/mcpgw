@@ -21,6 +21,22 @@ pub(crate) fn create_dir_all(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
+/// Fsyncs the directory holding a file that was just replaced by rename.
+/// Syncing the temp file only makes its *contents* durable; without this the
+/// rename that publishes them can still be lost to a power cut. Windows
+/// exposes no directory handle to sync, so there this is a no-op.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Narrows an existing file to owner read/write.
 pub(crate) fn harden_file(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
