@@ -1,0 +1,71 @@
+name: Bug report
+description: A client wasn't synced correctly, the gateway misbehaved, or something else broke
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If mcpgw wrote something wrong into a client config, or the gateway
+        dropped or mis-routed traffic, that gets priority. Redact tokens and
+        URLs before pasting anything.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The exact commands, in order.
+      placeholder: |
+        1. mcpgw add github -- npx -y @modelcontextprotocol/server-github
+        2. mcpgw sync --gateway
+        3. Claude Desktop's config now has …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: mcpgw version
+      description: Output of `mcpgw --version`
+      placeholder: "0.1.0, or a commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "macOS 15.1, Ubuntu 24.04, Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: clients
+    attributes:
+      label: Clients involved
+      placeholder: "Claude Desktop, Claude Code, Cursor, VS Code, the gateway itself"
+  - type: textarea
+    id: doctor
+    attributes:
+      label: mcpgw doctor --json output
+      description: Redact any `env` or header values it didn't already mask.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your ~/.config/mcpgw/config.toml, with credentials removed.
+      render: toml
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I ran `mcpgw doctor --json` and pasted its output above
+          required: true
+        - label: I removed all secrets from everything I pasted
+          required: true
