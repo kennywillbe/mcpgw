@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -22,6 +22,15 @@ use crate::upstream::UpstreamManager;
 /// a prefixed name is always unambiguous.
 pub const SEPARATOR: &str = "__";
 
+/// Ceiling on one downstream request, covering both acquiring the upstream
+/// (which can run a full connect ladder) and the forwarded call.
+///
+/// Deliberately generous: an MCP tool call may legitimately take minutes, so
+/// this is a backstop against hanging forever, not a latency budget. It is
+/// still shorter than the ~93s worst-case ladder plus an unbounded call,
+/// which is what a client used to be able to wait for with no answer at all.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Clone)]
 enum Mode {
     /// Single upstream, names passed through verbatim.
@@ -36,6 +45,7 @@ pub struct Gateway {
     mode: Mode,
     unavailable_hint: Option<String>,
     capture: Option<Arc<CaptureWriter>>,
+    request_timeout: Duration,
 }
 
 impl Gateway {
@@ -48,6 +58,7 @@ impl Gateway {
             mode: Mode::Pipe(upstream),
             unavailable_hint: None,
             capture: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -61,6 +72,7 @@ impl Gateway {
             mode: Mode::Aggregate(upstreams),
             unavailable_hint: None,
             capture: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -83,6 +95,15 @@ impl Gateway {
         self
     }
 
+    /// Overrides [`DEFAULT_REQUEST_TIMEOUT`] for this gateway. Exists so the
+    /// deployment can tighten or relax the ceiling (and so the suite can make
+    /// it tiny); no CLI flag surfaces it yet.
+    #[must_use]
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
     #[must_use]
     pub fn manager(&self) -> &Arc<UpstreamManager> {
         &self.manager
@@ -96,6 +117,27 @@ impl Gateway {
         let Some(writer) = &self.capture else { return };
         if let Err(err) = writer.append(&build(writer.session())) {
             eprintln!("warning: could not write traffic capture: {err}");
+        }
+    }
+
+    /// Runs `work` under the per-request deadline, reporting expiry as an
+    /// error that names the upstream and the ceiling it hit.
+    ///
+    /// The deadline covers acquiring the upstream as well as the forwarded
+    /// call: acquisition is the half that can run a whole connect ladder, and
+    /// a client with nothing to wait on is the failure this exists to
+    /// prevent.
+    async fn within_deadline<T>(
+        &self,
+        upstream: &str,
+        work: impl Future<Output = Result<T, ErrorData>>,
+    ) -> Result<T, ErrorData> {
+        match tokio::time::timeout(self.request_timeout, work).await {
+            Ok(result) => result,
+            Err(_) => Err(ErrorData::internal_error(
+                timed_out(upstream, self.request_timeout),
+                None,
+            )),
         }
     }
 
@@ -123,16 +165,22 @@ impl Gateway {
         for name in upstreams {
             let manager = Arc::clone(&self.manager);
             let name = name.clone();
+            // Per upstream rather than over the whole merge: one hung server
+            // must not decide how long the healthy ones get.
+            let deadline = self.request_timeout;
             tasks.spawn(async move {
                 let started = Instant::now();
-                let tools = async {
+                let work = async {
                     let service = manager.ready(&name).await.map_err(|err| err.to_string())?;
                     service
                         .list_all_tools()
                         .await
                         .map_err(|err| err.to_string())
-                }
-                .await;
+                };
+                let tools = match tokio::time::timeout(deadline, work).await {
+                    Ok(tools) => tools,
+                    Err(_) => Err(timed_out(&name, deadline)),
+                };
                 (name, started.elapsed(), tools)
             });
         }
@@ -216,14 +264,15 @@ impl ServerHandler for Gateway {
         match &self.mode {
             Mode::Pipe(upstream) => {
                 let started = Instant::now();
-                let tools = async {
-                    let service = self.upstream_service(upstream).await?;
-                    service
-                        .list_all_tools()
-                        .await
-                        .map_err(|err| ErrorData::internal_error(err.to_string(), None))
-                }
-                .await;
+                let tools = self
+                    .within_deadline(upstream, async {
+                        let service = self.upstream_service(upstream).await?;
+                        service
+                            .list_all_tools()
+                            .await
+                            .map_err(|err| ErrorData::internal_error(err.to_string(), None))
+                    })
+                    .await;
                 let elapsed = started.elapsed();
                 self.record(|session| {
                     let record = CaptureRecord::new(session, upstream, Kind::List, elapsed);
@@ -273,15 +322,16 @@ impl ServerHandler for Gateway {
         });
 
         let started = Instant::now();
-        let response = async {
-            let service = self.upstream_service(&upstream).await?;
-            service
-                .call_tool(request)
-                .await
-                .map(CallToolResponse::from)
-                .map_err(|err| ErrorData::internal_error(err.to_string(), None))
-        }
-        .await;
+        let response = self
+            .within_deadline(&upstream, async {
+                let service = self.upstream_service(&upstream).await?;
+                service
+                    .call_tool(request)
+                    .await
+                    .map(CallToolResponse::from)
+                    .map_err(|err| ErrorData::internal_error(err.to_string(), None))
+            })
+            .await;
         let elapsed = started.elapsed();
 
         self.record(|session| {
@@ -297,6 +347,13 @@ impl ServerHandler for Gateway {
         });
         response
     }
+}
+
+/// The one wording for a request that ran out its deadline. Names the
+/// upstream and the ceiling, because "which server, and how long did I
+/// actually wait" is what the user needs in order to act on it.
+fn timed_out(upstream: &str, deadline: Duration) -> String {
+    format!("upstream {upstream:?} did not answer within {deadline:?} (request deadline)")
 }
 
 /// Best-effort JSON rendering of a tool response for the capture log; the
@@ -408,7 +465,10 @@ pub async fn serve_stdio(gateway: Gateway) -> Result<rmcp::service::QuitReason, 
     use rmcp::ServiceExt as _;
     use rmcp::transport::io::stdio;
 
-    let running = gateway.serve(stdio()).await.map_err(Box::new)?;
+    // Boxed: the serve future embeds the handler futures, which carry the
+    // per-request deadline timers, and the whole thing is ~20 KB of stack if
+    // left inline. It is created once per process, so the allocation is free.
+    let running = Box::pin(gateway.serve(stdio())).await.map_err(Box::new)?;
     Ok(running.waiting().await?)
 }
 
