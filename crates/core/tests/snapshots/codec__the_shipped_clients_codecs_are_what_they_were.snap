@@ -47,4 +47,8 @@ expression: matrix
         "cline-cli",
         "Json / mcpServers / Cline",
     ),
+    (
+        "amp",
+        "Json / amp.mcpServers / Amp",
+    ),
 ]

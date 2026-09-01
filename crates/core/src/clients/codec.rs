@@ -123,6 +123,10 @@ pub enum EntrySchema {
     /// remote `type` spelled `streamableHttp`, and an `autoApprove` list of
     /// tool names mcpgw has no counterpart for.
     Cline,
+    /// Amp's shape: the `mcpServers` fields — `disabled` included — with no
+    /// `type` at all, so a remote entry is a bare `url` and the transport is
+    /// whichever target field is present.
+    Amp,
 }
 
 impl EntrySchema {
@@ -149,7 +153,11 @@ impl EntrySchema {
             // that one is read as absent: an entry an extension installed
             // carries a source of its own, and refusing to read it would
             // hide a server the user does have.
-            Self::McpServers | Self::VsCode | Self::Zed => parse_mcp_servers(obj),
+            //
+            // Amp only ever writes a subset of the shared fields, so reading
+            // it by the shared rules costs nothing and gains leniency: a
+            // hand-written `type` is understood rather than rejected.
+            Self::McpServers | Self::VsCode | Self::Zed | Self::Amp => parse_mcp_servers(obj),
         }
     }
 
@@ -194,9 +202,12 @@ impl EntrySchema {
                         obj.insert("serverUrl".to_owned(), url.as_str().into());
                         "headers"
                     }
-                    Self::Zed => {
-                        // A remote context server is a bare `url`; Zed has
-                        // no `type` field to disambiguate it from stdio.
+                    Self::Zed | Self::Amp => {
+                        // A remote entry is a bare `url` in both: neither has
+                        // a `type` field, and both infer the transport from
+                        // which target field is present. Writing the `type`
+                        // the other JSON clients take would be a field their
+                        // schemas do not define.
                         obj.insert("url".to_owned(), url.as_str().into());
                         "headers"
                     }

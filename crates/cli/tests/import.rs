@@ -459,6 +459,52 @@ fn import_dedupes_a_server_the_user_has_on_both_cline_surfaces() {
     }
 }
 
+/// Amp's settings file under the sandbox environment; XDG on macOS and
+/// Linux, the app-data dir only on Windows.
+fn amp_settings_rel() -> &'static str {
+    if cfg!(windows) {
+        "AppData/amp/settings.json"
+    } else {
+        ".config/amp/settings.json"
+    }
+}
+
+#[test]
+fn import_from_amp_reads_the_namespaced_key_only() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        amp_settings_rel(),
+        r#"{
+            "amp.notifications.enabled": true,
+            "amp.mcpServers": {
+                "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]},
+                "browser": {"command": "browser-mcp", "disabled": true},
+                "linear": {"url": "https://mcp.linear.app/sse"}
+            },
+            "amp": {"mcpServers": {"decoy": {"command": "never-read-me"}}}
+        }"#,
+    );
+    let out = sb.ok(&["import", "--from", "amp"]);
+    for name in ["+ playwright", "+ browser", "+ linear"] {
+        assert!(out.contains(name), "{out}");
+    }
+    // The dot belongs to the key, so the nested object is another property.
+    assert!(!out.contains("decoy"), "{out}");
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(json["servers"].as_object().unwrap().len(), 3);
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/sse"
+    );
+    // `disabled: true` is the inverse of the canonical flag.
+    assert_eq!(json["servers"]["browser"]["enabled"], false);
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "amp"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
 #[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();

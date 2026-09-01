@@ -381,6 +381,51 @@ fn the_cline_cli_reads_the_extension_format() {
 }
 
 #[test]
+fn amp_reads_the_namespaced_key_and_not_a_nested_one() {
+    let read = read_fixture(ClientKind::Amp, "amp_settings.json");
+
+    assert_eq!(
+        read.servers["playwright"].transport,
+        mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: vec![
+                "-y".to_owned(),
+                "@playwright/mcp@latest".to_owned(),
+                "--headless".to_owned()
+            ],
+            env: std::collections::BTreeMap::new(),
+        }
+    );
+    // `disabled` is the inverse of the canonical flag.
+    assert!(read.servers["playwright"].enabled);
+    assert!(!read.servers["browser"].enabled);
+
+    // A remote entry is a bare `url` — Amp has no `type` to say so — and its
+    // `${VAR}` interpolation is kept verbatim rather than expanded here.
+    assert_eq!(
+        read.servers["sourcegraph"].transport,
+        mcpgw_core::Transport::Http {
+            url: "${SRC_ENDPOINT}/.api/mcp/v1".to_owned(),
+            headers: [(
+                "Authorization".to_owned(),
+                "token ${SRC_ACCESS_TOKEN}".to_owned()
+            )]
+            .into_iter()
+            .collect(),
+        }
+    );
+
+    // The dot belongs to the key: a genuinely nested `amp` object is a
+    // different property and must stay invisible.
+    assert!(!read.servers.contains_key("decoy"));
+    // An entry that is only an off switch is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    assert_eq!(read.servers.len(), 4);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+#[test]
 fn broken_entries_become_problems_not_failures() {
     let read = read_fixture(ClientKind::ClaudeDesktop, "messy.json");
     // Exactly one entry survives; every other becomes a reported problem.
@@ -581,6 +626,42 @@ fn the_two_cline_surfaces_detect_independently() {
         ClientKind::Cline.detect_with(&env),
         Detection::Configured(_)
     ));
+}
+
+/// Amp's own dir holds its settings file, so "installed" and "configured"
+/// are told apart by the file — and the dir is XDG on macOS too, not the
+/// app-data dir the GUI clients use.
+#[test]
+fn amp_detects_from_its_config_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let appdata = home.join("AppData");
+    let env = move |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "HOME" | "USERPROFILE" => Some(home.clone().into()),
+            "APPDATA" => Some(appdata.clone().into()),
+            _ => None,
+        }
+    };
+
+    assert_eq!(ClientKind::Amp.detect_with(&env), Detection::NotInstalled);
+
+    let trace = ClientKind::Amp.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Amp.detect_with(&env), Detection::Installed);
+
+    let config = ClientKind::Amp.config_path_with(&env).unwrap();
+    let expected = if cfg!(windows) {
+        "AppData/amp/settings.json"
+    } else {
+        ".config/amp/settings.json"
+    };
+    assert!(config.ends_with(expected), "{}", config.display());
+    std::fs::write(&config, r#"{"amp.mcpServers": {}}"#).unwrap();
+    assert_eq!(
+        ClientKind::Amp.detect_with(&env),
+        Detection::Configured(config)
+    );
 }
 
 #[test]

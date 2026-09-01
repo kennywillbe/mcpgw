@@ -201,15 +201,26 @@ fn entry_shapes_per_client() {
         cline_http
     );
 
+    // Amp is the shared stdio shape, and a bare `url` for remote: it has no
+    // `type` field, so writing one would be a field its schema does not have.
+    let amp_stdio = client_entry(ClientKind::Amp, &canonical["github"]);
+    let amp_http = client_entry(ClientKind::Amp, &canonical["linear"]);
+    assert_eq!(amp_stdio, cursor_stdio);
+    assert_eq!(amp_http["url"], "https://mcp.linear.app/mcp");
+    assert!(amp_http.get("type").is_none());
+    // `source` is Zed's, not Amp's, however alike the two shapes look.
+    assert!(amp_http.get("source").is_none());
+    assert!(amp_stdio.get("disabled").is_none());
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
 }
 
 /// The clients whose entry shape is rewritten rather than passed through:
 /// opencode splits and rejoins the `command` array, Windsurf renames the
 /// remote URL, Zed adds a `source` its reader has to ignore, Cline spells the
-/// remote type its own way. Emitting and re-reading has to give back the
-/// server that went in — for every client, but for these it is load bearing
-/// rather than incidental.
+/// remote type its own way, Amp drops the `type` the shared shape carries.
+/// Emitting and re-reading has to give back the server that went in — for
+/// every client, but for these it is load bearing rather than incidental.
 #[test]
 fn emitting_and_re_reading_an_entry_returns_the_same_server() {
     let mut servers: Vec<mcpgw_core::Server> = canonical().into_values().collect();
@@ -248,6 +259,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
         ClientKind::Zed,
         ClientKind::Cline,
         ClientKind::ClineCli,
+        ClientKind::Amp,
     ] {
         let entries = kind.codec().entries;
         for server in &servers {
@@ -338,6 +350,15 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(cline["url"], url);
     assert_eq!(cline["type"], "streamableHttp");
     assert!(cline.get("command").is_none());
+
+    // Amp reads a remote entry from the URL alone, so the gateway is one.
+    let amp = client_entry(
+        ClientKind::Amp,
+        &gateway_server(ClientKind::Amp, url, "mcpgw"),
+    );
+    assert_eq!(amp["url"], url);
+    assert!(amp.get("type").is_none());
+    assert!(amp.get("command").is_none());
 
     for kind in ClientKind::ALL {
         assert_eq!(

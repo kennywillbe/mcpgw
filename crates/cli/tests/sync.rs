@@ -191,6 +191,32 @@ impl Sandbox {
             .unwrap()
     }
 
+    /// Amp follows the XDG layout on macOS as well as Linux, and only uses
+    /// the app-data dir on Windows.
+    fn amp_dir(&self) -> PathBuf {
+        if cfg!(windows) {
+            self.home.join("AppData/amp")
+        } else {
+            self.home.join(".config/amp")
+        }
+    }
+
+    /// `None` installs the directory alone (Amp present, unconfigured).
+    fn install_amp(&self, settings: Option<&str>) {
+        std::fs::create_dir_all(self.amp_dir()).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(self.amp_dir().join("settings.json"), text).unwrap();
+        }
+    }
+
+    fn amp_text(&self) -> String {
+        std::fs::read_to_string(self.amp_dir().join("settings.json")).unwrap()
+    }
+
+    fn amp_json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.amp_text()).unwrap()
+    }
+
     /// Cline's two surfaces read different files that nothing keeps in
     /// step, so each gets its own directory here.
     fn cline_dir(&self, kind: mcpgw_core::ClientKind) -> PathBuf {
@@ -312,6 +338,26 @@ const CLINE_SETTINGS: &str = r#"{
       "autoApprove": ["list_notes", "read_note"]
     }
   }
+}"#;
+
+/// An Amp settings file with everything a sync has to leave alone: settings
+/// that are not MCP at all, an entry mcpgw does not own, and — the one that
+/// only Amp can get wrong — a genuinely nested `amp` object, which is a
+/// different property from the `amp.mcpServers` key beside it.
+const AMP_SETTINGS: &str = r#"{
+  "amp.notifications.enabled": true,
+  "amp.mcpServers": {
+    "notes": {
+      "command": "notes-mcp",
+      "disabled": true
+    }
+  },
+  "amp": {
+    "mcpServers": {
+      "decoy": { "command": "never-read-me" }
+    }
+  },
+  "amp.tools.disable": ["edit_file"]
 }"#;
 
 /// The bridge command is either the bare name (mcpgw on PATH) or the path of
@@ -1027,6 +1073,69 @@ fn the_two_cline_surfaces_are_synced_independently() {
             "https://mcp.linear.app/mcp"
         );
     }
+}
+
+#[test]
+fn amp_sync_writes_the_namespaced_key_and_leaves_the_nested_one_alone() {
+    let sb = Sandbox::new();
+    sb.install_amp(Some(AMP_SETTINGS));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "amp"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("? notes"), "{out}");
+
+    let json = sb.amp_json();
+    // Settings that have nothing to do with MCP are untouched, dotted
+    // siblings of the server map included.
+    assert_eq!(json["amp.notifications.enabled"], true);
+    assert_eq!(json["amp.tools.disable"], serde_json::json!(["edit_file"]));
+    // So is the entry mcpgw does not own, its off switch included.
+    assert_eq!(json["amp.mcpServers"]["notes"]["disabled"], true);
+    // The nested object is a different property and stays a bystander: it is
+    // neither read as the server map nor written into.
+    assert_eq!(
+        json["amp"]["mcpServers"]["decoy"]["command"],
+        "never-read-me"
+    );
+    assert!(json["amp"]["mcpServers"].get("github").is_none());
+
+    assert_eq!(json["amp.mcpServers"]["github"]["command"], "npx");
+    assert_eq!(json["amp.mcpServers"]["github"]["env"]["TOKEN"], "t");
+    // Amp infers the transport from the URL; it has no `type` field.
+    assert_eq!(
+        json["amp.mcpServers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert!(json["amp.mcpServers"]["linear"].get("type").is_none());
+
+    let text = sb.amp_text();
+    let again = sb.ok(&["sync", "--client", "amp"]);
+    assert!(again.contains("no changes"), "{again}");
+    assert_eq!(sb.amp_text(), text);
+}
+
+#[test]
+fn amp_gateway_entry_is_a_bare_url() {
+    let sb = Sandbox::new();
+    sb.install_amp(None);
+    let out = sb.ok(&["sync", "--client", "amp", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.amp_json()["amp.mcpServers"]["mcpgw"].clone();
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
+    assert!(entry.get("type").is_none());
+    assert!(entry.get("command").is_none());
 }
 
 /// The `--client` and `--from` help is generated from `ClientKind::ALL`, so
