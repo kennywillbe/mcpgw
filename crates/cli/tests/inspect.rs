@@ -32,7 +32,7 @@ version = 1
 
 [servers.fx]
 type = "stdio"
-command = "{}"
+command = '{}'
 args = ["healthy"]
 
 [servers.other]
