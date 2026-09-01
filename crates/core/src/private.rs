@@ -1,0 +1,36 @@
+//! Owner-only filesystem helpers.
+//!
+//! Everything mcpgw keeps under the state dir is derived from client configs
+//! — which carry API tokens and `Authorization` headers — so it inherits the
+//! discipline capture files already had: directories 0700, files 0600. On
+//! non-unix targets both are no-ops beyond ordinary creation, because the
+//! mode bits have no equivalent there.
+
+use std::path::Path;
+
+/// Creates `dir` and its missing parents, owner-only where the platform has
+/// the concept. An existing directory keeps its current mode.
+pub(crate) fn create_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
+/// Narrows an existing file to owner read/write.
+pub(crate) fn harden_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}

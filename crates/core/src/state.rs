@@ -53,7 +53,7 @@ impl ManagedState {
             move |source| Error::Io { path: p, source }
         };
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+        crate::private::create_dir_all(parent).map_err(io_err(parent))?;
         let mut tmp = tempfile::Builder::new()
             .prefix(".managed.json.")
             .tempfile_in(parent)
@@ -68,6 +68,11 @@ impl ManagedState {
             path: path.to_owned(),
             source: err.error,
         })?;
+        // The state file names the servers mcpgw wrote into each client; it
+        // is not secret by itself, but it lives beside the backups and gets
+        // the same owner-only treatment rather than a second rule to
+        // remember.
+        crate::private::harden_file(path).map_err(io_err(path))?;
         Ok(())
     }
 }

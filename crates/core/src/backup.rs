@@ -24,7 +24,7 @@ fn backup_dir(state_dir: &Path, client_id: &str) -> PathBuf {
 /// Returns [`Error::Io`] for filesystem failures.
 pub fn backup_file(state_dir: &Path, client_id: &str, file: &Path) -> Result<PathBuf, Error> {
     let dir = backup_dir(state_dir, client_id);
-    std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+    crate::private::create_dir_all(&dir).map_err(io_err(&dir))?;
     let name = file
         .file_name()
         .map_or_else(|| "config".to_owned(), |n| n.to_string_lossy().into_owned());
@@ -39,7 +39,10 @@ pub fn backup_file(state_dir: &Path, client_id: &str, file: &Path) -> Result<Pat
         counter += 1;
         target = dir.join(format!("{millis:015}.{counter}-{name}"));
     }
+    // `copy` carries the source mode over, so a world-readable client config
+    // would produce a world-readable backup of its tokens.
     std::fs::copy(file, &target).map_err(io_err(file))?;
+    crate::private::harden_file(&target).map_err(io_err(&target))?;
     prune(&dir)?;
     Ok(target)
 }
