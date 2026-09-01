@@ -76,7 +76,7 @@ impl Config {
     pub fn parse(text: &str, path: &Path) -> Result<Self, Error> {
         let parse_err = |source| Error::Parse {
             path: path.to_owned(),
-            source,
+            source: Box::new(source),
         };
         let probe: VersionProbe = toml::from_str(text).map_err(parse_err)?;
         if probe.version != SUPPORTED_VERSION {
@@ -123,7 +123,9 @@ impl Config {
     ///
     /// Returns [`Error::Serialize`] if the model cannot be represented as TOML.
     pub fn to_toml_string(&self) -> Result<String, Error> {
-        toml::to_string_pretty(self).map_err(|source| Error::Serialize { source })
+        toml::to_string_pretty(self).map_err(|source| Error::Serialize {
+            source: Box::new(source),
+        })
     }
 }
 

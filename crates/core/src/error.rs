@@ -2,6 +2,9 @@ use std::path::PathBuf;
 
 use crate::config::SUPPORTED_VERSION;
 
+// The parser error types are boxed: inline they push this enum past the
+// 128-byte `clippy::result_large_err` threshold on Windows, where their
+// layouts are wider than on Linux and macOS.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     // Distinct from `Io` so callers can treat a missing config as the normal
@@ -20,13 +23,13 @@ pub enum Error {
     Parse {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 
     #[error("failed to serialize config")]
     Serialize {
         #[source]
-        source: toml::ser::Error,
+        source: Box<toml::ser::Error>,
     },
 
     #[error(
@@ -52,7 +55,7 @@ pub enum Error {
     Edit {
         path: PathBuf,
         #[source]
-        source: toml_edit::TomlError,
+        source: Box<toml_edit::TomlError>,
     },
 
     #[error("invalid {client} config in {path}")]
@@ -60,14 +63,14 @@ pub enum Error {
         client: &'static str,
         path: PathBuf,
         #[source]
-        source: serde_json::Error,
+        source: Box<serde_json::Error>,
     },
 
     #[error("invalid mcpgw state file {path} (delete it to reset; entries become unmanaged)")]
     StateParse {
         path: PathBuf,
         #[source]
-        source: serde_json::Error,
+        source: Box<serde_json::Error>,
     },
 }
 

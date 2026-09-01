@@ -38,7 +38,7 @@ impl ManagedState {
         };
         serde_json::from_str(&text).map_err(|source| Error::StateParse {
             path: path.to_owned(),
-            source,
+            source: Box::new(source),
         })
     }
 

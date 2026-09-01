@@ -77,7 +77,7 @@ impl ConfigStore {
         let config = Config::parse(&text, path)?;
         let doc: DocumentMut = text.parse().map_err(|source| Error::Edit {
             path: path.to_owned(),
-            source,
+            source: Box::new(source),
         })?;
         Ok(Self {
             path: path.to_owned(),

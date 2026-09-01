@@ -184,7 +184,7 @@ impl ClientKind {
         let parse_err = |source| Error::ClientParse {
             client: self.display_name(),
             path: path.to_owned(),
-            source,
+            source: Box::new(source),
         };
         let root: serde_json::Value = serde_json::from_str(text).map_err(parse_err)?;
         let Some(root) = root.as_object() else {
