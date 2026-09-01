@@ -35,4 +35,8 @@ expression: matrix
         "windsurf",
         "Json / mcpServers / Windsurf",
     ),
+    (
+        "zed",
+        "Jsonc / context_servers / Zed",
+    ),
 ]

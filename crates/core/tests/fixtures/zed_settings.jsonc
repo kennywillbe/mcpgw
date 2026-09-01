@@ -1,0 +1,33 @@
+// Zed settings — the whole editor's, not just its MCP servers.
+{
+  "theme": "One Dark",
+  "vim_mode": true,
+  "agent": {
+    "default_model": { "provider": "anthropic", "model": "claude-opus-4" }
+  },
+  "context_servers": {
+    // Added by hand, which is what `source: custom` means here.
+    "github": {
+      "source": "custom",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_example" }
+    },
+    // Installed by a Zed extension: a different source, still a server the
+    // user has.
+    "postgres": {
+      "source": "extension",
+      "command": "postgres-context-server",
+      "settings": { "database_url": "postgres://localhost/dev" }
+    },
+    "linear": {
+      "source": "custom",
+      "url": "https://mcp.linear.app/mcp",
+      "headers": { "Authorization": "Bearer token" }
+    },
+    "husk": {
+      "source": "custom",
+      "env": { "A": "B" }
+    }
+  }
+}

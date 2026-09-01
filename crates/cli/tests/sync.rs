@@ -155,6 +155,37 @@ impl Sandbox {
         }
     }
 
+    /// Zed follows the XDG layout on macOS as well as Linux, so its
+    /// directory is under the sandbox home rather than the app-data dir.
+    fn zed_dir(&self) -> PathBuf {
+        if cfg!(windows) {
+            self.home.join("AppData/Zed")
+        } else {
+            self.home.join(".config/zed")
+        }
+    }
+
+    /// `None` installs the directory alone (Zed present, unconfigured).
+    fn install_zed(&self, settings: Option<&str>) {
+        std::fs::create_dir_all(self.zed_dir()).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(self.zed_dir().join("settings.json"), text).unwrap();
+        }
+    }
+
+    fn zed_text(&self) -> String {
+        std::fs::read_to_string(self.zed_dir().join("settings.json")).unwrap()
+    }
+
+    /// The written settings as canonical JSON — the comments are asserted on
+    /// the text itself, the values here.
+    fn zed_json(&self) -> serde_json::Value {
+        mcpgw_core::ClientKind::Zed
+            .codec()
+            .parse_value(&self.zed_text())
+            .unwrap()
+    }
+
     fn windsurf_json(&self) -> serde_json::Value {
         let text =
             std::fs::read_to_string(self.home.join(".codeium/windsurf/mcp_config.json")).unwrap();
@@ -219,6 +250,24 @@ const WINDSURF_CONFIG: &str = r#"{
     }
   }
 }"#;
+
+/// Zed's file is the whole editor's settings, comments and all, so a sync
+/// has to leave every one of those bytes — and the entry an extension owns —
+/// exactly where it found them.
+const ZED_SETTINGS: &str = r#"// My Zed settings — do not reformat.
+{
+  "theme": "One Dark",
+  "vim_mode": true,
+  "context_servers": {
+    // Installed by an extension, not by me.
+    "postgres": {
+      "source": "extension",
+      "command": "postgres-context-server",
+      "settings": { "database_url": "postgres://localhost/dev" }
+    }
+  }
+}
+"#;
 
 /// The bridge command is either the bare name (mcpgw on PATH) or the path of
 /// the binary under test.
@@ -772,6 +821,76 @@ fn windsurf_gateway_entry_uses_server_url() {
     let entry = sb.windsurf_json()["mcpServers"]["mcpgw"].clone();
     assert_eq!(entry["serverUrl"], "http://127.0.0.1:8137/mcp");
     assert!(entry.get("url").is_none());
+    assert!(entry.get("command").is_none());
+}
+
+#[test]
+fn zed_sync_marks_entries_custom_and_leaves_the_rest_of_the_settings_alone() {
+    let sb = Sandbox::new();
+    sb.install_zed(Some(ZED_SETTINGS));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "zed"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("? postgres"), "{out}");
+
+    let text = sb.zed_text();
+    for comment in [
+        "// My Zed settings — do not reformat.",
+        "// Installed by an extension, not by me.",
+    ] {
+        assert!(text.contains(comment), "lost {comment:?} in:\n{text}");
+    }
+
+    let json = sb.zed_json();
+    // Settings that have nothing to do with MCP are untouched.
+    assert_eq!(json["theme"], "One Dark");
+    assert_eq!(json["vim_mode"], true);
+    // So is the entry mcpgw does not own, its foreign source included.
+    assert_eq!(json["context_servers"]["postgres"]["source"], "extension");
+    assert_eq!(
+        json["context_servers"]["postgres"]["settings"]["database_url"],
+        "postgres://localhost/dev"
+    );
+
+    // Without `source: custom` Zed ignores an entry without a word, so both
+    // transports carry it.
+    assert_eq!(json["context_servers"]["github"]["source"], "custom");
+    assert_eq!(json["context_servers"]["github"]["command"], "npx");
+    assert_eq!(json["context_servers"]["github"]["env"]["TOKEN"], "t");
+    assert_eq!(json["context_servers"]["linear"]["source"], "custom");
+    assert_eq!(
+        json["context_servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert!(json["context_servers"]["linear"].get("type").is_none());
+
+    let again = sb.ok(&["sync", "--client", "zed"]);
+    assert!(again.contains("no changes"), "{again}");
+    // A no-op run leaves the file byte for byte as the first one wrote it.
+    assert_eq!(sb.zed_text(), text);
+}
+
+#[test]
+fn zed_gateway_entry_is_a_custom_url() {
+    let sb = Sandbox::new();
+    sb.install_zed(None);
+    let out = sb.ok(&["sync", "--client", "zed", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.zed_json()["context_servers"]["mcpgw"].clone();
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
+    assert_eq!(entry["source"], "custom");
     assert!(entry.get("command").is_none());
 }
 

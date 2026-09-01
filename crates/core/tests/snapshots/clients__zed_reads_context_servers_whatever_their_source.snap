@@ -1,0 +1,49 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "github": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-github",
+                ],
+                env: {
+                    "GITHUB_TOKEN": "ghp_example",
+                },
+            },
+        },
+        "linear": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/mcp",
+                headers: {
+                    "Authorization": "Bearer token",
+                },
+            },
+        },
+        "postgres": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "postgres-context-server",
+                args: [],
+                env: {},
+            },
+        },
+    },
+    problems: [
+        Problem {
+            server: Some(
+                "husk",
+            ),
+            message: "has neither `command` nor `url`",
+        },
+    ],
+}
