@@ -3,7 +3,9 @@
 //! implementation of the protocol.
 //!
 //! Modes (first CLI argument): `healthy` (default), `slow` (never answers),
-//! `garbage` (non-JSON output), `exit` (dies immediately).
+//! `garbage` (non-JSON output), `exit` (dies immediately), `die-on-tools`
+//! (handshakes fine, then dies on the first tools/list — exercises
+//! died-after-ready reconnection).
 
 use std::io::{BufRead as _, Write as _};
 
@@ -19,7 +21,7 @@ fn main() {
             park();
         }
         "slow" => park(),
-        _ => serve(),
+        mode => serve(mode == "die-on-tools"),
     }
 }
 
@@ -27,7 +29,7 @@ fn park() {
     std::thread::sleep(std::time::Duration::from_secs(3600));
 }
 
-fn serve() {
+fn serve(die_on_tools: bool) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -59,6 +61,7 @@ fn serve() {
                     }),
                 );
             }
+            "tools/list" if die_on_tools => std::process::exit(0),
             "tools/list" => respond(
                 &mut stdout,
                 &id,

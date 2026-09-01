@@ -9,6 +9,7 @@ pub mod probe;
 pub mod state;
 pub mod store;
 pub mod sync;
+pub mod upstream;
 
 pub use clients::{ClientKind, ClientRead, Detection, Problem};
 pub use config::{Config, SUPPORTED_VERSION, Server, Transport};
