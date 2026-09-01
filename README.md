@@ -119,9 +119,16 @@ Honest limits, since this handles your tool traffic:
 
 - The gateway binds to `127.0.0.1` by default. `--bind` opens it up and warns
   you loudly; there is no authentication yet.
-- Traffic files are written mode 0600 under your state directory.
+- Requests carrying an `Origin` header that isn't a loopback page are refused
+  with 403, so a website cannot drive your gateway by rebinding its own domain
+  to `127.0.0.1`. MCP clients send no `Origin` and are unaffected.
+- Your state directory is mode 0700 and everything mcpgw writes into it —
+  backups of client configs, the managed-state file, traffic logs — is 0600.
+- `mcpgw list --json` masks `env` and header values; pass `--show-secrets` when
+  you actually want them.
 - Captured arguments and responses are **truncated at 2 KB, not redacted** — if
-  a secret is passed as a tool argument, it lands in that file. Use
+  a secret is passed as a tool argument, it lands in that file, and
+  `mcpgw watch --json` prints those lines back verbatim. Use
   `mcpgw serve --no-capture` if that's not acceptable yet.
 - Redaction, tool allowlists and OAuth are on the roadmap below, not in 0.1.0.
 

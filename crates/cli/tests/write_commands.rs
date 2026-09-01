@@ -17,7 +17,13 @@ fn stderr(out: &Output) -> String {
 }
 
 fn list_json(config: &Path) -> serde_json::Value {
-    let out = mcpgw(config, &["list", "--json"]);
+    list_json_with(config, &[])
+}
+
+fn list_json_with(config: &Path, extra: &[&str]) -> serde_json::Value {
+    let mut args = vec!["list", "--json"];
+    args.extend_from_slice(extra);
+    let out = mcpgw(config, &args);
     assert!(out.status.success());
     serde_json::from_slice(&out.stdout).unwrap()
 }
@@ -55,9 +61,13 @@ fn add_creates_config_from_template() {
     let github = &json["servers"]["github"];
     assert_eq!(github["type"], "stdio");
     assert_eq!(github["command"], "npx");
-    assert_eq!(github["env"]["TOKEN"], "t");
+    // Masked by default; the key stays so the entry is still readable.
+    assert_eq!(github["env"]["TOKEN"], "***");
     assert_eq!(github["enabled"], true);
     assert_eq!(github["tags"][0], "work");
+
+    let unmasked = list_json_with(&config, &["--show-secrets"]);
+    assert_eq!(unmasked["servers"]["github"]["env"]["TOKEN"], "t");
 }
 
 #[test]

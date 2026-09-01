@@ -52,3 +52,28 @@ fn broken_config_fails_with_nonzero_exit() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("broken.toml"));
 }
+
+#[test]
+fn json_output_masks_env_and_header_values_unless_asked() {
+    let out = run_list(&fixture("secrets.toml"), &["--json"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("ghp_realsecret"), "{text}");
+    assert!(!text.contains("t0ken"), "{text}");
+    // The names stay: which variables a server needs is the useful half.
+    assert!(text.contains("GITHUB_TOKEN"), "{text}");
+    assert!(text.contains("Authorization"), "{text}");
+
+    let out = run_list(&fixture("secrets.toml"), &["--json", "--show-secrets"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("ghp_realsecret"), "{text}");
+    assert!(text.contains("Bearer t0ken"), "{text}");
+}
+
+#[test]
+fn the_human_table_never_carried_secrets_to_begin_with() {
+    let out = run_list(&fixture("secrets.toml"), &[]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("github") && text.contains("linear"), "{text}");
+    assert!(!text.contains("ghp_realsecret"), "{text}");
+    assert!(!text.contains("t0ken"), "{text}");
+}

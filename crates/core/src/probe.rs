@@ -35,6 +35,12 @@ pub enum ProbeError {
 
     #[error("MCP handshake failed: {message}")]
     Handshake { message: String },
+
+    /// The probe never produced an outcome — its task panicked or was
+    /// cancelled. Reported like any other failure so one broken target
+    /// costs one row instead of the whole report.
+    #[error("probe did not complete: {reason}")]
+    Aborted { reason: String },
 }
 
 type Service = rmcp::service::RunningService<rmcp::RoleClient, ()>;
