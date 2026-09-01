@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
-use mcpgw_core::sync::{GATEWAY_NAME, apply_plan, gateway_server, plan_sync};
+use mcpgw_core::sync::{GATEWAY_NAME, apply_plan_to, gateway_server, plan_sync};
 use mcpgw_core::{ClientKind, Config, Detection, Error, backup, paths, state::ManagedState};
 use owo_colors::OwoColorize as _;
 
@@ -92,30 +92,28 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             Detection::Configured(path) => (path, true),
         };
 
-        let mut root = if exists {
+        let codec = kind.codec();
+        let mut doc = if exists {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("cannot read {}", path.display()))?;
-            match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(value) => value,
-                // JSONC or hand-broken JSON: refuse to rewrite what we
-                // cannot faithfully parse.
+            match codec.parse_document(&text) {
+                Ok(doc) => doc,
+                // Hand-broken, or JSONC in a client whose format is strict
+                // JSON: refuse to rewrite what we cannot faithfully parse.
                 Err(err) => {
                     heading(&format!(
-                        "skipped: {} is not strict JSON ({err}); fix or sync it manually",
-                        path.display()
+                        "skipped: {} is not {} ({err}); fix or sync it manually",
+                        path.display(),
+                        codec.format_name()
                     ));
                     continue;
                 }
             }
         } else {
-            serde_json::json!({})
+            codec.empty_document()
         };
 
-        let empty = serde_json::Map::new();
-        let current = root
-            .get(kind.root_key())
-            .and_then(serde_json::Value::as_object)
-            .unwrap_or(&empty);
+        let current = doc.entries(codec.root);
         let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
         // In gateway mode the desired set is the synthetic entry alone, so
         // entries managed by an earlier direct sync fall out as removes.
@@ -126,7 +124,7 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             )])
         });
         let desired = gateway_desired.as_ref().unwrap_or(&canonical);
-        let plan = plan_sync(kind, current, desired, &managed);
+        let plan = plan_sync(kind, &current, desired, &managed);
 
         heading(&describe(&plan));
         print_plan_lines(&plan, color);
@@ -151,8 +149,8 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             .clients
             .insert(kind.id().to_owned(), plan.managed_after());
         state.save(&state_path)?;
-        apply_plan(kind, &mut root, &plan);
-        write_json(&path, &root)?;
+        apply_plan_to(kind, &mut doc, &plan);
+        write_text(&path, &doc.to_text()?)?;
     }
     Ok(())
 }
@@ -250,19 +248,15 @@ fn rollback(targets: &[ClientKind], state_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_json(path: &Path, root: &serde_json::Value) -> anyhow::Result<()> {
-    let mut text = serde_json::to_string_pretty(root)?;
-    text.push('\n');
-    write_text(path, &text)
-}
-
 // Atomic replace, same discipline as the canonical store.
 //
 // Two known side effects of replacing the file wholesale, both accepted in
-// M6 ("client files are machine-written"): the whole document is
-// re-serialized, so indentation is normalized even where nothing changed
-// (for Claude Code that is all of ~/.claude.json), and the temp file's 0600
-// mode replaces whatever the client used. The rename also wins any race
+// M6 ("client files are machine-written"): a plain-JSON document is
+// re-serialized whole, so indentation is normalized even where nothing
+// changed (for Claude Code that is all of ~/.claude.json), and the temp
+// file's 0600 mode replaces whatever the client used. Comment-preserving
+// formats keep their layout — only the edited entries move. The rename
+// also wins any race
 // against a client writing the same file concurrently — mcpgw's copy was
 // read at the start of the run, so an edit made in between is lost. Backups
 // are the recovery path; a lock the client does not take cannot prevent it.

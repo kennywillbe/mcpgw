@@ -1,0 +1,22 @@
+---
+source: crates/core/tests/codec.rs
+expression: matrix
+---
+[
+    (
+        "claude-desktop",
+        "Json / mcpServers / McpServers",
+    ),
+    (
+        "claude-code",
+        "Json / mcpServers / McpServers",
+    ),
+    (
+        "cursor",
+        "Json / mcpServers / McpServers",
+    ),
+    (
+        "vscode",
+        "Json / servers / VsCode",
+    ),
+]

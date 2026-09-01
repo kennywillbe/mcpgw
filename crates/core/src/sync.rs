@@ -1,12 +1,15 @@
 //! Planning and applying canonical→client synchronization.
 //!
-//! Everything here is pure JSON-value manipulation: the CLI owns all I/O
+//! Everything here is pure value manipulation: the CLI owns all I/O
 //! (detection, backups, atomic writes), so the risky logic — what to touch
-//! and what to leave alone — is fully unit-testable.
+//! and what to leave alone — is fully unit-testable. Client-shaped values
+//! come from the client's [`codec`](crate::clients::codec); a plan is the
+//! same computation whatever format they end up written in.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::clients::ClientKind;
+use crate::clients::codec::{self, ClientDocument};
 use crate::config::{Server, Transport};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,14 +38,31 @@ impl SyncPlan {
     pub fn managed_after(&self) -> BTreeSet<String> {
         self.desired.keys().cloned().collect()
     }
+
+    /// The entries the plan actually writes. Entries whose emitted value
+    /// already matches the file are left out, so their formatting — and in
+    /// JSONC/TOML their comments — is never touched.
+    fn upserts(&self) -> Vec<(&str, &serde_json::Value)> {
+        self.adds
+            .iter()
+            .chain(&self.updates)
+            .map(|name| (name.as_str(), &self.desired[name]))
+            .collect()
+    }
 }
 
 /// Computes what `sync` would change for one client.
 ///
-/// `current` is the raw entry map from the client file (its `mcpServers` /
-/// `servers` object), `managed` the names mcpgw previously wrote there.
-/// Idempotency is byte-level: an entry counts as changed only when the
-/// value mcpgw would emit differs from what is on disk.
+/// `current` is the entry map read out of the client file, `managed` the
+/// names mcpgw previously wrote there. An entry counts as changed only when
+/// the value mcpgw would emit differs from what is on disk, so a run that
+/// changes nothing writes nothing.
+///
+/// The comparison is on parsed values, not raw text. For plain JSON the two
+/// are the same thing, but TOML and JSONC can spell one entry several ways
+/// (section vs inline table, single vs double quotes, trailing commas, key
+/// order, a comment in the middle) — comparing text there would report an
+/// update every run and rewrite the user's file into mcpgw's spelling.
 #[must_use]
 pub fn plan_sync(
     kind: ClientKind,
@@ -92,33 +112,16 @@ pub fn plan_sync(
     plan
 }
 
-/// Applies a plan to the parsed client document, touching only the entries
-/// the plan owns. Root-level keys other than the server map, and foreign
-/// entries inside it, are preserved byte-for-byte (`preserve_order`).
-pub fn apply_plan(kind: ClientKind, root: &mut serde_json::Value, plan: &SyncPlan) {
-    if !root.is_object() {
-        *root = serde_json::Value::Object(serde_json::Map::new());
-    }
-    // Normalized to an object above; the else-arm is unreachable.
-    let Some(map) = root.as_object_mut() else {
-        return;
-    };
-    let entries = map
-        .entry(kind.root_key().to_owned())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !entries.is_object() {
-        *entries = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let Some(entries) = entries.as_object_mut() else {
-        return;
-    };
+/// Applies a plan to a parsed client document of any format, touching only
+/// the entries the plan owns. Everything else — other root keys, foreign
+/// entries, and whatever the format preserves around them — is left alone.
+pub fn apply_plan_to(kind: ClientKind, doc: &mut ClientDocument, plan: &SyncPlan) {
+    doc.edit(kind.codec().root, &plan.removes, &plan.upserts());
+}
 
-    for name in &plan.removes {
-        entries.remove(name);
-    }
-    for name in plan.adds.iter().chain(&plan.updates) {
-        entries.insert(name.clone(), plan.desired[name].clone());
-    }
+/// [`apply_plan_to`] for a client document already in hand as JSON.
+pub fn apply_plan(kind: ClientKind, root: &mut serde_json::Value, plan: &SyncPlan) {
+    codec::edit_json(kind.codec().root, root, &plan.removes, &plan.upserts());
 }
 
 /// The entry name mcpgw owns in every client when syncing in gateway mode.
@@ -151,41 +154,8 @@ pub fn gateway_server(kind: ClientKind, url: &str, bridge_command: &str) -> Serv
     }
 }
 
-/// The client-shaped JSON for one canonical server.
-///
-/// VS Code's schema wants an explicit `type` on every entry; the
-/// `mcpServers` clients infer stdio from `command`, so `type` is emitted
-/// only where it carries information (http).
+/// The client-shaped value for one canonical server, as its codec spells it.
 #[must_use]
 pub fn client_entry(kind: ClientKind, server: &Server) -> serde_json::Value {
-    let mut obj = serde_json::Map::new();
-    match &server.transport {
-        Transport::Stdio { command, args, env } => {
-            if matches!(kind, ClientKind::VsCode) {
-                obj.insert("type".to_owned(), "stdio".into());
-            }
-            obj.insert("command".to_owned(), command.as_str().into());
-            if !args.is_empty() {
-                obj.insert("args".to_owned(), args.clone().into());
-            }
-            if !env.is_empty() {
-                obj.insert("env".to_owned(), string_map(env));
-            }
-        }
-        Transport::Http { url, headers } => {
-            obj.insert("type".to_owned(), "http".into());
-            obj.insert("url".to_owned(), url.as_str().into());
-            if !headers.is_empty() {
-                obj.insert("headers".to_owned(), string_map(headers));
-            }
-        }
-    }
-    serde_json::Value::Object(obj)
-}
-
-fn string_map(map: &BTreeMap<String, String>) -> serde_json::Value {
-    map.iter()
-        .map(|(k, v)| (k.clone(), serde_json::Value::from(v.as_str())))
-        .collect::<serde_json::Map<_, _>>()
-        .into()
+    kind.codec().entries.emit(server)
 }

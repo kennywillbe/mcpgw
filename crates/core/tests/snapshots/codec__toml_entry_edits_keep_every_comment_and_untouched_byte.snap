@@ -1,0 +1,15 @@
+---
+source: crates/core/tests/codec.rs
+expression: text
+---
+# My codex config.
+model = "gpt-5"
+
+[mcp_servers.mine]
+# Hand-written; leave it alone.
+command = "deno"
+
+[mcp_servers.added]
+command = "npx"
+args = ["-y", "srv"]
+env = { TOKEN = "t" }
