@@ -83,7 +83,31 @@ impl Sandbox {
         let text = std::fs::read_to_string(self.claude_desktop_path()).unwrap();
         serde_json::from_str(&text).unwrap()
     }
+
+    fn install_gemini(&self, settings: Option<&str>) {
+        let dir = self.home.join(".gemini");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(dir.join("settings.json"), text).unwrap();
+        }
+    }
+
+    fn gemini_json(&self) -> serde_json::Value {
+        let text = std::fs::read_to_string(self.home.join(".gemini/settings.json")).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
 }
+
+/// Gemini's settings file is the whole CLI's settings, not an MCP file: it
+/// carries theme, auth and everything else next to `mcpServers`.
+const GEMINI_SETTINGS: &str = r#"{
+  "theme": "Default",
+  "security": { "auth": { "selectedType": "oauth-personal" } },
+  "mcp": { "excluded": ["notes"] },
+  "mcpServers": {
+    "notes": { "command": "notes-mcp" }
+  }
+}"#;
 
 /// The bridge command is either the bare name (mcpgw on PATH) or the path of
 /// the binary under test.
@@ -368,6 +392,59 @@ fn gateway_mode_reverts_to_direct_entries() {
     let entries = sb.cursor_json()["mcpServers"].clone();
     assert_eq!(entries["github"]["command"], "npx");
     assert!(entries.get("mcpgw").is_none());
+}
+
+#[test]
+fn gemini_sync_preserves_the_rest_of_the_settings_file() {
+    let sb = Sandbox::new();
+    sb.install_gemini(Some(GEMINI_SETTINGS));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "gemini"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    // The excluded foreign entry is reported, never touched.
+    assert!(out.contains("? notes"), "{out}");
+
+    let json = sb.gemini_json();
+    assert_eq!(json["theme"], "Default");
+    assert_eq!(json["security"]["auth"]["selectedType"], "oauth-personal");
+    assert_eq!(json["mcp"]["excluded"], serde_json::json!(["notes"]));
+    assert_eq!(json["mcpServers"]["notes"]["command"], "notes-mcp");
+    assert_eq!(json["mcpServers"]["github"]["command"], "npx");
+    assert_eq!(json["mcpServers"]["github"]["env"]["TOKEN"], "t");
+    // Streamable HTTP, not the legacy SSE `url` field.
+    assert_eq!(
+        json["mcpServers"]["linear"]["httpUrl"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert!(json["mcpServers"]["linear"].get("url").is_none());
+
+    let again = sb.ok(&["sync", "--client", "gemini"]);
+    assert!(again.contains("no changes"), "{again}");
+}
+
+#[test]
+fn gemini_gateway_entry_uses_http_url() {
+    let sb = Sandbox::new();
+    sb.install_gemini(None);
+    let out = sb.ok(&["sync", "--client", "gemini", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.gemini_json()["mcpServers"]["mcpgw"].clone();
+    assert_eq!(entry["httpUrl"], "http://127.0.0.1:8137/mcp");
+    assert!(entry.get("url").is_none());
+    assert!(entry.get("type").is_none());
+    assert!(entry.get("command").is_none());
 }
 
 #[test]

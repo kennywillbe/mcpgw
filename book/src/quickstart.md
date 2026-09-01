@@ -9,8 +9,8 @@ Five minutes, start to finish. Nothing here touches a client file until you run
 mcpgw import
 ```
 
-`import` reads Claude Desktop, Claude Code, Cursor and VS Code, and pulls every
-server it finds into the canonical config. Names that aren't valid mcpgw names
+`import` reads Claude Desktop, Claude Code, Cursor, VS Code and Gemini CLI,
+and pulls every server it finds into the canonical config. Names that aren't valid mcpgw names
 get slugified, and every rename is printed. The same server configured in three
 clients is imported once.
 
@@ -19,7 +19,7 @@ mcpgw import --dry-run          # look before you leap
 mcpgw import --from cursor      # only one client (repeatable)
 ```
 
-Client ids are `claude-desktop`, `claude-code`, `cursor`, `vscode`.
+Client ids are `claude-desktop`, `claude-code`, `cursor`, `vscode`, `gemini`.
 
 ## 2. Add the rest by hand
 

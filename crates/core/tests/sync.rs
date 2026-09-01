@@ -116,6 +116,16 @@ fn entry_shapes_per_client() {
     assert_eq!(vs_stdio["type"], "stdio");
     assert!(cursor_stdio.get("type").is_none());
     assert_eq!(cursor_http["type"], "http");
+
+    // Gemini has no `type`, and its remote field must be `httpUrl`: writing
+    // `url` there would configure the legacy SSE transport instead.
+    let gemini_stdio = client_entry(ClientKind::Gemini, &canonical["github"]);
+    let gemini_http = client_entry(ClientKind::Gemini, &canonical["linear"]);
+    assert_eq!(gemini_stdio, cursor_stdio);
+    assert_eq!(gemini_http["httpUrl"], "https://mcp.linear.app/mcp");
+    assert!(gemini_http.get("url").is_none());
+    assert!(gemini_http.get("type").is_none());
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
 }
 
@@ -138,6 +148,15 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(stdio["command"], "/opt/mcpgw");
     assert_eq!(stdio["args"], serde_json::json!(["connect", "--url", url]));
     assert!(stdio.get("url").is_none());
+
+    // Gemini takes the gateway over HTTP, spelled its own way.
+    let gemini = client_entry(
+        ClientKind::Gemini,
+        &gateway_server(ClientKind::Gemini, url, "mcpgw"),
+    );
+    assert_eq!(gemini["httpUrl"], url);
+    assert!(gemini.get("url").is_none());
+    assert!(gemini.get("command").is_none());
 
     for kind in ClientKind::ALL {
         assert_eq!(

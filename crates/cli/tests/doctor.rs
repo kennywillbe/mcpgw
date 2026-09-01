@@ -110,7 +110,12 @@ fn json_output_carries_findings_and_counts() {
     assert_eq!(value["errors"], 1);
     assert_eq!(value["findings"][0]["severity"], "error");
     assert_eq!(value["findings"][0]["server"], "ghost");
-    assert_eq!(value["clients"].as_array().unwrap().len(), 4);
+    let clients = value["clients"].as_array().unwrap();
+    assert_eq!(clients.len(), 5);
+    assert!(
+        clients.iter().any(|c| c["client"] == "Gemini CLI"),
+        "{clients:?}"
+    );
 }
 
 #[test]

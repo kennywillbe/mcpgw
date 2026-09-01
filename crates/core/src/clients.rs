@@ -1,5 +1,5 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
-//! (Claude Desktop, Claude Code, Cursor, VS Code).
+//! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -25,6 +25,7 @@ pub enum ClientKind {
     ClaudeCode,
     Cursor,
     VsCode,
+    Gemini,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -53,11 +54,12 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
         Self::VsCode,
+        Self::Gemini,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -68,6 +70,7 @@ impl ClientKind {
             Self::ClaudeCode => "claude-code",
             Self::Cursor => "cursor",
             Self::VsCode => "vscode",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -84,6 +87,7 @@ impl ClientKind {
             Self::ClaudeCode => "Claude Code",
             Self::Cursor => "Cursor",
             Self::VsCode => "VS Code",
+            Self::Gemini => "Gemini CLI",
         }
     }
 
@@ -97,8 +101,9 @@ impl ClientKind {
 
     /// How this client's config is stored, addressed and shaped.
     ///
-    /// The four clients here are all plain-JSON `mcpServers` maps bar VS
-    /// Code, which renames the map and wants an explicit entry `type`.
+    /// The clients here are all plain-JSON `mcpServers` maps bar VS Code,
+    /// which renames the map and wants an explicit entry `type`, and Gemini
+    /// CLI, which keeps the map name but spells entries its own way.
     #[must_use]
     pub fn codec(self) -> Codec {
         match self {
@@ -106,6 +111,11 @@ impl ClientKind {
                 format: Format::Json,
                 root: RootPath::new(&["servers"]),
                 entries: EntrySchema::VsCode,
+            },
+            Self::Gemini => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["mcpServers"]),
+                entries: EntrySchema::Gemini,
             },
             _ => Codec {
                 format: Format::Json,
@@ -129,6 +139,9 @@ impl ClientKind {
             Self::ClaudeCode => home_dir(&get)?.join(".claude.json"),
             Self::Cursor => home_dir(&get)?.join(".cursor/mcp.json"),
             Self::VsCode => app_data_dir(&get)?.join("Code/User/mcp.json"),
+            // Gemini CLI is a CLI, so its settings live in the home dir on
+            // every platform rather than in the app-data dir.
+            Self::Gemini => home_dir(&get)?.join(".gemini/settings.json"),
         };
         Some(path)
     }
@@ -143,6 +156,7 @@ impl ClientKind {
             Self::ClaudeCode => home_dir(&get)?.join(".claude"),
             Self::Cursor => home_dir(&get)?.join(".cursor"),
             Self::VsCode => app_data_dir(&get)?.join("Code"),
+            Self::Gemini => home_dir(&get)?.join(".gemini"),
         };
         Some(path)
     }
@@ -245,7 +259,40 @@ impl ClientKind {
                 }),
             }
         }
+        self.apply_document_context(&root, &mut read);
         Ok(read)
+    }
+
+    /// Adjusts a finished read with facts that live outside the entry map.
+    ///
+    /// Almost everything about an entry is in the entry, which is why the
+    /// codec works one entry at a time. A client that keeps part of a
+    /// server's state elsewhere in the file needs the whole document, so it
+    /// gets this hook rather than a wider codec that every other client
+    /// would have to ignore.
+    fn apply_document_context(self, root: &serde_json::Value, read: &mut ClientRead) {
+        if self != Self::Gemini {
+            return;
+        }
+        // Gemini CLI has no per-server enabled flag: a server is switched
+        // off by naming it in the sibling `mcp.excluded` list. The list (and
+        // its `mcp.allowed` counterpart) is foreign state mcpgw only reads —
+        // disabling a server canonically removes the entry instead.
+        let Some(excluded) = root.get("mcp").and_then(|mcp| mcp.get("excluded")) else {
+            return;
+        };
+        let Some(names) = excluded.as_array() else {
+            read.problems.push(Problem {
+                server: None,
+                message: "`mcp.excluded` is not an array".to_owned(),
+            });
+            return;
+        };
+        for name in names.iter().filter_map(serde_json::Value::as_str) {
+            if let Some(server) = read.servers.get_mut(name) {
+                server.enabled = false;
+            }
+        }
     }
 }
 

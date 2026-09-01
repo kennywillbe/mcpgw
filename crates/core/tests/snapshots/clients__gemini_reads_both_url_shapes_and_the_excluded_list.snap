@@ -1,0 +1,77 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "both-urls": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://both.example.com/mcp",
+                headers: {},
+            },
+        },
+        "github": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-github",
+                ],
+                env: {
+                    "GITHUB_TOKEN": "$GITHUB_TOKEN",
+                },
+            },
+        },
+        "legacy-sse": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://sse.example.com/sse",
+                headers: {},
+            },
+        },
+        "linear": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/mcp",
+                headers: {
+                    "Authorization": "Bearer ${LINEAR_TOKEN}",
+                },
+            },
+        },
+        "notes": Server {
+            enabled: false,
+            tags: [],
+            transport: Stdio {
+                command: "notes-mcp",
+                args: [],
+                env: {},
+            },
+        },
+    },
+    problems: [
+        Problem {
+            server: Some(
+                "legacy-sse",
+            ),
+            message: "legacy `sse` transport read as http",
+        },
+        Problem {
+            server: Some(
+                "both-urls",
+            ),
+            message: "`url` ignored: `httpUrl` takes precedence",
+        },
+        Problem {
+            server: Some(
+                "husk",
+            ),
+            message: "has none of `command`, `httpUrl` or `url`",
+        },
+    ],
+}
