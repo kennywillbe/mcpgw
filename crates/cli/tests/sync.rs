@@ -145,6 +145,21 @@ impl Sandbox {
             .parse_value(&self.opencode_text(name))
             .unwrap()
     }
+
+    /// `None` installs the directory alone (Windsurf present, unconfigured).
+    fn install_windsurf(&self, config: Option<&str>) {
+        let dir = self.home.join(".codeium/windsurf");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = config {
+            std::fs::write(dir.join("mcp_config.json"), text).unwrap();
+        }
+    }
+
+    fn windsurf_json(&self) -> serde_json::Value {
+        let text =
+            std::fs::read_to_string(self.home.join(".codeium/windsurf/mcp_config.json")).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
 }
 
 /// Gemini's settings file is the whole CLI's settings, not an MCP file: it
@@ -193,6 +208,17 @@ const OPENCODE_CONFIG: &str = r#"// My opencode setup — do not reformat.
   },
 }
 "#;
+
+/// Windsurf's file is MCP-only, but a foreign entry in it still has to
+/// survive a sync — including the `${env:VAR}` interpolation it may carry.
+const WINDSURF_CONFIG: &str = r#"{
+  "mcpServers": {
+    "notes": {
+      "command": "notes-mcp",
+      "env": { "NOTES_KEY": "${env:NOTES_KEY}" }
+    }
+  }
+}"#;
 
 /// The bridge command is either the bare name (mcpgw on PATH) or the path of
 /// the binary under test.
@@ -692,6 +718,60 @@ fn opencode_gateway_entry_is_a_remote_type() {
     let entry = sb.opencode_json("opencode.json")["mcp"]["mcpgw"].clone();
     assert_eq!(entry["type"], "remote");
     assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
+    assert!(entry.get("command").is_none());
+}
+
+#[test]
+fn windsurf_sync_writes_server_url_and_leaves_foreign_entries_alone() {
+    let sb = Sandbox::new();
+    sb.install_windsurf(Some(WINDSURF_CONFIG));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "windsurf"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("? notes"), "{out}");
+
+    let json = sb.windsurf_json();
+    assert_eq!(json["mcpServers"]["notes"]["command"], "notes-mcp");
+    assert_eq!(
+        json["mcpServers"]["notes"]["env"]["NOTES_KEY"],
+        "${env:NOTES_KEY}"
+    );
+    assert_eq!(json["mcpServers"]["github"]["command"], "npx");
+    assert_eq!(json["mcpServers"]["github"]["env"]["TOKEN"], "t");
+    // The remote field Windsurf reads is `serverUrl`; a plain `url` would
+    // leave the entry unusable.
+    assert_eq!(
+        json["mcpServers"]["linear"]["serverUrl"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert!(json["mcpServers"]["linear"].get("url").is_none());
+    assert!(json["mcpServers"]["linear"].get("type").is_none());
+
+    let again = sb.ok(&["sync", "--client", "windsurf"]);
+    assert!(again.contains("no changes"), "{again}");
+}
+
+#[test]
+fn windsurf_gateway_entry_uses_server_url() {
+    let sb = Sandbox::new();
+    sb.install_windsurf(None);
+    let out = sb.ok(&["sync", "--client", "windsurf", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.windsurf_json()["mcpServers"]["mcpgw"].clone();
+    assert_eq!(entry["serverUrl"], "http://127.0.0.1:8137/mcp");
+    assert!(entry.get("url").is_none());
     assert!(entry.get("command").is_none());
 }
 

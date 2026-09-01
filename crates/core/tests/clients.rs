@@ -214,6 +214,63 @@ fn opencode_infers_the_type_and_reports_undecidable_entries() {
 }
 
 #[test]
+fn windsurf_reads_both_remote_spellings() {
+    let read = read_fixture(ClientKind::Windsurf, "windsurf_mcp.json");
+
+    // Windsurf's own field is `serverUrl`; `${env:VAR}` interpolation in a
+    // header is passed through verbatim.
+    assert_eq!(
+        read.servers["linear"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [(
+                "Authorization".to_owned(),
+                "Bearer ${env:LINEAR_TOKEN}".to_owned()
+            )]
+            .into_iter()
+            .collect(),
+        }
+    );
+    // A plain `url` is not Windsurf's spelling but appears in enough
+    // examples to read rather than reject — and needs no note of its own.
+    assert_eq!(
+        read.servers["figma"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.figma.com/mcp".to_owned(),
+            headers: std::collections::BTreeMap::new(),
+        }
+    );
+    assert!(
+        !read
+            .problems
+            .iter()
+            .any(|p| p.server.as_deref() == Some("figma"))
+    );
+    // With both present `serverUrl` wins, and the read says which one lost.
+    assert_eq!(
+        read.servers["notes"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://notes.example/mcp".to_owned(),
+            headers: std::collections::BTreeMap::new(),
+        }
+    );
+    assert!(read.problems.iter().any(|p| {
+        p.server.as_deref() == Some("notes")
+            && p.message == "`url` ignored: `serverUrl` takes precedence"
+    }));
+    // The stdio shape is the shared one, interpolation included.
+    let mcpgw_core::Transport::Stdio { env, .. } = &read.servers["github"].transport else {
+        panic!("github should be stdio");
+    };
+    assert_eq!(env["GITHUB_TOKEN"], "${env:GITHUB_TOKEN}");
+    // An entry with no target field at all is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    assert_eq!(read.servers.len(), 4);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+#[test]
 fn broken_entries_become_problems_not_failures() {
     let read = read_fixture(ClientKind::ClaudeDesktop, "messy.json");
     // Exactly one entry survives; every other becomes a reported problem.
@@ -323,6 +380,19 @@ fn detect_reports_three_states() {
     assert_eq!(
         ClientKind::Opencode.detect_with(&env),
         Detection::Configured(json)
+    );
+
+    // Windsurf's trace is the directory its config lives in, so again the
+    // two states are told apart by the file.
+    let trace = ClientKind::Windsurf.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Windsurf.detect_with(&env), Detection::Installed);
+    let config = ClientKind::Windsurf.config_path_with(&env).unwrap();
+    assert!(config.ends_with(".codeium/windsurf/mcp_config.json"));
+    std::fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
+    assert_eq!(
+        ClientKind::Windsurf.detect_with(&env),
+        Detection::Configured(config)
     );
 }
 

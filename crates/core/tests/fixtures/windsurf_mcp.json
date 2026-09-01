@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${env:GITHUB_TOKEN}" }
+    },
+    "linear": {
+      "serverUrl": "https://mcp.linear.app/mcp",
+      "headers": { "Authorization": "Bearer ${env:LINEAR_TOKEN}" }
+    },
+    "figma": {
+      "url": "https://mcp.figma.com/mcp"
+    },
+    "notes": {
+      "serverUrl": "https://notes.example/mcp",
+      "url": "https://notes.example/sse"
+    },
+    "husk": {
+      "env": { "A": "B" }
+    }
+  }
+}

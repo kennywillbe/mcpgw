@@ -112,6 +112,9 @@ pub enum EntrySchema {
     /// its program and arguments in one `command` array, and its variables
     /// are `environment` rather than `env`.
     Opencode,
+    /// Windsurf's shape: the `mcpServers` rules with the remote URL spelled
+    /// `serverUrl`.
+    Windsurf,
 }
 
 impl EntrySchema {
@@ -129,64 +132,12 @@ impl EntrySchema {
             return Err("entry is not an object".to_owned());
         };
         match self {
-            Self::Gemini => return parse_gemini(obj),
-            Self::Codex => return parse_codex(obj),
-            Self::Opencode => return parse_opencode(obj),
-            Self::McpServers | Self::VsCode => {}
+            Self::Gemini => parse_gemini(obj),
+            Self::Codex => parse_codex(obj),
+            Self::Opencode => parse_opencode(obj),
+            Self::Windsurf => parse_windsurf(obj),
+            Self::McpServers | Self::VsCode => parse_mcp_servers(obj),
         }
-
-        let explicit = match obj.get("type") {
-            None => None,
-            Some(Value::String(t)) => Some(t.as_str()),
-            Some(_) => return Err("`type` is not a string".to_owned()),
-        };
-        let has_command = obj.contains_key("command");
-        let has_url = obj.contains_key("url");
-
-        let mut note = None;
-        let stdio = match explicit {
-            Some("stdio") => true,
-            Some("http" | "streamable-http" | "streamable_http") => false,
-            Some("sse") => {
-                // Legacy transport we don't model; the URL still identifies
-                // the server, so read it as http and say so.
-                note = Some("legacy `sse` transport read as http".to_owned());
-                false
-            }
-            Some(other) => return Err(format!("unknown transport type {other:?}")),
-            // No explicit type: infer from which target field is present.
-            None => match (has_command, has_url) {
-                (true, false) => true,
-                (false, true) => false,
-                (true, true) => return Err("has both `command` and `url`".to_owned()),
-                (false, false) => return Err("has neither `command` nor `url`".to_owned()),
-            },
-        };
-
-        // Some clients (e.g. Cline-style configs) mark entries disabled in
-        // place.
-        let enabled = !matches!(obj.get("disabled"), Some(Value::Bool(true)));
-
-        let transport = if stdio {
-            Transport::Stdio {
-                command: string_field(obj, "command")?.ok_or("missing `command`")?,
-                args: string_list(obj, "args")?,
-                env: string_object(obj, "env")?,
-            }
-        } else {
-            Transport::Http {
-                url: string_field(obj, "url")?.ok_or("missing `url`")?,
-                headers: string_object(obj, "headers")?,
-            }
-        };
-        Ok((
-            Server {
-                enabled,
-                tags: Vec::new(),
-                transport,
-            },
-            note,
-        ))
     }
 
     /// The client-shaped value for one canonical server.
@@ -224,6 +175,12 @@ impl EntrySchema {
                         obj.insert("url".to_owned(), url.as_str().into());
                         "http_headers"
                     }
+                    Self::Windsurf => {
+                        // Windsurf reads the remote URL from `serverUrl`
+                        // alone, and infers the transport from its presence.
+                        obj.insert("serverUrl".to_owned(), url.as_str().into());
+                        "headers"
+                    }
                     Self::McpServers | Self::VsCode => {
                         obj.insert("type".to_owned(), "http".into());
                         obj.insert("url".to_owned(), url.as_str().into());
@@ -238,6 +195,93 @@ impl EntrySchema {
         }
         Value::Object(obj)
     }
+}
+
+/// The `mcpServers` entry shape shared by Claude Desktop, Claude Code, Cursor
+/// and VS Code: an optional `type`, and otherwise `command` for stdio or
+/// `url` for remote.
+fn parse_mcp_servers(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
+    let explicit = match obj.get("type") {
+        None => None,
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(_) => return Err("`type` is not a string".to_owned()),
+    };
+    let has_command = obj.contains_key("command");
+    let has_url = obj.contains_key("url");
+
+    let mut note = None;
+    let stdio = match explicit {
+        Some("stdio") => true,
+        Some("http" | "streamable-http" | "streamable_http") => false,
+        Some("sse") => {
+            // Legacy transport we don't model; the URL still identifies
+            // the server, so read it as http and say so.
+            note = Some("legacy `sse` transport read as http".to_owned());
+            false
+        }
+        Some(other) => return Err(format!("unknown transport type {other:?}")),
+        // No explicit type: infer from which target field is present.
+        None => match (has_command, has_url) {
+            (true, false) => true,
+            (false, true) => false,
+            (true, true) => return Err("has both `command` and `url`".to_owned()),
+            (false, false) => return Err("has neither `command` nor `url`".to_owned()),
+        },
+    };
+
+    // Some clients (e.g. Cline-style configs) mark entries disabled in
+    // place.
+    let enabled = !matches!(obj.get("disabled"), Some(Value::Bool(true)));
+
+    let transport = if stdio {
+        Transport::Stdio {
+            command: string_field(obj, "command")?.ok_or("missing `command`")?,
+            args: string_list(obj, "args")?,
+            env: string_object(obj, "env")?,
+        }
+    } else {
+        Transport::Http {
+            url: string_field(obj, "url")?.ok_or("missing `url`")?,
+            headers: string_object(obj, "headers")?,
+        }
+    };
+    Ok((
+        Server {
+            enabled,
+            tags: Vec::new(),
+            transport,
+        },
+        note,
+    ))
+}
+
+/// Windsurf's entry shape: the `mcpServers` rules with one renamed field, so
+/// it is read by renaming that field back and deferring to them.
+///
+/// `serverUrl` is what Windsurf's own docs and its UI write; a plain `url`
+/// turns up in enough third-party examples to be worth accepting, and an
+/// entry carrying both resolves the way Windsurf itself does.
+///
+/// Values may hold Windsurf's `${env:VAR}` / `${file:/path}` interpolation,
+/// which is kept verbatim: expanding it here would bake a secret into the
+/// canonical config.
+fn parse_windsurf(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
+    let Some(server_url) = obj.get("serverUrl") else {
+        return parse_mcp_servers(obj);
+    };
+    let mut renamed = obj.clone();
+    renamed.insert("url".to_owned(), server_url.clone());
+    renamed.remove("serverUrl");
+
+    let (server, shared) = parse_mcp_servers(&renamed)?;
+    let precedence = obj
+        .contains_key("url")
+        .then(|| "`url` ignored: `serverUrl` takes precedence".to_owned());
+    let note = match (precedence, shared) {
+        (Some(precedence), Some(shared)) => Some(format!("{precedence}; {shared}")),
+        (precedence, shared) => precedence.or(shared),
+    };
+    Ok((server, note))
 }
 
 /// Gemini CLI's entry shape, which shares no discriminator with the others:
