@@ -775,6 +775,28 @@ fn windsurf_gateway_entry_uses_server_url() {
     assert!(entry.get("command").is_none());
 }
 
+/// The `--client` and `--from` help is generated from `ClientKind::ALL`, so
+/// this fails the moment an adapter lands without it — which is what the
+/// hand-written list it replaced never did.
+#[test]
+fn the_client_flags_list_every_shipped_id() {
+    let sb = Sandbox::new();
+    let sync = sb.ok(&["sync", "--help"]);
+    let import = sb.ok(&["import", "--help"]);
+    for kind in mcpgw_core::ClientKind::ALL {
+        assert!(
+            sync.contains(kind.id()),
+            "sync help lost {}:\n{sync}",
+            kind.id()
+        );
+        assert!(
+            import.contains(kind.id()),
+            "import help lost {}:\n{import}",
+            kind.id()
+        );
+    }
+}
+
 #[test]
 fn gateway_and_rollback_conflict() {
     let sb = Sandbox::new();

@@ -9,8 +9,12 @@ use owo_colors::OwoColorize as _;
 
 #[derive(clap::Args)]
 pub struct SyncArgs {
-    /// Only sync these clients (repeatable; ids: claude-desktop, claude-code, cursor, vscode)
-    #[arg(long = "client", value_name = "ID")]
+    /// Only sync these clients (repeatable)
+    #[arg(
+        long = "client",
+        value_name = "ID",
+        long_help = super::client_ids_help("Only sync these clients")
+    )]
     pub clients: Vec<String>,
     /// Show what would change without writing anything
     #[arg(long)]
