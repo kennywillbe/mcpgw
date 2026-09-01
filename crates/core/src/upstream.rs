@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
@@ -67,9 +68,21 @@ pub enum UpstreamStatus {
 
 enum Slot {
     Idle,
-    Connecting,
+    /// A ladder owns this slot. The flag is that ladder's liveness witness:
+    /// see [`ConnectGuard`] for why the claim has to be revocable without
+    /// taking the lock.
+    Connecting(Arc<AtomicBool>),
     Ready(Arc<UpstreamService>),
     Failed(String),
+}
+
+impl Slot {
+    /// Whether the slot is claimed by a ladder that is still running. An
+    /// abandoned `Connecting` reads as `Idle` everywhere: it describes a
+    /// future nobody is polling any more.
+    fn connecting(&self) -> bool {
+        matches!(self, Slot::Connecting(live) if live.load(Ordering::Acquire))
+    }
 }
 
 struct Upstream {
@@ -78,6 +91,47 @@ struct Upstream {
     /// Notified every time the slot leaves `Connecting`, so demands that
     /// arrive mid-ladder can wait for its outcome without holding the lock.
     settled: Notify,
+}
+
+/// Owns the `Connecting` claim for one run of the connect ladder.
+///
+/// The ladder runs with no lock held, so the only way it can end without a
+/// state transition is the `ready()` future being dropped — which a gateway
+/// client disconnecting mid-`tools/call` does routinely, with up to ~93s of
+/// exposure at the default timeouts. Left alone, the slot would stay
+/// `Connecting` for the life of the process: `status()` frozen there and
+/// every later demand parked on `settled` with nobody left to wake it.
+///
+/// Revoking the claim through an atomic rather than the slot lock is what
+/// makes this work at all — `Drop` is synchronous and the lock is async, so
+/// there is no way to take it here.
+struct ConnectGuard<'a> {
+    upstream: &'a Upstream,
+    live: Arc<AtomicBool>,
+}
+
+impl Drop for ConnectGuard<'_> {
+    fn drop(&mut self) {
+        // A ladder that settled cleared this itself; nothing left to undo.
+        if !self.live.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        // Waiters register before they read the slot, so one that registered
+        // earlier is woken here and one that arrives later reads a revoked
+        // claim and takes the slot over instead of parking. Either way no
+        // wakeup is lost.
+        self.upstream.settled.notify_waiters();
+    }
+}
+
+/// What one look at the slot decided, carried out of the lock's scope.
+enum Claim {
+    /// A live service to hand back.
+    Live(Arc<UpstreamService>),
+    /// Another caller owns the ladder; wait for its outcome.
+    Wait,
+    /// This caller now owns the slot and runs a ladder of N attempts.
+    Own(u32, Arc<AtomicBool>),
 }
 
 pub struct UpstreamManager {
@@ -136,8 +190,9 @@ impl UpstreamManager {
             // A Ready slot whose transport died counts as Idle-with-history;
             // report Ready only while actually alive.
             Slot::Ready(service) if !dead(service) => UpstreamStatus::Ready,
-            Slot::Idle | Slot::Ready(_) => UpstreamStatus::Idle,
-            Slot::Connecting => UpstreamStatus::Connecting,
+            Slot::Connecting(_) if slot.connecting() => UpstreamStatus::Connecting,
+            // An abandoned claim included: nothing is running.
+            Slot::Idle | Slot::Ready(_) | Slot::Connecting(_) => UpstreamStatus::Idle,
             Slot::Failed(message) => UpstreamStatus::Failed(message.clone()),
         })
     }
@@ -154,6 +209,10 @@ impl UpstreamManager {
     ///
     /// A `Failed` upstream gets a single fresh attempt per call (no backoff
     /// ladder).
+    ///
+    /// Cancel-safe: dropping this future mid-ladder (a downstream client
+    /// hanging up during `tools/call`) releases the slot instead of wedging
+    /// the upstream — see [`ConnectGuard`].
     ///
     /// # Errors
     ///
@@ -172,46 +231,60 @@ impl UpstreamManager {
             });
         }
 
-        let attempts = loop {
-            let mut slot = upstream.slot.lock().await;
-            match &*slot {
-                Slot::Ready(service) if !dead(service) => {
-                    return Ok(Arc::clone(service));
+        let (attempts, live) = loop {
+            // Registered before the slot is read, so an outcome that lands
+            // between the read and the wait below still wakes this caller.
+            // `enable` is what registers; dropping an enabled `Notified`
+            // that was never awaited simply unregisters it.
+            let settled = upstream.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+
+            let claim = {
+                let mut slot = upstream.slot.lock().await;
+                match &*slot {
+                    Slot::Ready(service) if !dead(service) => Claim::Live(Arc::clone(service)),
+                    // Someone else owns the ladder; wait for its outcome
+                    // instead of starting a second one.
+                    Slot::Connecting(_) if slot.connecting() => Claim::Wait,
+                    // Dead-after-ready is a new crash episode, and an
+                    // abandoned claim is a slot nobody owns: full ladder.
+                    Slot::Ready(_) | Slot::Idle | Slot::Connecting(_) => {
+                        let live = Arc::new(AtomicBool::new(true));
+                        *slot = Slot::Connecting(Arc::clone(&live));
+                        Claim::Own(ATTEMPTS, live)
+                    }
+                    // Latched: one fresh chance per demand.
+                    Slot::Failed(_) => {
+                        let live = Arc::new(AtomicBool::new(true));
+                        *slot = Slot::Connecting(Arc::clone(&live));
+                        Claim::Own(1, live)
+                    }
                 }
-                Slot::Connecting => {
-                    // Someone else owns the ladder. Wait for its outcome
-                    // instead of starting a second one, and do it without
-                    // the lock. `enable` registers this waiter before the
-                    // lock goes, so a connect that settles in between
-                    // cannot slip past unheard.
-                    let settled = upstream.settled.notified();
-                    tokio::pin!(settled);
-                    settled.as_mut().enable();
-                    drop(slot);
-                    settled.await;
-                }
-                // Dead-after-ready is a new crash episode: full ladder.
-                Slot::Ready(_) | Slot::Idle => {
-                    *slot = Slot::Connecting;
-                    break ATTEMPTS;
-                }
-                // Latched: one fresh chance per demand.
-                Slot::Failed(_) => {
-                    *slot = Slot::Connecting;
-                    break 1;
-                }
+            };
+            match claim {
+                Claim::Live(service) => return Ok(service),
+                Claim::Wait => settled.await,
+                Claim::Own(attempts, live) => break (attempts, live),
             }
         };
 
+        // Armed for the whole ladder: if this future is dropped before the
+        // outcome below is published, the guard hands the slot back.
+        let guard = ConnectGuard {
+            upstream,
+            live: Arc::clone(&live),
+        };
         let outcome = self
             .connect_with_backoff(name, &upstream.server, attempts)
             .await;
 
         let mut slot = upstream.slot.lock().await;
-        // A shutdown during the ladder left the slot Idle. It could not see
-        // this connection to cancel it, so the connection must not be
-        // installed behind its back — discard it instead.
-        let abandoned = !matches!(*slot, Slot::Connecting);
+        // A shutdown during the ladder left the slot Idle, and a demand that
+        // found the claim revoked may have started a ladder of its own.
+        // Either way this connection must not be installed behind their
+        // backs — discard it instead.
+        let abandoned = !matches!(&*slot, Slot::Connecting(owner) if Arc::ptr_eq(owner, &live));
         let result = match outcome {
             Ok(service) => {
                 let service = Arc::new(service);
@@ -233,6 +306,10 @@ impl UpstreamManager {
             }
         };
         drop(slot);
+        // The ladder is over and its outcome is published, so the guard has
+        // nothing left to undo: clearing the flag here is what disarms it.
+        live.store(false, Ordering::Release);
+        drop(guard);
         upstream.settled.notify_waiters();
         result
     }
@@ -247,6 +324,11 @@ impl UpstreamManager {
                 service.cancellation_token().cancel();
             }
             *slot = Slot::Idle;
+            drop(slot);
+            // Backstop for callers already parked on a ladder this shutdown
+            // just disowned: they wake, find the slot Idle and get an answer
+            // of their own instead of waiting for a settle that never comes.
+            upstream.settled.notify_waiters();
         }
     }
 
