@@ -1,0 +1,36 @@
+---
+source: crates/core/tests/clients.rs
+expression: "read_fixture(ClientKind::ClaudeDesktop, \"claude_desktop.json\")"
+---
+ClientRead {
+    servers: {
+        "filesystem": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-filesystem",
+                    "/Users/dev/Desktop",
+                ],
+                env: {},
+            },
+        },
+        "github": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-github",
+                ],
+                env: {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "REDACTED",
+                },
+            },
+        },
+    },
+    problems: [],
+}

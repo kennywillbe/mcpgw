@@ -1,0 +1,42 @@
+---
+source: crates/core/tests/clients.rs
+expression: read.problems
+---
+[
+    Problem {
+        server: Some(
+            "bad-args",
+        ),
+        message: "`args` contains a non-string element",
+    },
+    Problem {
+        server: Some(
+            "bad-env-value",
+        ),
+        message: "`env.PORT` is not a string",
+    },
+    Problem {
+        server: Some(
+            "both-targets",
+        ),
+        message: "has both `command` and `url`",
+    },
+    Problem {
+        server: Some(
+            "no-target",
+        ),
+        message: "has neither `command` nor `url`",
+    },
+    Problem {
+        server: Some(
+            "not-an-object",
+        ),
+        message: "entry is not an object",
+    },
+    Problem {
+        server: Some(
+            "weird-type",
+        ),
+        message: "unknown transport type \"carrier-pigeon\"",
+    },
+]

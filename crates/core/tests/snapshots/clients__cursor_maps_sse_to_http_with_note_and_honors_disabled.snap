@@ -1,0 +1,35 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "browser": Server {
+            enabled: false,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "@browsermcp/mcp@latest",
+                ],
+                env: {},
+            },
+        },
+        "linear": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/sse",
+                headers: {},
+            },
+        },
+    },
+    problems: [
+        Problem {
+            server: Some(
+                "linear",
+            ),
+            message: "legacy `sse` transport read as http",
+        },
+    ],
+}

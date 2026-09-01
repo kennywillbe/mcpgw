@@ -1,0 +1,32 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "context7": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.context7.com/mcp",
+                headers: {
+                    "CONTEXT7_API_KEY": "REDACTED",
+                },
+            },
+        },
+        "sqlite": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "uvx",
+                args: [
+                    "mcp-server-sqlite",
+                    "--db-path",
+                    "/tmp/db.sqlite",
+                ],
+                env: {},
+            },
+        },
+    },
+    problems: [],
+}

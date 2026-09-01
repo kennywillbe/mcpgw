@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "no-target": { "env": { "A": "B" } },
+    "both-targets": { "command": "npx", "url": "https://x" },
+    "not-an-object": 42,
+    "weird-type": { "type": "carrier-pigeon", "url": "https://x" },
+    "bad-env-value": { "command": "npx", "env": { "PORT": 8080 } },
+    "bad-args": { "command": "npx", "args": ["ok", {"nested": true}] },
+    "survivor": { "command": "npx", "args": ["-y", "fine"] }
+  }
+}

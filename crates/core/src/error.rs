@@ -54,6 +54,14 @@ pub enum Error {
         #[source]
         source: toml_edit::TomlError,
     },
+
+    #[error("invalid {client} config in {path}")]
+    ClientParse {
+        client: &'static str,
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 fn known(available: &[String]) -> String {

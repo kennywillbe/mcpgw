@@ -1,0 +1,30 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "fetch": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "uvx",
+                args: [
+                    "mcp-server-fetch",
+                ],
+                env: {},
+            },
+        },
+        "remote": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://example.com/mcp",
+                headers: {
+                    "Authorization": "Bearer ${input:api-key}",
+                },
+            },
+        },
+    },
+    problems: [],
+}

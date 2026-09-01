@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "linear": {
+      "url": "https://mcp.linear.app/sse",
+      "type": "sse"
+    },
+    "browser": {
+      "command": "npx",
+      "args": ["@browsermcp/mcp@latest"],
+      "disabled": true
+    }
+  }
+}

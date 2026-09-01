@@ -1,0 +1,24 @@
+{
+  "installMethod": "brew",
+  "autoUpdates": true,
+  "tipsHistory": { "new-user-warmup": 1 },
+  "projects": {
+    "/Users/dev/some-repo": {
+      "allowedTools": [],
+      "mcpServers": { "project-scoped-ignored": { "command": "echo" } }
+    }
+  },
+  "mcpServers": {
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": { "CONTEXT7_API_KEY": "REDACTED" }
+    },
+    "sqlite": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-sqlite", "--db-path", "/tmp/db.sqlite"]
+    }
+  },
+  "numStartups": 300
+}

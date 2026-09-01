@@ -12,6 +12,7 @@ toml_edit.workspace = true
 fs4.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

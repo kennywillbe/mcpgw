@@ -1,0 +1,17 @@
+{
+  "inputs": [
+    { "type": "promptString", "id": "api-key", "description": "API Key", "password": true }
+  ],
+  "servers": {
+    "fetch": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "remote": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${input:api-key}" }
+    }
+  }
+}

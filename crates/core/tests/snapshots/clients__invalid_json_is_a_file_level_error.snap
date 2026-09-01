@@ -1,0 +1,5 @@
+---
+source: crates/core/tests/clients.rs
+expression: err.to_string()
+---
+invalid Cursor config in x.json
