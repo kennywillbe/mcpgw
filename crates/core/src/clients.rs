@@ -3,7 +3,7 @@
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
-//! must survive them. Only unparseable JSON fails the whole file.
+//! must survive them. Only an unparseable file fails as a whole.
 //!
 //! What each client's file looks like lives in [`codec`]; this module owns
 //! only what is the same everywhere — detection, paths, and the lenient
@@ -15,8 +15,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Server, Transport};
+use crate::config::Server;
 use crate::error::Error;
+use codec::{Codec, EntrySchema, Format, RootPath};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
@@ -94,12 +95,23 @@ impl ClientKind {
         !matches!(self, Self::ClaudeDesktop)
     }
 
-    /// The JSON key holding the server map (`servers` is the VS Code outlier).
+    /// How this client's config is stored, addressed and shaped.
+    ///
+    /// The four clients here are all plain-JSON `mcpServers` maps bar VS
+    /// Code, which renames the map and wants an explicit entry `type`.
     #[must_use]
-    pub fn root_key(self) -> &'static str {
+    pub fn codec(self) -> Codec {
         match self {
-            Self::VsCode => "servers",
-            _ => "mcpServers",
+            Self::VsCode => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["servers"]),
+                entries: EntrySchema::VsCode,
+            },
+            _ => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["mcpServers"]),
+                entries: EntrySchema::McpServers,
+            },
         }
     }
 
@@ -184,37 +196,40 @@ impl ClientKind {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::ClientParse`] when the text is not valid JSON or its
-    /// root is not an object. Broken entries are collected as problems.
+    /// Returns [`Error::ClientParse`] when the text does not parse in the
+    /// client's format or its root is not an object. Broken entries are
+    /// collected as problems.
     pub fn read_text(self, text: &str, path: &Path) -> Result<ClientRead, Error> {
         let parse_err = |source| Error::ClientParse {
             client: self.display_name(),
             path: path.to_owned(),
             source: Box::new(source),
         };
-        let root: serde_json::Value = serde_json::from_str(text).map_err(parse_err)?;
-        let Some(root) = root.as_object() else {
+        let codec = self.codec();
+        let root = codec.parse_value(text).map_err(parse_err)?;
+        if !root.is_object() {
             return Err(parse_err(serde::de::Error::custom("root is not an object")));
-        };
+        }
 
         let mut read = ClientRead {
             servers: BTreeMap::new(),
             problems: Vec::new(),
         };
-        // Absent root key is the normal "no MCP servers yet" state.
-        let Some(entries) = root.get(self.root_key()) else {
-            return Ok(read);
-        };
-        let Some(entries) = entries.as_object() else {
-            read.problems.push(Problem {
-                server: None,
-                message: format!("`{}` is not an object", self.root_key()),
-            });
-            return Ok(read);
+        let entries = match codec.root.locate_in(&root) {
+            // Absent root key is the normal "no MCP servers yet" state.
+            Ok(None) => return Ok(read),
+            Ok(Some(entries)) => entries,
+            Err(key) => {
+                read.problems.push(Problem {
+                    server: None,
+                    message: format!("`{key}` is not an object"),
+                });
+                return Ok(read);
+            }
         };
 
         for (name, entry) in entries {
-            match parse_entry(entry) {
+            match codec.entries.parse(entry) {
                 Ok((server, note)) => {
                     if let Some(note) = note {
                         read.problems.push(Problem {
@@ -231,111 +246,6 @@ impl ClientKind {
             }
         }
         Ok(read)
-    }
-}
-
-/// Converts one client entry; `Err` is a problem reason, the optional note
-/// reports a lossy-but-successful conversion.
-fn parse_entry(entry: &serde_json::Value) -> Result<(Server, Option<String>), String> {
-    let Some(obj) = entry.as_object() else {
-        return Err("entry is not an object".to_owned());
-    };
-
-    let explicit = match obj.get("type") {
-        None => None,
-        Some(serde_json::Value::String(t)) => Some(t.as_str()),
-        Some(_) => return Err("`type` is not a string".to_owned()),
-    };
-    let has_command = obj.contains_key("command");
-    let has_url = obj.contains_key("url");
-
-    let mut note = None;
-    let stdio = match explicit {
-        Some("stdio") => true,
-        Some("http" | "streamable-http" | "streamable_http") => false,
-        Some("sse") => {
-            // Legacy transport we don't model; the URL still identifies the
-            // server, so read it as http and say so.
-            note = Some("legacy `sse` transport read as http".to_owned());
-            false
-        }
-        Some(other) => return Err(format!("unknown transport type {other:?}")),
-        // No explicit type: infer from which target field is present.
-        None => match (has_command, has_url) {
-            (true, false) => true,
-            (false, true) => false,
-            (true, true) => return Err("has both `command` and `url`".to_owned()),
-            (false, false) => return Err("has neither `command` nor `url`".to_owned()),
-        },
-    };
-
-    // Some clients (e.g. Cline-style configs) mark entries disabled in place.
-    let enabled = !matches!(obj.get("disabled"), Some(serde_json::Value::Bool(true)));
-
-    let transport = if stdio {
-        Transport::Stdio {
-            command: string_field(obj, "command")?.ok_or("missing `command`")?,
-            args: string_list(obj, "args")?,
-            env: string_object(obj, "env")?,
-        }
-    } else {
-        Transport::Http {
-            url: string_field(obj, "url")?.ok_or("missing `url`")?,
-            headers: string_object(obj, "headers")?,
-        }
-    };
-    Ok((
-        Server {
-            enabled,
-            tags: Vec::new(),
-            transport,
-        },
-        note,
-    ))
-}
-
-fn string_field(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<Option<String>, String> {
-    match obj.get(key) {
-        None => Ok(None),
-        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(format!("`{key}` is not a string")),
-    }
-}
-
-fn string_list(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<Vec<String>, String> {
-    match obj.get(key) {
-        None => Ok(Vec::new()),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .map(|item| match item {
-                serde_json::Value::String(s) => Ok(s.clone()),
-                _ => Err(format!("`{key}` contains a non-string element")),
-            })
-            .collect(),
-        Some(_) => Err(format!("`{key}` is not an array")),
-    }
-}
-
-fn string_object(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<BTreeMap<String, String>, String> {
-    match obj.get(key) {
-        None => Ok(BTreeMap::new()),
-        Some(serde_json::Value::Object(map)) => map
-            .iter()
-            .map(|(k, v)| match v {
-                serde_json::Value::String(s) => Ok((k.clone(), s.clone())),
-                _ => Err(format!("`{key}.{k}` is not a string")),
-            })
-            .collect(),
-        Some(_) => Err(format!("`{key}` is not an object")),
     }
 }
 
