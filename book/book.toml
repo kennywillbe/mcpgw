@@ -1,0 +1,11 @@
+[book]
+title = "mcpgw"
+authors = ["kennywillbe"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/kennywillbe/mcpgw"
+edit-url-template = "https://github.com/kennywillbe/mcpgw/edit/main/book/{path}"
+site-url = "https://kennywillbe.github.io/mcpgw/"
+default-theme = "rust"

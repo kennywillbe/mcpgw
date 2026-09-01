@@ -3,7 +3,9 @@ resolver = "3"
 members = ["crates/core", "crates/cli", "crates/test-server"]
 
 [workspace.package]
-version = "0.1.0"
+# Versions are literal per-crate rather than inherited: release-please's cargo
+# updater rewrites `[package] version` in each manifest and cannot follow
+# workspace inheritance.
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Manage MCP servers across every client from one place"
@@ -14,7 +16,6 @@ keywords = ["mcp", "gateway", "cli", "ai", "llm"]
 categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
-mcpgw-core = { version = "0.1.0", path = "crates/core" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
 toml_edit = "0.23"

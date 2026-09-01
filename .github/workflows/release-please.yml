@@ -1,0 +1,28 @@
+name: Release Please
+
+# Keeps a "chore: release" PR open with the next version and changelog. Merging
+# it bumps the manifests, writes CHANGELOG.md and pushes the tags.
+#
+# The `v*` tag it pushes for the CLI is what triggers release.yml, which builds
+# the binaries. That only works if the tag is pushed with a PAT: a tag created
+# by the default GITHUB_TOKEN deliberately does not trigger other workflows.
+# Set RELEASE_PLEASE_TOKEN (repo + workflow scope) or release.yml will need a
+# manual re-run.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

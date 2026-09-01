@@ -5,6 +5,8 @@
 [![CI](https://github.com/kennywillbe/mcpgw/actions/workflows/ci.yml/badge.svg)](https://github.com/kennywillbe/mcpgw/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/mcpgw.svg)](https://crates.io/crates/mcpgw)
 
+**[Documentation →](https://kennywillbe.github.io/mcpgw/)**
+
 ![demo](docs/demo.gif)
 
 <!-- The GIF above is generated with vhs from docs/demo.tape: `vhs docs/demo.tape`. -->
@@ -134,6 +136,11 @@ Post-launch, ordered by what feedback says first:
 - OAuth 2.1 with DCR and PKCE
 - a full TUI for `watch`
 - `mcpgw connect` starting a managed gateway daemon on its own
+
+## Contributing
+
+Conventional commits, green CI, PRs against `main` — details in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

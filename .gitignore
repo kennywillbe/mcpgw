@@ -1,1 +1,5 @@
 /target
+book/book
+
+# Internal planning notes, kept local.
+docs/PLAN.md

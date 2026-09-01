@@ -23,6 +23,10 @@ Env MCPGW_STATE_DIR "/tmp/mcpgw-demo/state"
 Hide
 Type "rm -rf /tmp/mcpgw-demo && mkdir -p /tmp/mcpgw-demo/state"
 Enter
+# Warm the npx cache so the gateway's first spawn in the recording is instant.
+Type "npx -y @modelcontextprotocol/server-github --help </dev/null >/dev/null 2>&1"
+Enter
+Sleep 8s
 Type "clear"
 Enter
 Show
@@ -74,6 +78,17 @@ Type "mcpgw serve &"
 Sleep 600ms
 Enter
 Sleep 3s
+
+# Drive real traffic through the gateway (a raw MCP client over the connect
+# bridge) so watch has something to show; hidden because a viewer's traffic
+# would normally come from Claude/Cursor.
+Hide
+Type `{ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"demo","version":"0"}}}' '{"jsonrpc":"2.0","method":"notifications/initialized"}' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'; sleep 6; } | mcpgw connect >/dev/null 2>&1`
+Enter
+Sleep 9s
+Type "clear"
+Enter
+Show
 
 Type "mcpgw watch"
 Sleep 400ms
