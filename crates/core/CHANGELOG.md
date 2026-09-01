@@ -1,9 +1,10 @@
 # Changelog
 
-## 0.1.0 (2026-09-01)
+`mcpgw-core` moves in lockstep with the `mcpgw` CLI and shares its version
+number, so there is one changelog for both:
 
+<https://github.com/kennywillbe/mcpgw/blob/main/CHANGELOG.md>
 
-### Bug Fixes
-
-* address the review findings ([4bf1bf5](https://github.com/kennywillbe/mcpgw/commit/4bf1bf50670676bbf64969b63f54f18ec6d17357))
-* box large error sources, move CI actions off node20 ([e92febc](https://github.com/kennywillbe/mcpgw/commit/e92febcdcf59f2a12dbc7833633c4bd1cc3e6cc3))
+This file is only here because crates.io looks for a changelog next to the
+manifest; it is not generated or updated by release tooling. Entries up to
+0.1.0 that used to live here are in the root changelog under the same versions.

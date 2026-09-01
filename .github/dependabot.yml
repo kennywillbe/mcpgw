@@ -1,0 +1,30 @@
+version: 2
+
+# One grouped PR per ecosystem per week, rather than a PR per dependency: CI
+# here is a 3-OS matrix and a full clippy+test run, so ungrouped updates would
+# spend most of the week rebuilding the same workspace.
+#
+# The `deps` prefix is a changelog section in release-please-config.json, which
+# is what puts these under "Dependencies" instead of dropping them.
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-deps:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-deps:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: deps
