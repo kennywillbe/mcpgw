@@ -34,6 +34,16 @@ rmcp = { version = "3", features = [
     "transport-io",
     "transport-streamable-http-server",
     "transport-streamable-http-client-reqwest",
+    # `transport-streamable-http-client-reqwest` pulls reqwest in, but rmcp
+    # declares it with default-features = false, so without this feature the
+    # client is compiled with no TLS backend at all and every https upstream
+    # fails at the connection level ("error sending request ... when send
+    # initialize request"). Found by dogfooding: the suite only ever dialed
+    # http://127.0.0.1, so nothing caught it. `reqwest` maps to
+    # reqwest/rustls — rustls keeps the single-static-binary story, and its
+    # platform verifier trusts the OS store, so corporate and proxy roots
+    # work without shipping our own CA bundle.
+    "reqwest",
 ] }
 rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
 axum = "0.8"
