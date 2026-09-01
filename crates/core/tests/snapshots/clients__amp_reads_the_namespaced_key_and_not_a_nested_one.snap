@@ -1,0 +1,58 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "browser": Server {
+            enabled: false,
+            tags: [],
+            transport: Stdio {
+                command: "browser-mcp",
+                args: [],
+                env: {
+                    "BROWSER_PROFILE": "work",
+                },
+            },
+        },
+        "linear": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/sse",
+                headers: {},
+            },
+        },
+        "playwright": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@playwright/mcp@latest",
+                    "--headless",
+                ],
+                env: {},
+            },
+        },
+        "sourcegraph": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "${SRC_ENDPOINT}/.api/mcp/v1",
+                headers: {
+                    "Authorization": "token ${SRC_ACCESS_TOKEN}",
+                },
+            },
+        },
+    },
+    problems: [
+        Problem {
+            server: Some(
+                "husk",
+            ),
+            message: "has neither `command` nor `url`",
+        },
+    ],
+}

@@ -1,0 +1,30 @@
+{
+  "amp.notifications.enabled": true,
+  "amp.mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--headless"]
+    },
+    "browser": {
+      "command": "browser-mcp",
+      "env": { "BROWSER_PROFILE": "work" },
+      "disabled": true
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/sse"
+    },
+    "sourcegraph": {
+      "url": "${SRC_ENDPOINT}/.api/mcp/v1",
+      "headers": { "Authorization": "token ${SRC_ACCESS_TOKEN}" }
+    },
+    "husk": {
+      "disabled": false
+    }
+  },
+  "amp": {
+    "mcpServers": {
+      "decoy": { "command": "never-read-me" }
+    }
+  },
+  "amp.tools.disable": ["edit_file"]
+}
