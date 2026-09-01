@@ -1,5 +1,6 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
-//! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI).
+//! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI,
+//! opencode).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -27,6 +28,7 @@ pub enum ClientKind {
     VsCode,
     Gemini,
     Codex,
+    Opencode,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -55,13 +57,14 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
         Self::VsCode,
         Self::Gemini,
         Self::Codex,
+        Self::Opencode,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -74,6 +77,7 @@ impl ClientKind {
             Self::VsCode => "vscode",
             Self::Gemini => "gemini",
             Self::Codex => "codex",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -92,6 +96,8 @@ impl ClientKind {
             Self::VsCode => "VS Code",
             Self::Gemini => "Gemini CLI",
             Self::Codex => "Codex CLI",
+            // Lowercase is the project's own spelling of its name.
+            Self::Opencode => "opencode",
         }
     }
 
@@ -107,8 +113,9 @@ impl ClientKind {
     ///
     /// Most clients here are plain-JSON `mcpServers` maps. VS Code renames
     /// the map and wants an explicit entry `type`, Gemini CLI keeps the map
-    /// name but spells entries its own way, and Codex CLI is TOML end to
-    /// end — a `[mcp_servers]` table of `snake_case` entries.
+    /// name but spells entries its own way, Codex CLI is TOML end to end —
+    /// a `[mcp_servers]` table of `snake_case` entries — and opencode is
+    /// JSONC under a plain `mcp` key.
     #[must_use]
     pub fn codec(self) -> Codec {
         match self {
@@ -127,6 +134,13 @@ impl ClientKind {
                 root: RootPath::new(&["mcp_servers"]),
                 entries: EntrySchema::Codex,
             },
+            // Comments in an opencode config are ordinary, so this is the
+            // first client read and written through the JSONC path.
+            Self::Opencode => Codec {
+                format: Format::Jsonc,
+                root: RootPath::new(&["mcp"]),
+                entries: EntrySchema::Opencode,
+            },
             _ => Codec {
                 format: Format::Json,
                 root: RootPath::new(&["mcpServers"]),
@@ -142,19 +156,55 @@ impl ClientKind {
     }
 
     /// Same as [`ClientKind::config_path`] with an injectable environment.
+    ///
+    /// Where a client accepts several filenames this is whichever one exists,
+    /// in the order [`ClientKind::config_path_candidates_with`] lists them,
+    /// and the first candidate when none does — so the answer is the file a
+    /// read would open and the file a write would create.
     #[must_use]
     pub fn config_path_with(self, get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-        let path = match self {
-            Self::ClaudeDesktop => app_data_dir(&get)?.join("Claude/claude_desktop_config.json"),
-            Self::ClaudeCode => home_dir(&get)?.join(".claude.json"),
-            Self::Cursor => home_dir(&get)?.join(".cursor/mcp.json"),
-            Self::VsCode => app_data_dir(&get)?.join("Code/User/mcp.json"),
+        let candidates = self.config_path_candidates_with(&get);
+        candidates
+            .iter()
+            .find(|path| path.is_file())
+            .or_else(|| candidates.first())
+            .cloned()
+    }
+
+    /// Every path this client may keep its MCP config at, most preferred
+    /// first.
+    ///
+    /// One path is the rule. opencode is the exception: `opencode.json` and
+    /// `opencode.jsonc` are both first-class there, so a machine may have
+    /// either — and one with neither gets the `.json` spelling, which is what
+    /// its own docs lead with.
+    #[must_use]
+    pub fn config_path_candidates_with(
+        self,
+        get: impl Fn(&str) -> Option<OsString>,
+    ) -> Vec<PathBuf> {
+        let Some(dir) = (match self {
+            Self::ClaudeDesktop => app_data_dir(&get).map(|dir| dir.join("Claude")),
+            Self::ClaudeCode => home_dir(&get),
+            Self::Cursor => home_dir(&get).map(|dir| dir.join(".cursor")),
+            Self::VsCode => app_data_dir(&get).map(|dir| dir.join("Code/User")),
             // Gemini and Codex are CLIs, so their settings live in the
             // home dir on every platform rather than in the app-data dir.
-            Self::Gemini => home_dir(&get)?.join(".gemini/settings.json"),
-            Self::Codex => home_dir(&get)?.join(".codex/config.toml"),
+            Self::Gemini => home_dir(&get).map(|dir| dir.join(".gemini")),
+            Self::Codex => home_dir(&get).map(|dir| dir.join(".codex")),
+            Self::Opencode => xdg_config_dir(&get).map(|dir| dir.join("opencode")),
+        }) else {
+            return Vec::new();
         };
-        Some(path)
+        let names: &[&str] = match self {
+            Self::ClaudeDesktop => &["claude_desktop_config.json"],
+            Self::ClaudeCode => &[".claude.json"],
+            Self::Cursor | Self::VsCode => &["mcp.json"],
+            Self::Gemini => &["settings.json"],
+            Self::Codex => &["config.toml"],
+            Self::Opencode => &["opencode.json", "opencode.jsonc"],
+        };
+        names.iter().map(|name| dir.join(name)).collect()
     }
 
     /// A path whose existence indicates the client is installed at all,
@@ -169,6 +219,7 @@ impl ClientKind {
             Self::VsCode => app_data_dir(&get)?.join("Code"),
             Self::Gemini => home_dir(&get)?.join(".gemini"),
             Self::Codex => home_dir(&get)?.join(".codex"),
+            Self::Opencode => xdg_config_dir(&get)?.join("opencode"),
         };
         Some(path)
     }
@@ -324,9 +375,15 @@ fn app_data_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     } else if cfg!(windows) {
         get("APPDATA").filter(|v| !v.is_empty()).map(PathBuf::from)
     } else {
-        match get("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            Some(xdg) => Some(PathBuf::from(xdg)),
-            None => Some(home_dir(get)?.join(".config")),
-        }
+        xdg_config_dir(get)
+    }
+}
+
+// The XDG config dir on *every* platform, which is what a client following
+// the XDG layout uses even on Windows (%USERPROFILE%\.config\, not %APPDATA%).
+fn xdg_config_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    match get("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(xdg) => Some(PathBuf::from(xdg)),
+        None => Some(home_dir(get)?.join(".config")),
     }
 }

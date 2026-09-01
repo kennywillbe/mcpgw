@@ -149,7 +149,68 @@ fn entry_shapes_per_client() {
     );
     assert_eq!(with_headers["http_headers"]["Authorization"], "Bearer t");
 
+    // opencode spells the transport `local`/`remote`, folds the program and
+    // its arguments into one array, and calls the variables `environment`.
+    let opencode_stdio = client_entry(ClientKind::Opencode, &canonical["github"]);
+    let opencode_http = client_entry(ClientKind::Opencode, &canonical["linear"]);
+    assert_eq!(opencode_stdio["type"], "local");
+    assert_eq!(
+        opencode_stdio["command"],
+        serde_json::json!(["npx", "-y", "@modelcontextprotocol/server-github"])
+    );
+    assert!(opencode_stdio.get("args").is_none());
+    assert_eq!(opencode_stdio["environment"]["TOKEN"], "t");
+    assert!(opencode_stdio.get("env").is_none());
+    assert_eq!(opencode_http["type"], "remote");
+    assert_eq!(opencode_http["url"], "https://mcp.linear.app/mcp");
+    assert!(opencode_http.get("headers").is_none());
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
+}
+
+/// The array `command` is the one field mcpgw splits and rejoins, so it is
+/// the one that can lose an argument. Emitting and re-reading has to give
+/// back the server that went in — for every client, but here it is load
+/// bearing rather than incidental.
+#[test]
+fn emitting_and_re_reading_an_entry_returns_the_same_server() {
+    let mut servers: Vec<mcpgw_core::Server> = canonical().into_values().collect();
+    // Disabled is a canonical fact, not an emitted one: a client only ever
+    // receives entries that are on.
+    for server in &mut servers {
+        server.enabled = true;
+    }
+    servers.push(mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [(
+                "Authorization".to_owned(),
+                "Bearer {env:LINEAR_TOKEN}".to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        },
+    });
+    // A bare command with no arguments: the array must not collapse.
+    servers.push(mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: mcpgw_core::Transport::Stdio {
+            command: "notes-mcp".to_owned(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+        },
+    });
+
+    let entries = ClientKind::Opencode.codec().entries;
+    for server in servers {
+        let emitted = entries.emit(&server);
+        let (parsed, note) = entries.parse(&emitted).unwrap();
+        assert_eq!(parsed, server, "round trip changed {emitted}");
+        assert_eq!(note, None);
+    }
 }
 
 #[test]
@@ -180,6 +241,15 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(gemini["httpUrl"], url);
     assert!(gemini.get("url").is_none());
     assert!(gemini.get("command").is_none());
+
+    // opencode takes the gateway as a remote entry.
+    let opencode = client_entry(
+        ClientKind::Opencode,
+        &gateway_server(ClientKind::Opencode, url, "mcpgw"),
+    );
+    assert_eq!(opencode["type"], "remote");
+    assert_eq!(opencode["url"], url);
+    assert!(opencode.get("command").is_none());
 
     // Codex takes the gateway over HTTP too, with no `type` to go with it.
     let codex = client_entry(

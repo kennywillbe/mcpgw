@@ -1,0 +1,44 @@
+// opencode keeps its whole configuration here, comments and all.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "system",
+  "model": "anthropic/claude-sonnet-4-5",
+  "mcp": {
+    // The one I run locally.
+    "github": {
+      "type": "local",
+      // Program and arguments share a single array here.
+      "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+      "environment": {
+        "GITHUB_TOKEN": "$GITHUB_TOKEN"
+      },
+      "cwd": "./servers/github",
+      "enabled": true
+    },
+    "linear": {
+      "type": "remote",
+      "url": "https://mcp.linear.app/mcp",
+      "headers": {
+        // opencode expands this itself; mcpgw must not.
+        "Authorization": "Bearer {env:LINEAR_TOKEN}"
+      }
+    },
+    "figma": {
+      "type": "remote",
+      "url": "https://mcp.figma.com/mcp",
+      "oauth": {
+        "clientId": "figma-desktop"
+      }
+    },
+    "notes": {
+      "type": "local",
+      "command": ["notes-mcp"],
+      "enabled": false
+    },
+    // Never finished writing this one.
+    "husk": {
+      "type": "local",
+      "command": []
+    },
+  }
+}

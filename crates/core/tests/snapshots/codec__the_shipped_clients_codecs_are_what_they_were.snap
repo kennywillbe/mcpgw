@@ -27,4 +27,8 @@ expression: matrix
         "codex",
         "Toml / mcp_servers / Codex",
     ),
+    (
+        "opencode",
+        "Jsonc / mcp / Opencode",
+    ),
 ]
