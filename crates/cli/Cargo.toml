@@ -3,7 +3,12 @@ name = "mcpgw"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "One binary that manages your MCP servers across every client and gateways their traffic"
 
 [dependencies]
 mcpgw-core.workspace = true

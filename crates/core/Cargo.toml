@@ -3,7 +3,12 @@ name = "mcpgw-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Core library for mcpgw: the canonical MCP server config model"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Config model, client adapters, gateway and traffic capture behind the mcpgw CLI"
 
 [dependencies]
 serde.workspace = true

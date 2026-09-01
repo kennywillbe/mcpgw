@@ -7,6 +7,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Manage MCP servers across every client from one place"
+repository = "https://github.com/kennywillbe/mcpgw"
+homepage = "https://github.com/kennywillbe/mcpgw"
+readme = "README.md"
+keywords = ["mcp", "gateway", "cli", "ai", "llm"]
+categories = ["command-line-utilities", "network-programming"]
 
 [workspace.dependencies]
 mcpgw-core = { version = "0.1.0", path = "crates/core" }
