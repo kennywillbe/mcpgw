@@ -175,6 +175,41 @@ fn a_lost_adoption_record_never_costs_the_client_entry() {
 }
 
 #[test]
+fn import_from_gemini_adopts_and_carries_the_excluded_flag() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        ".gemini/settings.json",
+        r#"{
+            "theme": "Default",
+            "mcp": { "excluded": ["notes"] },
+            "mcpServers": {
+                "github": {"command": "npx", "args": ["server-github"], "trust": true},
+                "linear": {"httpUrl": "https://mcp.linear.app/mcp"},
+                "notes": {"command": "notes-mcp"}
+            }
+        }"#,
+    );
+    let out = sb.ok(&["import", "--from", "gemini"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("+ notes"), "{out}");
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    // `mcp.excluded` is Gemini's only off switch, so it has to survive the
+    // trip into the canonical config as a disabled server.
+    assert_eq!(json["servers"]["notes"]["enabled"], false);
+    assert_ne!(json["servers"]["github"]["enabled"], false);
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "gemini"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
+#[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.write_client(

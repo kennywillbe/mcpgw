@@ -1,6 +1,5 @@
 ---
 source: crates/core/tests/clients.rs
-assertion_line: 51
 expression: read.problems
 ---
 [

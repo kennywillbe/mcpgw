@@ -19,4 +19,8 @@ expression: matrix
         "vscode",
         "Json / servers / VsCode",
     ),
+    (
+        "gemini",
+        "Json / mcpServers / Gemini",
+    ),
 ]

@@ -1,0 +1,47 @@
+{
+  "theme": "Default",
+  "selectedAuthType": "oauth-personal",
+  "security": {
+    "auth": {
+      "selectedType": "oauth-personal"
+    }
+  },
+  "mcp": {
+    "allowed": ["github", "notes"],
+    "excluded": ["notes"]
+  },
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "$GITHUB_TOKEN"
+      },
+      "cwd": "./servers/github",
+      "timeout": 30000,
+      "trust": false,
+      "includeTools": ["list_issues"]
+    },
+    "linear": {
+      "httpUrl": "https://mcp.linear.app/mcp",
+      "headers": {
+        "Authorization": "Bearer ${LINEAR_TOKEN}"
+      }
+    },
+    "legacy-sse": {
+      "url": "https://sse.example.com/sse"
+    },
+    "both-urls": {
+      "httpUrl": "https://both.example.com/mcp",
+      "url": "https://both.example.com/sse"
+    },
+    "notes": {
+      "command": "notes-mcp"
+    },
+    "husk": {
+      "env": {
+        "A": "B"
+      }
+    }
+  }
+}

@@ -100,6 +100,10 @@ pub enum EntrySchema {
     /// VS Code's `servers` shape, whose schema wants an explicit `type` on
     /// every entry.
     VsCode,
+    /// Gemini CLI's shape: no `type` at all, and two distinct remote fields
+    /// — `httpUrl` is streamable HTTP, plain `url` is the legacy SSE
+    /// transport. Writing the wrong one silently picks the wrong protocol.
+    Gemini,
 }
 
 impl EntrySchema {
@@ -116,6 +120,9 @@ impl EntrySchema {
         let Some(obj) = entry.as_object() else {
             return Err("entry is not an object".to_owned());
         };
+        if matches!(self, Self::Gemini) {
+            return parse_gemini(obj);
+        }
 
         let explicit = match obj.get("type") {
             None => None,
@@ -189,8 +196,14 @@ impl EntrySchema {
                 }
             }
             Transport::Http { url, headers } => {
-                obj.insert("type".to_owned(), "http".into());
-                obj.insert("url".to_owned(), url.as_str().into());
+                if matches!(self, Self::Gemini) {
+                    // `url` here would mean SSE to Gemini; streamable HTTP
+                    // is spelled `httpUrl`, and there is no `type` field.
+                    obj.insert("httpUrl".to_owned(), url.as_str().into());
+                } else {
+                    obj.insert("type".to_owned(), "http".into());
+                    obj.insert("url".to_owned(), url.as_str().into());
+                }
                 if !headers.is_empty() {
                     obj.insert("headers".to_owned(), string_map(headers));
                 }
@@ -198,6 +211,60 @@ impl EntrySchema {
         }
         Value::Object(obj)
     }
+}
+
+/// Gemini CLI's entry shape, which shares no discriminator with the others:
+/// there is no `type`, the transport is whichever target field is present,
+/// and the two remote fields are different protocols.
+///
+/// Everything else an entry may carry (`cwd`, `timeout`, `trust`,
+/// `includeTools`, `authProviderType`, …) is ignored on read — those fields
+/// have no canonical counterpart, and an entry mcpgw does not manage keeps
+/// them verbatim because sync never rewrites it.
+fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
+    let http_url = string_field(obj, "httpUrl")?;
+    let sse_url = string_field(obj, "url")?;
+    let mut note = None;
+
+    let transport = match (http_url, sse_url) {
+        (Some(http_url), sse) => {
+            if sse.is_some() {
+                // Gemini itself prefers httpUrl; saying so keeps a reader
+                // from assuming the SSE endpoint is the live one.
+                note = Some("`url` ignored: `httpUrl` takes precedence".to_owned());
+            }
+            Transport::Http {
+                url: http_url,
+                headers: string_object(obj, "headers")?,
+            }
+        }
+        (None, Some(sse_url)) => {
+            // Legacy transport we don't model; the URL still identifies the
+            // server, so read it as http and say so.
+            note = Some("legacy `sse` transport read as http".to_owned());
+            Transport::Http {
+                url: sse_url,
+                headers: string_object(obj, "headers")?,
+            }
+        }
+        (None, None) => Transport::Stdio {
+            command: string_field(obj, "command")?
+                .ok_or("has none of `command`, `httpUrl` or `url`")?,
+            args: string_list(obj, "args")?,
+            env: string_object(obj, "env")?,
+        },
+    };
+
+    Ok((
+        Server {
+            // Gemini has no per-entry enabled flag; exclusion lives in a
+            // sibling root key and is applied after the whole file is read.
+            enabled: true,
+            tags: Vec::new(),
+            transport,
+        },
+        note,
+    ))
 }
 
 /// One client's read/write rules, the whole of what makes clients differ.

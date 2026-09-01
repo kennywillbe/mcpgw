@@ -42,6 +42,55 @@ fn vscode_reads_servers_root_key() {
 }
 
 #[test]
+fn gemini_reads_both_url_shapes_and_the_excluded_list() {
+    let read = read_fixture(ClientKind::Gemini, "gemini_settings.json");
+
+    // `httpUrl` is streamable HTTP, plain `url` is legacy SSE, and an entry
+    // carrying both resolves to `httpUrl` — all three land as http.
+    assert_eq!(
+        read.servers["linear"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [(
+                "Authorization".to_owned(),
+                "Bearer ${LINEAR_TOKEN}".to_owned()
+            )]
+            .into_iter()
+            .collect(),
+        }
+    );
+    // Env values keep their `$VAR` spelling: Gemini expands them, mcpgw
+    // must not resolve them at read time.
+    let mcpgw_core::Transport::Stdio { env, .. } = &read.servers["github"].transport else {
+        panic!("github should be stdio");
+    };
+    assert_eq!(env["GITHUB_TOKEN"], "$GITHUB_TOKEN");
+
+    // No per-entry flag: `notes` is off only because `mcp.excluded` says so.
+    assert!(!read.servers["notes"].enabled);
+    assert!(read.servers["github"].enabled);
+    // An entry with no target field at all is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+
+    insta::assert_debug_snapshot!(read);
+}
+
+#[test]
+fn gemini_tolerates_a_malformed_excluded_list() {
+    let read = ClientKind::Gemini
+        .read_text(
+            r#"{"mcp": {"excluded": "notes"}, "mcpServers": {"notes": {"command": "x"}}}"#,
+            Path::new("settings.json"),
+        )
+        .unwrap();
+    // The list is unreadable, so nothing is disabled — but the file is not
+    // rejected and the problem is reported.
+    assert!(read.servers["notes"].enabled);
+    assert_eq!(read.problems.len(), 1);
+    assert_eq!(read.problems[0].message, "`mcp.excluded` is not an array");
+}
+
+#[test]
 fn broken_entries_become_problems_not_failures() {
     let read = read_fixture(ClientKind::ClaudeDesktop, "messy.json");
     // Exactly one entry survives; every other becomes a reported problem.
@@ -106,6 +155,18 @@ fn detect_reports_three_states() {
     std::fs::write(&config, "{}").unwrap();
     assert_eq!(
         ClientKind::Cursor.detect_with(&env),
+        Detection::Configured(config)
+    );
+
+    // Gemini's trace dir also holds its config file, so the two states have
+    // to be distinguished by the file rather than by the directory.
+    let trace = ClientKind::Gemini.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Gemini.detect_with(&env), Detection::Installed);
+    let config = ClientKind::Gemini.config_path_with(&env).unwrap();
+    std::fs::write(&config, "{}").unwrap();
+    assert_eq!(
+        ClientKind::Gemini.detect_with(&env),
         Detection::Configured(config)
     );
 }
