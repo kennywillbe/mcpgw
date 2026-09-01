@@ -1,0 +1,63 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "figma": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.figma.com/mcp",
+                headers: {},
+            },
+        },
+        "github": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-github",
+                ],
+                env: {
+                    "GITHUB_TOKEN": "$GITHUB_TOKEN",
+                },
+            },
+        },
+        "linear": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/mcp",
+                headers: {
+                    "Authorization": "Bearer ${LINEAR_TOKEN}",
+                },
+            },
+        },
+        "notes": Server {
+            enabled: false,
+            tags: [],
+            transport: Stdio {
+                command: "notes-mcp",
+                args: [],
+                env: {},
+            },
+        },
+    },
+    problems: [
+        Problem {
+            server: Some(
+                "figma",
+            ),
+            message: "codex-managed auth not carried over",
+        },
+        Problem {
+            server: Some(
+                "husk",
+            ),
+            message: "has neither `command` nor `url`",
+        },
+    ],
+}

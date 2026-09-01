@@ -96,6 +96,27 @@ impl Sandbox {
         let text = std::fs::read_to_string(self.home.join(".gemini/settings.json")).unwrap();
         serde_json::from_str(&text).unwrap()
     }
+
+    fn install_codex(&self, config: Option<&str>) {
+        let dir = self.home.join(".codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = config {
+            std::fs::write(dir.join("config.toml"), text).unwrap();
+        }
+    }
+
+    fn codex_text(&self) -> String {
+        std::fs::read_to_string(self.home.join(".codex/config.toml")).unwrap()
+    }
+
+    /// The written TOML as canonical JSON, so the assertions below are about
+    /// values rather than the spelling the writer happened to pick.
+    fn codex_toml(&self) -> serde_json::Value {
+        mcpgw_core::ClientKind::Codex
+            .codec()
+            .parse_value(&self.codex_text())
+            .unwrap()
+    }
 }
 
 /// Gemini's settings file is the whole CLI's settings, not an MCP file: it
@@ -108,6 +129,25 @@ const GEMINI_SETTINGS: &str = r#"{
     "notes": { "command": "notes-mcp" }
   }
 }"#;
+
+/// Codex's config.toml is the whole CLI's configuration, and TOML means a
+/// sync has comments and hand formatting to lose as well as sibling keys.
+const CODEX_CONFIG: &str = r#"# My codex setup — do not reformat.
+model = "gpt-5-codex"
+approval_policy = "on-request"
+
+[sandbox_workspace_write]
+network_access = false
+
+# Added by hand, months ago.
+[mcp_servers.notes]
+command = "notes-mcp"
+startup_timeout_sec = 20
+required = true
+
+[mcp_servers.notes.tools.search]
+enabled = true
+"#;
 
 /// The bridge command is either the bare name (mcpgw on PATH) or the path of
 /// the binary under test.
@@ -443,6 +483,70 @@ fn gemini_gateway_entry_uses_http_url() {
     let entry = sb.gemini_json()["mcpServers"]["mcpgw"].clone();
     assert_eq!(entry["httpUrl"], "http://127.0.0.1:8137/mcp");
     assert!(entry.get("url").is_none());
+    assert!(entry.get("type").is_none());
+    assert!(entry.get("command").is_none());
+}
+
+#[test]
+fn codex_sync_preserves_comments_siblings_and_foreign_entries() {
+    let sb = Sandbox::new();
+    sb.install_codex(Some(CODEX_CONFIG));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "codex"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("? notes"), "{out}");
+
+    // toml_edit rewrites only the entries the plan owns, so the hand-written
+    // bytes around them survive verbatim.
+    let text = sb.codex_text();
+    for comment in [
+        "# My codex setup — do not reformat.",
+        "# Added by hand, months ago.",
+    ] {
+        assert!(text.contains(comment), "lost {comment:?} in:\n{text}");
+    }
+    assert!(text.contains("[mcp_servers.notes.tools.search]"), "{text}");
+
+    let toml = sb.codex_toml();
+    assert_eq!(toml["model"], "gpt-5-codex");
+    assert_eq!(toml["approval_policy"], "on-request");
+    assert_eq!(toml["sandbox_workspace_write"]["network_access"], false);
+    // The foreign entry keeps every field Codex knows and mcpgw does not.
+    assert_eq!(toml["mcp_servers"]["notes"]["startup_timeout_sec"], 20);
+    assert_eq!(toml["mcp_servers"]["notes"]["required"], true);
+
+    assert_eq!(toml["mcp_servers"]["github"]["command"], "npx");
+    assert_eq!(toml["mcp_servers"]["github"]["env"]["TOKEN"], "t");
+    assert_eq!(
+        toml["mcp_servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert!(toml["mcp_servers"]["linear"].get("type").is_none());
+
+    let again = sb.ok(&["sync", "--client", "codex"]);
+    assert!(again.contains("no changes"), "{again}");
+}
+
+#[test]
+fn codex_gateway_entry_is_a_plain_url() {
+    let sb = Sandbox::new();
+    sb.install_codex(None);
+    let out = sb.ok(&["sync", "--client", "codex", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.codex_toml()["mcp_servers"]["mcpgw"].clone();
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
     assert!(entry.get("type").is_none());
     assert!(entry.get("command").is_none());
 }

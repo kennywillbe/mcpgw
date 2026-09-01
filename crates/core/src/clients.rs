@@ -1,5 +1,5 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
-//! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI).
+//! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -26,6 +26,7 @@ pub enum ClientKind {
     Cursor,
     VsCode,
     Gemini,
+    Codex,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -54,12 +55,13 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
         Self::VsCode,
         Self::Gemini,
+        Self::Codex,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -71,6 +73,7 @@ impl ClientKind {
             Self::Cursor => "cursor",
             Self::VsCode => "vscode",
             Self::Gemini => "gemini",
+            Self::Codex => "codex",
         }
     }
 
@@ -88,6 +91,7 @@ impl ClientKind {
             Self::Cursor => "Cursor",
             Self::VsCode => "VS Code",
             Self::Gemini => "Gemini CLI",
+            Self::Codex => "Codex CLI",
         }
     }
 
@@ -101,9 +105,10 @@ impl ClientKind {
 
     /// How this client's config is stored, addressed and shaped.
     ///
-    /// The clients here are all plain-JSON `mcpServers` maps bar VS Code,
-    /// which renames the map and wants an explicit entry `type`, and Gemini
-    /// CLI, which keeps the map name but spells entries its own way.
+    /// Most clients here are plain-JSON `mcpServers` maps. VS Code renames
+    /// the map and wants an explicit entry `type`, Gemini CLI keeps the map
+    /// name but spells entries its own way, and Codex CLI is TOML end to
+    /// end — a `[mcp_servers]` table of `snake_case` entries.
     #[must_use]
     pub fn codec(self) -> Codec {
         match self {
@@ -116,6 +121,11 @@ impl ClientKind {
                 format: Format::Json,
                 root: RootPath::new(&["mcpServers"]),
                 entries: EntrySchema::Gemini,
+            },
+            Self::Codex => Codec {
+                format: Format::Toml,
+                root: RootPath::new(&["mcp_servers"]),
+                entries: EntrySchema::Codex,
             },
             _ => Codec {
                 format: Format::Json,
@@ -139,9 +149,10 @@ impl ClientKind {
             Self::ClaudeCode => home_dir(&get)?.join(".claude.json"),
             Self::Cursor => home_dir(&get)?.join(".cursor/mcp.json"),
             Self::VsCode => app_data_dir(&get)?.join("Code/User/mcp.json"),
-            // Gemini CLI is a CLI, so its settings live in the home dir on
-            // every platform rather than in the app-data dir.
+            // Gemini and Codex are CLIs, so their settings live in the
+            // home dir on every platform rather than in the app-data dir.
             Self::Gemini => home_dir(&get)?.join(".gemini/settings.json"),
+            Self::Codex => home_dir(&get)?.join(".codex/config.toml"),
         };
         Some(path)
     }
@@ -157,6 +168,7 @@ impl ClientKind {
             Self::Cursor => home_dir(&get)?.join(".cursor"),
             Self::VsCode => app_data_dir(&get)?.join("Code"),
             Self::Gemini => home_dir(&get)?.join(".gemini"),
+            Self::Codex => home_dir(&get)?.join(".codex"),
         };
         Some(path)
     }

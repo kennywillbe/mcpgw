@@ -126,6 +126,29 @@ fn entry_shapes_per_client() {
     assert!(gemini_http.get("url").is_none());
     assert!(gemini_http.get("type").is_none());
 
+    // Codex spells remote entries `url` + `http_headers`, and its stdio
+    // shape is the plain one — the TOML rendering is the codec's job.
+    let codex_stdio = client_entry(ClientKind::Codex, &canonical["github"]);
+    let codex_http = client_entry(ClientKind::Codex, &canonical["linear"]);
+    assert_eq!(codex_stdio, cursor_stdio);
+    assert_eq!(codex_http["url"], "https://mcp.linear.app/mcp");
+    assert!(codex_http.get("type").is_none());
+    assert!(codex_http.get("headers").is_none());
+    let with_headers = client_entry(
+        ClientKind::Codex,
+        &mcpgw_core::Server {
+            enabled: true,
+            tags: Vec::new(),
+            transport: mcpgw_core::Transport::Http {
+                url: "https://h.example/mcp".to_owned(),
+                headers: [("Authorization".to_owned(), "Bearer t".to_owned())]
+                    .into_iter()
+                    .collect(),
+            },
+        },
+    );
+    assert_eq!(with_headers["http_headers"]["Authorization"], "Bearer t");
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
 }
 
@@ -157,6 +180,15 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(gemini["httpUrl"], url);
     assert!(gemini.get("url").is_none());
     assert!(gemini.get("command").is_none());
+
+    // Codex takes the gateway over HTTP too, with no `type` to go with it.
+    let codex = client_entry(
+        ClientKind::Codex,
+        &gateway_server(ClientKind::Codex, url, "mcpgw"),
+    );
+    assert_eq!(codex["url"], url);
+    assert!(codex.get("type").is_none());
+    assert!(codex.get("command").is_none());
 
     for kind in ClientKind::ALL {
         assert_eq!(

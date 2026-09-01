@@ -104,6 +104,10 @@ pub enum EntrySchema {
     /// — `httpUrl` is streamable HTTP, plain `url` is the legacy SSE
     /// transport. Writing the wrong one silently picks the wrong protocol.
     Gemini,
+    /// Codex CLI's TOML shape: no `type`, headers spelled `http_headers`,
+    /// a per-entry `enabled` flag, and a long tail of optional fields whose
+    /// set keeps growing release to release.
+    Codex,
 }
 
 impl EntrySchema {
@@ -120,8 +124,10 @@ impl EntrySchema {
         let Some(obj) = entry.as_object() else {
             return Err("entry is not an object".to_owned());
         };
-        if matches!(self, Self::Gemini) {
-            return parse_gemini(obj);
+        match self {
+            Self::Gemini => return parse_gemini(obj),
+            Self::Codex => return parse_codex(obj),
+            Self::McpServers | Self::VsCode => {}
         }
 
         let explicit = match obj.get("type") {
@@ -196,16 +202,25 @@ impl EntrySchema {
                 }
             }
             Transport::Http { url, headers } => {
-                if matches!(self, Self::Gemini) {
-                    // `url` here would mean SSE to Gemini; streamable HTTP
-                    // is spelled `httpUrl`, and there is no `type` field.
-                    obj.insert("httpUrl".to_owned(), url.as_str().into());
-                } else {
-                    obj.insert("type".to_owned(), "http".into());
-                    obj.insert("url".to_owned(), url.as_str().into());
-                }
+                let headers_key = match self {
+                    Self::Gemini => {
+                        // `url` here would mean SSE to Gemini; streamable
+                        // HTTP is spelled `httpUrl`, and there is no `type`.
+                        obj.insert("httpUrl".to_owned(), url.as_str().into());
+                        "headers"
+                    }
+                    Self::Codex => {
+                        obj.insert("url".to_owned(), url.as_str().into());
+                        "http_headers"
+                    }
+                    Self::McpServers | Self::VsCode => {
+                        obj.insert("type".to_owned(), "http".into());
+                        obj.insert("url".to_owned(), url.as_str().into());
+                        "headers"
+                    }
+                };
                 if !headers.is_empty() {
-                    obj.insert("headers".to_owned(), string_map(headers));
+                    obj.insert(headers_key.to_owned(), string_map(headers));
                 }
             }
         }
@@ -260,6 +275,52 @@ fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), St
             // Gemini has no per-entry enabled flag; exclusion lives in a
             // sibling root key and is applied after the whole file is read.
             enabled: true,
+            tags: Vec::new(),
+            transport,
+        },
+        note,
+    ))
+}
+
+/// Codex CLI's entry shape. Transport is whichever target field is present
+/// — `command` for stdio, `url` for remote — with no `type` discriminator,
+/// and remote headers are `http_headers` rather than `headers`.
+///
+/// Codex's entry schema grows every few releases (`env_vars`, `cwd`,
+/// `startup_timeout_sec`, `tool_timeout_sec`, `required`, `enabled_tools`,
+/// per-tool sub-tables, …), so unknown fields are read as if absent instead
+/// of rejected: an entry mcpgw does not manage keeps every one of them
+/// verbatim because sync never rewrites it.
+fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
+    let command = string_field(obj, "command")?;
+    let url = string_field(obj, "url")?;
+    let mut note = None;
+
+    let transport = match (command, url) {
+        (Some(command), None) => Transport::Stdio {
+            command,
+            args: string_list(obj, "args")?,
+            env: string_object(obj, "env")?,
+        },
+        (None, Some(url)) => {
+            if obj.contains_key("auth") || obj.contains_key("bearer_token_env_var") {
+                // Codex mints or forwards the credential itself; the
+                // canonical config has no field for that, so importing this
+                // entry yields a URL that will not authenticate on its own.
+                note = Some("codex-managed auth not carried over".to_owned());
+            }
+            Transport::Http {
+                url,
+                headers: string_object(obj, "http_headers")?,
+            }
+        }
+        (Some(_), Some(_)) => return Err("has both `command` and `url`".to_owned()),
+        (None, None) => return Err("has neither `command` nor `url`".to_owned()),
+    };
+
+    Ok((
+        Server {
+            enabled: !matches!(obj.get("enabled"), Some(Value::Bool(false))),
             tags: Vec::new(),
             transport,
         },

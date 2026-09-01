@@ -91,6 +91,53 @@ fn gemini_tolerates_a_malformed_excluded_list() {
 }
 
 #[test]
+fn codex_reads_toml_entries_and_tolerates_the_evolving_fields() {
+    let read = read_fixture(ClientKind::Codex, "codex_config.toml");
+
+    // The stdio entry's extras (env_vars, cwd, the timeouts, the per-tool
+    // sub-table) have no canonical counterpart and must not break the read.
+    assert_eq!(
+        read.servers["github"].transport,
+        mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: ["-y", "@modelcontextprotocol/server-github"]
+                .map(str::to_owned)
+                .to_vec(),
+            env: [("GITHUB_TOKEN".to_owned(), "$GITHUB_TOKEN".to_owned())]
+                .into_iter()
+                .collect(),
+        }
+    );
+    // Remote headers are `http_headers` here, not `headers`.
+    assert_eq!(
+        read.servers["linear"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [(
+                "Authorization".to_owned(),
+                "Bearer ${LINEAR_TOKEN}".to_owned()
+            )]
+            .into_iter()
+            .collect(),
+        }
+    );
+    // Codex mints this server's credential itself, so the imported URL is
+    // not the whole story — that has to reach the user as a problem.
+    assert!(read.problems.iter().any(|p| {
+        p.server.as_deref() == Some("figma") && p.message == "codex-managed auth not carried over"
+    }));
+    // Unlike Gemini, Codex does have a per-entry off switch.
+    assert!(!read.servers["notes"].enabled);
+    assert!(read.servers["github"].enabled);
+    // An entry with no target field at all is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    // The non-MCP siblings are simply not servers.
+    assert_eq!(read.servers.len(), 4);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+#[test]
 fn broken_entries_become_problems_not_failures() {
     let read = read_fixture(ClientKind::ClaudeDesktop, "messy.json");
     // Exactly one entry survives; every other becomes a reported problem.
@@ -167,6 +214,18 @@ fn detect_reports_three_states() {
     std::fs::write(&config, "{}").unwrap();
     assert_eq!(
         ClientKind::Gemini.detect_with(&env),
+        Detection::Configured(config)
+    );
+
+    // Same shape for Codex: ~/.codex exists as soon as the CLI has run,
+    // config.toml only once there is something to configure.
+    let trace = ClientKind::Codex.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Codex.detect_with(&env), Detection::Installed);
+    let config = ClientKind::Codex.config_path_with(&env).unwrap();
+    std::fs::write(&config, "model = \"gpt-5-codex\"\n").unwrap();
+    assert_eq!(
+        ClientKind::Codex.detect_with(&env),
         Detection::Configured(config)
     );
 }

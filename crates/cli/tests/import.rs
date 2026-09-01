@@ -210,6 +210,52 @@ fn import_from_gemini_adopts_and_carries_the_excluded_flag() {
 }
 
 #[test]
+fn import_from_codex_reads_toml_and_flags_managed_auth() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        ".codex/config.toml",
+        r#"model = "gpt-5-codex"
+
+[mcp_servers.github]
+command = "npx"
+args = ["server-github"]
+startup_timeout_sec = 20
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+http_headers = { Authorization = "Bearer t" }
+
+[mcp_servers.figma]
+url = "https://mcp.figma.com/mcp"
+auth = "oauth"
+
+[mcp_servers.notes]
+command = "notes-mcp"
+enabled = false
+"#,
+    );
+    let out = sb.ok(&["import", "--from", "codex"]);
+    for name in ["+ github", "+ linear", "+ figma", "+ notes"] {
+        assert!(out.contains(name), "{out}");
+    }
+    // The credential Codex mints for this server cannot come along, so the
+    // import has to say so rather than hand over a URL that will 401.
+    assert!(out.contains("codex-managed auth not carried over"), "{out}");
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert_eq!(json["servers"]["notes"]["enabled"], false);
+    assert_ne!(json["servers"]["github"]["enabled"], false);
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "codex"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
+#[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.write_client(
