@@ -43,6 +43,8 @@ enum Command {
     Import(commands::import::ImportArgs),
     /// Push the canonical server list into client configs
     Sync(commands::sync::SyncArgs),
+    /// Run the gateway: serve canonical servers over one MCP endpoint
+    Serve(commands::serve::ServeArgs),
     /// Diagnose the canonical config and every detected client
     Doctor {
         /// Machine-readable output
@@ -70,6 +72,7 @@ fn main() -> anyhow::Result<ExitCode> {
         }
         Command::Import(args) => commands::import::run(&args).map(|()| ExitCode::SUCCESS),
         Command::Sync(args) => commands::sync::run(&args, color).map(|()| ExitCode::SUCCESS),
+        Command::Serve(args) => commands::serve::run(&args).map(|()| ExitCode::SUCCESS),
         Command::Doctor {
             json,
             probe,

@@ -74,6 +74,20 @@ fn serve(die_on_tools: bool) {
                     ]
                 }),
             ),
+            "tools/call" => {
+                let tool = msg["params"]["name"].as_str().unwrap_or("");
+                let message = msg["params"]["arguments"]["message"].as_str().unwrap_or("");
+                let text = match tool {
+                    "echo" => message.to_owned(),
+                    "reverse" => message.chars().rev().collect(),
+                    other => format!("unknown tool {other}"),
+                };
+                respond(
+                    &mut stdout,
+                    &id,
+                    &serde_json::json!({ "content": [{ "type": "text", "text": text }] }),
+                );
+            }
             "ping" => respond(&mut stdout, &id, &serde_json::json!({})),
             _ => {}
         }

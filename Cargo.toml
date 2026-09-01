@@ -21,8 +21,15 @@ anyhow = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 url = "2"
 which = "8"
-rmcp = { version = "3", features = ["client", "transport-child-process"] }
-tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros"] }
+rmcp = { version = "3", features = [
+    "client",
+    "transport-child-process",
+    "server",
+    "transport-streamable-http-server",
+] }
+rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "signal", "net"] }
 owo-colors = "4"
 insta = "1"
 assert_cmd = "2"

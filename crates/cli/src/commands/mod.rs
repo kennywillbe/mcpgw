@@ -3,6 +3,7 @@ pub mod doctor;
 pub mod import;
 pub mod list;
 pub mod remove;
+pub mod serve;
 pub mod sync;
 pub mod toggle;
 

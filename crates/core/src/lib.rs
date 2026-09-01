@@ -3,6 +3,7 @@ pub mod clients;
 pub mod config;
 pub mod doctor;
 pub mod error;
+pub mod gateway;
 pub mod import;
 pub mod paths;
 pub mod probe;

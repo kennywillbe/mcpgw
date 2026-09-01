@@ -12,6 +12,7 @@ serde_json.workspace = true
 [dev-dependencies]
 mcpgw-core.workspace = true
 tokio.workspace = true
+rmcp-client-http.workspace = true
 
 [lints]
 workspace = true
