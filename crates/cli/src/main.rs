@@ -1,4 +1,5 @@
 use std::io::IsTerminal as _;
+use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
@@ -38,15 +39,25 @@ enum Command {
         /// Server name
         name: String,
     },
+    /// Diagnose the canonical config and every detected client
+    Doctor {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
+    let color = std::io::stdout().is_terminal();
     match cli.command {
-        Command::List { json } => commands::list::run(json, std::io::stdout().is_terminal()),
-        Command::Add(args) => commands::add::run(&args),
-        Command::Remove(args) => commands::remove::run(&args),
-        Command::Enable { name } => commands::toggle::run(&name, true),
-        Command::Disable { name } => commands::toggle::run(&name, false),
+        Command::List { json } => commands::list::run(json, color).map(|()| ExitCode::SUCCESS),
+        Command::Add(args) => commands::add::run(&args).map(|()| ExitCode::SUCCESS),
+        Command::Remove(args) => commands::remove::run(&args).map(|()| ExitCode::SUCCESS),
+        Command::Enable { name } => commands::toggle::run(&name, true).map(|()| ExitCode::SUCCESS),
+        Command::Disable { name } => {
+            commands::toggle::run(&name, false).map(|()| ExitCode::SUCCESS)
+        }
+        Command::Doctor { json } => commands::doctor::run(json, color),
     }
 }

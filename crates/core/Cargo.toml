@@ -13,6 +13,7 @@ fs4.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

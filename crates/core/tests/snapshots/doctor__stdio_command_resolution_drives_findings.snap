@@ -1,0 +1,14 @@
+---
+source: crates/core/tests/doctor.rs
+expression: findings
+---
+[
+    Finding {
+        client: None,
+        server: Some(
+            "bad",
+        ),
+        severity: Error,
+        message: "command \"absent\" not found in PATH",
+    },
+]
