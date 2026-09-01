@@ -118,6 +118,11 @@ pub enum EntrySchema {
     /// Zed's `context_servers` shape: the `mcpServers` fields, no `type`,
     /// and a mandatory `source` on anything written.
     Zed,
+    /// Cline's shape, shared by its VS Code extension and its standalone
+    /// CLI: the `mcpServers` fields with `disabled` as the off switch, a
+    /// remote `type` spelled `streamableHttp`, and an `autoApprove` list of
+    /// tool names mcpgw has no counterpart for.
+    Cline,
 }
 
 impl EntrySchema {
@@ -139,6 +144,7 @@ impl EntrySchema {
             Self::Codex => parse_codex(obj),
             Self::Opencode => parse_opencode(obj),
             Self::Windsurf => parse_windsurf(obj),
+            Self::Cline => parse_cline(obj),
             // Zed adds `source` to the shared fields and nothing else, and
             // that one is read as absent: an entry an extension installed
             // carries a source of its own, and refusing to read it would
@@ -194,6 +200,14 @@ impl EntrySchema {
                         obj.insert("url".to_owned(), url.as_str().into());
                         "headers"
                     }
+                    Self::Cline => {
+                        // Cline's own spelling of streamable HTTP. An entry
+                        // left untyped would read back as the legacy SSE
+                        // transport, which is a different protocol.
+                        obj.insert("type".to_owned(), "streamableHttp".into());
+                        obj.insert("url".to_owned(), url.as_str().into());
+                        "headers"
+                    }
                     Self::McpServers | Self::VsCode => {
                         obj.insert("type".to_owned(), "http".into());
                         obj.insert("url".to_owned(), url.as_str().into());
@@ -234,7 +248,11 @@ fn parse_mcp_servers(obj: &Map<String, Value>) -> Result<(Server, Option<String>
     let mut note = None;
     let stdio = match explicit {
         Some("stdio") => true,
-        Some("http" | "streamable-http" | "streamable_http") => false,
+        // One transport, four spellings in the wild: the MCP spec's own
+        // `http`, the two hyphen/underscore forms clients copied from the
+        // protocol name, and Cline's camelCase. Reading any of them as
+        // "unknown transport" would drop a working server.
+        Some("http" | "streamable-http" | "streamable_http" | "streamableHttp") => false,
         Some("sse") => {
             // Legacy transport we don't model; the URL still identifies
             // the server, so read it as http and say so.
@@ -251,8 +269,9 @@ fn parse_mcp_servers(obj: &Map<String, Value>) -> Result<(Server, Option<String>
         },
     };
 
-    // Some clients (e.g. Cline-style configs) mark entries disabled in
-    // place.
+    // Cursor and Cline both switch an entry off in place, and both spell it
+    // `disabled` — the inverse of the canonical flag, so an absent field
+    // means enabled.
     let enabled = !matches!(obj.get("disabled"), Some(Value::Bool(true)));
 
     let transport = if stdio {
@@ -303,6 +322,30 @@ fn parse_windsurf(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
         (Some(precedence), Some(shared)) => Some(format!("{precedence}; {shared}")),
         (precedence, shared) => precedence.or(shared),
     };
+    Ok((server, note))
+}
+
+/// Cline's entry shape: the `mcpServers` rules — `disabled` included — with
+/// one transport difference, so it is read by deferring to them and then
+/// correcting that one case.
+///
+/// A remote entry with no `type` is the legacy SSE transport, not streamable
+/// HTTP: Cline shipped remote servers before the streamable transport
+/// existed, and files written then still carry the bare `url`. The shared
+/// rules read an untyped `url` as http without comment, which is right for
+/// every other client and wrong here.
+///
+/// `autoApprove` is a list of tool names Cline runs without asking. It has no
+/// canonical counterpart, so it is read as absent — an entry mcpgw does not
+/// manage keeps it verbatim because sync never rewrites it.
+fn parse_cline(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
+    let (server, note) = parse_mcp_servers(obj)?;
+    if !obj.contains_key("type") && matches!(server.transport, Transport::Http { .. }) {
+        return Ok((
+            server,
+            Some("legacy `sse` transport read as http".to_owned()),
+        ));
+    }
     Ok((server, note))
 }
 

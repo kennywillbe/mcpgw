@@ -1,0 +1,80 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "browser": Server {
+            enabled: false,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@browsermcp/mcp",
+                ],
+                env: {},
+            },
+        },
+        "github": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-github",
+                ],
+                env: {
+                    "GITHUB_TOKEN": "ghp_example",
+                },
+            },
+        },
+        "legacy": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://legacy.example/sse",
+                headers: {},
+            },
+        },
+        "linear": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/mcp",
+                headers: {
+                    "Authorization": "Bearer token",
+                },
+            },
+        },
+        "untyped": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://notes.example/sse",
+                headers: {},
+            },
+        },
+    },
+    problems: [
+        Problem {
+            server: Some(
+                "legacy",
+            ),
+            message: "legacy `sse` transport read as http",
+        },
+        Problem {
+            server: Some(
+                "untyped",
+            ),
+            message: "legacy `sse` transport read as http",
+        },
+        Problem {
+            server: Some(
+                "husk",
+            ),
+            message: "has neither `command` nor `url`",
+        },
+    ],
+}

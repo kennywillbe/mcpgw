@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_example" },
+      "autoApprove": ["search_repositories", "get_file_contents"]
+    },
+    "browser": {
+      "command": "npx",
+      "args": ["-y", "@browsermcp/mcp"],
+      "disabled": true
+    },
+    "legacy": {
+      "url": "https://legacy.example/sse",
+      "type": "sse"
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/mcp",
+      "type": "streamableHttp",
+      "headers": { "Authorization": "Bearer token" },
+      "autoApprove": []
+    },
+    "untyped": {
+      "url": "https://notes.example/sse"
+    },
+    "husk": {
+      "autoApprove": ["everything"]
+    }
+  }
+}
