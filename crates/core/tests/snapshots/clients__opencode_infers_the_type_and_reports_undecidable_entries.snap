@@ -1,0 +1,24 @@
+---
+source: crates/core/tests/clients.rs
+expression: read.problems
+---
+[
+    Problem {
+        server: Some(
+            "both",
+        ),
+        message: "has both `command` and `url`",
+    },
+    Problem {
+        server: Some(
+            "neither",
+        ),
+        message: "has neither `command` nor `url`",
+    },
+    Problem {
+        server: Some(
+            "odd",
+        ),
+        message: "unknown type \"carrier-pigeon\"",
+    },
+]

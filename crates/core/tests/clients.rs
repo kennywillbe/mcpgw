@@ -138,6 +138,82 @@ fn codex_reads_toml_entries_and_tolerates_the_evolving_fields() {
 }
 
 #[test]
+fn opencode_reads_a_commented_file_and_both_entry_types() {
+    let read = read_fixture(ClientKind::Opencode, "opencode.jsonc");
+
+    // The command array is one field holding program *and* arguments.
+    assert_eq!(
+        read.servers["github"].transport,
+        mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: ["-y", "@modelcontextprotocol/server-github"]
+                .map(str::to_owned)
+                .to_vec(),
+            // Spelled `environment`, not `env`.
+            env: [("GITHUB_TOKEN".to_owned(), "$GITHUB_TOKEN".to_owned())]
+                .into_iter()
+                .collect(),
+        }
+    );
+    // opencode's own `{env:VAR}` interpolation is passed through verbatim.
+    assert_eq!(
+        read.servers["linear"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [(
+                "Authorization".to_owned(),
+                "Bearer {env:LINEAR_TOKEN}".to_owned()
+            )]
+            .into_iter()
+            .collect(),
+        }
+    );
+    // opencode holds this server's OAuth tokens itself, so the imported URL
+    // is not the whole story — that has to reach the user as a problem.
+    assert!(read.problems.iter().any(|p| {
+        p.server.as_deref() == Some("figma")
+            && p.message == "opencode-managed oauth not carried over"
+    }));
+    assert!(!read.servers["notes"].enabled);
+    assert!(read.servers["github"].enabled);
+    // A local entry with an empty command array is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    // The non-MCP siblings ($schema, theme, model) are not servers.
+    assert_eq!(read.servers.len(), 4);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+#[test]
+fn opencode_infers_the_type_and_reports_undecidable_entries() {
+    let read = ClientKind::Opencode
+        .read_text(
+            r#"{"mcp": {
+                "local-ish": {"command": ["deno"]},
+                "remote-ish": {"url": "https://example.com/mcp"},
+                "both": {"command": ["deno"], "url": "https://example.com/mcp"},
+                "neither": {"environment": {"A": "B"}},
+                "odd": {"type": "carrier-pigeon", "url": "https://example.com/mcp"}
+            }}"#,
+            Path::new("opencode.json"),
+        )
+        .unwrap();
+
+    // opencode's schema requires `type`; a hand-written file that omits it
+    // still reads, because the target field says which shape it is.
+    assert!(matches!(
+        read.servers["local-ish"].transport,
+        mcpgw_core::Transport::Stdio { .. }
+    ));
+    assert!(matches!(
+        read.servers["remote-ish"].transport,
+        mcpgw_core::Transport::Http { .. }
+    ));
+    assert_eq!(read.servers.len(), 2);
+    insta::assert_debug_snapshot!(read.problems);
+}
+
+#[test]
 fn broken_entries_become_problems_not_failures() {
     let read = read_fixture(ClientKind::ClaudeDesktop, "messy.json");
     // Exactly one entry survives; every other becomes a reported problem.
@@ -228,6 +304,74 @@ fn detect_reports_three_states() {
         ClientKind::Codex.detect_with(&env),
         Detection::Configured(config)
     );
+
+    // opencode accepts two filenames, so detection has to find whichever of
+    // them the machine actually has.
+    let trace = ClientKind::Opencode.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Opencode.detect_with(&env), Detection::Installed);
+    let jsonc = trace.join("opencode.jsonc");
+    std::fs::write(&jsonc, "// hi\n{}\n").unwrap();
+    assert_eq!(
+        ClientKind::Opencode.detect_with(&env),
+        Detection::Configured(jsonc.clone())
+    );
+    // With both present the .json spelling wins, matching the order a fresh
+    // machine gets created in.
+    let json = trace.join("opencode.json");
+    std::fs::write(&json, "{}\n").unwrap();
+    assert_eq!(
+        ClientKind::Opencode.detect_with(&env),
+        Detection::Configured(json)
+    );
+}
+
+#[test]
+fn a_machine_with_no_opencode_config_resolves_to_the_json_spelling() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let env = move |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "HOME" | "USERPROFILE" => Some(home.clone().into()),
+            _ => None,
+        }
+    };
+
+    // Both candidates are offered; nothing exists, so a write creates the
+    // first of them.
+    let candidates = ClientKind::Opencode.config_path_candidates_with(&env);
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates[0].ends_with(".config/opencode/opencode.json"));
+    assert!(candidates[1].ends_with(".config/opencode/opencode.jsonc"));
+    assert_eq!(
+        ClientKind::Opencode.config_path_with(&env).unwrap(),
+        candidates[0]
+    );
+    // XDG layout on every platform, so this is never the app-data dir.
+    assert_ne!(
+        ClientKind::Opencode.config_path_with(&env),
+        ClientKind::VsCode.config_path_with(&env)
+    );
+}
+
+#[test]
+fn an_existing_opencode_jsonc_is_the_file_that_gets_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let env = move |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "HOME" | "USERPROFILE" => Some(home.clone().into()),
+            _ => None,
+        }
+    };
+
+    let jsonc = ClientKind::Opencode
+        .install_trace_with(&env)
+        .unwrap()
+        .join("opencode.jsonc");
+    std::fs::create_dir_all(jsonc.parent().unwrap()).unwrap();
+    std::fs::write(&jsonc, "{}\n").unwrap();
+    assert_eq!(ClientKind::Opencode.config_path_with(&env).unwrap(), jsonc);
 }
 
 #[test]

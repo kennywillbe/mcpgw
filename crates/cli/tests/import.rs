@@ -256,6 +256,63 @@ enabled = false
 }
 
 #[test]
+fn import_from_opencode_reads_jsonc_and_flags_managed_oauth() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        ".config/opencode/opencode.jsonc",
+        r#"// My opencode config.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": { "Authorization": "Bearer {env:CONTEXT7_KEY}" },
+    },
+    "github": {
+      "type": "local",
+      "command": ["npx", "-y", "server-github"],
+      "environment": { "TOKEN": "t" },
+    },
+    "figma": { "type": "remote", "url": "https://mcp.figma.com/mcp", "oauth": {} },
+    "notes": { "type": "local", "command": ["notes-mcp"], "enabled": false },
+  },
+}
+"#,
+    );
+    let out = sb.ok(&["import", "--from", "opencode"]);
+    for name in ["+ context7", "+ github", "+ figma", "+ notes"] {
+        assert!(out.contains(name), "{out}");
+    }
+    // The tokens opencode holds for this server cannot come along, so the
+    // import has to say so rather than hand over a URL that will 401.
+    assert!(
+        out.contains("opencode-managed oauth not carried over"),
+        "{out}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(
+        json["servers"]["context7"]["url"],
+        "https://mcp.context7.com/mcp"
+    );
+    // opencode's own interpolation survives unexpanded — `list` masks header
+    // values, so the canonical file is where that is visible.
+    let canonical = std::fs::read_to_string(sb.home.join("config.toml")).unwrap();
+    assert!(
+        canonical.contains("Bearer {env:CONTEXT7_KEY}"),
+        "{canonical}"
+    );
+    assert_eq!(json["servers"]["github"]["command"], "npx");
+    assert_eq!(json["servers"]["github"]["args"][1], "server-github");
+    assert_eq!(json["servers"]["notes"]["enabled"], false);
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "opencode"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
+#[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.write_client(

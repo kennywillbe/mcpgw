@@ -117,6 +117,34 @@ impl Sandbox {
             .parse_value(&self.codex_text())
             .unwrap()
     }
+
+    /// opencode follows the XDG layout on every platform, so its directory is
+    /// under the sandbox home rather than the app-data dir.
+    fn opencode_dir(&self) -> PathBuf {
+        self.home.join(".config/opencode")
+    }
+
+    /// `name` picks which of the two accepted filenames the fixture uses;
+    /// `None` installs the directory alone (opencode present, unconfigured).
+    fn install_opencode(&self, name_and_config: Option<(&str, &str)>) {
+        std::fs::create_dir_all(self.opencode_dir()).unwrap();
+        if let Some((name, text)) = name_and_config {
+            std::fs::write(self.opencode_dir().join(name), text).unwrap();
+        }
+    }
+
+    fn opencode_text(&self, name: &str) -> String {
+        std::fs::read_to_string(self.opencode_dir().join(name)).unwrap()
+    }
+
+    /// The written JSONC as canonical JSON — comments and all are asserted on
+    /// the text itself, values here.
+    fn opencode_json(&self, name: &str) -> serde_json::Value {
+        mcpgw_core::ClientKind::Opencode
+            .codec()
+            .parse_value(&self.opencode_text(name))
+            .unwrap()
+    }
 }
 
 /// Gemini's settings file is the whole CLI's settings, not an MCP file: it
@@ -147,6 +175,23 @@ required = true
 
 [mcp_servers.notes.tools.search]
 enabled = true
+"#;
+
+/// opencode's config is JSONC in practice: comments and a trailing comma in
+/// a file that also holds the rest of the CLI's settings.
+const OPENCODE_CONFIG: &str = r#"// My opencode setup — do not reformat.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "system",
+  "mcp": {
+    // Added by hand, months ago.
+    "notes": {
+      "type": "local",
+      "command": ["notes-mcp"],
+      "cwd": "./notes",
+    },
+  },
+}
 "#;
 
 /// The bridge command is either the bare name (mcpgw on PATH) or the path of
@@ -548,6 +593,105 @@ fn codex_gateway_entry_is_a_plain_url() {
     let entry = sb.codex_toml()["mcp_servers"]["mcpgw"].clone();
     assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
     assert!(entry.get("type").is_none());
+    assert!(entry.get("command").is_none());
+}
+
+/// The headline of the JSONC write path: a hand-written opencode config goes
+/// through a sync with its comments, its trailing commas and its foreign
+/// entry's extra fields intact.
+#[test]
+fn opencode_sync_preserves_comments_siblings_and_foreign_entries() {
+    let sb = Sandbox::new();
+    sb.install_opencode(Some(("opencode.jsonc", OPENCODE_CONFIG)));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "opencode"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("? notes"), "{out}");
+
+    let text = sb.opencode_text("opencode.jsonc");
+    for comment in [
+        "// My opencode setup — do not reformat.",
+        "// Added by hand, months ago.",
+    ] {
+        assert!(text.contains(comment), "lost {comment:?} in:\n{text}");
+    }
+    // The foreign entry keeps its own spelling, extra field included.
+    assert!(text.contains(r#""cwd": "./notes""#), "{text}");
+
+    let json = sb.opencode_json("opencode.jsonc");
+    assert_eq!(json["$schema"], "https://opencode.ai/config.json");
+    assert_eq!(json["theme"], "system");
+    assert_eq!(
+        json["mcp"]["notes"]["command"],
+        serde_json::json!(["notes-mcp"])
+    );
+
+    // Program and arguments in one array, variables under `environment`.
+    assert_eq!(json["mcp"]["github"]["type"], "local");
+    assert_eq!(
+        json["mcp"]["github"]["command"],
+        serde_json::json!(["npx", "server-github"])
+    );
+    assert_eq!(json["mcp"]["github"]["environment"]["TOKEN"], "t");
+    assert_eq!(json["mcp"]["linear"]["type"], "remote");
+    assert_eq!(json["mcp"]["linear"]["url"], "https://mcp.linear.app/mcp");
+
+    let again = sb.ok(&["sync", "--client", "opencode"]);
+    assert!(again.contains("no changes"), "{again}");
+    // A no-op run leaves the file byte for byte as the first one wrote it.
+    assert_eq!(sb.opencode_text("opencode.jsonc"), text);
+}
+
+/// Both filenames are first-class, so which one a sync writes is decided by
+/// what the machine already has — and by the `.json` default when it has
+/// nothing.
+#[test]
+fn opencode_writes_the_extension_the_machine_already_uses() {
+    let sb = Sandbox::new();
+    sb.install_opencode(None);
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["sync", "--client", "opencode"]);
+    assert!(sb.opencode_dir().join("opencode.json").is_file());
+    assert!(!sb.opencode_dir().join("opencode.jsonc").exists());
+    assert_eq!(
+        sb.opencode_json("opencode.json")["mcp"]["github"]["command"],
+        serde_json::json!(["npx", "server-github"])
+    );
+
+    let other = Sandbox::new();
+    other.install_opencode(Some(("opencode.jsonc", "// mine\n{}\n")));
+    other.ok(&["add", "github", "--", "npx", "server-github"]);
+    other.ok(&["sync", "--client", "opencode"]);
+    assert!(!other.opencode_dir().join("opencode.json").exists());
+    let text = other.opencode_text("opencode.jsonc");
+    assert!(text.contains("// mine"), "{text}");
+    assert_eq!(
+        other.opencode_json("opencode.jsonc")["mcp"]["github"]["type"],
+        "local"
+    );
+}
+
+#[test]
+fn opencode_gateway_entry_is_a_remote_type() {
+    let sb = Sandbox::new();
+    sb.install_opencode(None);
+    let out = sb.ok(&["sync", "--client", "opencode", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.opencode_json("opencode.json")["mcp"]["mcpgw"].clone();
+    assert_eq!(entry["type"], "remote");
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
     assert!(entry.get("command").is_none());
 }
 

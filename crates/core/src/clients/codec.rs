@@ -108,6 +108,10 @@ pub enum EntrySchema {
     /// a per-entry `enabled` flag, and a long tail of optional fields whose
     /// set keeps growing release to release.
     Codex,
+    /// opencode's shape: `type` is `local` or `remote`, a local entry holds
+    /// its program and arguments in one `command` array, and its variables
+    /// are `environment` rather than `env`.
+    Opencode,
 }
 
 impl EntrySchema {
@@ -127,6 +131,7 @@ impl EntrySchema {
         match self {
             Self::Gemini => return parse_gemini(obj),
             Self::Codex => return parse_codex(obj),
+            Self::Opencode => return parse_opencode(obj),
             Self::McpServers | Self::VsCode => {}
         }
 
@@ -187,6 +192,12 @@ impl EntrySchema {
     /// The client-shaped value for one canonical server.
     #[must_use]
     pub fn emit(self, server: &Server) -> Value {
+        // opencode shares no field spelling with the others — not even the
+        // type of `command` — so it is written whole rather than patched
+        // into the shape below.
+        if matches!(self, Self::Opencode) {
+            return emit_opencode(server);
+        }
         let mut obj = Map::new();
         match &server.transport {
             Transport::Stdio { command, args, env } => {
@@ -218,6 +229,7 @@ impl EntrySchema {
                         obj.insert("url".to_owned(), url.as_str().into());
                         "headers"
                     }
+                    Self::Opencode => unreachable!("emitted whole above"),
                 };
                 if !headers.is_empty() {
                     obj.insert(headers_key.to_owned(), string_map(headers));
@@ -326,6 +338,99 @@ fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), Str
         },
         note,
     ))
+}
+
+/// opencode's entry shape. `type` is the discriminator (`local` or
+/// `remote`), a local entry's `command` is a single array holding the program
+/// *and* its arguments, and its variables are `environment`.
+///
+/// The type is optional here only because a hand-written file may omit it;
+/// opencode's own schema requires it, so the inference below is leniency for
+/// reads, never something the writer relies on. Unknown fields (`cwd`, the
+/// rest of the schema) are read as absent — an entry mcpgw does not manage
+/// keeps them verbatim because sync never rewrites it.
+fn parse_opencode(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
+    let declared = match obj.get("type") {
+        None => None,
+        Some(Value::String(t)) => Some(t.clone()),
+        Some(_) => return Err("`type` is not a string".to_owned()),
+    };
+    let has_command = obj.contains_key("command");
+    let local = match declared.as_deref() {
+        Some("local") => true,
+        Some("remote") => false,
+        Some(other) => return Err(format!("unknown type {other:?}")),
+        None => match (has_command, obj.contains_key("url")) {
+            (true, false) => true,
+            (false, true) => false,
+            (true, true) => return Err("has both `command` and `url`".to_owned()),
+            (false, false) => return Err("has neither `command` nor `url`".to_owned()),
+        },
+    };
+
+    let mut note = None;
+    let transport = if local {
+        let mut argv = string_list(obj, "command")?.into_iter();
+        let command = argv.next().ok_or_else(|| {
+            if has_command {
+                "`command` is empty".to_owned()
+            } else {
+                "missing `command`".to_owned()
+            }
+        })?;
+        Transport::Stdio {
+            command,
+            args: argv.collect(),
+            env: string_object(obj, "environment")?,
+        }
+    } else {
+        if !matches!(obj.get("oauth"), None | Some(Value::Bool(false))) {
+            // opencode holds the OAuth tokens itself; the canonical config
+            // has no field for them, so the imported URL will not
+            // authenticate on its own.
+            note = Some("opencode-managed oauth not carried over".to_owned());
+        }
+        Transport::Http {
+            // Header values may carry opencode's own `{env:VAR}`
+            // interpolation, which is kept verbatim: expanding it here would
+            // bake a secret into the canonical config.
+            url: string_field(obj, "url")?.ok_or("missing `url`")?,
+            headers: string_object(obj, "headers")?,
+        }
+    };
+
+    Ok((
+        Server {
+            enabled: !matches!(obj.get("enabled"), Some(Value::Bool(false))),
+            tags: Vec::new(),
+            transport,
+        },
+        note,
+    ))
+}
+
+fn emit_opencode(server: &Server) -> Value {
+    let mut obj = Map::new();
+    match &server.transport {
+        Transport::Stdio { command, args, env } => {
+            obj.insert("type".to_owned(), "local".into());
+            let mut argv = Vec::with_capacity(args.len() + 1);
+            argv.push(Value::from(command.as_str()));
+            argv.extend(args.iter().map(|arg| Value::from(arg.as_str())));
+            obj.insert("command".to_owned(), argv.into());
+            if !env.is_empty() {
+                obj.insert("environment".to_owned(), string_map(env));
+            }
+        }
+        Transport::Http { url, headers } => {
+            obj.insert("type".to_owned(), "remote".into());
+            obj.insert("url".to_owned(), url.as_str().into());
+            if !headers.is_empty() {
+                obj.insert("headers".to_owned(), string_map(headers));
+            }
+        }
+    }
+    Value::Object(obj)
 }
 
 /// One client's read/write rules, the whole of what makes clients differ.
