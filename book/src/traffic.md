@@ -33,7 +33,8 @@ so you see context immediately instead of an empty screen.
 ```sh
 mcpgw watch --server github     # one upstream
 mcpgw watch --tool create_issue # bare tool name, no server prefix
-mcpgw watch --json              # raw JSONL, for jq
+mcpgw watch --json              # JSONL, for jq
+mcpgw watch --json --show-secrets  # …with args/response unmasked
 ```
 
 ```sh
@@ -73,9 +74,12 @@ Captured arguments and responses are **cut at 2 KB and marked
 argument, it lands in that file.
 
 The mitigations today are that the file is `0600` under your own state
-directory, and that `mcpgw serve --no-capture` disables capture entirely.
-Redaction is on the [roadmap](./roadmap.md); until it ships, this is the honest
-description.
+directory, that `mcpgw serve --no-capture` disables capture entirely, and that
+`watch` does not put those bodies back on your terminal: the one-line view
+never showed them, and `--json` replaces each with `"***"` unless you ask for
+`--show-secrets`. That bounds the spread, not the file itself. Redaction at
+capture time is on the [roadmap](./roadmap.md); until it ships, this is the
+honest description.
 
 ## One server, no gateway
 
