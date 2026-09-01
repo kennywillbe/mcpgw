@@ -1,0 +1,2 @@
+/* The book ships exactly one theme (rust); hide the switcher. */
+#theme-toggle { display: none; }
