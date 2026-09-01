@@ -111,8 +111,24 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
         }
     }
 
+    // Canonical file first, then the adoption record — deliberately the
+    // reverse of the intent-first order sync uses, because the two ledgers
+    // claim different things. Sync's state entry claims what that run is
+    // about to *write* into the client, so an over-claim self-heals: the next
+    // sync sees a managed name missing from the client and adds it. Import's
+    // state entry claims client entries that only the canonical config
+    // justifies. Claim them first and a failed `store.save()` leaves the
+    // state saying "mcpgw manages cursor's github" with no canonical github
+    // behind it — which the next sync reads as a removal and deletes the
+    // user's entry. This order fails the harmless way instead: the entries
+    // read as unmanaged and are left untouched, and re-running import adopts
+    // them.
     store.save()?;
-    state.save(&state_path)?;
+    state.save(&state_path).context(
+        "the canonical config was written but the adoption record was not; re-run \
+         `mcpgw import` to finish adopting — your client entries are untouched \
+         until it succeeds",
+    )?;
     println!(
         "imported {imported}, already present {}, skipped {skipped}",
         plan.already.len()
