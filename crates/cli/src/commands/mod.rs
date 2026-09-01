@@ -1,4 +1,5 @@
 pub mod add;
+pub mod connect;
 pub mod doctor;
 pub mod import;
 pub mod list;

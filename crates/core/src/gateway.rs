@@ -32,6 +32,7 @@ enum Mode {
 pub struct Gateway {
     manager: Arc<UpstreamManager>,
     mode: Mode,
+    unavailable_hint: Option<String>,
 }
 
 impl Gateway {
@@ -42,6 +43,7 @@ impl Gateway {
         Self {
             manager,
             mode: Mode::Pipe(upstream),
+            unavailable_hint: None,
         }
     }
 
@@ -53,7 +55,18 @@ impl Gateway {
         Self {
             manager,
             mode: Mode::Aggregate(upstreams),
+            unavailable_hint: None,
         }
+    }
+
+    /// Appends `hint` to every unreachable-upstream error. The deployment,
+    /// not the core error types, knows what the user should do about it —
+    /// `mcpgw connect` uses this to say which gateway is down and how to
+    /// start it.
+    #[must_use]
+    pub fn with_unavailable_hint(mut self, hint: String) -> Self {
+        self.unavailable_hint = Some(hint);
+        self
     }
 
     #[must_use]
@@ -67,10 +80,13 @@ impl Gateway {
     ) -> Result<Arc<crate::upstream::UpstreamService>, ErrorData> {
         // Upstream failures surface as loud MCP errors — never as a silent
         // empty result.
-        self.manager
-            .ready(name)
-            .await
-            .map_err(|err| ErrorData::internal_error(err.to_string(), None))
+        self.manager.ready(name).await.map_err(|err| {
+            let message = match &self.unavailable_hint {
+                Some(hint) => format!("{err} — {hint}"),
+                None => err.to_string(),
+            };
+            ErrorData::internal_error(message, None)
+        })
     }
 
     /// Lists every upstream's tools in parallel and merges them under their
@@ -236,4 +252,31 @@ pub async fn serve_http(
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// Errors that end a stdio serving session.
+#[derive(Debug, thiserror::Error)]
+pub enum StdioError {
+    // Boxed: rmcp's initialize error is several hundred bytes and would
+    // otherwise bloat every Result in this path.
+    #[error("stdio handshake failed: {0}")]
+    Initialize(#[from] Box<rmcp::service::ServerInitializeError>),
+    #[error("stdio service ended abnormally: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// Serves the gateway over stdin/stdout until the client hangs up. This is
+/// the downstream face `mcpgw connect` presents to stdio-only clients, so
+/// stdout belongs to the protocol: nothing else may write to it.
+///
+/// # Errors
+///
+/// Returns [`StdioError`] when the initialize handshake fails or the
+/// service task panics.
+pub async fn serve_stdio(gateway: Gateway) -> Result<rmcp::service::QuitReason, StdioError> {
+    use rmcp::ServiceExt as _;
+    use rmcp::transport::io::stdio;
+
+    let running = gateway.serve(stdio()).await.map_err(Box::new)?;
+    Ok(running.waiting().await?)
 }

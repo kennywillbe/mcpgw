@@ -853,6 +853,7 @@ dependencies = [
  "insta",
  "mcpgw-core",
  "owo-colors",
+ "rmcp",
  "serde_json",
  "tempfile",
  "tokio",

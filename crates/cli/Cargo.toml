@@ -18,6 +18,7 @@ tempfile.workspace = true
 [dev-dependencies]
 insta.workspace = true
 assert_cmd.workspace = true
+rmcp.workspace = true
 
 [lints]
 workspace = true
