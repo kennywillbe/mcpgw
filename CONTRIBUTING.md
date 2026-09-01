@@ -11,10 +11,14 @@ version and write the changelog:
 feat: add --tag filter to list
 fix: don't drop env vars when re-importing a stdio server
 docs: describe the state directory layout
-chore: bump rmcp to 3.1
+deps: bump rmcp to 3.1
+chore: drop the unused sync fixture
 refactor: pull probe timeout handling into one place
 test: cover rollback with a missing backup dir
 ```
+
+`feat`, `fix`, `perf` and `deps` show up in the changelog; the rest are
+recorded but hidden.
 
 Append `!` for a breaking change — `feat!: rename --gateway-url to --url`.
 Anything else (`wip:`, no prefix at all) is ignored by release tooling, which
@@ -77,3 +81,9 @@ Adding a crate to the workspace? If it depends on `mcpgw-core` with a
 `version = "…"` pin, add it to `extra-files` as well, or cargo will refuse to
 resolve the workspace on the next release.
 
+## Dependency updates
+
+Dependabot opens one grouped PR a week per ecosystem — `cargo-deps` for crates,
+`actions-deps` for workflow actions — under a `deps:` prefix, which
+release-please files under **Dependencies** in the changelog. A `deps:` commit
+with nothing else alongside it bumps the patch version.
