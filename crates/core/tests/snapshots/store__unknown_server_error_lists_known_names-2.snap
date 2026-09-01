@@ -1,0 +1,5 @@
+---
+source: crates/core/tests/store.rs
+expression: "store.remove_server(\"nope\").unwrap_err().to_string()"
+---
+no server named "nope" (known servers: github)

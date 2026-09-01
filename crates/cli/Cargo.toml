@@ -15,6 +15,7 @@ owo-colors.workspace = true
 [dev-dependencies]
 insta.workspace = true
 assert_cmd.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

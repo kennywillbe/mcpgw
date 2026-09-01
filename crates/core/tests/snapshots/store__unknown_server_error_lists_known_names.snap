@@ -1,0 +1,5 @@
+---
+source: crates/core/tests/store.rs
+expression: "store.set_enabled(\"nope\", true).unwrap_err().to_string()"
+---
+no server named "nope" (known servers: github)

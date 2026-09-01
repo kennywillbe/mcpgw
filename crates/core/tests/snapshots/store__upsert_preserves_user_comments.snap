@@ -1,0 +1,19 @@
+---
+source: crates/core/tests/store.rs
+expression: "std::fs::read_to_string(&path).unwrap()"
+---
+# my precious header comment
+version = 1 # schema version
+
+# github powers the code review flow — do not disable
+[servers.github]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[servers.linear]
+enabled = true
+tags = ["work"]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+headers = {}

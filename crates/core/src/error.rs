@@ -38,4 +38,28 @@ pub enum Error {
         "invalid server name {name:?}: only lowercase letters, digits, '-' and '_' are allowed"
     )]
     InvalidName { name: String },
+
+    #[error("server {name:?} already exists")]
+    DuplicateName { name: String },
+
+    #[error("no server named {name:?}{}", known(available))]
+    UnknownServer {
+        name: String,
+        available: Vec<String>,
+    },
+
+    #[error("invalid config in {path}")]
+    Edit {
+        path: PathBuf,
+        #[source]
+        source: toml_edit::TomlError,
+    },
+}
+
+fn known(available: &[String]) -> String {
+    if available.is_empty() {
+        " (the config has no servers)".to_owned()
+    } else {
+        format!(" (known servers: {})", available.join(", "))
+    }
 }

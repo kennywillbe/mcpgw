@@ -1,0 +1,13 @@
+---
+source: crates/core/tests/store.rs
+expression: "std::fs::read_to_string(&path).unwrap()"
+---
+# my precious header comment
+version = 1 # schema version
+
+[servers.github]
+enabled = true
+tags = ["work"]
+type = "http"
+url = "https://x"
+headers = {}

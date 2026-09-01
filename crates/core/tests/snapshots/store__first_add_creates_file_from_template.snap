@@ -1,0 +1,15 @@
+---
+source: crates/core/tests/store.rs
+expression: "std::fs::read_to_string(&path).unwrap()"
+---
+# mcpgw canonical config — the single source of truth for your MCP servers.
+# `mcpgw sync` pushes these entries into every client config.
+# Hand-edits (comments, ordering) are preserved by mcpgw commands.
+version = 1
+
+[servers.linear]
+enabled = true
+tags = ["work"]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+headers = {}
