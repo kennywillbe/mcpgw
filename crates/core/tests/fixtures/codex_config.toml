@@ -1,0 +1,38 @@
+# Codex CLI keeps its whole configuration here, MCP servers included.
+model = "gpt-5-codex"
+model_reasoning_effort = "medium"
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = false
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "$GITHUB_TOKEN" }
+env_vars = ["PATH", "HOME"]
+cwd = "./servers/github"
+startup_timeout_sec = 20
+tool_timeout_sec = 60
+required = true
+
+[mcp_servers.github.tools.list_issues]
+enabled = true
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+http_headers = { Authorization = "Bearer ${LINEAR_TOKEN}" }
+
+[mcp_servers.figma]
+url = "https://mcp.figma.com/mcp"
+auth = "oauth"
+bearer_token_env_var = "FIGMA_TOKEN"
+env_http_headers = { X-Trace = "TRACE_ID" }
+
+[mcp_servers.notes]
+command = "notes-mcp"
+enabled = false
+
+[mcp_servers.husk]
+env = { A = "B" }
