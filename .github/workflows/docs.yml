@@ -30,7 +30,7 @@ jobs:
       # mdBook shipped a breaking config change.
       MDBOOK_VERSION: 0.4.52
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The release tarball is a single static binary — seconds, versus a
       # `cargo install` build even with a warm cache.
