@@ -1,19 +1,50 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use mcpgw_core::doctor::{Finding, Severity, check_server, classify_problems};
-use mcpgw_core::{ClientKind, Config, Detection, Error};
+use mcpgw_core::probe::probe_stdio;
+use mcpgw_core::{ClientKind, Config, Detection, Error, Server, Transport};
 use owo_colors::OwoColorize as _;
 
-pub fn run(json: bool, color: bool) -> anyhow::Result<ExitCode> {
+/// Key = the exact process a probe would spawn; entries shared between the
+/// canonical config and clients (or several clients) probe once.
+type TargetKey = (String, Vec<String>, BTreeMap<String, String>);
+
+#[derive(Default)]
+struct ProbePlan {
+    targets: BTreeMap<TargetKey, Vec<String>>,
+    skipped_http: usize,
+}
+
+impl ProbePlan {
+    fn collect(&mut self, source: &str, name: &str, server: &Server) {
+        if !server.enabled {
+            return;
+        }
+        match &server.transport {
+            Transport::Stdio { command, args, env } => self
+                .targets
+                .entry((command.clone(), args.clone(), env.clone()))
+                .or_default()
+                .push(format!("{name} ({source})")),
+            Transport::Http { .. } => self.skipped_http += 1,
+        }
+    }
+}
+
+pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<ExitCode> {
     let command_exists = |cmd: &str| which::which(cmd).is_ok();
     let mut findings: Vec<Finding> = Vec::new();
+    let mut plan = ProbePlan::default();
 
     let path = super::canonical_config_path()?;
     let canonical_note = match Config::load(&path) {
         Ok(config) => {
             for (name, server) in &config.servers {
                 findings.extend(check_server(None, name, server, &command_exists));
+                plan.collect("canonical", name, server);
             }
             format!("{} servers", config.servers.len())
         }
@@ -55,6 +86,7 @@ pub fn run(json: bool, color: bool) -> anyhow::Result<ExitCode> {
                                 server,
                                 &command_exists,
                             ));
+                            plan.collect(name, server_name, server);
                         }
                     }
                     Err(err) => findings.push(Finding {
@@ -68,24 +100,32 @@ pub fn run(json: bool, color: bool) -> anyhow::Result<ExitCode> {
         }
     }
 
-    let errors = count(&findings, Severity::Error);
+    let probe_results = match probe {
+        Some(timeout) => Some(run_probes(plan, timeout)?),
+        None => None,
+    };
+
+    let errors = count(&findings, Severity::Error)
+        + probe_results
+            .as_ref()
+            .map_or(0, |p| p.results.iter().filter(|(_, r)| r.is_err()).count());
     let warnings = count(&findings, Severity::Warning);
 
     if json {
-        let clients: Vec<serde_json::Value> = detections
-            .iter()
-            .map(|(client, state)| serde_json::json!({ "client": client, "state": state }))
-            .collect();
-        let out = serde_json::json!({
-            "config": { "path": path, "state": canonical_note },
-            "clients": clients,
-            "findings": findings,
-            "errors": errors,
-            "warnings": warnings,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        emit_json(
+            &path,
+            &canonical_note,
+            &detections,
+            &findings,
+            probe_results.as_ref(),
+            errors,
+            warnings,
+        )?;
     } else {
         render(&path, &canonical_note, &detections, &findings, color);
+        if let Some(probes) = &probe_results {
+            render_probes(probes, color);
+        }
         println!();
         summary_line(errors, warnings, color);
     }
@@ -95,6 +135,123 @@ pub fn run(json: bool, color: bool) -> anyhow::Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+// Pure serialization of already-computed pieces; bundling them into a
+// struct would exist only to appease the lint.
+#[allow(clippy::too_many_arguments)]
+fn emit_json(
+    path: &Path,
+    canonical_note: &str,
+    detections: &[(&'static str, String)],
+    findings: &[Finding],
+    probes: Option<&ProbeReport>,
+    errors: usize,
+    warnings: usize,
+) -> anyhow::Result<()> {
+    let clients: Vec<serde_json::Value> = detections
+        .iter()
+        .map(|(client, state)| serde_json::json!({ "client": client, "state": state }))
+        .collect();
+    let mut out = serde_json::json!({
+        "config": { "path": path, "state": canonical_note },
+        "clients": clients,
+        "findings": findings,
+        "errors": errors,
+        "warnings": warnings,
+    });
+    if let Some(probes) = probes {
+        let entries: Vec<serde_json::Value> = probes
+            .results
+            .iter()
+            .map(|(label, outcome)| match outcome {
+                Ok(success) => serde_json::json!({
+                    "servers": label, "ok": true,
+                    "server_name": success.server_name,
+                    "server_version": success.server_version,
+                    "tools": success.tool_count,
+                }),
+                Err(err) => serde_json::json!({
+                    "servers": label, "ok": false, "error": err.to_string(),
+                }),
+            })
+            .collect();
+        out["probes"] = serde_json::json!({
+            "results": entries,
+            "skipped_http": probes.skipped_http,
+        });
+    }
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    Ok(())
+}
+
+struct ProbeReport {
+    results: Vec<(
+        String,
+        Result<mcpgw_core::probe::ProbeSuccess, mcpgw_core::probe::ProbeError>,
+    )>,
+    skipped_http: usize,
+}
+
+fn run_probes(plan: ProbePlan, timeout: Duration) -> anyhow::Result<ProbeReport> {
+    let skipped_http = plan.skipped_http;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let mut results = runtime.block_on(async {
+        let mut set = tokio::task::JoinSet::new();
+        for ((command, args, env), labels) in plan.targets {
+            set.spawn(async move {
+                let outcome = probe_stdio(&command, &args, &env, timeout).await;
+                (labels.join(", "), outcome)
+            });
+        }
+        let mut collected = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            collected.push(joined.expect("probe task panicked"));
+        }
+        collected
+    });
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(ProbeReport {
+        results,
+        skipped_http,
+    })
+}
+
+fn render_probes(probes: &ProbeReport, color: bool) {
+    println!();
+    if color {
+        println!("{}", "probes".bold());
+    } else {
+        println!("probes");
+    }
+    for (label, outcome) in &probes.results {
+        match outcome {
+            Ok(success) => {
+                let line = format!(
+                    "{label}: {} {}, {} tools",
+                    success.server_name, success.server_version, success.tool_count
+                );
+                if color {
+                    println!("  {} {line}", "✓".green());
+                } else {
+                    println!("  ✓ {line}");
+                }
+            }
+            Err(err) => {
+                if color {
+                    println!("  {} {label}: {err}", "✗".red());
+                } else {
+                    println!("  ✗ {label}: {err}");
+                }
+            }
+        }
+    }
+    if probes.skipped_http > 0 {
+        println!(
+            "  – {} http server(s) not probed yet (gateway milestones add this)",
+            probes.skipped_http
+        );
+    }
 }
 
 fn count(findings: &[Finding], severity: Severity) -> usize {

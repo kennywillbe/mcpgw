@@ -112,3 +112,46 @@ fn json_output_carries_findings_and_counts() {
     assert_eq!(value["findings"][0]["server"], "ghost");
     assert_eq!(value["clients"].as_array().unwrap().len(), 4);
 }
+
+#[test]
+fn probe_reports_handshake_failure_with_nonzero_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    // `cargo` exists (so static doctor is green) but speaks no MCP: the
+    // static pass alone exits 0, the probe pass must exit 1.
+    let static_out = run_doctor(dir.path(), Some(HEALTHY), &[]);
+    assert!(static_out.status.success());
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--probe", "--timeout", "15"]);
+    assert!(!out.status.success());
+    let text = stdout(&out);
+    assert!(text.contains("probes"), "{text}");
+    assert!(text.contains("build (canonical)"), "{text}");
+}
+
+#[test]
+fn probe_skips_http_servers_with_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = r#"
+version = 1
+[servers.remote]
+type = "http"
+url = "https://mcp.example.com/mcp"
+"#;
+    let out = run_doctor(dir.path(), Some(config), &["--probe"]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(stdout(&out).contains("not probed yet"));
+}
+
+#[test]
+fn probe_json_carries_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_doctor(
+        dir.path(),
+        Some(HEALTHY),
+        &["--probe", "--timeout", "15", "--json"],
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = value["probes"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["ok"], false);
+}

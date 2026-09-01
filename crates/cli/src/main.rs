@@ -44,6 +44,12 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Also spawn each stdio server and run a live MCP handshake
+        #[arg(long)]
+        probe: bool,
+        /// Per-server probe timeout in seconds
+        #[arg(long, default_value_t = 10, requires = "probe", value_name = "SECS")]
+        timeout: u64,
     },
 }
 
@@ -58,6 +64,14 @@ fn main() -> anyhow::Result<ExitCode> {
         Command::Disable { name } => {
             commands::toggle::run(&name, false).map(|()| ExitCode::SUCCESS)
         }
-        Command::Doctor { json } => commands::doctor::run(json, color),
+        Command::Doctor {
+            json,
+            probe,
+            timeout,
+        } => commands::doctor::run(
+            json,
+            color,
+            probe.then(|| std::time::Duration::from_secs(timeout)),
+        ),
     }
 }
