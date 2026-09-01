@@ -4,25 +4,37 @@
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
   "packages": {
-    "crates/core": {
-      "component": "mcpgw-core",
-      "include-component-in-tag": true
-    },
     "crates/cli": {
       "component": "mcpgw",
       "include-component-in-tag": false,
-      "changelog-path": "/CHANGELOG.md"
+      "changelog-path": "/CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "/crates/core/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "/crates/cli/Cargo.toml",
+          "jsonpath": "$.dependencies['mcpgw-core'].version"
+        },
+        {
+          "type": "toml",
+          "path": "/crates/test-server/Cargo.toml",
+          "jsonpath": "$['dev-dependencies']['mcpgw-core'].version"
+        },
+        {
+          "type": "toml",
+          "path": "/Cargo.lock",
+          "jsonpath": "$.package[?(@.name==\"mcpgw\"||@.name.value==\"mcpgw\")].version"
+        },
+        {
+          "type": "toml",
+          "path": "/Cargo.lock",
+          "jsonpath": "$.package[?(@.name==\"mcpgw-core\"||@.name.value==\"mcpgw-core\")].version"
+        }
+      ]
     }
-  },
-  "plugins": [
-    {
-      "type": "cargo-workspace",
-      "merge": false
-    },
-    {
-      "type": "linked-versions",
-      "groupName": "mcpgw-workspace",
-      "components": ["mcpgw-core", "mcpgw"]
-    }
-  ]
+  }
 }
