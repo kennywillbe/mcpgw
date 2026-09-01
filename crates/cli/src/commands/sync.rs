@@ -21,7 +21,7 @@ pub struct SyncArgs {
 }
 
 pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
-    let targets = select_clients(&args.clients)?;
+    let targets = super::select_clients(&args.clients)?;
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
 
@@ -185,20 +185,6 @@ fn rollback(targets: &[ClientKind], state_dir: &Path) -> anyhow::Result<()> {
         bail!("no backups found for the selected clients");
     }
     Ok(())
-}
-
-fn select_clients(ids: &[String]) -> anyhow::Result<Vec<ClientKind>> {
-    if ids.is_empty() {
-        return Ok(ClientKind::ALL.to_vec());
-    }
-    ids.iter()
-        .map(|id| {
-            ClientKind::from_id(id).with_context(|| {
-                let valid: Vec<&str> = ClientKind::ALL.iter().map(|k| k.id()).collect();
-                format!("unknown client {id:?} (valid: {})", valid.join(", "))
-            })
-        })
-        .collect()
 }
 
 fn write_json(path: &Path, root: &serde_json::Value) -> anyhow::Result<()> {
