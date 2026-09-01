@@ -1,6 +1,6 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
 //! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI,
-//! opencode).
+//! opencode, Windsurf).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -29,6 +29,7 @@ pub enum ClientKind {
     Gemini,
     Codex,
     Opencode,
+    Windsurf,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -57,7 +58,7 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
@@ -65,6 +66,7 @@ impl ClientKind {
         Self::Gemini,
         Self::Codex,
         Self::Opencode,
+        Self::Windsurf,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -78,6 +80,7 @@ impl ClientKind {
             Self::Gemini => "gemini",
             Self::Codex => "codex",
             Self::Opencode => "opencode",
+            Self::Windsurf => "windsurf",
         }
     }
 
@@ -98,6 +101,7 @@ impl ClientKind {
             Self::Codex => "Codex CLI",
             // Lowercase is the project's own spelling of its name.
             Self::Opencode => "opencode",
+            Self::Windsurf => "Windsurf",
         }
     }
 
@@ -114,8 +118,9 @@ impl ClientKind {
     /// Most clients here are plain-JSON `mcpServers` maps. VS Code renames
     /// the map and wants an explicit entry `type`, Gemini CLI keeps the map
     /// name but spells entries its own way, Codex CLI is TOML end to end —
-    /// a `[mcp_servers]` table of `snake_case` entries — and opencode is
-    /// JSONC under a plain `mcp` key.
+    /// a `[mcp_servers]` table of `snake_case` entries — opencode is
+    /// JSONC under a plain `mcp` key, and Windsurf keeps the `mcpServers`
+    /// rules but spells the remote URL `serverUrl`.
     #[must_use]
     pub fn codec(self) -> Codec {
         match self {
@@ -140,6 +145,11 @@ impl ClientKind {
                 format: Format::Jsonc,
                 root: RootPath::new(&["mcp"]),
                 entries: EntrySchema::Opencode,
+            },
+            Self::Windsurf => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["mcpServers"]),
+                entries: EntrySchema::Windsurf,
             },
             _ => Codec {
                 format: Format::Json,
@@ -193,6 +203,10 @@ impl ClientKind {
             Self::Gemini => home_dir(&get).map(|dir| dir.join(".gemini")),
             Self::Codex => home_dir(&get).map(|dir| dir.join(".codex")),
             Self::Opencode => xdg_config_dir(&get).map(|dir| dir.join("opencode")),
+            // Windsurf is mid-rebrand to Devin, so this path is worth
+            // re-checking: it is still `.codeium` today, and a future one
+            // becomes another entry in the candidate list above.
+            Self::Windsurf => home_dir(&get).map(|dir| dir.join(".codeium/windsurf")),
         }) else {
             return Vec::new();
         };
@@ -203,6 +217,7 @@ impl ClientKind {
             Self::Gemini => &["settings.json"],
             Self::Codex => &["config.toml"],
             Self::Opencode => &["opencode.json", "opencode.jsonc"],
+            Self::Windsurf => &["mcp_config.json"],
         };
         names.iter().map(|name| dir.join(name)).collect()
     }
@@ -220,6 +235,7 @@ impl ClientKind {
             Self::Gemini => home_dir(&get)?.join(".gemini"),
             Self::Codex => home_dir(&get)?.join(".codex"),
             Self::Opencode => xdg_config_dir(&get)?.join("opencode"),
+            Self::Windsurf => home_dir(&get)?.join(".codeium/windsurf"),
         };
         Some(path)
     }

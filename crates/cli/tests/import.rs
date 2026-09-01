@@ -313,6 +313,38 @@ fn import_from_opencode_reads_jsonc_and_flags_managed_oauth() {
 }
 
 #[test]
+fn import_from_windsurf_reads_both_remote_spellings() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        ".codeium/windsurf/mcp_config.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"],
+                       "env": {"TOKEN": "${env:GITHUB_TOKEN}"}},
+            "linear": {"serverUrl": "https://mcp.linear.app/mcp"},
+            "figma": {"url": "https://mcp.figma.com/mcp"}
+        }}"#,
+    );
+    let out = sb.ok(&["import", "--from", "windsurf"]);
+    for name in ["+ github", "+ linear", "+ figma"] {
+        assert!(out.contains(name), "{out}");
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert_eq!(json["servers"]["figma"]["url"], "https://mcp.figma.com/mcp");
+    // Windsurf's own interpolation survives unexpanded.
+    let canonical = std::fs::read_to_string(sb.home.join("config.toml")).unwrap();
+    assert!(canonical.contains("${env:GITHUB_TOKEN}"), "{canonical}");
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "windsurf"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
+#[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.write_client(

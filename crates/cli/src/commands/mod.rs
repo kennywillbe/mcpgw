@@ -20,6 +20,14 @@ pub fn canonical_config_path() -> anyhow::Result<PathBuf> {
         .context("cannot determine a home directory to resolve the config path")
 }
 
+/// Help text for a client-selecting flag, with the ids taken from
+/// [`mcpgw_core::ClientKind::ALL`] rather than written out — a hand-kept list
+/// goes stale the first time an adapter lands.
+pub fn client_ids_help(lead: &str) -> String {
+    let ids: Vec<&str> = mcpgw_core::ClientKind::ALL.iter().map(|k| k.id()).collect();
+    format!("{lead} (repeatable; ids: {})", ids.join(", "))
+}
+
 pub fn select_clients(ids: &[String]) -> anyhow::Result<Vec<mcpgw_core::ClientKind>> {
     use mcpgw_core::ClientKind;
     if ids.is_empty() {

@@ -165,13 +165,23 @@ fn entry_shapes_per_client() {
     assert_eq!(opencode_http["url"], "https://mcp.linear.app/mcp");
     assert!(opencode_http.get("headers").is_none());
 
+    // Windsurf is the shared stdio shape, and `serverUrl` for remote — a
+    // plain `url` there is a field Windsurf does not read.
+    let windsurf_stdio = client_entry(ClientKind::Windsurf, &canonical["github"]);
+    let windsurf_http = client_entry(ClientKind::Windsurf, &canonical["linear"]);
+    assert_eq!(windsurf_stdio, cursor_stdio);
+    assert_eq!(windsurf_http["serverUrl"], "https://mcp.linear.app/mcp");
+    assert!(windsurf_http.get("url").is_none());
+    assert!(windsurf_http.get("type").is_none());
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
 }
 
-/// The array `command` is the one field mcpgw splits and rejoins, so it is
-/// the one that can lose an argument. Emitting and re-reading has to give
-/// back the server that went in — for every client, but here it is load
-/// bearing rather than incidental.
+/// The clients whose entry shape is rewritten rather than passed through:
+/// opencode splits and rejoins the `command` array, Windsurf renames the
+/// remote URL. Emitting and re-reading has to give back the server that went
+/// in — for every client, but for these two it is load bearing rather than
+/// incidental.
 #[test]
 fn emitting_and_re_reading_an_entry_returns_the_same_server() {
     let mut servers: Vec<mcpgw_core::Server> = canonical().into_values().collect();
@@ -204,12 +214,19 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
         },
     });
 
-    let entries = ClientKind::Opencode.codec().entries;
-    for server in servers {
-        let emitted = entries.emit(&server);
-        let (parsed, note) = entries.parse(&emitted).unwrap();
-        assert_eq!(parsed, server, "round trip changed {emitted}");
-        assert_eq!(note, None);
+    for kind in [ClientKind::Opencode, ClientKind::Windsurf] {
+        let entries = kind.codec().entries;
+        for server in &servers {
+            let emitted = entries.emit(server);
+            let (parsed, note) = entries.parse(&emitted).unwrap();
+            assert_eq!(
+                &parsed,
+                server,
+                "{} round trip changed {emitted}",
+                kind.id()
+            );
+            assert_eq!(note, None);
+        }
     }
 }
 
@@ -259,6 +276,15 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(codex["url"], url);
     assert!(codex.get("type").is_none());
     assert!(codex.get("command").is_none());
+
+    // Windsurf takes the gateway over HTTP under its own field name.
+    let windsurf = client_entry(
+        ClientKind::Windsurf,
+        &gateway_server(ClientKind::Windsurf, url, "mcpgw"),
+    );
+    assert_eq!(windsurf["serverUrl"], url);
+    assert!(windsurf.get("url").is_none());
+    assert!(windsurf.get("command").is_none());
 
     for kind in ClientKind::ALL {
         assert_eq!(

@@ -31,4 +31,8 @@ expression: matrix
         "opencode",
         "Jsonc / mcp / Opencode",
     ),
+    (
+        "windsurf",
+        "Json / mcpServers / Windsurf",
+    ),
 ]

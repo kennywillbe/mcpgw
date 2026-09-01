@@ -1,0 +1,62 @@
+---
+source: crates/core/tests/clients.rs
+expression: read
+---
+ClientRead {
+    servers: {
+        "figma": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.figma.com/mcp",
+                headers: {},
+            },
+        },
+        "github": Server {
+            enabled: true,
+            tags: [],
+            transport: Stdio {
+                command: "npx",
+                args: [
+                    "-y",
+                    "@modelcontextprotocol/server-github",
+                ],
+                env: {
+                    "GITHUB_TOKEN": "${env:GITHUB_TOKEN}",
+                },
+            },
+        },
+        "linear": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.linear.app/mcp",
+                headers: {
+                    "Authorization": "Bearer ${env:LINEAR_TOKEN}",
+                },
+            },
+        },
+        "notes": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://notes.example/mcp",
+                headers: {},
+            },
+        },
+    },
+    problems: [
+        Problem {
+            server: Some(
+                "notes",
+            ),
+            message: "`url` ignored: `serverUrl` takes precedence",
+        },
+        Problem {
+            server: Some(
+                "husk",
+            ),
+            message: "has neither `command` nor `url`",
+        },
+    ],
+}

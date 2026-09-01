@@ -8,8 +8,12 @@ use mcpgw_core::{ConfigStore, Detection, paths};
 
 #[derive(clap::Args)]
 pub struct ImportArgs {
-    /// Only import from these clients (repeatable; ids as in sync --client)
-    #[arg(long = "from", value_name = "ID")]
+    /// Only import from these clients (repeatable)
+    #[arg(
+        long = "from",
+        value_name = "ID",
+        long_help = super::client_ids_help("Only import from these clients")
+    )]
     pub from: Vec<String>,
     /// Show what would be imported without writing anything
     #[arg(long)]
