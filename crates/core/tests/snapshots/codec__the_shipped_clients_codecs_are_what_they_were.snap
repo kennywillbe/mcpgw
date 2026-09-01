@@ -39,4 +39,12 @@ expression: matrix
         "zed",
         "Jsonc / context_servers / Zed",
     ),
+    (
+        "cline",
+        "Json / mcpServers / Cline",
+    ),
+    (
+        "cline-cli",
+        "Json / mcpServers / Cline",
+    ),
 ]
