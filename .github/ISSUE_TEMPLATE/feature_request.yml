@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a capability, a client integration, or a change in behaviour
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        mcpgw is deliberately narrow: one config, every client, and a gateway
+        that watches the traffic. Requests that turn it into a full API
+        management platform are unlikely to be accepted — see the Roadmap
+        section of the README for what's already planned.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you cannot do today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should mcpgw do? Example commands or config help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Workarounds, other tools, and why they fall short.
