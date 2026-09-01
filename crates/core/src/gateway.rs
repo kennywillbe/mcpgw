@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
@@ -13,6 +14,7 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 
+use crate::capture::{CaptureRecord, CaptureWriter, Kind};
 use crate::upstream::UpstreamManager;
 
 /// Separator between server and tool name in aggregate mode. Server names
@@ -33,6 +35,7 @@ pub struct Gateway {
     manager: Arc<UpstreamManager>,
     mode: Mode,
     unavailable_hint: Option<String>,
+    capture: Option<Arc<CaptureWriter>>,
 }
 
 impl Gateway {
@@ -44,6 +47,7 @@ impl Gateway {
             manager,
             mode: Mode::Pipe(upstream),
             unavailable_hint: None,
+            capture: None,
         }
     }
 
@@ -56,6 +60,7 @@ impl Gateway {
             manager,
             mode: Mode::Aggregate(upstreams),
             unavailable_hint: None,
+            capture: None,
         }
     }
 
@@ -69,9 +74,29 @@ impl Gateway {
         self
     }
 
+    /// Records every upstream list/call into `writer`. Off by default:
+    /// `mcpgw serve` turns it on, `mcpgw connect` deliberately leaves it off
+    /// because the gateway it bridges to already records the same traffic.
+    #[must_use]
+    pub fn with_capture(mut self, writer: Arc<CaptureWriter>) -> Self {
+        self.capture = Some(writer);
+        self
+    }
+
     #[must_use]
     pub fn manager(&self) -> &Arc<UpstreamManager> {
         &self.manager
+    }
+
+    /// Writes one record, if capture is on. Deliberately a blocking append
+    /// on the request path: a record is a few hundred bytes to an appended
+    /// file, which costs far less than the channel and flush machinery that
+    /// moving it off-thread would need. Capture never fails a request.
+    fn record(&self, build: impl FnOnce(&str) -> CaptureRecord) {
+        let Some(writer) = &self.capture else { return };
+        if let Err(err) = writer.append(&build(writer.session())) {
+            eprintln!("warning: could not write traffic capture: {err}");
+        }
     }
 
     async fn upstream_service(
@@ -99,6 +124,7 @@ impl Gateway {
             let manager = Arc::clone(&self.manager);
             let name = name.clone();
             tasks.spawn(async move {
+                let started = Instant::now();
                 let tools = async {
                     let service = manager.ready(&name).await.map_err(|err| err.to_string())?;
                     service
@@ -107,7 +133,7 @@ impl Gateway {
                         .map_err(|err| err.to_string())
                 }
                 .await;
-                (name, tools)
+                (name, started.elapsed(), tools)
             });
         }
 
@@ -115,13 +141,22 @@ impl Gateway {
         // regardless of which upstream answers first.
         let mut by_server: BTreeMap<String, Vec<Tool>> = BTreeMap::new();
         while let Some(joined) = tasks.join_next().await {
-            let (name, tools) = match joined {
+            let (name, elapsed, tools) = match joined {
                 Ok(result) => result,
                 Err(err) => {
                     eprintln!("warning: listing tools panicked: {err}");
                     continue;
                 }
             };
+            // Every upstream attempt is recorded, failures included — a
+            // degraded merge is exactly what `watch` needs to show.
+            self.record(|session| {
+                let record = CaptureRecord::new(session, &name, Kind::List, elapsed);
+                match &tools {
+                    Ok(tools) => record.with_response(format!("{} tool(s)", tools.len())),
+                    Err(err) => record.with_error(err),
+                }
+            });
             match tools {
                 Ok(tools) => {
                     by_server.insert(name, tools);
@@ -180,13 +215,25 @@ impl ServerHandler for Gateway {
     ) -> Result<ListToolsResult, ErrorData> {
         match &self.mode {
             Mode::Pipe(upstream) => {
-                let service = self.upstream_service(upstream).await?;
-                let tools = service
-                    .list_all_tools()
-                    .await
-                    .map_err(|err| ErrorData::internal_error(err.to_string(), None))?;
+                let started = Instant::now();
+                let tools = async {
+                    let service = self.upstream_service(upstream).await?;
+                    service
+                        .list_all_tools()
+                        .await
+                        .map_err(|err| ErrorData::internal_error(err.to_string(), None))
+                }
+                .await;
+                let elapsed = started.elapsed();
+                self.record(|session| {
+                    let record = CaptureRecord::new(session, upstream, Kind::List, elapsed);
+                    match &tools {
+                        Ok(tools) => record.with_response(format!("{} tool(s)", tools.len())),
+                        Err(err) => record.with_error(&err.message),
+                    }
+                });
                 Ok(ListToolsResult {
-                    tools,
+                    tools: tools?,
                     ..ListToolsResult::default()
                 })
             }
@@ -218,13 +265,52 @@ impl ServerHandler for Gateway {
                 server
             }
         };
-        let service = self.upstream_service(&upstream).await?;
-        service
-            .call_tool(request)
-            .await
-            .map(Into::into)
-            .map_err(|err| ErrorData::internal_error(err.to_string(), None))
+        // Captured before the request moves upstream; `request.name` is the
+        // bare tool name by now, which is what a per-server view wants.
+        let tool = request.name.to_string();
+        let args = request.arguments.clone().map(|args| {
+            crate::capture::body(&serde_json::Value::Object(args.into_iter().collect()))
+        });
+
+        let started = Instant::now();
+        let response = async {
+            let service = self.upstream_service(&upstream).await?;
+            service
+                .call_tool(request)
+                .await
+                .map(CallToolResponse::from)
+                .map_err(|err| ErrorData::internal_error(err.to_string(), None))
+        }
+        .await;
+        let elapsed = started.elapsed();
+
+        self.record(|session| {
+            let mut record =
+                CaptureRecord::new(session, &upstream, Kind::Call, elapsed).with_tool(&tool);
+            if let Some(args) = args.clone() {
+                record = record.with_args(args);
+            }
+            match &response {
+                Ok(response) => record.with_response(preview(response)),
+                Err(err) => record.with_error(&err.message),
+            }
+        });
+        response
     }
+}
+
+/// Best-effort JSON rendering of a tool response for the capture log; the
+/// debug form is a readable fallback for anything that will not serialize.
+fn preview(response: &CallToolResponse) -> String {
+    let text = match response {
+        CallToolResponse::Complete(result) => {
+            serde_json::to_string(result).unwrap_or_else(|_| format!("{result:?}"))
+        }
+        // Elicitation and task responses carry no result body worth
+        // serializing here; their debug form names the shape well enough.
+        other => format!("{other:?}"),
+    };
+    crate::capture::truncate(&text)
 }
 
 /// Serves the gateway over Streamable HTTP at `/mcp` on `listener` until

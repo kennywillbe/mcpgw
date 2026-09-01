@@ -2,11 +2,13 @@ pub mod add;
 pub mod connect;
 pub mod doctor;
 pub mod import;
+pub mod inspect;
 pub mod list;
 pub mod remove;
 pub mod serve;
 pub mod sync;
 pub mod toggle;
+pub mod watch;
 
 use std::io::Write as _;
 use std::path::PathBuf;

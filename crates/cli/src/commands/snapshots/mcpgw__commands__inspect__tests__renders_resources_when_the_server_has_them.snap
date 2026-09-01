@@ -1,0 +1,12 @@
+---
+source: crates/cli/src/commands/inspect.rs
+expression: "render(\"fx\", &inspection, false)"
+---
+fx — mcpgw-test-server 9.9.9
+
+tools (2)
+  echo     echoes input
+  reverse
+
+resources (1)
+  notes  file:///notes.md (text/markdown)

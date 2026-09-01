@@ -1,0 +1,5 @@
+---
+source: crates/core/tests/capture.rs
+expression: "serde_json::to_string(&record).unwrap()"
+---
+{"ts":1767225600123,"session":"s3ss10n","server":"github","tool":"create_issue","kind":"call","duration_ms":42,"ok":false,"error":"upstream \"github\" failed","args":"{\"title\":\"bug\"}","response":"{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}"}

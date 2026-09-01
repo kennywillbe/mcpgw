@@ -1,0 +1,5 @@
+---
+source: crates/cli/src/commands/watch.rs
+expression: "render_line(&record, NOW, false)"
+---
+   2h  ✗  linear tools/list                   4ms  upstream "linear" failed after 3 attempt(s): refused

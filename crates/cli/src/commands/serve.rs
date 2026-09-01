@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 use mcpgw_core::Config;
+use mcpgw_core::capture::CaptureWriter;
 use mcpgw_core::gateway::{Gateway, serve_http};
 use mcpgw_core::upstream::UpstreamManager;
 
@@ -17,6 +18,9 @@ pub struct ServeArgs {
     /// server). Exactly one turns the gateway into an unprefixed pipe.
     #[arg(long, value_name = "NAME")]
     pub server: Vec<String>,
+    /// Do not write the JSONL traffic log
+    #[arg(long)]
+    pub no_capture: bool,
 }
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
@@ -55,6 +59,14 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         );
     }
 
+    let capture = if args.no_capture {
+        None
+    } else {
+        let state_dir = mcpgw_core::paths::state_dir()
+            .context("cannot determine a home directory to resolve the state directory")?;
+        Some(Arc::new(CaptureWriter::under_state_dir(&state_dir)))
+    };
+
     let manager = Arc::new(UpstreamManager::new(config.servers));
     // One explicit --server keeps the M9 shape: a pure pipe with untouched
     // tool names. Everything else aggregates under `server__tool`.
@@ -69,6 +81,15 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         ),
     };
 
+    let capture_note = match &capture {
+        Some(writer) => format!("capturing traffic to {}", writer.dir().display()),
+        None => "traffic capture disabled (--no-capture)".to_owned(),
+    };
+    let gateway = match &capture {
+        Some(writer) => gateway.with_capture(Arc::clone(writer)),
+        None => gateway,
+    };
+
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind((args.bind.as_str(), args.port))
@@ -76,6 +97,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             .with_context(|| format!("cannot bind {}:{}", args.bind, args.port))?;
         let addr = listener.local_addr()?;
         println!("mcpgw gateway listening on http://{addr}/mcp — {serving}");
+        println!("{capture_note}");
 
         let shutdown = async {
             let _ = tokio::signal::ctrl_c().await;

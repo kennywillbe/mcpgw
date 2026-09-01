@@ -1,4 +1,5 @@
 pub mod backup;
+pub mod capture;
 pub mod clients;
 pub mod config;
 pub mod doctor;

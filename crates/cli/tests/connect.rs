@@ -2,7 +2,6 @@
 //! client spawns the real binary, which pipes to a gateway served in-process.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,21 +11,8 @@ use mcpgw_core::{Server, Transport};
 use rmcp::ServiceExt as _;
 use rmcp::transport::TokioChildProcess;
 
-/// The scripted fixture server lives in a sibling package, so `CARGO_BIN_EXE`
-/// cannot name it here; it sits next to this test executable's parent
-/// (`target/<profile>/`), which holds for every cargo layout the suite runs
-/// under and CI always builds the whole workspace.
-fn fixture_binary() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().parent().unwrap();
-    let path = dir.join(format!("mcpgw-test-server{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.exists(),
-        "fixture binary missing at {} — build the workspace first",
-        path.display()
-    );
-    path
-}
+mod util;
+use util::fixture_binary;
 
 /// Serves a gateway piping the healthy fixture on an ephemeral port and
 /// returns its `/mcp` URL plus the manager (for shutdown).

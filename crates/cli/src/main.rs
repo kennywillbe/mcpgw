@@ -47,6 +47,10 @@ enum Command {
     Serve(commands::serve::ServeArgs),
     /// Bridge a stdio-only client to a running gateway over HTTP
     Connect(commands::connect::ConnectArgs),
+    /// Show what one server offers: identity, tools and resources
+    Inspect(commands::inspect::InspectArgs),
+    /// Follow the gateway's captured traffic live
+    Watch(commands::watch::WatchArgs),
     /// Diagnose the canonical config and every detected client
     Doctor {
         /// Machine-readable output
@@ -76,6 +80,8 @@ fn main() -> anyhow::Result<ExitCode> {
         Command::Sync(args) => commands::sync::run(&args, color).map(|()| ExitCode::SUCCESS),
         Command::Serve(args) => commands::serve::run(&args).map(|()| ExitCode::SUCCESS),
         Command::Connect(args) => commands::connect::run(&args).map(|()| ExitCode::SUCCESS),
+        Command::Inspect(args) => commands::inspect::run(&args, color).map(|()| ExitCode::SUCCESS),
+        Command::Watch(args) => commands::watch::run(&args, color).map(|()| ExitCode::SUCCESS),
         Command::Doctor {
             json,
             probe,

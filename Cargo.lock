@@ -887,6 +887,7 @@ dependencies = [
  "mcpgw-core",
  "rmcp",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use mcpgw_core::capture::{CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER};
 use mcpgw_core::gateway::{Gateway, resolve, serve_http};
 use mcpgw_core::upstream::UpstreamManager;
 use mcpgw_core::{Server, Transport};
@@ -223,4 +224,105 @@ fn resolve_prefers_the_longest_known_server_name() {
     assert_eq!(resolve("nope__t", &servers), None);
     // A bare name without the separator belongs to no server.
     assert_eq!(resolve("a", &servers), None);
+}
+
+/// Every JSONL line written into `dir`, sorted so the parallel tools/list
+/// records land in a deterministic order.
+fn captured(dir: &std::path::Path) -> Vec<CaptureRecord> {
+    let mut records: Vec<CaptureRecord> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .flat_map(|text| {
+            text.lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect::<Vec<CaptureRecord>>()
+        })
+        .collect();
+    records.sort_by(|a, b| (a.ts, &a.server).cmp(&(b.ts, &b.server)));
+    records
+}
+
+#[tokio::test]
+async fn capture_records_every_upstream_list_and_call() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let manager = manager(&[("fx1", "healthy"), ("fx2", "exit")]);
+    let gateway = Gateway::aggregate(
+        Arc::clone(&manager),
+        vec!["fx1".to_owned(), "fx2".to_owned()],
+    )
+    .with_capture(Arc::clone(&writer));
+    let client = connect(gateway).await;
+
+    // One list (two upstream attempts, one of which cannot start), one good
+    // call and one call into the dead upstream.
+    client.list_all_tools().await.unwrap();
+    client.call_tool(call("fx1__echo", "hi")).await.unwrap();
+    client.call_tool(call("fx2__echo", "hi")).await.unwrap_err();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    let shape: Vec<(Kind, &str, Option<&str>, bool)> = records
+        .iter()
+        .map(|r| (r.kind, r.server.as_str(), r.tool.as_deref(), r.ok))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (Kind::List, "fx1", None, true),
+            (Kind::List, "fx2", None, false),
+            (Kind::Call, "fx1", Some("echo"), true),
+            (Kind::Call, "fx2", Some("echo"), false),
+        ],
+        "{records:#?}"
+    );
+
+    // Every record is stamped with the writer's session, and calls carry
+    // both sides of the exchange.
+    assert!(records.iter().all(|r| r.session == writer.session()));
+    let good_call = &records[2];
+    assert_eq!(good_call.args.as_deref(), Some(r#"{"message":"hi"}"#));
+    assert!(good_call.response.as_deref().unwrap().contains("hi"));
+    assert!(good_call.error.is_none());
+
+    // The failed upstream names itself in the error of both its records.
+    assert!(records[1].error.as_deref().unwrap().contains("fx2"));
+    assert!(records[3].error.as_deref().unwrap().contains("fx2"));
+}
+
+#[tokio::test]
+async fn capture_truncates_oversized_bodies() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let manager = manager(&[("fx", "healthy")]);
+    let gateway =
+        Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
+    let client = connect(gateway).await;
+
+    // Multibyte payload well past the cap, echoed back just as long.
+    let message = "é".repeat(MAX_BODY_BYTES);
+    client.call_tool(call("echo", &message)).await.unwrap();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    assert_eq!(records.len(), 1, "{records:#?}");
+    for body in [&records[0].args, &records[0].response] {
+        let body = body.as_deref().unwrap();
+        assert!(body.ends_with(TRUNCATION_MARKER), "{body}");
+        let kept = body.strip_suffix(TRUNCATION_MARKER).unwrap();
+        assert!(kept.len() <= MAX_BODY_BYTES);
+    }
+}
+
+#[tokio::test]
+async fn capture_is_off_unless_asked_for() {
+    let state = tempfile::tempdir().unwrap();
+    let (client, manager) = gateway_client("healthy").await;
+    client.list_all_tools().await.unwrap();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+    // Nothing constructed a writer, so no traffic dir was ever created.
+    assert!(!state.path().join("traffic").exists());
 }

@@ -50,18 +50,45 @@ type Service = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 /// Returns [`ProbeError`] for spawn failures, handshake/protocol errors and
 /// timeouts.
 pub async fn probe_server(server: &Server, timeout: Duration) -> Result<ProbeSuccess, ProbeError> {
-    match &server.transport {
-        Transport::Stdio { command, args, env } => probe_stdio(command, args, env, timeout).await,
-        Transport::Http { url, headers } => probe_http(url, headers, timeout).await,
-    }
+    connected(server, timeout, inspect).await
 }
 
-async fn probe_stdio(
+/// Connects to `server`, hands the live service to `use_service`, and races
+/// the whole thing against `timeout`. On expiry the future is dropped, which
+/// closes the connection (and kills a spawned child with it).
+async fn connected<T, F>(
+    server: &Server,
+    timeout: Duration,
+    use_service: impl FnOnce(Service) -> F,
+) -> Result<T, ProbeError>
+where
+    F: Future<Output = Result<T, ProbeError>>,
+{
+    let hint = match &server.transport {
+        // Only a spawned server can be busy downloading itself.
+        Transport::Stdio { .. } => DOWNLOAD_HINT,
+        Transport::Http { .. } => "",
+    };
+    let work = async {
+        let service = match &server.transport {
+            Transport::Stdio { command, args, env } => connect_stdio(command, args, env).await?,
+            Transport::Http { url, headers } => connect_http(url, headers).await?,
+        };
+        use_service(service).await
+    };
+    tokio::time::timeout(timeout, work)
+        .await
+        .map_err(|_| ProbeError::Timeout {
+            seconds: timeout.as_secs(),
+            hint,
+        })?
+}
+
+async fn connect_stdio(
     command: &str,
     args: &[String],
     env: &BTreeMap<String, String>,
-    timeout: Duration,
-) -> Result<ProbeSuccess, ProbeError> {
+) -> Result<Service, ProbeError> {
     let mut cmd = Command::new(command);
     cmd.args(args);
     for (key, value) in env {
@@ -77,39 +104,19 @@ async fn probe_stdio(
         command: command.to_owned(),
         source,
     })?;
-
-    let probe = async move {
-        let service = ().serve(transport).await.map_err(handshake)?;
-        inspect(service).await
-    };
-    tokio::time::timeout(timeout, probe)
-        .await
-        .map_err(|_| ProbeError::Timeout {
-            seconds: timeout.as_secs(),
-            hint: DOWNLOAD_HINT,
-        })?
+    ().serve(transport).await.map_err(handshake)
 }
 
-async fn probe_http(
+async fn connect_http(
     url: &str,
     headers: &BTreeMap<String, String>,
-    timeout: Duration,
-) -> Result<ProbeSuccess, ProbeError> {
+) -> Result<Service, ProbeError> {
     let config = crate::upstream::http_config(url, headers)
         .map_err(|message| ProbeError::Handshake { message })?;
-    let probe = async move {
-        let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
-        // Connect errors (refused, TLS, 4xx) arrive as handshake failures —
-        // there is no separate "spawn" step for a remote server.
-        let service = ().serve(transport).await.map_err(handshake)?;
-        inspect(service).await
-    };
-    tokio::time::timeout(timeout, probe)
-        .await
-        .map_err(|_| ProbeError::Timeout {
-            seconds: timeout.as_secs(),
-            hint: "",
-        })?
+    let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
+    // Connect errors (refused, TLS, 4xx) arrive as handshake failures —
+    // there is no separate "spawn" step for a remote server.
+    ().serve(transport).await.map_err(handshake)
 }
 
 fn handshake(err: impl std::fmt::Display) -> ProbeError {
@@ -134,5 +141,88 @@ async fn inspect(service: Service) -> Result<ProbeSuccess, ProbeError> {
         server_name,
         server_version,
         tool_count: tools.len(),
+    })
+}
+
+/// A tool or resource listing read straight off a server, for `mcpgw inspect`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Inspection {
+    pub server_name: String,
+    pub server_version: String,
+    pub tools: Vec<ToolInfo>,
+    pub resources: Vec<ResourceInfo>,
+    /// False when the server advertises no `resources` capability, so an
+    /// empty list can be told apart from "this server has no resources API".
+    pub supports_resources: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ToolInfo {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ResourceInfo {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+/// Connects to `server` and lists everything it offers: identity, tools and
+/// (where supported) resources.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] for spawn failures, handshake/protocol errors and
+/// timeouts, exactly like [`probe_server`].
+pub async fn inspect_server(server: &Server, timeout: Duration) -> Result<Inspection, ProbeError> {
+    connected(server, timeout, list_everything).await
+}
+
+async fn list_everything(service: Service) -> Result<Inspection, ProbeError> {
+    let info = service.peer_info();
+    let identity = info.as_ref().and_then(|info| info.server_info.clone());
+    // Tools-only servers are the common case; asking such a server for
+    // resources answers "method not found", so the capability decides.
+    let supports_resources = info
+        .as_ref()
+        .is_some_and(|info| info.capabilities.resources.is_some());
+
+    let tools = service.list_all_tools().await.map_err(handshake)?;
+    let resources = if supports_resources {
+        // A server may advertise the capability and still refuse the call;
+        // that is a thin listing, not a failed inspection.
+        service.list_all_resources().await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let _ = service.cancel().await;
+
+    let (server_name, server_version) = identity.map_or_else(
+        || ("unknown".to_owned(), String::new()),
+        |imp| (imp.name, imp.version),
+    );
+    Ok(Inspection {
+        server_name,
+        server_version,
+        tools: tools
+            .into_iter()
+            .map(|tool| ToolInfo {
+                name: tool.name.into_owned(),
+                description: tool.description.map(std::borrow::Cow::into_owned),
+            })
+            .collect(),
+        resources: resources
+            .into_iter()
+            .map(|resource| ResourceInfo {
+                uri: resource.uri,
+                name: resource.name,
+                description: resource.description,
+                mime_type: resource.mime_type,
+            })
+            .collect(),
+        supports_resources,
     })
 }
