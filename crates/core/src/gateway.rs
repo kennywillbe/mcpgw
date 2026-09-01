@@ -334,10 +334,55 @@ pub async fn serve_http(
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(guard_origin));
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await
+}
+
+/// Rejects browser requests that do not come from a loopback page.
+///
+/// Binding to loopback is not protection on its own: under DNS rebinding a
+/// hostile page's own domain resolves to 127.0.0.1, which makes its requests
+/// same-origin and lets it drive `POST /mcp` with no CORS preflight. The MCP
+/// spec therefore requires servers to validate `Origin`. Non-browser MCP
+/// clients send no `Origin` at all, so an absent header passes untouched.
+async fn guard_origin(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    match request.headers().get(http::header::ORIGIN) {
+        Some(origin) if !origin.to_str().is_ok_and(is_local_origin) => (
+            http::StatusCode::FORBIDDEN,
+            "origin not allowed: mcpgw only accepts requests from loopback origins\n",
+        )
+            .into_response(),
+        _ => next.run(request).await,
+    }
+}
+
+/// Whether an `Origin` header value names a loopback web origin
+/// (`http(s)://localhost|127.0.0.1|[::1]` with an optional port).
+fn is_local_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        // Anything else — including the `null` origin a `file://` page
+        // sends — is not a local page.
+        return false;
+    };
+    // Strip a trailing `:port`; the bracketed IPv6 host keeps its brackets,
+    // whose closing `]` is what distinguishes it from a port.
+    let host = match rest.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => rest,
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
 /// Errors that end a stdio serving session.
@@ -365,4 +410,39 @@ pub async fn serve_stdio(gateway: Gateway) -> Result<rmcp::service::QuitReason, 
 
     let running = gateway.serve(stdio()).await.map_err(Box::new)?;
     Ok(running.waiting().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_origin;
+
+    #[test]
+    fn loopback_origins_pass_in_every_spelling() {
+        for origin in [
+            "http://localhost",
+            "http://localhost:8137",
+            "https://localhost:3000",
+            "http://127.0.0.1:8137",
+            "http://[::1]",
+            "http://[::1]:8137",
+        ] {
+            assert!(is_local_origin(origin), "{origin}");
+        }
+    }
+
+    #[test]
+    fn remote_and_lookalike_origins_are_rejected() {
+        for origin in [
+            "https://evil.example",
+            // The rebinding shape: a hostile name, not the loopback literal.
+            "http://localhost.evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://notlocalhost",
+            "null",
+            "file://",
+            "",
+        ] {
+            assert!(!is_local_origin(origin), "{origin}");
+        }
+    }
 }

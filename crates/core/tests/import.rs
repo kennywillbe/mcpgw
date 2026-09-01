@@ -40,6 +40,33 @@ fn identical_definitions_dedup_across_clients() {
 }
 
 #[test]
+fn dedup_merges_metadata_instead_of_keeping_only_the_first_source() {
+    // Same transport in both clients, but VS Code has it disabled and reads
+    // it through the lossy sse mapping.
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"linear": {"type": "http", "url": "https://mcp.linear.app/mcp"}}}"#,
+    );
+    let vscode = read(
+        ClientKind::VsCode,
+        r#"{"servers": {"linear": {"type": "sse", "url": "https://mcp.linear.app/mcp",
+            "disabled": true}}}"#,
+    );
+    let plan = plan_import(
+        &[("cursor".into(), cursor), ("vscode".into(), vscode)],
+        &BTreeMap::new(),
+    );
+
+    assert_eq!(plan.new.len(), 1);
+    let candidate = &plan.new[0];
+    assert_eq!(candidate.origins.len(), 2);
+    // Disabled anywhere wins, and the second source's note is not lost.
+    assert!(!candidate.server.enabled);
+    assert_eq!(candidate.notes.len(), 1);
+    assert!(candidate.notes[0].contains("sse"), "{:?}", candidate.notes);
+}
+
+#[test]
 fn cross_client_name_clash_suffixes_the_later_one() {
     let cursor = read(
         ClientKind::Cursor,

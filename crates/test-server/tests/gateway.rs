@@ -35,12 +35,17 @@ fn manager(upstreams: &[(&str, &str)]) -> Arc<UpstreamManager> {
     )
 }
 
-/// Serves `gateway` on an ephemeral port and connects a client to it.
-async fn connect(gateway: Gateway) -> Client {
+/// Serves `gateway` on an ephemeral port and returns the bound address.
+async fn serve(gateway: Gateway) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve_http(gateway, listener, std::future::pending()));
+    addr
+}
 
+/// Serves `gateway` on an ephemeral port and connects a client to it.
+async fn connect(gateway: Gateway) -> Client {
+    let addr = serve(gateway).await;
     let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp"));
     ().serve(transport).await.unwrap()
 }
@@ -325,4 +330,57 @@ async fn capture_is_off_unless_asked_for() {
     manager.shutdown().await;
     // Nothing constructed a writer, so no traffic dir was ever created.
     assert!(!state.path().join("traffic").exists());
+}
+
+/// Sends one raw HTTP request so the test can set an arbitrary `Origin`
+/// without adding an HTTP client to the dev-dependencies, and returns the
+/// status line of the response.
+async fn raw_post(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
+    use std::fmt::Write as _;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let mut request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\
+         Connection: close\r\n",
+        body.len()
+    );
+    if let Some(origin) = origin {
+        let _ = write!(request, "Origin: {origin}\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_hostile_origin_is_refused_before_it_reaches_the_gateway() {
+    let manager = manager(&[("fx", "healthy")]);
+    let addr = serve(Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
+
+    // DNS rebinding: the page's own domain resolves to loopback, so only the
+    // Origin header tells the two apart.
+    let status = raw_post(addr, Some("https://evil.example")).await;
+    assert!(status.contains("403"), "{status}");
+    let status = raw_post(addr, Some("http://localhost.evil.example")).await;
+    assert!(status.contains("403"), "{status}");
+
+    // A loopback page and a non-browser client (no Origin at all) both pass
+    // the guard — whatever the gateway answers, it is not a 403.
+    for origin in [Some("http://localhost:8137"), None] {
+        let status = raw_post(addr, origin).await;
+        assert!(!status.contains("403"), "{origin:?} -> {status}");
+    }
+    manager.shutdown().await;
 }

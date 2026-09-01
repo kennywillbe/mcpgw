@@ -227,7 +227,7 @@ impl CaptureWriter {
         let mut file = match open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir_all(&self.dir).map_err(io_err(&self.dir))?;
+                crate::private::create_dir_all(&self.dir).map_err(io_err(&self.dir))?;
                 open(&path).map_err(io_err(&path))?
             }
             Err(err) => return Err(io_err(&path)(err)),

@@ -13,7 +13,7 @@ use rmcp::ServiceExt as _;
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::config::{Server, Transport};
 
@@ -46,12 +46,20 @@ pub enum UpstreamError {
         attempts: u32,
         message: String,
     },
+
+    #[error("upstream {name:?} was shut down while connecting")]
+    ShutDown { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamStatus {
     /// Not started yet (lazy) or shut down.
     Idle,
+    /// A connect ladder is running right now. Reported as its own state
+    /// rather than folded into `Idle`: with a 30s timeout per attempt the
+    /// ladder can run for a minute and a half, and "starting" is what a
+    /// waiting user actually wants to see there.
+    Connecting,
     Ready,
     /// Latched after exhausting attempts; the next request gets one chance.
     Failed(String),
@@ -59,6 +67,7 @@ pub enum UpstreamStatus {
 
 enum Slot {
     Idle,
+    Connecting,
     Ready(Arc<UpstreamService>),
     Failed(String),
 }
@@ -66,6 +75,9 @@ enum Slot {
 struct Upstream {
     server: Server,
     slot: Mutex<Slot>,
+    /// Notified every time the slot leaves `Connecting`, so demands that
+    /// arrive mid-ladder can wait for its outcome without holding the lock.
+    settled: Notify,
 }
 
 pub struct UpstreamManager {
@@ -85,6 +97,7 @@ impl UpstreamManager {
                     Upstream {
                         server,
                         slot: Mutex::new(Slot::Idle),
+                        settled: Notify::new(),
                     },
                 )
             })
@@ -113,7 +126,9 @@ impl UpstreamManager {
         self.upstreams.keys().map(String::as_str)
     }
 
-    /// Current status without touching the upstream.
+    /// Current status without touching the upstream. The slot lock is never
+    /// held across a connect, so this answers immediately even while an
+    /// upstream is halfway through its ladder.
     pub async fn status(&self, name: &str) -> Option<UpstreamStatus> {
         let upstream = self.upstreams.get(name)?;
         let slot = upstream.slot.lock().await;
@@ -122,20 +137,28 @@ impl UpstreamManager {
             // report Ready only while actually alive.
             Slot::Ready(service) if !dead(service) => UpstreamStatus::Ready,
             Slot::Idle | Slot::Ready(_) => UpstreamStatus::Idle,
+            Slot::Connecting => UpstreamStatus::Connecting,
             Slot::Failed(message) => UpstreamStatus::Failed(message.clone()),
         })
     }
 
     /// Returns a live service for `name`, spawning it on first demand.
     ///
-    /// Concurrent callers coalesce on the per-upstream lock: exactly one
-    /// connect cycle runs, everyone else waits for its outcome. A `Failed`
-    /// upstream gets a single fresh attempt per call (no backoff ladder).
+    /// Concurrent callers still coalesce — exactly one connect cycle runs and
+    /// everyone else waits for its outcome — but the slot lock is only ever
+    /// held for the state transitions around the ladder, never across it.
+    /// The ladder can take three connect timeouts plus its backoff sleeps
+    /// (a minute and a half at the defaults), and holding the lock for that
+    /// long blocked [`status`](Self::status), [`shutdown`](Self::shutdown)
+    /// and every unrelated `tools/call` on the same upstream behind it.
+    ///
+    /// A `Failed` upstream gets a single fresh attempt per call (no backoff
+    /// ladder).
     ///
     /// # Errors
     ///
-    /// Returns [`UpstreamError`] for unknown/disabled upstreams and
-    /// exhausted connect attempts.
+    /// Returns [`UpstreamError`] for unknown/disabled upstreams, exhausted
+    /// connect attempts, and a shutdown that lands mid-connect.
     pub async fn ready(&self, name: &str) -> Result<Arc<UpstreamService>, UpstreamError> {
         let upstream = self
             .upstreams
@@ -149,34 +172,74 @@ impl UpstreamManager {
             });
         }
 
-        let mut slot = upstream.slot.lock().await;
-        let attempts = match &*slot {
-            Slot::Ready(service) if !dead(service) => {
-                return Ok(Arc::clone(service));
+        let attempts = loop {
+            let mut slot = upstream.slot.lock().await;
+            match &*slot {
+                Slot::Ready(service) if !dead(service) => {
+                    return Ok(Arc::clone(service));
+                }
+                Slot::Connecting => {
+                    // Someone else owns the ladder. Wait for its outcome
+                    // instead of starting a second one, and do it without
+                    // the lock. `enable` registers this waiter before the
+                    // lock goes, so a connect that settles in between
+                    // cannot slip past unheard.
+                    let settled = upstream.settled.notified();
+                    tokio::pin!(settled);
+                    settled.as_mut().enable();
+                    drop(slot);
+                    settled.await;
+                }
+                // Dead-after-ready is a new crash episode: full ladder.
+                Slot::Ready(_) | Slot::Idle => {
+                    *slot = Slot::Connecting;
+                    break ATTEMPTS;
+                }
+                // Latched: one fresh chance per demand.
+                Slot::Failed(_) => {
+                    *slot = Slot::Connecting;
+                    break 1;
+                }
             }
-            // Dead-after-ready is a new crash episode: full ladder.
-            Slot::Ready(_) | Slot::Idle => ATTEMPTS,
-            // Latched: one fresh chance per demand.
-            Slot::Failed(_) => 1,
         };
 
-        match self
+        let outcome = self
             .connect_with_backoff(name, &upstream.server, attempts)
-            .await
-        {
+            .await;
+
+        let mut slot = upstream.slot.lock().await;
+        // A shutdown during the ladder left the slot Idle. It could not see
+        // this connection to cancel it, so the connection must not be
+        // installed behind its back — discard it instead.
+        let abandoned = !matches!(*slot, Slot::Connecting);
+        let result = match outcome {
             Ok(service) => {
                 let service = Arc::new(service);
-                *slot = Slot::Ready(Arc::clone(&service));
-                Ok(service)
+                if abandoned {
+                    service.cancellation_token().cancel();
+                    Err(UpstreamError::ShutDown {
+                        name: name.to_owned(),
+                    })
+                } else {
+                    *slot = Slot::Ready(Arc::clone(&service));
+                    Ok(service)
+                }
             }
             Err(err) => {
-                *slot = Slot::Failed(err.to_string());
+                if !abandoned {
+                    *slot = Slot::Failed(err.to_string());
+                }
                 Err(err)
             }
-        }
+        };
+        drop(slot);
+        upstream.settled.notify_waiters();
+        result
     }
 
     /// Stops every running upstream (children die with their transports).
+    /// Never waits for a connect in flight: that ladder finds the slot no
+    /// longer its own when it lands and throws its connection away.
     pub async fn shutdown(&self) {
         for upstream in self.upstreams.values() {
             let mut slot = upstream.slot.lock().await;

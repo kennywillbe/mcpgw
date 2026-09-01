@@ -60,6 +60,24 @@ pub fn plan_import(
                 existing
                     .origins
                     .push((client_id.clone(), orig_name.clone()));
+                // Dedup keys on the transport alone, so everything *around*
+                // the transport has to be merged rather than dropped with
+                // the later source: a lossy-read note that only one client
+                // produced still matters, and so does a tag only one client
+                // carries. `enabled` merges conservatively — disabled in any
+                // client imports disabled, because re-enabling is one
+                // command while an unnoticed re-enable is a surprise.
+                existing.server.enabled &= server.enabled;
+                for tag in &server.tags {
+                    if !existing.server.tags.contains(tag) {
+                        existing.server.tags.push(tag.clone());
+                    }
+                }
+                for note in notes {
+                    if !existing.notes.contains(&note) {
+                        existing.notes.push(note);
+                    }
+                }
                 continue;
             }
 

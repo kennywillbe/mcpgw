@@ -48,7 +48,7 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
         if path != tail.path {
             tail = Tail::new(path);
         }
-        for line in tail.poll()? {
+        for line in poll_or_report(&mut tail) {
             let Ok(record) = serde_json::from_str::<CaptureRecord>(&line) else {
                 // A line the current build cannot parse (older or newer
                 // format) is skipped rather than ending the stream.
@@ -64,6 +64,20 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
             }
         }
         std::thread::sleep(POLL);
+    }
+}
+
+/// One follow round. A read failure is reported and swallowed rather than
+/// propagated: a watch is meant to be left running all day, and a single
+/// EACCES or a stat caught mid-rotation must not end it. The next poll is
+/// 500ms away, so retrying costs nothing and only Ctrl-C stops the stream.
+fn poll_or_report(tail: &mut Tail) -> Vec<String> {
+    match tail.poll() {
+        Ok(lines) => lines,
+        Err(err) => {
+            eprintln!("watch: {err:#} — retrying");
+            Vec::new()
+        }
     }
 }
 
@@ -288,6 +302,22 @@ mod tests {
         assert!(tail.poll().unwrap().is_empty());
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         assert_eq!(tail.poll().unwrap(), ["three"]);
+    }
+
+    #[test]
+    fn a_read_failure_is_reported_and_the_tail_keeps_going() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where a file is expected fails to read on every
+        // platform, which is the shape of any transient I/O error here.
+        let blocked = dir.path().join("2026-01-01.jsonl");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut tail = Tail::new(blocked.clone());
+        assert!(poll_or_report(&mut tail).is_empty());
+
+        // The same tail recovers once the path is readable again.
+        std::fs::remove_dir(&blocked).unwrap();
+        std::fs::write(&blocked, "one\n").unwrap();
+        assert_eq!(poll_or_report(&mut tail), ["one"]);
     }
 
     #[test]

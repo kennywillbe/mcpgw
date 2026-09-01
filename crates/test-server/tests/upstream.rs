@@ -167,6 +167,43 @@ async fn configured_headers_reach_the_http_upstream() {
     assert_eq!(headers["x-tenant"], "acme");
 }
 
+/// The connect ladder used to run under the per-upstream lock, so a hung
+/// server made `status` and `shutdown` wait out three connect timeouts plus
+/// the backoff sleeps — around 93 seconds at the defaults.
+#[tokio::test]
+async fn status_and_shutdown_answer_while_a_connect_is_in_flight() {
+    // The `slow` fixture never answers the handshake, so the ladder is stuck
+    // in its first attempt for the whole test.
+    let mgr = Arc::new(
+        UpstreamManager::new(
+            [("fx".to_owned(), stdio_server("slow"))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let connecting = tokio::spawn({
+        let mgr = Arc::clone(&mgr);
+        async move { mgr.ready("fx").await }
+    });
+
+    // Let the ladder get past spawning and into its wait.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = Instant::now();
+    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Connecting));
+    mgr.shutdown().await;
+    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Idle));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "blocked for {:?} behind the connect",
+        started.elapsed()
+    );
+
+    // Dropping the task kills the parked child with its transport.
+    connecting.abort();
+}
+
 #[tokio::test]
 async fn concurrent_demands_coalesce_into_one_instance() {
     let mgr = Arc::new(manager(&[("fx", stdio_server("healthy"))]));

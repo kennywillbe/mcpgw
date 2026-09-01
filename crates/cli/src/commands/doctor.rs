@@ -189,31 +189,61 @@ fn emit_json(
     Ok(())
 }
 
+type ProbeRow = (
+    String,
+    Result<mcpgw_core::probe::ProbeSuccess, mcpgw_core::probe::ProbeError>,
+);
+
 struct ProbeReport {
-    results: Vec<(
-        String,
-        Result<mcpgw_core::probe::ProbeSuccess, mcpgw_core::probe::ProbeError>,
-    )>,
+    results: Vec<ProbeRow>,
 }
 
 fn run_probes(plan: ProbePlan, timeout: Duration) -> anyhow::Result<ProbeReport> {
     let runtime = tokio::runtime::Runtime::new()?;
     let mut results = runtime.block_on(async {
         let mut set = tokio::task::JoinSet::new();
-        for (server, labels) in plan.targets.into_values() {
-            set.spawn(async move {
-                let outcome = probe_server(&server, timeout).await;
-                (labels.join(", "), outcome)
+        let mut labels: BTreeMap<tokio::task::Id, String> = BTreeMap::new();
+        for (server, target_labels) in plan.targets.into_values() {
+            let label = target_labels.join(", ");
+            let handle = set.spawn({
+                let label = label.clone();
+                async move { (label, probe_server(&server, timeout).await) }
             });
+            labels.insert(handle.id(), label);
         }
-        let mut collected = Vec::new();
-        while let Some(joined) = set.join_next().await {
-            collected.push(joined.expect("probe task panicked"));
-        }
-        collected
+        collect_probes(set, &labels).await
     });
     results.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(ProbeReport { results })
+}
+
+/// Drains the probe tasks. A task that panics costs its own row, not the
+/// whole report: doctor exists to tell the user what is wrong with their
+/// setup, and it can still do that for the other servers. `labels` maps task
+/// ids back to target names so even the failed row says which server it was.
+async fn collect_probes(
+    mut set: tokio::task::JoinSet<ProbeRow>,
+    labels: &BTreeMap<tokio::task::Id, String>,
+) -> Vec<ProbeRow> {
+    let mut collected = Vec::new();
+    while let Some(joined) = set.join_next_with_id().await {
+        collected.push(match joined {
+            Ok((_, row)) => row,
+            Err(err) => {
+                let label = labels
+                    .get(&err.id())
+                    .cloned()
+                    .unwrap_or_else(|| "unknown server".to_owned());
+                (
+                    label,
+                    Err(mcpgw_core::probe::ProbeError::Aborted {
+                        reason: err.to_string(),
+                    }),
+                )
+            }
+        });
+    }
+    collected
 }
 
 fn render_probes(probes: &ProbeReport, color: bool) {
@@ -325,5 +355,41 @@ fn summary_line(errors: usize, warnings: usize, color: bool) {
         println!("{}", text.yellow());
     } else {
         println!("{}", text.green());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mcpgw_core::probe::{ProbeError, ProbeSuccess};
+
+    use super::{ProbeRow, collect_probes};
+
+    #[tokio::test]
+    async fn a_panicking_probe_becomes_one_failed_row() {
+        let mut set = tokio::task::JoinSet::<ProbeRow>::new();
+        let mut labels = std::collections::BTreeMap::new();
+
+        let handle = set.spawn(async { panic!("probe blew up") });
+        labels.insert(handle.id(), "boom (canonical)".to_owned());
+        set.spawn(async {
+            (
+                "fine (canonical)".to_owned(),
+                Ok(ProbeSuccess {
+                    server_name: "fixture".to_owned(),
+                    server_version: "1".to_owned(),
+                    tool_count: 2,
+                }),
+            )
+        });
+
+        let mut rows = collect_probes(set, &labels).await;
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(rows.len(), 2);
+        // The panicked target is named, not lost, and the healthy one still
+        // reports.
+        assert_eq!(rows[0].0, "boom (canonical)");
+        assert!(matches!(rows[0].1, Err(ProbeError::Aborted { .. })));
+        assert_eq!(rows[1].0, "fine (canonical)");
+        assert!(rows[1].1.is_ok());
     }
 }

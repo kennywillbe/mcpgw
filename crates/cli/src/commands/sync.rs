@@ -63,6 +63,10 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     };
 
     let state_path = state_dir.join("managed.json");
+    // Held across the whole load→modify→save window: a second `mcpgw sync
+    // --client other` running at the same time would otherwise write back a
+    // state it read before this run's changes and drop them.
+    let _state_lock = ManagedState::lock(&state_path)?;
     let mut state = ManagedState::load(&state_path)?;
 
     for kind in targets {
@@ -137,12 +141,18 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         if exists {
             backup::backup_file(&state_dir, kind.id(), &path)?;
         }
-        apply_plan(kind, &mut root, &plan);
-        write_json(&path, &root)?;
+        // Intent first: the state file records what this run is about to
+        // write *before* the client file is touched. A crash in between then
+        // leaves entries claimed but absent, which the next sync sees as
+        // plain adds and repairs. The reverse order fails the other way —
+        // entries in the client file that mcpgw never claimed are foreign
+        // forever, and sync refuses to touch them.
         state
             .clients
             .insert(kind.id().to_owned(), plan.managed_after());
         state.save(&state_path)?;
+        apply_plan(kind, &mut root, &plan);
+        write_json(&path, &root)?;
     }
     Ok(())
 }
@@ -218,6 +228,14 @@ fn rollback(targets: &[ClientKind], state_dir: &Path) -> anyhow::Result<()> {
         };
         let text = std::fs::read_to_string(&backup_path)
             .with_context(|| format!("cannot read backup {}", backup_path.display()))?;
+        // Rollback is a client write like any other, so it takes a backup of
+        // what it is about to destroy: a rollback fired by mistake is then
+        // itself undoable instead of costing the live config outright. It
+        // also re-stamps the stack, so repeated rollbacks alternate between
+        // the last two states rather than silently re-applying one snapshot.
+        if config_path.exists() {
+            backup::backup_file(state_dir, kind.id(), &config_path)?;
+        }
         write_text(&config_path, &text)?;
         println!(
             "restored {} from {}",
@@ -239,6 +257,15 @@ fn write_json(path: &Path, root: &serde_json::Value) -> anyhow::Result<()> {
 }
 
 // Atomic replace, same discipline as the canonical store.
+//
+// Two known side effects of replacing the file wholesale, both accepted in
+// M6 ("client files are machine-written"): the whole document is
+// re-serialized, so indentation is normalized even where nothing changed
+// (for Claude Code that is all of ~/.claude.json), and the temp file's 0600
+// mode replaces whatever the client used. The rename also wins any race
+// against a client writing the same file concurrently — mcpgw's copy was
+// read at the start of the run, so an edit made in between is lost. Backups
+// are the recovery path; a lock the client does not take cannot prevent it.
 fn write_text(path: &Path, text: &str) -> anyhow::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -250,5 +277,19 @@ fn write_text(path: &Path, text: &str) -> anyhow::Result<()> {
     tmp.persist(path)
         .map_err(|err| anyhow::Error::from(err.error))
         .with_context(|| format!("cannot write {}", path.display()))?;
+    // Syncing the bytes leaves the rename that publishes them undurable.
+    sync_dir(parent);
     Ok(())
+}
+
+/// Best-effort directory fsync so the rename above survives a power loss.
+/// Failure is not worth aborting a completed write over — and Windows has no
+/// directory handle to sync at all.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }

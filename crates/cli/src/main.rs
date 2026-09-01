@@ -24,6 +24,9 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
+        /// Print env and header values instead of masking them
+        #[arg(long)]
+        show_secrets: bool,
     },
     /// Add a server to the canonical config
     Add(commands::add::AddArgs),
@@ -69,7 +72,9 @@ fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let color = std::io::stdout().is_terminal();
     match cli.command {
-        Command::List { json } => commands::list::run(json, color).map(|()| ExitCode::SUCCESS),
+        Command::List { json, show_secrets } => {
+            commands::list::run(json, show_secrets, color).map(|()| ExitCode::SUCCESS)
+        }
         Command::Add(args) => commands::add::run(&args).map(|()| ExitCode::SUCCESS),
         Command::Remove(args) => commands::remove::run(&args).map(|()| ExitCode::SUCCESS),
         Command::Enable { name } => commands::toggle::run(&name, true).map(|()| ExitCode::SUCCESS),

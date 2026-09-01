@@ -38,7 +38,19 @@ rmcp = { version = "3", features = [
 rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
 axum = "0.8"
 http = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "signal", "net"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "process",
+    "time",
+    "macros",
+    "signal",
+    "net",
+    # Named rather than inherited from what rmcp/axum happen to enable:
+    # `sync` carries Mutex/Notify in the upstream manager, `io-util` the
+    # raw-socket helpers in the gateway tests.
+    "sync",
+    "io-util",
+] }
 owo-colors = "4"
 insta = "1"
 assert_cmd = "2"

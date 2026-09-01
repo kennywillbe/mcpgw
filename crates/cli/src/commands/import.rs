@@ -1,10 +1,9 @@
-use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 
 use anyhow::Context as _;
 use mcpgw_core::import::{ImportCandidate, plan_import};
 use mcpgw_core::state::ManagedState;
-use mcpgw_core::{Config, ConfigStore, Detection, Error, paths};
+use mcpgw_core::{ConfigStore, Detection, paths};
 
 #[derive(clap::Args)]
 pub struct ImportArgs {
@@ -30,12 +29,14 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     }
 
     let config_path = super::canonical_config_path()?;
-    let canonical = match Config::load(&config_path) {
-        Ok(config) => config.servers,
-        Err(Error::NotFound { .. }) => BTreeMap::new(),
-        Err(err) => return Err(err.into()),
-    };
-    let plan = plan_import(&sources, &canonical);
+    // Locked before the plan is built, not after it is printed: reading the
+    // canonical config unlocked left a window in which a concurrent `mcpgw
+    // add` could claim one of the planned names, turning the first write
+    // into a DuplicateName abort halfway through the reported progress. The
+    // store now supplies both the planning input and the write handle, so
+    // they cannot describe different files.
+    let mut store = ConfigStore::edit_or_create(&config_path)?;
+    let plan = plan_import(&sources, &store.config().servers);
 
     if plan.new.is_empty() && plan.already.is_empty() && plan.conflicts.is_empty() {
         println!("nothing to import");
@@ -49,8 +50,10 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
     let state_path = state_dir.join("managed.json");
+    // Held until the run ends, like sync: adoption is a read-modify-write of
+    // the same file and must not race another mcpgw process.
+    let _state_lock = ManagedState::lock(&state_path)?;
     let mut state = ManagedState::load(&state_path)?;
-    let mut store = ConfigStore::edit_or_create(&config_path)?;
     let mut imported = 0;
     let mut skipped = 0;
 
