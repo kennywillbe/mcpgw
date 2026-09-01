@@ -4,6 +4,12 @@
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
 //! must survive them. Only unparseable JSON fails the whole file.
+//!
+//! What each client's file looks like lives in [`codec`]; this module owns
+//! only what is the same everywhere — detection, paths, and the lenient
+//! read loop.
+
+pub mod codec;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

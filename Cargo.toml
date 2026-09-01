@@ -25,6 +25,14 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
+# The JSONC clients (VS Code-family settings files) are hand-edited, so a
+# sync that dropped their comments would be vandalism. `cst` is the only
+# maintained Rust JSONC reader that also *edits*: it keeps a concrete syntax
+# tree, so an entry can be replaced with every comment, quote style and
+# indent around it left where it was. The alternatives all lose that —
+# json5/json_comments/serde-jsonc parse to a value and cannot write back,
+# and a full formatter (biome, dprint) would reformat the whole file.
+jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
 url = "2"
 which = "8"
 rmcp = { version = "3", features = [
