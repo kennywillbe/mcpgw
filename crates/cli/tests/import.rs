@@ -20,6 +20,8 @@ impl Sandbox {
     fn mcpgw(&self, args: &[&str]) -> Output {
         Command::cargo_bin("mcpgw")
             .unwrap()
+            // Hermetic: no test may phone home for a version notice.
+            .env("MCPGW_NO_UPDATE_CHECK", "1")
             .args(args)
             .env("MCPGW_CONFIG", self.home.join("config.toml"))
             .env("MCPGW_STATE_DIR", self.home.join("state"))

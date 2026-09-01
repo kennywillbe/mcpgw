@@ -55,6 +55,33 @@ install "mcpgw-${version}-${target}/mcpgw" /usr/local/bin/
 Prebuilt targets: `aarch64-apple-darwin`, `x86_64-apple-darwin`,
 `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
 
+## Updating
+
+```sh
+mcpgw self-update
+```
+
+Downloads the latest release archive for your platform, checks it against the
+release's `SHA256SUMS`, and replaces the running binary with it. It refuses to
+touch an install that belongs to a package manager: under `~/.cargo/bin` it
+tells you to run `cargo install mcpgw`, under a Homebrew prefix `brew upgrade
+mcpgw`.
+
+`mcpgw self-update --check` changes nothing and only reports, exiting `0` when
+you already have the latest release and `10` when you don't — a pair a script
+can branch on.
+
+Once a day, after a command has finished, mcpgw asks GitHub whether a newer
+release exists and prints one line to stderr if there is:
+
+```text
+mcpgw 0.2.0 is available (you have 0.1.0) — run `mcpgw self-update`
+```
+
+It never writes to stdout, so `--json` output stays parseable, and it stays
+quiet when the network doesn't answer. `MCPGW_NO_UPDATE_CHECK=1` turns it off
+entirely.
+
 ## Check it
 
 ```sh

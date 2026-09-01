@@ -12,6 +12,8 @@ fn fixture(name: &str) -> PathBuf {
 fn run_list(config: &Path, extra: &[&str]) -> Output {
     Command::cargo_bin("mcpgw")
         .unwrap()
+        // Hermetic: no test may phone home for a version notice.
+        .env("MCPGW_NO_UPDATE_CHECK", "1")
         .arg("list")
         .args(extra)
         .env("MCPGW_CONFIG", config)

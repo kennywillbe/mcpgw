@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod render;
+mod update;
 
 #[derive(Parser)]
 #[command(
@@ -66,27 +67,45 @@ enum Command {
         #[arg(long, default_value_t = 10, requires = "probe", value_name = "SECS")]
         timeout: u64,
     },
+    /// Replace this binary with the latest release
+    SelfUpdate(commands::self_update::SelfUpdateArgs),
 }
 
 fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let color = std::io::stdout().is_terminal();
-    match cli.command {
+    // `serve` and `connect` run until they are killed and own the terminal
+    // (connect owns stdio outright), and `self-update` reports on releases
+    // itself — none of them wants a version notice appended.
+    let notice = !matches!(
+        cli.command,
+        Command::Serve(_) | Command::Connect(_) | Command::SelfUpdate(_)
+    );
+    let code = dispatch(cli.command, color)?;
+    // Only after a command that worked, and only once its own output is
+    // out: a notice is a footnote, never the last word on a failure.
+    if notice && code == 0 {
+        update::notice::print_if_due(env!("CARGO_PKG_VERSION"));
+    }
+    Ok(ExitCode::from(code))
+}
+
+/// Runs one command, returning its process exit code.
+fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
+    match command {
         Command::List { json, show_secrets } => {
-            commands::list::run(json, show_secrets, color).map(|()| ExitCode::SUCCESS)
+            commands::list::run(json, show_secrets, color).map(|()| 0)
         }
-        Command::Add(args) => commands::add::run(&args).map(|()| ExitCode::SUCCESS),
-        Command::Remove(args) => commands::remove::run(&args).map(|()| ExitCode::SUCCESS),
-        Command::Enable { name } => commands::toggle::run(&name, true).map(|()| ExitCode::SUCCESS),
-        Command::Disable { name } => {
-            commands::toggle::run(&name, false).map(|()| ExitCode::SUCCESS)
-        }
-        Command::Import(args) => commands::import::run(&args).map(|()| ExitCode::SUCCESS),
-        Command::Sync(args) => commands::sync::run(&args, color).map(|()| ExitCode::SUCCESS),
-        Command::Serve(args) => commands::serve::run(&args).map(|()| ExitCode::SUCCESS),
-        Command::Connect(args) => commands::connect::run(&args).map(|()| ExitCode::SUCCESS),
-        Command::Inspect(args) => commands::inspect::run(&args, color).map(|()| ExitCode::SUCCESS),
-        Command::Watch(args) => commands::watch::run(&args, color).map(|()| ExitCode::SUCCESS),
+        Command::Add(args) => commands::add::run(&args).map(|()| 0),
+        Command::Remove(args) => commands::remove::run(&args).map(|()| 0),
+        Command::Enable { name } => commands::toggle::run(&name, true).map(|()| 0),
+        Command::Disable { name } => commands::toggle::run(&name, false).map(|()| 0),
+        Command::Import(args) => commands::import::run(&args).map(|()| 0),
+        Command::Sync(args) => commands::sync::run(&args, color).map(|()| 0),
+        Command::Serve(args) => commands::serve::run(&args).map(|()| 0),
+        Command::Connect(args) => commands::connect::run(&args).map(|()| 0),
+        Command::Inspect(args) => commands::inspect::run(&args, color).map(|()| 0),
+        Command::Watch(args) => commands::watch::run(&args, color).map(|()| 0),
         Command::Doctor {
             json,
             probe,
@@ -96,5 +115,6 @@ fn main() -> anyhow::Result<ExitCode> {
             color,
             probe.then(|| std::time::Duration::from_secs(timeout)),
         ),
+        Command::SelfUpdate(args) => commands::self_update::run(&args),
     }
 }

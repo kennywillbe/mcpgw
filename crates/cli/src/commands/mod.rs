@@ -5,6 +5,7 @@ pub mod import;
 pub mod inspect;
 pub mod list;
 pub mod remove;
+pub mod self_update;
 pub mod serve;
 pub mod sync;
 pub mod toggle;

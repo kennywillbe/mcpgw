@@ -15,6 +15,8 @@ fn run_inspect(home: &Path, config_text: &str, args: &[&str]) -> Output {
     std::fs::write(&config, config_text).unwrap();
     Command::cargo_bin("mcpgw")
         .unwrap()
+        // Hermetic: no test may phone home for a version notice.
+        .env("MCPGW_NO_UPDATE_CHECK", "1")
         .arg("inspect")
         .args(args)
         .env("MCPGW_CONFIG", &config)
