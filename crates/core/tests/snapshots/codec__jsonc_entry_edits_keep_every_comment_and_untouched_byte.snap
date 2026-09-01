@@ -1,0 +1,20 @@
+---
+source: crates/core/tests/codec.rs
+expression: text
+---
+// Hand-written config, comments and all.
+{
+  // The servers I added myself.
+  "mcpServers": {
+    // Keep this one exactly as it is.
+    "mine": { "command": "deno" },
+    "outdated": {
+      "command": "new"
+    },
+    "added": {
+      "command": "npx",
+      "args": ["-y", "srv"],
+    },
+  },
+  "telemetry": false, // and a trailing note
+}

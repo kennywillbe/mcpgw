@@ -1,0 +1,15 @@
+---
+source: crates/core/tests/codec.rs
+expression: fresh.to_text().unwrap()
+---
+{
+  "tools": {
+    "mcp": {
+      "servers": {
+        "added": {
+          "url": "u"
+        }
+      }
+    }
+  }
+}
