@@ -80,6 +80,14 @@ impl ClientKind {
         }
     }
 
+    /// Whether the client accepts remote-URL entries in its MCP config.
+    #[must_use]
+    pub fn supports_http_entries(self) -> bool {
+        // Claude Desktop only launches local stdio servers — it has no remote
+        // URL entry shape at all, so it needs the `mcpgw connect` bridge.
+        !matches!(self, Self::ClaudeDesktop)
+    }
+
     /// The JSON key holding the server map (`servers` is the VS Code outlier).
     #[must_use]
     pub fn root_key(self) -> &'static str {

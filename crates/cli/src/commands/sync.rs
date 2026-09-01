@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
-use mcpgw_core::sync::{apply_plan, plan_sync};
+use mcpgw_core::sync::{GATEWAY_NAME, apply_plan, gateway_server, plan_sync};
 use mcpgw_core::{ClientKind, Config, Detection, Error, backup, paths, state::ManagedState};
 use owo_colors::OwoColorize as _;
 
@@ -18,6 +18,12 @@ pub struct SyncArgs {
     /// Restore each selected client's config from its most recent backup
     #[arg(long, conflicts_with = "dry_run")]
     pub rollback: bool,
+    /// Write a single entry pointing at the gateway instead of one entry per server
+    #[arg(long, conflicts_with = "rollback")]
+    pub gateway: bool,
+    /// URL of the gateway written by `--gateway`
+    #[arg(long, default_value = super::connect::DEFAULT_URL, value_name = "URL")]
+    pub gateway_url: String,
 }
 
 pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
@@ -29,13 +35,31 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         return rollback(&targets, &state_dir);
     }
 
-    let config_path = super::canonical_config_path()?;
-    let canonical = match Config::load(&config_path) {
-        Ok(config) => config.servers,
-        // An absent canonical config means "manage nothing": previously
-        // managed entries get removed, everything else is untouched.
-        Err(Error::NotFound { .. }) => BTreeMap::new(),
-        Err(err) => return Err(err.into()),
+    // Gateway mode writes one synthetic entry per client, so the canonical
+    // servers are irrelevant there — an unreadable config must not block it.
+    let canonical = if args.gateway {
+        BTreeMap::new()
+    } else {
+        let config_path = super::canonical_config_path()?;
+        match Config::load(&config_path) {
+            Ok(config) => config.servers,
+            // An absent canonical config means "manage nothing": previously
+            // managed entries get removed, everything else is untouched.
+            Err(Error::NotFound { .. }) => BTreeMap::new(),
+            Err(err) => return Err(err.into()),
+        }
+    };
+
+    let bridge = if args.gateway {
+        println!(
+            "gateway mode — every client gets a single `{GATEWAY_NAME}` entry pointing at {}",
+            args.gateway_url
+        );
+        // Resolved once: probing PATH per client would give the same answer.
+        Some(bridge_command())
+    } else {
+        println!("direct mode — every enabled server gets its own client entry");
+        None
     };
 
     let state_path = state_dir.join("managed.json");
@@ -89,7 +113,16 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             .and_then(serde_json::Value::as_object)
             .unwrap_or(&empty);
         let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
-        let plan = plan_sync(kind, current, &canonical, &managed);
+        // In gateway mode the desired set is the synthetic entry alone, so
+        // entries managed by an earlier direct sync fall out as removes.
+        let gateway_desired = bridge.as_ref().map(|command| {
+            BTreeMap::from([(
+                GATEWAY_NAME.to_owned(),
+                gateway_server(kind, &args.gateway_url, command),
+            )])
+        });
+        let desired = gateway_desired.as_ref().unwrap_or(&canonical);
+        let plan = plan_sync(kind, current, desired, &managed);
 
         heading(&describe(&plan));
         print_plan_lines(&plan, color);
@@ -112,6 +145,18 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         state.save(&state_path)?;
     }
     Ok(())
+}
+
+/// What the client should run to reach the gateway over stdio.
+///
+/// The bare name keeps working across upgrades and is what a user reading the
+/// client file expects; the absolute path is the fallback for an mcpgw that
+/// was never put on PATH (a downloaded binary run in place).
+fn bridge_command() -> String {
+    if which::which("mcpgw").is_ok() {
+        return "mcpgw".to_owned();
+    }
+    std::env::current_exe().map_or_else(|_| "mcpgw".to_owned(), |path| path.display().to_string())
 }
 
 fn describe(plan: &mcpgw_core::sync::SyncPlan) -> String {

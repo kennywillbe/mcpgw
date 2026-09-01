@@ -121,6 +121,36 @@ pub fn apply_plan(kind: ClientKind, root: &mut serde_json::Value, plan: &SyncPla
     }
 }
 
+/// The entry name mcpgw owns in every client when syncing in gateway mode.
+pub const GATEWAY_NAME: &str = "mcpgw";
+
+/// The synthetic server that points one client at a running gateway.
+///
+/// It is a plain [`Server`] so gateway mode reaches the client file through
+/// [`client_entry`] like every other entry — the two shapes cannot drift.
+#[must_use]
+pub fn gateway_server(kind: ClientKind, url: &str, bridge_command: &str) -> Server {
+    let transport = if kind.supports_http_entries() {
+        Transport::Http {
+            url: url.to_owned(),
+            headers: BTreeMap::new(),
+        }
+    } else {
+        Transport::Stdio {
+            command: bridge_command.to_owned(),
+            // The URL is spelled out even when it is the default, so a reader
+            // of the client file can see where the bridge points.
+            args: vec!["connect".to_owned(), "--url".to_owned(), url.to_owned()],
+            env: BTreeMap::new(),
+        }
+    };
+    Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport,
+    }
+}
+
 /// The client-shaped JSON for one canonical server.
 ///
 /// VS Code's schema wants an explicit `type` on every entry; the

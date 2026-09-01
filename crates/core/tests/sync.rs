@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use mcpgw_core::state::ManagedState;
-use mcpgw_core::sync::{apply_plan, client_entry, plan_sync};
+use mcpgw_core::sync::{apply_plan, client_entry, gateway_server, plan_sync};
 use mcpgw_core::{ClientKind, Config, backup};
 
 fn canonical() -> BTreeMap<String, mcpgw_core::Server> {
@@ -117,6 +117,34 @@ fn entry_shapes_per_client() {
     assert!(cursor_stdio.get("type").is_none());
     assert_eq!(cursor_http["type"], "http");
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
+}
+
+#[test]
+fn gateway_entry_shapes_per_client() {
+    let url = "http://127.0.0.1:8137/mcp";
+    let http = client_entry(
+        ClientKind::Cursor,
+        &gateway_server(ClientKind::Cursor, url, "mcpgw"),
+    );
+    assert_eq!(http["type"], "http");
+    assert_eq!(http["url"], url);
+    assert!(http.get("command").is_none());
+
+    // Claude Desktop cannot take a URL, so it gets the stdio bridge.
+    let stdio = client_entry(
+        ClientKind::ClaudeDesktop,
+        &gateway_server(ClientKind::ClaudeDesktop, url, "/opt/mcpgw"),
+    );
+    assert_eq!(stdio["command"], "/opt/mcpgw");
+    assert_eq!(stdio["args"], serde_json::json!(["connect", "--url", url]));
+    assert!(stdio.get("url").is_none());
+
+    for kind in ClientKind::ALL {
+        assert_eq!(
+            kind.supports_http_entries(),
+            kind != ClientKind::ClaudeDesktop
+        );
+    }
 }
 
 #[test]
