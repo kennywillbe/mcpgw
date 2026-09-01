@@ -25,6 +25,9 @@ pub(crate) fn create_dir_all(dir: &Path) -> std::io::Result<()> {
 /// Syncing the temp file only makes its *contents* durable; without this the
 /// rename that publishes them can still be lost to a power cut. Windows
 /// exposes no directory handle to sync, so there this is a no-op.
+// The signature stays uniform so callers never cfg their error handling;
+// off unix the body has nothing left that can fail.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -38,6 +41,8 @@ pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Narrows an existing file to owner read/write.
+// Same reason as `sync_dir`: uniform signature, nothing fallible off unix.
+#[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
 pub(crate) fn harden_file(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
