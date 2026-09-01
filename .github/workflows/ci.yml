@@ -19,5 +19,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # --locked everywhere: an off-lock re-resolution has already broken
+      # this build once, when a patch-level bump under toml/serde_json moved
+      # the boxed error layouts in crates/core/src/error.rs. release.yml
+      # pins the same way.
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
