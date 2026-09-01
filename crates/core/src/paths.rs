@@ -5,7 +5,11 @@ use std::path::PathBuf;
 /// suite uses to keep tests away from the real home directory.
 pub const CONFIG_ENV: &str = "MCPGW_CONFIG";
 
+/// Overrides the state directory (managed-state, backups); test seam.
+pub const STATE_ENV: &str = "MCPGW_STATE_DIR";
+
 const XDG_ENV: &str = "XDG_CONFIG_HOME";
+const XDG_DATA_ENV: &str = "XDG_DATA_HOME";
 
 #[cfg(windows)]
 const HOME_ENV: &str = "USERPROFILE";
@@ -35,6 +39,26 @@ pub fn config_path_with(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBu
         None => PathBuf::from(get(HOME_ENV).filter(|v| !v.is_empty())?).join(".config"),
     };
     Some(base.join("mcpgw").join("config.toml"))
+}
+
+/// Resolves mcpgw's state directory (`~/.local/share/mcpgw` by convention,
+/// like the config path deliberately identical on every platform).
+#[must_use]
+pub fn state_dir() -> Option<PathBuf> {
+    state_dir_with(|key| std::env::var_os(key))
+}
+
+/// Same as [`state_dir`] with an injectable environment.
+#[must_use]
+pub fn state_dir_with(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if let Some(explicit) = get(STATE_ENV).filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(explicit));
+    }
+    let base = match get(XDG_DATA_ENV).filter(|v| !v.is_empty()) {
+        Some(xdg) => PathBuf::from(xdg),
+        None => PathBuf::from(get(HOME_ENV).filter(|v| !v.is_empty())?).join(".local/share"),
+    };
+    Some(base.join("mcpgw"))
 }
 
 #[cfg(test)]

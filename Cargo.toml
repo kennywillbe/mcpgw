@@ -18,7 +18,7 @@ tempfile = "3"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 url = "2"
 which = "8"
 rmcp = { version = "3", features = ["client", "transport-child-process"] }

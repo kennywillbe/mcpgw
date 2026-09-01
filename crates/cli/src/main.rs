@@ -39,6 +39,8 @@ enum Command {
         /// Server name
         name: String,
     },
+    /// Push the canonical server list into client configs
+    Sync(commands::sync::SyncArgs),
     /// Diagnose the canonical config and every detected client
     Doctor {
         /// Machine-readable output
@@ -64,6 +66,7 @@ fn main() -> anyhow::Result<ExitCode> {
         Command::Disable { name } => {
             commands::toggle::run(&name, false).map(|()| ExitCode::SUCCESS)
         }
+        Command::Sync(args) => commands::sync::run(&args, color).map(|()| ExitCode::SUCCESS),
         Command::Doctor {
             json,
             probe,

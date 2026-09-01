@@ -53,6 +53,23 @@ impl ClientKind {
         Self::VsCode,
     ];
 
+    /// Stable machine id used in `--client` filters and the state file.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ClaudeDesktop => "claude-desktop",
+            Self::ClaudeCode => "claude-code",
+            Self::Cursor => "cursor",
+            Self::VsCode => "vscode",
+        }
+    }
+
+    /// Reverse of [`ClientKind::id`].
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.id() == id)
+    }
+
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {

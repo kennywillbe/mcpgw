@@ -1,0 +1,15 @@
+---
+source: crates/core/tests/sync.rs
+expression: "serde_json::to_string_pretty(&vs_stdio).unwrap()"
+---
+{
+  "type": "stdio",
+  "command": "npx",
+  "args": [
+    "-y",
+    "@modelcontextprotocol/server-github"
+  ],
+  "env": {
+    "TOKEN": "t"
+  }
+}

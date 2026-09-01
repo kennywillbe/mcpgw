@@ -2,6 +2,7 @@ pub mod add;
 pub mod doctor;
 pub mod list;
 pub mod remove;
+pub mod sync;
 pub mod toggle;
 
 use std::io::Write as _;

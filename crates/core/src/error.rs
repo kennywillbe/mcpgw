@@ -62,6 +62,13 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+
+    #[error("invalid mcpgw state file {path} (delete it to reset; entries become unmanaged)")]
+    StateParse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 fn known(available: &[String]) -> String {
