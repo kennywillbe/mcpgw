@@ -271,6 +271,44 @@ fn windsurf_reads_both_remote_spellings() {
 }
 
 #[test]
+fn zed_reads_context_servers_whatever_their_source() {
+    let read = read_fixture(ClientKind::Zed, "zed_settings.jsonc");
+
+    // The stdio shape is the shared one; `source` is not part of it.
+    assert_eq!(
+        read.servers["github"].transport,
+        mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: vec![
+                "-y".to_owned(),
+                "@modelcontextprotocol/server-github".to_owned()
+            ],
+            env: [("GITHUB_TOKEN".to_owned(), "ghp_example".to_owned())]
+                .into_iter()
+                .collect(),
+        }
+    );
+    // An entry an extension installed carries a source of its own, and is
+    // read like any other — a user who has it should see it.
+    assert!(read.servers.contains_key("postgres"));
+    // A remote context server is a bare `url`, with no `type` to say so.
+    assert_eq!(
+        read.servers["linear"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [("Authorization".to_owned(), "Bearer token".to_owned())]
+                .into_iter()
+                .collect(),
+        }
+    );
+    // `source: custom` alone is not a server; it is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    assert_eq!(read.servers.len(), 3);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+#[test]
 fn broken_entries_become_problems_not_failures() {
     let read = read_fixture(ClientKind::ClaudeDesktop, "messy.json");
     // Exactly one entry survives; every other becomes a reported problem.
@@ -392,6 +430,25 @@ fn detect_reports_three_states() {
     std::fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
     assert_eq!(
         ClientKind::Windsurf.detect_with(&env),
+        Detection::Configured(config)
+    );
+
+    // Zed is XDG on macOS too, so its directory is under the home dir on
+    // every non-Windows platform rather than in the app-data dir.
+    let trace = ClientKind::Zed.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Zed.detect_with(&env), Detection::Installed);
+    let config = ClientKind::Zed.config_path_with(&env).unwrap();
+    if cfg!(windows) {
+        assert!(config.ends_with("AppData/Zed/settings.json"));
+    } else {
+        assert!(config.ends_with(".config/zed/settings.json"));
+    }
+    // The settings file is the whole editor's, so it counts as configured
+    // even before anything puts a `context_servers` key in it.
+    std::fs::write(&config, "// mine\n{ \"vim_mode\": true }\n").unwrap();
+    assert_eq!(
+        ClientKind::Zed.detect_with(&env),
         Detection::Configured(config)
     );
 }

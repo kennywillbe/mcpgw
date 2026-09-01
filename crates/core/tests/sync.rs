@@ -174,14 +174,25 @@ fn entry_shapes_per_client() {
     assert!(windsurf_http.get("url").is_none());
     assert!(windsurf_http.get("type").is_none());
 
+    // Zed is the shared shape plus the `source` Zed silently requires; an
+    // entry written without it is one Zed drops on the floor.
+    let zed_stdio = client_entry(ClientKind::Zed, &canonical["github"]);
+    let zed_http = client_entry(ClientKind::Zed, &canonical["linear"]);
+    assert_eq!(zed_stdio["source"], "custom");
+    assert_eq!(zed_http["source"], "custom");
+    assert_eq!(zed_stdio["command"], "npx");
+    assert_eq!(zed_stdio["env"]["TOKEN"], "t");
+    assert_eq!(zed_http["url"], "https://mcp.linear.app/mcp");
+    assert!(zed_http.get("type").is_none());
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
 }
 
 /// The clients whose entry shape is rewritten rather than passed through:
 /// opencode splits and rejoins the `command` array, Windsurf renames the
-/// remote URL. Emitting and re-reading has to give back the server that went
-/// in — for every client, but for these two it is load bearing rather than
-/// incidental.
+/// remote URL, Zed adds a `source` its reader has to ignore. Emitting and
+/// re-reading has to give back the server that went in — for every client,
+/// but for these three it is load bearing rather than incidental.
 #[test]
 fn emitting_and_re_reading_an_entry_returns_the_same_server() {
     let mut servers: Vec<mcpgw_core::Server> = canonical().into_values().collect();
@@ -214,7 +225,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
         },
     });
 
-    for kind in [ClientKind::Opencode, ClientKind::Windsurf] {
+    for kind in [ClientKind::Opencode, ClientKind::Windsurf, ClientKind::Zed] {
         let entries = kind.codec().entries;
         for server in &servers {
             let emitted = entries.emit(server);
@@ -285,6 +296,15 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(windsurf["serverUrl"], url);
     assert!(windsurf.get("url").is_none());
     assert!(windsurf.get("command").is_none());
+
+    // The gateway is an entry like any other, so it needs the `source` too.
+    let zed = client_entry(
+        ClientKind::Zed,
+        &gateway_server(ClientKind::Zed, url, "mcpgw"),
+    );
+    assert_eq!(zed["url"], url);
+    assert_eq!(zed["source"], "custom");
+    assert!(zed.get("command").is_none());
 
     for kind in ClientKind::ALL {
         assert_eq!(

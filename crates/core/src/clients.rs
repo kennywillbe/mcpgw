@@ -1,6 +1,6 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
 //! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI,
-//! opencode, Windsurf).
+//! opencode, Windsurf, Zed).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -30,6 +30,7 @@ pub enum ClientKind {
     Codex,
     Opencode,
     Windsurf,
+    Zed,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -58,7 +59,7 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
@@ -67,6 +68,7 @@ impl ClientKind {
         Self::Codex,
         Self::Opencode,
         Self::Windsurf,
+        Self::Zed,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -81,6 +83,7 @@ impl ClientKind {
             Self::Codex => "codex",
             Self::Opencode => "opencode",
             Self::Windsurf => "windsurf",
+            Self::Zed => "zed",
         }
     }
 
@@ -102,6 +105,7 @@ impl ClientKind {
             // Lowercase is the project's own spelling of its name.
             Self::Opencode => "opencode",
             Self::Windsurf => "Windsurf",
+            Self::Zed => "Zed",
         }
     }
 
@@ -119,8 +123,9 @@ impl ClientKind {
     /// the map and wants an explicit entry `type`, Gemini CLI keeps the map
     /// name but spells entries its own way, Codex CLI is TOML end to end —
     /// a `[mcp_servers]` table of `snake_case` entries — opencode is
-    /// JSONC under a plain `mcp` key, and Windsurf keeps the `mcpServers`
-    /// rules but spells the remote URL `serverUrl`.
+    /// JSONC under a plain `mcp` key, Windsurf keeps the `mcpServers`
+    /// rules but spells the remote URL `serverUrl`, and Zed keeps its
+    /// servers under `context_servers` inside its whole-editor settings.
     #[must_use]
     pub fn codec(self) -> Codec {
         match self {
@@ -150,6 +155,13 @@ impl ClientKind {
                 format: Format::Json,
                 root: RootPath::new(&["mcpServers"]),
                 entries: EntrySchema::Windsurf,
+            },
+            // Zed's settings file is hand-edited and its own parser accepts
+            // comments, so it is read and written as JSONC.
+            Self::Zed => Codec {
+                format: Format::Jsonc,
+                root: RootPath::new(&["context_servers"]),
+                entries: EntrySchema::Zed,
             },
             _ => Codec {
                 format: Format::Json,
@@ -207,6 +219,7 @@ impl ClientKind {
             // re-checking: it is still `.codeium` today, and a future one
             // becomes another entry in the candidate list above.
             Self::Windsurf => home_dir(&get).map(|dir| dir.join(".codeium/windsurf")),
+            Self::Zed => zed_config_dir(&get),
         }) else {
             return Vec::new();
         };
@@ -214,7 +227,10 @@ impl ClientKind {
             Self::ClaudeDesktop => &["claude_desktop_config.json"],
             Self::ClaudeCode => &[".claude.json"],
             Self::Cursor | Self::VsCode => &["mcp.json"],
-            Self::Gemini => &["settings.json"],
+            // Neither of these is an MCP file: each is the whole of its
+            // tool's settings, so everything outside the server map is
+            // foreign state a write has to leave exactly as it found it.
+            Self::Gemini | Self::Zed => &["settings.json"],
             Self::Codex => &["config.toml"],
             Self::Opencode => &["opencode.json", "opencode.jsonc"],
             Self::Windsurf => &["mcp_config.json"],
@@ -236,6 +252,7 @@ impl ClientKind {
             Self::Codex => home_dir(&get)?.join(".codex"),
             Self::Opencode => xdg_config_dir(&get)?.join("opencode"),
             Self::Windsurf => home_dir(&get)?.join(".codeium/windsurf"),
+            Self::Zed => zed_config_dir(&get)?,
         };
         Some(path)
     }
@@ -392,6 +409,20 @@ fn app_data_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
         get("APPDATA").filter(|v| !v.is_empty()).map(PathBuf::from)
     } else {
         xdg_config_dir(get)
+    }
+}
+
+// Zed is XDG on macOS as well as Linux — its settings are in ~/.config/zed
+// on both, *not* in ~/Library/Application Support like the GUI clients that
+// go through `app_data_dir`. Windows is the one platform where it uses the
+// native app-data dir.
+fn zed_config_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    if cfg!(windows) {
+        get("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|appdata| PathBuf::from(appdata).join("Zed"))
+    } else {
+        Some(xdg_config_dir(get)?.join("zed"))
     }
 }
 

@@ -345,6 +345,48 @@ fn import_from_windsurf_reads_both_remote_spellings() {
 }
 
 #[test]
+fn import_from_zed_reads_every_source_out_of_the_editor_settings() {
+    let sb = Sandbox::new();
+    // Zed is XDG on macOS as well as Linux; Windows is the exception.
+    let rel = if cfg!(windows) {
+        "AppData/Zed/settings.json"
+    } else {
+        ".config/zed/settings.json"
+    };
+    sb.write_client(
+        rel,
+        r#"// mine
+        {
+            "theme": "One Dark",
+            "context_servers": {
+                "github": {"source": "custom", "command": "npx",
+                           "args": ["server-github"]},
+                "postgres": {"source": "extension",
+                             "command": "postgres-context-server"},
+                "linear": {"source": "custom", "url": "https://mcp.linear.app/mcp"}
+            }
+        }"#,
+    );
+    let out = sb.ok(&["import", "--from", "zed"]);
+    for name in ["+ github", "+ postgres", "+ linear"] {
+        assert!(out.contains(name), "{out}");
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    // `source` is Zed's own bookkeeping and has no canonical counterpart.
+    let canonical = std::fs::read_to_string(sb.home.join("config.toml")).unwrap();
+    assert!(!canonical.contains("source ="), "{canonical}");
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "zed"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
+#[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.write_client(

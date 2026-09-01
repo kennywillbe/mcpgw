@@ -115,6 +115,9 @@ pub enum EntrySchema {
     /// Windsurf's shape: the `mcpServers` rules with the remote URL spelled
     /// `serverUrl`.
     Windsurf,
+    /// Zed's `context_servers` shape: the `mcpServers` fields, no `type`,
+    /// and a mandatory `source` on anything written.
+    Zed,
 }
 
 impl EntrySchema {
@@ -136,7 +139,11 @@ impl EntrySchema {
             Self::Codex => parse_codex(obj),
             Self::Opencode => parse_opencode(obj),
             Self::Windsurf => parse_windsurf(obj),
-            Self::McpServers | Self::VsCode => parse_mcp_servers(obj),
+            // Zed adds `source` to the shared fields and nothing else, and
+            // that one is read as absent: an entry an extension installed
+            // carries a source of its own, and refusing to read it would
+            // hide a server the user does have.
+            Self::McpServers | Self::VsCode | Self::Zed => parse_mcp_servers(obj),
         }
     }
 
@@ -181,6 +188,12 @@ impl EntrySchema {
                         obj.insert("serverUrl".to_owned(), url.as_str().into());
                         "headers"
                     }
+                    Self::Zed => {
+                        // A remote context server is a bare `url`; Zed has
+                        // no `type` field to disambiguate it from stdio.
+                        obj.insert("url".to_owned(), url.as_str().into());
+                        "headers"
+                    }
                     Self::McpServers | Self::VsCode => {
                         obj.insert("type".to_owned(), "http".into());
                         obj.insert("url".to_owned(), url.as_str().into());
@@ -192,6 +205,15 @@ impl EntrySchema {
                     obj.insert(headers_key.to_owned(), string_map(headers));
                 }
             }
+        }
+        if matches!(self, Self::Zed) {
+            // Zed drops a context server that carries no `source` without
+            // saying anything — the commonest reason a hand-added server
+            // never shows up in it. `custom` is the value for one the user
+            // configured, and it is the only one mcpgw ever writes: any
+            // other source claims the entry came from an extension Zed
+            // would then load code from (GHSA-cv6g-cmxc-vw8j).
+            obj.insert("source".to_owned(), "custom".into());
         }
         Value::Object(obj)
     }

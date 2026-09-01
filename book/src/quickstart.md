@@ -10,8 +10,8 @@ mcpgw import
 ```
 
 `import` reads Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI,
-Codex CLI, opencode and Windsurf, and pulls every server it finds into the
-canonical config. Names
+Codex CLI, opencode, Windsurf and Zed, and pulls every server it finds into
+the canonical config. Names
 that aren't valid mcpgw names get slugified, and every rename is printed. The
 same server configured in three clients is imported once.
 
@@ -21,7 +21,8 @@ mcpgw import --from cursor      # only one client (repeatable)
 ```
 
 Client ids are `claude-desktop`, `claude-code`, `cursor`, `vscode`, `gemini`,
-`codex`, `opencode`, `windsurf` — `mcpgw sync --help` prints the current list.
+`codex`, `opencode`, `windsurf`, `zed` — `mcpgw sync --help` prints the
+current list.
 
 ## 2. Add the rest by hand
 

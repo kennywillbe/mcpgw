@@ -111,8 +111,8 @@ fn json_output_carries_findings_and_counts() {
     assert_eq!(value["findings"][0]["severity"], "error");
     assert_eq!(value["findings"][0]["server"], "ghost");
     let clients = value["clients"].as_array().unwrap();
-    assert_eq!(clients.len(), 8);
-    for name in ["Gemini CLI", "Codex CLI", "opencode", "Windsurf"] {
+    assert_eq!(clients.len(), 9);
+    for name in ["Gemini CLI", "Codex CLI", "opencode", "Windsurf", "Zed"] {
         assert!(clients.iter().any(|c| c["client"] == name), "{clients:?}");
     }
 }
