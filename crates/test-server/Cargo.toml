@@ -10,7 +10,7 @@ publish = false
 serde_json.workspace = true
 
 [dev-dependencies]
-mcpgw-core = { version = "0.2.2", path = "../core" }
+mcpgw-core = { version = "0.3.0", path = "../core" }
 tokio.workspace = true
 rmcp-client-http.workspace = true
 axum.workspace = true
