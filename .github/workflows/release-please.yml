@@ -17,6 +17,12 @@ permissions:
   contents: write
   pull-requests: write
 
+# Serialize, never cancel: a cancelled run can leave a half-written release PR
+# or a tag pushed without its GitHub release.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
 jobs:
   release-please:
     runs-on: ubuntu-latest
