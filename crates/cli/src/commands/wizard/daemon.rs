@@ -190,6 +190,7 @@ fn install(
     if let Err(err) = mcpgw_core::daemon::preflight(&spec) {
         return Ok(no_service(cx, &err.to_string()));
     }
+    crate::commands::daemon::warn_about_protected_paths(&spec);
 
     let installed = match service.install(&spec) {
         Ok(installed) => installed,
@@ -202,6 +203,22 @@ fn install(
             return Ok(Outcome::Handled);
         }
     };
+
+    // Same record `mcpgw daemon install` leaves, and for the same reason:
+    // the wizard can be pointed at any port with --gateway-url, and a later
+    // `mcpgw daemon status` must probe that one rather than the default.
+    if let Err(err) = mcpgw_core::daemon::save_spec(&spec) {
+        println!(
+            "  {}",
+            ui::dim(
+                &format!(
+                    "the address could not be recorded ({err}), so `mcpgw daemon status` will \
+                     need --url",
+                ),
+                cx.color,
+            )
+        );
+    }
 
     println!("  installed at {}", installed.unit_path.display());
     for note in &installed.notes {

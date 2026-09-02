@@ -129,11 +129,7 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
         .filter(|c| c.origins.len() > 1 && !clashing.contains(c.name.as_str()))
         .collect();
     if !shared.is_empty() {
-        bullets.push(format!(
-            "{} of them are the same server configured in more than one place — \
-             I'll keep one copy of each:",
-            shared.len()
-        ));
+        bullets.push(shared_heading(shared.len()));
         for candidate in &shared {
             bullets.push(format!(
                 "  {} — from {}{}",
@@ -211,6 +207,23 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
         ));
     }
     bullets
+}
+
+/// The heading over the servers that turned up in more than one client.
+///
+/// Written out twice rather than pluralized by rule: one duplicate is the
+/// common case on a first run, and "1 of them are" on the first screen mcpgw
+/// ever shows reads like a machine talking.
+fn shared_heading(count: usize) -> String {
+    if count == 1 {
+        "1 of them is the same server configured in more than one place — I'll keep one copy:"
+            .to_owned()
+    } else {
+        format!(
+            "{count} of them are the same server configured in more than one place — \
+             I'll keep one copy of each:"
+        )
+    }
 }
 
 /// Candidates grouped by the client-side name two of them disagreed about:

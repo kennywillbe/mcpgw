@@ -55,6 +55,17 @@ Two things in it are decisions rather than defaults:
   with every stdio server failing to spawn. The cost is that the `PATH` is
   frozen: change it, or move your config, and re-run `install`.
 
+One thing to avoid: a launch agent cannot read through `~/Desktop`,
+`~/Documents` or `~/Downloads` unless it has been granted Full Disk Access,
+and it has no way to ask for one. A binary that lives in any of those does
+not fail to start — it hangs before it runs, so the service reports itself
+running, the logs stay empty and nothing ever listens. The same applies to
+any stdio server whose command resolves into one of those folders. `install`
+warns when it sees either and installs anyway (the grant may already be
+there, and nothing in the API says whether it is). A Homebrew or `cargo
+install` path is never affected; a `target/release` build inside a Desktop
+clone always is.
+
 The rest of the commands do what they say:
 
 ```sh
@@ -264,6 +275,15 @@ when its terminal does
 Three separate questions, deliberately: something can be listening on the
 port without being a gateway, and a gateway can be running without anything
 being installed to keep it running. `--url` points the probe somewhere else.
+
+The probe follows the service. `mcpgw daemon install` records the address it
+installed with under the state directory (`daemon.json`, `0600`, removed
+again by `mcpgw daemon uninstall`), so a service installed with `--port
+18137` is probed on 18137 and `mcpgw daemon start` brings it back up there
+too — neither needs the flag repeated. With nothing recorded both fall back
+to `http://127.0.0.1:8137/mcp`; a service installed by 0.3.0 or earlier is in
+that state, and `status` names it rather than reporting a healthy gateway as
+down.
 
 It exits `0` when a gateway is answering and `1` when it is not, so it can be
 used as a check in a script.

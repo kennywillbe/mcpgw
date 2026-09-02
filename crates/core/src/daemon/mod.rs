@@ -56,6 +56,10 @@ pub const STDOUT_LOG: &str = "daemon.out.log";
 /// Filename the daemon's stderr is redirected to.
 pub const STDERR_LOG: &str = "daemon.err.log";
 
+/// Filename, under the state dir, recording what the installed service was
+/// installed with. See [`save_spec`].
+pub const SPEC_FILE: &str = "daemon.json";
+
 /// How long a status probe waits for the gateway before calling it down.
 /// Loopback either answers immediately or is not there.
 pub const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -71,7 +75,12 @@ pub fn platform_service() -> PlatformService {
 /// Built once by the CLI and handed to the platform unchanged, so the three
 /// implementations cannot disagree about which binary, which config or which
 /// address the installed service will use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Also what [`save_spec`] persists at install time: a `status` that dialed a
+/// default while the service was installed on another port reported a healthy
+/// gateway as down, and no supervisor offers a portable way to read the
+/// address back out of its own definition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DaemonSpec {
     /// Absolute path to the `mcpgw` binary the service should run.
     pub exe: PathBuf,
@@ -122,7 +131,7 @@ impl DaemonSpec {
 }
 
 /// The two files a supervised gateway writes its output to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogPaths {
     pub stdout: PathBuf,
     pub stderr: PathBuf,
@@ -359,6 +368,121 @@ fn touch_owner_only(path: &Path) -> Result<(), DaemonError> {
         path: path.to_owned(),
         source,
     })
+}
+
+/// The home-relative folders macOS puts behind TCC.
+///
+/// A launch agent has no TCC grant and no window to ask for one, so a binary
+/// under any of these does not fail to start — it hangs in dyld before
+/// `main`, which is why this is worth a warning of its own rather than being
+/// left to `daemon logs` (there are none) or `daemon status` (it says the
+/// service is running).
+#[cfg(target_os = "macos")]
+pub const TCC_PROTECTED_DIRS: [&str; 3] = ["Desktop", "Documents", "Downloads"];
+
+/// Which TCC-protected folder of `home` `path` sits under, if any.
+///
+/// `home` is a parameter rather than read from the environment so the check
+/// is testable without one, and both sides are canonicalized so a symlinked
+/// `~/Desktop/mcpgw/target/release/mcpgw` is not waved through. A path that
+/// cannot be canonicalized (it may not exist yet) is compared as given.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn tcc_protected_dir(path: &Path, home: &Path) -> Option<&'static str> {
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let path = real(path);
+    let home = real(home);
+    TCC_PROTECTED_DIRS
+        .into_iter()
+        .find(|dir| path.starts_with(home.join(dir)))
+}
+
+/// Where [`save_spec`] records the installed service's [`DaemonSpec`].
+#[must_use]
+pub fn spec_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(SPEC_FILE)
+}
+
+/// Records `spec` as the shape of the service that was just installed.
+///
+/// Written by the shared CLI install path rather than by a platform, so
+/// launchd, systemd and the Windows service manager all leave the same file
+/// behind and `status` needs no per-OS parser for a plist, a unit or a
+/// registry value.
+///
+/// # Errors
+///
+/// [`DaemonError::Io`] when the state directory or the file cannot be written.
+pub fn save_spec(spec: &DaemonSpec) -> Result<(), DaemonError> {
+    let path = spec_path(&spec.state_dir);
+    crate::private::create_dir_all(&spec.state_dir).map_err(|source| DaemonError::Io {
+        action: "create",
+        path: spec.state_dir.clone(),
+        source,
+    })?;
+    let json = serde_json::to_vec_pretty(spec).map_err(|source| DaemonError::Io {
+        action: "encode",
+        path: path.clone(),
+        source: source.into(),
+    })?;
+    // Created 0600 rather than hardened afterwards: the file names a config
+    // path and a home directory, and a window where it is world-readable is
+    // a window.
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|source| DaemonError::Io {
+        action: "create",
+        path: path.clone(),
+        source,
+    })?;
+    std::io::Write::write_all(&mut file, &json).map_err(|source| DaemonError::Io {
+        action: "write",
+        path: path.clone(),
+        source,
+    })?;
+    drop(file);
+    // A file left behind by an earlier, looser build is narrowed rather than
+    // left as found — same discipline as the log files.
+    crate::private::harden_file(&path).map_err(|source| DaemonError::Io {
+        action: "harden",
+        path,
+        source,
+    })
+}
+
+/// The spec the installed service was installed with, if one was recorded.
+///
+/// [`None`] covers both "nothing is installed" and "installed by a build
+/// before this file existed", which callers treat the same way: fall back to
+/// the defaults and say so if the defaults turn out to be wrong.
+#[must_use]
+pub fn load_spec(state_dir: &Path) -> Option<DaemonSpec> {
+    let bytes = std::fs::read(spec_path(state_dir)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Forgets the recorded spec. Removing one that is not there succeeds: the
+/// end state is what was asked for.
+///
+/// # Errors
+///
+/// [`DaemonError::Io`] when the file exists and cannot be removed.
+pub fn remove_spec(state_dir: &Path) -> Result<(), DaemonError> {
+    let path = spec_path(state_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DaemonError::Io {
+            action: "remove",
+            path,
+            source,
+        }),
+    }
 }
 
 /// How far a status probe got against a gateway URL.

@@ -124,6 +124,93 @@ fn a_spec_names_the_url_and_the_serve_arguments_a_service_will_run() {
     assert_eq!(spec("::1", 9000, dir.path()).url(), "http://[::1]:9000/mcp");
 }
 
+/// The record `status` reads to find out where the service it is asking
+/// about actually listens.
+#[test]
+fn the_installed_spec_survives_a_round_trip_through_the_state_dir() {
+    use mcpgw_core::daemon::{load_spec, remove_spec, save_spec, spec_path};
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    // Nothing recorded is not a failure — it is every install made before
+    // this file existed, and every machine with no service at all.
+    assert_eq!(load_spec(&state), None);
+
+    let installed = spec("127.0.0.1", 18137, &state);
+    save_spec(&installed).unwrap();
+    assert_eq!(load_spec(&state), Some(installed.clone()));
+    assert_eq!(
+        load_spec(&state).unwrap().url(),
+        "http://127.0.0.1:18137/mcp"
+    );
+
+    // Half a file, or one from a future schema, must not stop `status` from
+    // running — it falls back to the default exactly as if none were there.
+    std::fs::write(spec_path(&state), b"{\"bind\":").unwrap();
+    assert_eq!(load_spec(&state), None);
+
+    save_spec(&installed).unwrap();
+    remove_spec(&state).unwrap();
+    assert!(!spec_path(&state).exists());
+    // Removing what is not there is the end state that was asked for.
+    remove_spec(&state).unwrap();
+}
+
+/// It names a config path and a home directory, so it gets the same 0600 the
+/// rest of the state dir has.
+#[cfg(unix)]
+#[test]
+fn the_installed_spec_is_written_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let path = mcpgw_core::daemon::spec_path(&state);
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    mcpgw_core::daemon::save_spec(&spec("127.0.0.1", 18137, &state)).unwrap();
+    assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
+
+    // A file an older, looser build left readable is narrowed on the next
+    // write rather than left as found.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    mcpgw_core::daemon::save_spec(&spec("127.0.0.1", 18137, &state)).unwrap();
+    assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
+}
+
+/// The folders a launch agent cannot read through, and where the silent dyld
+/// hang comes from. Driven with an injected home so it runs the same on a CI
+/// runner as on a developer's machine.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_binary_under_a_tcc_protected_folder_is_named_by_the_folder() {
+    use mcpgw_core::daemon::tcc_protected_dir;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    for folder in ["Desktop", "Documents", "Downloads"] {
+        let exe = home.join(folder).join("clone/target/release/mcpgw");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+        assert_eq!(tcc_protected_dir(&exe, home), Some(folder));
+    }
+    // The paths a real install uses, and a folder that merely starts like a
+    // protected one.
+    for exe in [
+        home.join("Desktopish/mcpgw"),
+        home.join(".cargo/bin/mcpgw"),
+        PathBuf::from("/opt/homebrew/bin/mcpgw"),
+    ] {
+        assert_eq!(tcc_protected_dir(&exe, home), None, "{}", exe.display());
+    }
+    // A symlink out of an unprotected path into Desktop hangs just the same,
+    // so both sides are compared canonicalized.
+    let link = home.join("bin-mcpgw");
+    std::os::unix::fs::symlink(home.join("Desktop/clone/target/release/mcpgw"), &link).unwrap();
+    assert_eq!(tcc_protected_dir(&link, home), Some("Desktop"));
+}
+
 #[tokio::test]
 async fn a_port_nobody_holds_probes_as_down() {
     // Bound and released: the port is known to have been free, and nothing
