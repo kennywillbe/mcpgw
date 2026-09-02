@@ -3,8 +3,8 @@ use std::path::Path;
 
 use mcpgw_core::state::ManagedState;
 use mcpgw_core::sync::{
-    apply_plan, apply_plan_to, client_entry, gateway_server, per_server_gateway_server,
-    per_server_gateway_servers, plan_client_context, plan_sync,
+    apply_plan, apply_plan_to, client_entry, per_server_gateway_server, per_server_gateway_servers,
+    plan_client_context, plan_sync,
 };
 use mcpgw_core::{ClientKind, Config, backup};
 
@@ -426,108 +426,6 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
     }
 }
 
-#[test]
-fn gateway_entry_shapes_per_client() {
-    let url = "http://127.0.0.1:8137/mcp";
-    let http = client_entry(
-        ClientKind::Cursor,
-        &gateway_server(ClientKind::Cursor, url, "mcpgw"),
-    );
-    assert_eq!(http["type"], "http");
-    assert_eq!(http["url"], url);
-    assert!(http.get("command").is_none());
-
-    // Claude Desktop cannot take a URL, so it gets the stdio bridge.
-    let stdio = client_entry(
-        ClientKind::ClaudeDesktop,
-        &gateway_server(ClientKind::ClaudeDesktop, url, "/opt/mcpgw"),
-    );
-    assert_eq!(stdio["command"], "/opt/mcpgw");
-    assert_eq!(stdio["args"], serde_json::json!(["connect", "--url", url]));
-    assert!(stdio.get("url").is_none());
-
-    // Gemini takes the gateway over HTTP, spelled its own way.
-    let gemini = client_entry(
-        ClientKind::Gemini,
-        &gateway_server(ClientKind::Gemini, url, "mcpgw"),
-    );
-    assert_eq!(gemini["httpUrl"], url);
-    assert!(gemini.get("url").is_none());
-    assert!(gemini.get("command").is_none());
-
-    // opencode takes the gateway as a remote entry.
-    let opencode = client_entry(
-        ClientKind::Opencode,
-        &gateway_server(ClientKind::Opencode, url, "mcpgw"),
-    );
-    assert_eq!(opencode["type"], "remote");
-    assert_eq!(opencode["url"], url);
-    assert!(opencode.get("command").is_none());
-
-    // Codex takes the gateway over HTTP too, with no `type` to go with it.
-    let codex = client_entry(
-        ClientKind::Codex,
-        &gateway_server(ClientKind::Codex, url, "mcpgw"),
-    );
-    assert_eq!(codex["url"], url);
-    assert!(codex.get("type").is_none());
-    assert!(codex.get("command").is_none());
-
-    // Windsurf takes the gateway over HTTP under its own field name.
-    let windsurf = client_entry(
-        ClientKind::Windsurf,
-        &gateway_server(ClientKind::Windsurf, url, "mcpgw"),
-    );
-    assert_eq!(windsurf["serverUrl"], url);
-    assert!(windsurf.get("url").is_none());
-    assert!(windsurf.get("command").is_none());
-
-    // The gateway is an entry like any other, so it needs the `source` too.
-    let zed = client_entry(
-        ClientKind::Zed,
-        &gateway_server(ClientKind::Zed, url, "mcpgw"),
-    );
-    assert_eq!(zed["url"], url);
-    assert_eq!(zed["source"], "custom");
-    assert!(zed.get("command").is_none());
-
-    // Cline reads an untyped remote entry as SSE, so even the gateway has
-    // to carry the type that says otherwise.
-    let cline = client_entry(
-        ClientKind::Cline,
-        &gateway_server(ClientKind::Cline, url, "mcpgw"),
-    );
-    assert_eq!(cline["url"], url);
-    assert_eq!(cline["type"], "streamableHttp");
-    assert!(cline.get("command").is_none());
-
-    // Amp reads a remote entry from the URL alone, so the gateway is one.
-    let amp = client_entry(
-        ClientKind::Amp,
-        &gateway_server(ClientKind::Amp, url, "mcpgw"),
-    );
-    assert_eq!(amp["url"], url);
-    assert!(amp.get("type").is_none());
-    assert!(amp.get("command").is_none());
-
-    // Zoo Code inherited that same SSE-by-default reading, so the gateway
-    // carries a type there too — spelled the way Zoo Code accepts.
-    let zoo = client_entry(
-        ClientKind::ZooCode,
-        &gateway_server(ClientKind::ZooCode, url, "mcpgw"),
-    );
-    assert_eq!(zoo["url"], url);
-    assert_eq!(zoo["type"], "streamable-http");
-    assert!(zoo.get("command").is_none());
-
-    for kind in ClientKind::ALL {
-        assert_eq!(
-            kind.supports_http_entries(),
-            kind != ClientKind::ClaudeDesktop
-        );
-    }
-}
-
 /// The whole per-server emission, one golden entry per client kind. Written
 /// out rather than field-probed: the failure this guards against is a client
 /// gaining or losing a field, which a probe for the fields we thought of
@@ -594,6 +492,16 @@ fn per_server_gateway_entry_shapes_per_client() {
         )
         .is_err()
     );
+
+    // Claude Desktop is the one client that cannot take a URL, and so the one
+    // that gets the bridge: an adapter that lands without saying which side it
+    // is on fails here rather than emitting the wrong entry shape in silence.
+    for kind in ClientKind::ALL {
+        assert_eq!(
+            kind.supports_http_entries(),
+            kind != ClientKind::ClaudeDesktop
+        );
+    }
 }
 
 /// The point of naming per-server entries after their server: flipping a
@@ -646,15 +554,16 @@ fn flipping_to_per_server_gateway_mode_updates_the_same_names() {
 
 /// The migration off the old single-entry gateway shape: `mcpgw` was managed,
 /// so it is a plain remove, and the per-server names come in beside it.
+///
+/// The entry is a literal because nothing emits that shape any more — which is
+/// exactly why the bytes a 0.3.x `sync --aggregate` left in a live config are
+/// worth pinning here.
 #[test]
 fn migrating_off_the_aggregate_entry_removes_it() {
     let canonical = canonical();
     let base = "http://127.0.0.1:8137/mcp";
     let current = serde_json::json!({
-        "mcpgw": client_entry(
-            ClientKind::Cursor,
-            &gateway_server(ClientKind::Cursor, base, "mcpgw"),
-        ),
+        "mcpgw": { "type": "http", "url": base },
     });
     let desired =
         per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw").unwrap();

@@ -119,6 +119,23 @@ impl Sandbox {
         ]);
         self.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
     }
+
+    /// A Cursor config as 0.3.x `sync --aggregate` left it — one `mcpgw` entry
+    /// for the whole gateway, claimed in the state file.
+    ///
+    /// Written by hand because no mcpgw that writes this shape exists any
+    /// more, and eject still has to clear it out of the configs that hold it.
+    fn install_legacy_aggregate_cursor(&self) {
+        self.install_cursor(Some(
+            r#"{"mcpServers": {"mcpgw": {"type": "http", "url": "http://127.0.0.1:8137/mcp"}}}"#,
+        ));
+        std::fs::create_dir_all(&self.state).unwrap();
+        std::fs::write(
+            self.state.join("managed.json"),
+            r#"{"clients": {"cursor": ["mcpgw"]}}"#,
+        )
+        .unwrap();
+    }
 }
 
 /// The Cursor file eject has to reproduce, byte for byte: the two servers of
@@ -192,13 +209,14 @@ fn eject_restores_the_original_transports_byte_for_byte() {
     assert_eq!(sb.cursor_json()["mcpServers"]["mine"]["command"], "deno");
 }
 
+/// The `mcpgw` entry an older release wrote is still eject's to remove: an
+/// install that never re-synced after the upgrade must still be able to get
+/// out cleanly.
 #[test]
-fn eject_drops_the_aggregate_entry_and_puts_the_servers_back() {
+fn eject_drops_the_legacy_aggregate_entry_and_puts_the_servers_back() {
     let sb = Sandbox::new();
-    sb.install_cursor(None);
+    sb.install_legacy_aggregate_cursor();
     sb.add_servers();
-    sb.ok(&["sync", "--aggregate"]);
-    assert!(sb.cursor_json()["mcpServers"]["mcpgw"]["url"].is_string());
 
     let out = sb.ok(&["eject", "--yes"]);
     assert!(out.contains("2 entries restored, 1 removed"), "{out}");
@@ -220,9 +238,8 @@ fn eject_drops_the_aggregate_entry_and_puts_the_servers_back() {
 #[test]
 fn a_later_sync_takes_the_restored_entries_back_over() {
     let sb = Sandbox::new();
-    sb.install_cursor(None);
+    sb.install_legacy_aggregate_cursor();
     sb.add_servers();
-    sb.ok(&["sync", "--aggregate"]);
     sb.ok(&["eject", "--yes"]);
 
     assert_eq!(
@@ -268,7 +285,7 @@ fn a_stdio_only_client_gets_its_original_definitions_back_unchanged() {
     let sb = Sandbox::new();
     sb.install_claude_desktop();
     sb.add_servers();
-    sb.ok(&["sync", "--aggregate"]);
+    sb.ok(&["sync"]);
     sb.ok(&["eject", "--yes"]);
 
     assert_eq!(sb.claude_desktop_text(), CLAUDE_DESKTOP_DIRECT);

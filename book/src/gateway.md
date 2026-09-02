@@ -65,7 +65,7 @@ pipe to that server, tool names untouched.
 
 ## Per-server endpoints
 
-Alongside the aggregate, every served server gets its own endpoint, where its
+Alongside `/mcp`, every served server gets its own endpoint, where its
 tools appear under their own names. No flag — serving one implies serving all
 of them:
 
@@ -97,8 +97,8 @@ server's behalf, and the answer was fetched with your credentials.
 (`github__create_issue`); resource URIs and prompt names cannot. Two servers
 can both offer `file:///README.md` — one name, two different documents — and
 rewriting the URIs would break every link inside the contents that points at
-them. So the aggregate merges what it can merge honestly, and `/s/<name>` is
-where the rest lives.
+them. So `/mcp` merges what it can merge honestly, and `/s/<name>` is where the
+rest lives — which is why it is `/s/<name>` that clients are pointed at.
 
 One caveat: an endpoint reports its server's capabilities as of the last time
 it reached that server. A client connecting to a freshly started gateway,
@@ -183,23 +183,15 @@ mcpgw sync --dry-run
 mcpgw sync --rollback              # back to whatever was there before
 ```
 
-### The other shape: one entry for the whole gateway
+There is no other shape. `sync` has no modes and nothing to choose between:
+every enabled server gets its own entry pointing at its own endpoint, in every
+client, and that is all mcpgw does to a client config.
 
-```sh
-mcpgw sync --aggregate
-```
-
-The alternative to one entry per server: a single `mcpgw` entry pointing at
-`/mcp`, where every tool is namespaced `server__tool`. One entry per client
-instead of a dozen, at the price of prefixed tool names and no resources or
-prompts (see above). Worth it when a client charges you per entry — a UI that
-lists servers, a harness with a low limit — and not otherwise, which is why
-per-server is the default.
-
-Switching between the two is a normal sync either way: the entries the other
-shape wrote are mcpgw's own, so they are replaced rather than left behind.
-Aggregate mode also does not need the canonical config to be readable, since
-the one entry it writes says nothing about which servers exist.
+Up to 0.3.x there was a second one — `sync --aggregate`, a single `mcpgw` entry
+per client pointing at `/mcp`, with every tool namespaced `server__tool`. The
+flag is gone. A config that still holds that entry is migrated by the next
+plain `mcpgw sync`: the entry was mcpgw's own, so it is removed and the
+per-server entries arrive in its place, in one run and without a flag.
 
 ### Checking the path clients take
 

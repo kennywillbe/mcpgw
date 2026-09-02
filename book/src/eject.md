@@ -15,8 +15,8 @@ for your clients to keep working.
 ## What it writes
 
 Your canonical config still holds every server as you originally defined it —
-the command, the args, the env, the URL and headers. Gateway mode never
-replaced those; it only changed what your *clients* were pointed at. Eject
+the command, the args, the env, the URL and headers. Syncing never replaced
+those; it only changed what your *clients* were pointed at. Eject
 writes the originals back under the same names, so a gateway entry is a plain
 update over the entry it already occupies, not a remove and an add.
 

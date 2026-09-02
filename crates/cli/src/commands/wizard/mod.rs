@@ -347,7 +347,7 @@ fn status_card(cx: &Ctx) {
 
 fn describe_gateway(cx: &Ctx, enabled: usize) -> String {
     match cx.reach {
-        // Every enabled server gets its own endpoint beside the aggregate,
+        // Every enabled server gets its own endpoint beside `/mcp`,
         // so what a client can dial is one more than the server count.
         GatewayReach::Answering(_) => {
             let endpoints = enabled + 1;

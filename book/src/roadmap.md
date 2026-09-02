@@ -24,9 +24,11 @@ Things this page used to promise, so the line is clear:
 
 - **The setup wizard** — a bare `mcpgw` on a terminal; see
   [Quickstart](./quickstart.md).
-- **The gateway as the only sync mode.** `mcpgw sync` writes entries that point
-  at mcpgw. There is no direct mode to choose any more; `--gateway` is an
-  accepted no-op for one release.
+- **One behaviour, no modes.** `mcpgw sync` writes one entry per server, each
+  pointing at that server's own endpoint on mcpgw. There is nothing to choose:
+  the direct mode and the single-entry `--aggregate` mode are both gone, and a
+  client that still holds what either of them wrote is migrated by the next
+  plain `mcpgw sync`.
 - **Per-server endpoints** (`/s/<name>`), on by default.
 - **Running as a service** on macOS, Linux and Windows — see
   [Running as a daemon](./daemon.md).
@@ -45,9 +47,9 @@ Things this page used to promise, so the line is clear:
 - **A remote server's OAuth is your problem.** mcpgw forwards the header you
   configure; it does not run the flow and does not refresh anything.
 - **No linux-arm64 prebuilt binary yet.** `cargo install mcpgw` works there.
-- **The aggregate endpoint serves tools only.** Resources and prompts reach a
-  client through a per-server endpoint (`/s/<name>`), because their
-  names cannot be namespaced across servers the way tool names can. See
+- **The gateway's own `/mcp` endpoint serves tools only.** Resources and
+  prompts reach a client through a per-server endpoint (`/s/<name>`), because
+  their names cannot be namespaced across servers the way tool names can. See
   [Gateway](./gateway.md).
 
 ## Asking for things

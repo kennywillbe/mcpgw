@@ -94,9 +94,8 @@ mcpgw sync             # point every client at it, one entry per server
 Every server keeps its name and its own entry in the client — only the
 transport changes, to that server's own `/s/<name>` endpoint on the gateway —
 so tool names stay as they are and anything the client keeps beside the entry
-survives the move. `mcpgw sync --aggregate` writes the whole gateway as one
-entry instead, where tools are exposed as `server__tool` so adding a server
-never renames an existing tool.
+survives the move. That is the only shape `sync` writes: mcpgw has one
+behaviour, not a set of modes to pick between.
 
 Each upstream gets one connection, multiplexed across clients — no process per
 session. If an upstream dies it's restarted with backoff, and if it keeps

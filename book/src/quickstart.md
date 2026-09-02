@@ -170,7 +170,7 @@ your state directory.
 
 ```sh
 mcpgw sync --client cursor --client vscode    # a subset
-mcpgw sync --aggregate                        # one `mcpgw` entry instead of one per server
+mcpgw sync --gateway-url http://127.0.0.1:9000/mcp  # a gateway somewhere else
 mcpgw sync --rollback                         # undo the last sync
 ```
 
