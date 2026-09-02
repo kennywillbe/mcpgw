@@ -19,7 +19,13 @@ const STAMP_FILE: &str = "update-check.json";
 
 /// One check a day. The point is to notice a release within a day or so of
 /// it landing, not to track the repository.
-const INTERVAL: Duration = Duration::from_hours(24);
+// Spelled in seconds rather than with `Duration::from_hours`, which is what
+// clippy asks for here: that constructor was stabilised very recently and
+// the workspace pins no rust-version, so it would turn an older-but-
+// otherwise-fine toolchain into a bare "no function in `Duration`" error
+// instead of cargo's MSRV message. Readability is not worth that.
+#[allow(clippy::duration_suboptimal_units)]
+const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Hard deadline on the whole check. The command's own work has already
 /// finished by the time this runs, so the worst case is the shell prompt
@@ -93,12 +99,20 @@ fn last_seen(stamp: &str) -> Option<String> {
 
 /// Best-effort: a state directory that cannot be written is not a reason to
 /// say anything to the user, it only means the check runs again tomorrow.
+///
+/// The hardened helpers rather than bare `std::fs`, because on a fresh
+/// machine this is often the first thing to create the state directory —
+/// and every later `create_dir_all` leaves an existing directory's mode
+/// alone, so a 0755 created here would stay 0755 for the config backups
+/// and the managed state that land beside it.
 fn write_stamp(path: &Path, now: u64, last_seen: Option<&str>) {
     let stamp = serde_json::json!({ "last_check": now, "last_seen": last_seen });
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = mcpgw_core::private::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, stamp.to_string());
+    if std::fs::write(path, stamp.to_string()).is_ok() {
+        let _ = mcpgw_core::private::harden_file(path);
+    }
 }
 
 fn unix_now() -> Option<u64> {
@@ -155,6 +169,24 @@ mod tests {
         assert_eq!(last_check(&written), Some(1_000_000));
         assert_eq!(last_seen(&written).as_deref(), Some("0.9.1"));
         assert!(!is_due(Some(&written), 1_000_000));
+    }
+
+    /// The stamp shares the state directory with config backups and the
+    /// managed state, so whichever writer gets there first has to leave the
+    /// directory owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn the_stamp_and_the_directory_it_creates_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("share").join("mcpgw");
+        let path = state.join(STAMP_FILE);
+        write_stamp(&path, 1_000_000, None);
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
+        assert_eq!(mode(&state), 0o700, "{:o}", mode(&state));
     }
 
     #[test]
