@@ -230,6 +230,17 @@ pub fn gateway_entry_url(server: &Server) -> Option<String> {
     }
 }
 
+/// Whether `server` already reaches a gateway listening at `base_url` — same
+/// scheme, host and port, whatever endpoint path it asks for.
+///
+/// The question `sync` asks of an entry it is about to replace: one that does
+/// not aim there dials a server directly, and replacing it is the migration
+/// the user should hear about once.
+#[must_use]
+pub fn aims_at_gateway(server: &Server, base_url: &str) -> bool {
+    gateway_entry_url(server).is_some_and(|url| same_origin(&url, base_url))
+}
+
 fn bridge_url(command: &str, args: &[String]) -> Option<String> {
     let binary = std::path::Path::new(command).file_stem()?.to_str()?;
     if binary != "mcpgw" || args.first().map(String::as_str) != Some("connect") {

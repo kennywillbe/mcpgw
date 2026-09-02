@@ -1,24 +1,65 @@
 # Quickstart
 
-Five minutes, start to finish. Nothing here touches a client file until you run
-`sync`, and `sync` shows you the diff first if you ask.
-
-## 0. Or let the wizard drive
+Type `mcpgw`. That is the quickstart.
 
 ```sh
-mcpgw            # on a terminal, this is `mcpgw init`
-mcpgw init       # the same thing, spelled out
+mcpgw
 ```
 
-Run on a terminal with no arguments, mcpgw walks you through the rest of this
-page one step at a time: what it found on your machine, what it would adopt,
-whether to run the gateway in the background, and which clients to point at it.
-It asks before every change and writes nothing until you say yes.
+On a terminal, a bare `mcpgw` with no arguments is the setup wizard, and it
+does the whole of this page one confirmed step at a time. It asks before every
+change and writes nothing until you say yes.
 
-`mcpgw init --yes` never prompts and takes the recommended answer at each step,
-for scripts and for agents. It still prints the whole plan, and where a step
-needs a decision that cannot be made for you it stops and says which command to
-run instead.
+## What the wizard does
+
+**1 — looks around.** Which of the thirteen supported MCP clients are installed
+here, and how many servers each one holds.
+
+```text
+Looking around — 2 MCP clients found.
+  Cursor          2 servers  ~/.cursor/mcp.json
+  Claude Desktop  1 server   ~/Library/Application Support/Claude/claude_desktop_config.json
+  11 other supported clients are not installed here
+```
+
+**2 — adopts what they already hold.** Every server it found goes into the
+canonical config, once, with the duplicates folded together and every rename
+printed.
+
+```text
+Importing what your clients already have.
+  2 servers to bring in, from Cursor.
+  The rest come across as they are: github, linear.
+```
+
+**3 — offers to keep the gateway running.** A launch agent, a systemd user
+unit, or a Windows service, depending on the machine — and on macOS it warns
+about the "Background Items Added" notification *before* it appears, rather
+than leaving you to wonder what just asked. Declining is a normal answer:
+`mcpgw serve` in a terminal is the same gateway.
+
+**4 — points every client at the gateway** and checks the result: is the
+gateway answering, does every enabled server answer through its own endpoint,
+and does every entry that was just written point at one that does.
+
+```text
+Checking that it actually works…
+  ✓ gateway answering at http://127.0.0.1:8137/mcp
+  ✓ github  http://127.0.0.1:8137/s/github — 41 tools
+  ✓ Cursor  2 entries, all pointing at endpoints that answer
+```
+
+It ends by telling you to restart your clients, because no harness re-reads its
+MCP config while running.
+
+```sh
+mcpgw init          # the same thing, spelled out
+mcpgw init --yes    # never prompts: the recommended answer at every step
+```
+
+`--yes` is for scripts and agents. It still prints the whole plan, and where a
+step needs a decision that cannot be made for you it stops and says which
+command to run instead.
 
 Off a terminal — in a pipe, a CI job, a `Dockerfile` — a bare `mcpgw` prints
 help and exits 2 rather than opening a wizard nobody can answer.
@@ -27,8 +68,10 @@ Once everything is set up, a bare `mcpgw` stops being a wizard and becomes a
 status card: how many servers, whether the gateway is answering, which clients
 are synced.
 
-The steps below are what the wizard does, and remain the way to do any one of
-them on its own.
+## Piece by piece
+
+The steps below are what the wizard does, and each remains the way to do that
+one thing on its own — after setup, they are how you keep the list current.
 
 ## 1. Adopt what you already have
 
@@ -96,12 +139,19 @@ mcpgw enable scratch
 mcpgw remove scratch
 ```
 
-## 4. Push it to every client
+## 4. Point every client at the gateway
 
 ```sh
 mcpgw sync --dry-run     # the diff, no writes
 mcpgw sync               # write it
 ```
+
+Each enabled server keeps its entry and its name in the client; only the
+transport changes, to that server's own endpoint on the gateway
+(`http://127.0.0.1:8137/s/<name>`). So the client's list looks the same before
+and after, tool names are untouched, and anything the client keeps beside the
+entry — Cline's off switch, its auto-approved tools — survives the move. Then
+run the gateway, with [`mcpgw daemon install`](./daemon.md) or `mcpgw serve`.
 
 `sync` only rewrites entries mcpgw wrote. Anything you added to a client by
 hand is left exactly where it is and reported as unmanaged, with an `import`
@@ -110,7 +160,21 @@ your state directory.
 
 ```sh
 mcpgw sync --client cursor --client vscode    # a subset
+mcpgw sync --aggregate                        # one `mcpgw` entry instead of one per server
 mcpgw sync --rollback                         # undo the last sync
+```
+
+The first time this moves entries that used to point straight at your servers,
+`sync` says so once:
+
+```text
+  These entries used to point straight at the servers. They now point at mcpgw,
+  which forwards to the same servers — same names, same tools.
+
+  One thing changed: if the gateway isn't running, they won't answer.
+  `mcpgw daemon status` tells you, `mcpgw daemon install` keeps it running.
+
+  Undo everything this run did: mcpgw sync --rollback
 ```
 
 ## 5. Check it actually works
@@ -146,5 +210,7 @@ mcpgw inspect github
 
 ## Next
 
-Now that the list is real, put a gateway in front of it — see
-[Gateway](./gateway.md).
+[Gateway](./gateway.md) is what your clients are now talking to,
+[Running as a daemon](./daemon.md) is how it stays up, and
+[Watching traffic](./traffic.md) is what you get for having it in the middle.
+If you decide against all of it, [Backing out](./eject.md) is one command.

@@ -7,6 +7,11 @@ in the morning is ask for a tool list, and nothing is there to answer.
 `mcpgw daemon` is the answer — the gateway supervised by the machine's own
 service manager, started at login and restarted when it dies.
 
+Since every client entry mcpgw writes points at the gateway, this is not a
+nicety: a gateway nobody started is a client with no servers. The setup wizard
+offers to install it for that reason, and `mcpgw daemon install` is the same
+step on its own.
+
 Every command works on all three platforms, each through that platform's own
 supervisor: a launch agent on macOS, a systemd user unit on Linux, a service
 on Windows. The three sections below are what is different about each; the

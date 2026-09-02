@@ -111,7 +111,8 @@ directory, that `mcpgw serve --no-capture` disables capture entirely, and that
 never showed them, and `--json` replaces each with `"***"` unless you ask for
 `--show-secrets`. That bounds the spread, not the file itself. Redaction at
 capture time is on the [roadmap](./roadmap.md); until it ships, this is the
-honest description.
+honest description, and the [Trust model](./trust-model.md) puts it beside
+everything else worth knowing before every call goes through one process.
 
 ## One server, no gateway
 
