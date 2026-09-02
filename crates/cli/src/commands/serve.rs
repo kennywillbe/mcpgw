@@ -19,9 +19,9 @@ pub struct ServeArgs {
     /// server). Exactly one turns the gateway into an unprefixed pipe.
     #[arg(long, value_name = "NAME")]
     pub server: Vec<String>,
-    /// Also expose every served server on its own endpoint at /s/<NAME>,
-    /// with its tool names unprefixed
-    #[arg(long)]
+    /// Accepted and ignored: per-server endpoints are always served. Kept
+    /// for one release so existing scripts keep running.
+    #[arg(long, hide = true)]
     pub per_server: bool,
     /// Do not write the JSONL traffic log
     #[arg(long)]
@@ -95,21 +95,17 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         None => gateway,
     };
 
-    // Opt-in for now: without the flag the process serves exactly what it
-    // served before, down to the routes it answers on.
-    let endpoints = args.per_server.then(|| {
-        let pipes = selected.iter().map(|name| {
-            let pipe = Gateway::new(Arc::clone(&manager), name.clone());
-            // Each pipe records under its own server name, so per-server
-            // traffic lands in the same log as the aggregate's.
-            let pipe = match &capture {
-                Some(writer) => pipe.with_capture(Arc::clone(writer)),
-                None => pipe,
-            };
-            (name.clone(), pipe)
-        });
-        Endpoints::new(EndpointTable::new(pipes.collect::<Vec<_>>()))
+    let pipes = selected.iter().map(|name| {
+        let pipe = Gateway::new(Arc::clone(&manager), name.clone());
+        // Each pipe records under its own server name, so per-server
+        // traffic lands in the same log as the aggregate's.
+        let pipe = match &capture {
+            Some(writer) => pipe.with_capture(Arc::clone(writer)),
+            None => pipe,
+        };
+        (name.clone(), pipe)
     });
+    let endpoints = Endpoints::new(EndpointTable::new(pipes.collect::<Vec<_>>()));
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -118,20 +114,18 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             .with_context(|| format!("cannot bind {}:{}", args.bind, args.port))?;
         let addr = listener.local_addr()?;
         println!("mcpgw gateway listening on http://{addr}/mcp — {serving}");
-        if endpoints.is_some() {
-            let urls: Vec<String> = selected
-                .iter()
-                .map(|name| format!("http://{addr}{}", endpoint_path(name)))
-                .collect();
-            println!("per-server endpoints: {}", urls.join(", "));
-        }
+        let urls: Vec<String> = selected
+            .iter()
+            .map(|name| format!("http://{addr}{}", endpoint_path(name)))
+            .collect();
+        println!("per-server endpoints: {}", urls.join(", "));
         println!("{capture_note}");
 
         let shutdown = async {
             let _ = tokio::signal::ctrl_c().await;
             println!("\nshutting down");
         };
-        serve_http_with(gateway, endpoints, listener, shutdown).await?;
+        serve_http_with(gateway, Some(endpoints), listener, shutdown).await?;
         // Ctrl-C fell through the graceful shutdown: kill the children too.
         manager.shutdown().await;
         Ok(())

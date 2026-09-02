@@ -182,8 +182,8 @@ fn announce_mode(args: &SyncArgs) -> anyhow::Result<Option<String>> {
             .with_context(|| format!("--gateway-url {} is not a URL", args.gateway_url))?;
         println!(
             "gateway mode — every enabled server keeps its name and points at \
-             its own endpoint on the gateway at {} (serve it with `mcpgw serve \
-             --per-server`)",
+             its own endpoint on the gateway at {} (serve it with `mcpgw \
+             serve`)",
             args.gateway_url
         );
     }
