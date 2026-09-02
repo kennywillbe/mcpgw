@@ -1,0 +1,83 @@
+name: Linux daemon (live)
+
+# Never automatic. crates/cli/tests/daemon_systemd.rs writes a real unit into
+# the user manager of whoever runs it and enables it — harmless on a throwaway
+# VM, but `mcpgw.service` is global to a login session, so this is the kind of
+# thing that should be somebody's decision rather than a side effect of
+# pushing. A GitHub ubuntu-latest runner boots systemd as PID 1, so once the
+# runner account has a user manager of its own the only thing standing between
+# this workflow and a real install → run → stop → start → uninstall cycle is
+# MCPGW_DAEMON_LIVE, which is set below and nowhere else.
+on: workflow_dispatch
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The job runs as `runner` from a service, not from a login session, so
+      # there is no `user@$(id -u).service` and no /run/user/$(id -u) — and
+      # without those `systemctl --user` has no manager to talk to. Lingering
+      # starts one and keeps it up for the life of the VM; XDG_RUNTIME_DIR is
+      # how systemctl finds its bus socket, and DBUS_SESSION_BUS_ADDRESS is
+      # what anything else reaching for the session bus reads.
+      - name: Give the runner account a systemd user manager
+        run: |
+          sudo loginctl enable-linger "$USER"
+          runtime="/run/user/$(id -u)"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$runtime/bus" >> "$GITHUB_ENV"
+
+      # Starting the manager is asynchronous, so wait for it rather than race
+      # it, and print what it says: when this workflow fails, the first
+      # question is always whether the failure is mcpgw's or the runner's.
+      - name: The user manager answers
+        run: |
+          for _ in $(seq 1 30); do
+            if systemctl --user show --property=Version >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          # `is-system-running` exits non-zero for "degraded", which is a
+          # perfectly usable manager, so read the word and not the status.
+          echo "is-system-running: $(systemctl --user is-system-running || true)"
+          systemctl --user --version | head -n 1
+          loginctl show-user "$USER" --property=Linger
+
+      # The test drives a gateway that fronts the scripted fixture server, and
+      # util::fixture_binary() looks for that binary next to the test
+      # executable rather than building it — a plain `cargo test -p mcpgw`
+      # would fail on a missing mcpgw-test-server, so build the workspace.
+      - run: cargo build --locked --workspace
+
+      - run: cargo test --locked -p mcpgw --test daemon_systemd -- --nocapture
+        env:
+          MCPGW_DAEMON_LIVE: "1"
+
+      # The test cleans up after itself even when an assertion fails, but a
+      # crashed or cancelled run cannot. Fail loudly here rather than let a
+      # stray unit disappear quietly with the runner: a leak means the
+      # uninstall path is broken, which is exactly what this workflow exists
+      # to find out.
+      - name: No mcpgw unit left behind
+        if: always()
+        run: |
+          listed=$(systemctl --user list-unit-files mcpgw.service --no-legend 2>/dev/null || true)
+          unit="$HOME/.config/systemd/user/mcpgw.service"
+          if [ -n "$listed" ]; then
+            echo "::error::the user manager still lists a unit: $listed"
+            exit 1
+          fi
+          if [ -e "$unit" ]; then
+            echo "::error::$unit survived the run"
+            exit 1
+          fi
+          echo "clean: no mcpgw.service in the user manager and none on disk"
+          # The absence of the unit is what success looks like here, and every
+          # command above that reported it did so by *failing*. Say so
+          # explicitly so the step's exit status is not the last one of those.
+          exit 0
