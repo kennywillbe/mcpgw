@@ -242,6 +242,23 @@ impl Gateway {
             .map_or_else(tools_only, |info| forwarded(&info.capabilities))
     }
 
+    /// Who this face says it is at `initialize`.
+    ///
+    /// A pipe answers with the upstream's own name and version once it has
+    /// heard them: a harness shows this to the user, and one gateway serving
+    /// N servers under N endpoints all called "mcpgw" tells them nothing
+    /// about which server they are looking at. The source is the same
+    /// snapshot [`Gateway::capabilities`] uses, and for the same reason —
+    /// this runs inside the handshake, so it may not go and ask. Before
+    /// first contact, and for the aggregate, the honest answer is that this
+    /// is mcpgw.
+    fn identity(&self) -> Implementation {
+        self.pipe_upstream()
+            .and_then(|upstream| self.manager.last_server_info(upstream))
+            .and_then(|info| info.server_info.clone())
+            .unwrap_or_else(|| Implementation::new("mcpgw", env!("CARGO_PKG_VERSION")))
+    }
+
     /// Forwards one request to `upstream` under the request deadline and
     /// records the attempt.
     ///
@@ -414,40 +431,34 @@ impl ServerHandler for Gateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = self.capabilities();
-        info.server_info = Implementation::new("mcpgw", env!("CARGO_PKG_VERSION"));
+        info.server_info = self.identity();
         info
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let session = Self::session_of(&context);
         match &self.mode {
+            // One request, one answer, handed back exactly as the upstream
+            // wrote it. The pipe used to collect every page with
+            // `list_all_tools` and rebuild the result around the tools it
+            // found, which threw away everything else the upstream had put
+            // there — the SEP-2549 caching fields (`ttlMs`, `cacheScope`)
+            // among them, which a strict client rejects the answer for — and
+            // left the client with no cursor to page with either.
             Mode::Pipe(upstream) => {
-                let started = Instant::now();
-                let tools = self
-                    .within_deadline(upstream, async {
-                        let service = self.upstream_service(upstream).await?;
-                        service
-                            .list_all_tools()
-                            .await
-                            .map_err(|err| ErrorData::internal_error(err.to_string(), None))
-                    })
-                    .await;
-                let elapsed = started.elapsed();
-                self.record(session.as_deref(), |session| {
-                    let record = CaptureRecord::new(session, upstream, Kind::List, elapsed);
-                    match &tools {
-                        Ok(tools) => record.with_response(format!("{} tool(s)", tools.len())),
-                        Err(err) => record.with_error(&err.message),
-                    }
-                });
-                Ok(ListToolsResult {
-                    tools: tools?,
-                    ..ListToolsResult::default()
-                })
+                self.forward(
+                    session.as_deref(),
+                    upstream,
+                    Kind::List,
+                    None,
+                    |service| async move { service.list_tools(request).await },
+                    |result| format!("{} tool(s)", result.tools.len()),
+                )
+                .await
             }
             Mode::Aggregate(upstreams) => {
                 Ok(self.aggregate_tools(session.as_deref(), upstreams).await)

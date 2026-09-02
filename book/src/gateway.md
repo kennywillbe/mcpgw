@@ -63,7 +63,10 @@ mcpgw serve --per-server
 
 A per-server endpoint is a plain pipe, so it forwards everything an MCP server
 can offer — tools, resources, resource templates, prompts and argument
-completion — with names, URIs and errors untouched.
+completion — with names, URIs and errors untouched. Answers are handed back as
+the server wrote them: caching metadata, `_meta`, and pagination cursors all
+survive the hop, and a client pages through a long `tools/list` against the
+server's own cursors instead of being handed one list the gateway assembled.
 
 `/mcp` serves tools only, and that is deliberate. Tools can be namespaced
 (`github__create_issue`); resource URIs and prompt names cannot. Two servers
@@ -77,7 +80,11 @@ it reached that server. A client connecting to a freshly started gateway,
 before anything has talked to the server yet, is told "tools" — the
 conservative answer — because working it out for real would mean starting the
 server in the middle of a handshake. Anything that connects after the first
-request through the endpoint sees the full set.
+request through the endpoint sees the full set. The name an endpoint reports at
+`initialize` follows the same rule: once the gateway has met the server it
+answers with that server's own name and version (`Context7 4.0.4`), which is
+what a client shows the user; before first contact, and on `/mcp`, it is
+`mcpgw`.
 
 The endpoints share one process and one set of upstream connections, so a
 client can take the whole gateway, a single server, or both at once without
