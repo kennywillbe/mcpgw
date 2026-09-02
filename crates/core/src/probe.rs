@@ -15,6 +15,30 @@ use crate::config::{Server, Transport};
 const DOWNLOAD_HINT: &str =
     " (first `npx`/`uvx` runs download packages — retry or raise --timeout)";
 
+/// Whether anything is listening at `base`'s host and port.
+///
+/// A bare TCP connect rather than an MCP handshake, because this answers one
+/// question only: is the daemon up. That is the single failure whose fix is
+/// `mcpgw serve`, and it has to be told apart from a gateway that is up but
+/// does not serve some endpoint a client dials — which is a per-entry problem
+/// with an entirely different fix. Rolling both into one handshake would
+/// report the wrong one half the time.
+pub async fn gateway_listening(base: &str, timeout: Duration) -> bool {
+    let Ok(url) = url::Url::parse(base) else {
+        return false;
+    };
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return false;
+    };
+    // `host_str` keeps the brackets on an IPv6 literal; the resolver wants
+    // the address without them.
+    let host = host.trim_matches(['[', ']']);
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port))).await,
+        Ok(Ok(_))
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeSuccess {
     pub server_name: String,

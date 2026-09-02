@@ -154,6 +154,50 @@ above). Switching between the two modes is a normal sync either way: the
 entries the other mode wrote are mcpgw's, so they are replaced, not left
 behind.
 
+### Checking the path clients take
+
+```sh
+mcpgw doctor --probe
+```
+
+A server that answers when mcpgw spawns it directly tells you nothing about
+whether a client can reach it through the gateway, so `--probe` reports the two
+separately:
+
+```text
+probes — direct to each server
+  ✓ github (canonical): github-mcp-server 0.19.1, 41 tools
+
+probes — through the gateway at http://127.0.0.1:8137/mcp
+  ✓ http://127.0.0.1:8137/s/github ← Cursor "github", Zed "github": github-mcp-server 0.19.1, 41 tools
+```
+
+The second section takes every entry mcpgw wrote into a client, keeps the ones
+aimed at the gateway, and runs a real `initialize` and `tools/list` against
+that endpoint — the same request the client makes. Entries you wrote by hand
+are left alone, and entries pointing somewhere else are not the gateway's
+business.
+
+Two failures it exists to name. A gateway that isn't running is one error, not
+one per client:
+
+```text
+  ✗ not reachable — start it with `mcpgw serve` (3 endpoint(s) not checked)
+```
+
+And an entry left over from a server that has since been renamed or disabled,
+which is the failure that otherwise shows up as a client silently missing its
+tools:
+
+```text
+  ✗ Cursor "ghost" points at http://127.0.0.1:8137/s/ghost, which the running
+    gateway does not serve — no server endpoint named "ghost" — known
+    endpoints: /s/github, /s/linear
+```
+
+`--gateway-url` points the check at a gateway on another port, matching
+`sync --gateway --gateway-url`.
+
 ## stdio-only clients
 
 Claude Desktop only speaks stdio, so it can't be handed a URL. `mcpgw connect`

@@ -2,10 +2,20 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use mcpgw_core::doctor::{Finding, Severity, check_server, classify_problems};
-use mcpgw_core::probe::probe_server;
+use mcpgw_core::doctor::{
+    Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
+    classify_gateway_failure, classify_problems, gateway_unreachable, unserved_endpoint,
+};
+use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
+use mcpgw_core::state::ManagedState;
 use mcpgw_core::{ClientKind, Config, Detection, Error, Server, Transport};
 use owo_colors::OwoColorize as _;
+
+/// Budget for the "is anything listening" check, independent of `--timeout`.
+/// A refused connect answers instantly; the only thing this bounds is a
+/// black-holed address, and waiting a full probe timeout to be told the
+/// daemon is down would make a down gateway feel like a hang.
+const REACH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Key = the exact endpoint a probe would talk to; entries shared between
 /// the canonical config and clients (or several clients) probe once. The
@@ -40,10 +50,21 @@ impl ProbePlan {
     }
 }
 
-pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<u8> {
+pub fn run(
+    json: bool,
+    color: bool,
+    probe: Option<Duration>,
+    gateway_url: &str,
+) -> anyhow::Result<u8> {
     let command_exists = |cmd: &str| which::which(cmd).is_ok();
     let mut findings: Vec<Finding> = Vec::new();
     let mut plan = ProbePlan::default();
+    let mut gateway_plan = GatewayPlan::new(gateway_url);
+    // Which client entries mcpgw wrote. A lost or unreadable state file means
+    // nothing is managed, which is exactly the answer sync gives it too — the
+    // gateway pass then finds no entries and stays quiet rather than
+    // second-guessing entries that are the user's.
+    let managed = managed_state();
 
     let path = super::canonical_config_path()?;
     let canonical_note = match Config::load(&path) {
@@ -66,6 +87,80 @@ pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<u
         }
     };
 
+    let detections = scan_clients(
+        &mut findings,
+        &mut plan,
+        &mut gateway_plan,
+        &managed,
+        &command_exists,
+    );
+
+    let (probe_results, gateway_report) = match probe {
+        Some(timeout) => {
+            // One runtime for both passes: they ask the same machine the same
+            // kind of question, and a second reactor would only add threads.
+            let runtime = tokio::runtime::Runtime::new()?;
+            let direct = run_probes(&runtime, plan, timeout);
+            let gateway = (!gateway_plan.is_empty())
+                .then(|| run_gateway_probes(&runtime, gateway_plan, timeout));
+            (Some(direct), gateway)
+        }
+        None => (None, None),
+    };
+
+    let gateway_findings = gateway_report
+        .as_ref()
+        .map_or(&[][..], |report| &report.findings);
+    let errors = count(&findings, Severity::Error)
+        + count(gateway_findings, Severity::Error)
+        + probe_results
+            .as_ref()
+            .map_or(0, |p| p.results.iter().filter(|(_, r)| r.is_err()).count())
+        + gateway_report.as_ref().map_or(0, GatewayReport::failures);
+    let warnings = count(&findings, Severity::Warning) + count(gateway_findings, Severity::Warning);
+
+    if json {
+        // Gateway findings join the same array: a consumer counting problems
+        // should not have to know which pass produced them.
+        let all: Vec<Finding> = findings
+            .iter()
+            .chain(gateway_findings)
+            .cloned()
+            .collect::<Vec<_>>();
+        emit_json(
+            &path,
+            &canonical_note,
+            &detections,
+            &all,
+            probe_results.as_ref(),
+            gateway_report.as_ref(),
+            errors,
+            warnings,
+        )?;
+    } else {
+        render(&path, &canonical_note, &detections, &findings, color);
+        if let Some(probes) = &probe_results {
+            render_probes(probes, color);
+        }
+        if let Some(report) = &gateway_report {
+            render_gateway(report, color);
+        }
+        println!();
+        summary_line(errors, warnings, color);
+    }
+
+    Ok(u8::from(errors > 0))
+}
+
+/// The static pass over every detected client: appends its findings, feeds
+/// both probe plans, and returns the one-line state of each client.
+fn scan_clients(
+    findings: &mut Vec<Finding>,
+    plan: &mut ProbePlan,
+    gateway_plan: &mut GatewayPlan,
+    managed: &ManagedState,
+    command_exists: &dyn Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
     let mut detections: Vec<(&'static str, String)> = Vec::new();
     for kind in ClientKind::ALL {
         let name = kind.display_name();
@@ -85,14 +180,27 @@ pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<u
                 match kind.load(&config_path) {
                     Ok(read) => {
                         findings.extend(classify_problems(name, &read));
+                        let mine = managed.clients.get(kind.id());
                         for (server_name, server) in &read.servers {
                             findings.extend(check_server(
                                 Some(name),
                                 server_name,
                                 server,
-                                &command_exists,
+                                command_exists,
                             ));
-                            plan.collect(name, server_name, server);
+                            // Only entries mcpgw wrote: an entry the user
+                            // pointed at the gateway by hand is theirs to
+                            // keep working, and doctor has no record of what
+                            // they meant it to reach.
+                            let via_gateway = mine.is_some_and(|names| names.contains(server_name))
+                                && gateway_plan.collect(name, server_name, server);
+                            // An entry the gateway pass owns is not also a
+                            // direct target: it is the same URL, so probing
+                            // it twice reports one failure under two headings
+                            // and counts it as two errors.
+                            if !via_gateway {
+                                plan.collect(name, server_name, server);
+                            }
                         }
                     }
                     Err(err) => findings.push(Finding {
@@ -105,38 +213,16 @@ pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<u
             }
         }
     }
+    detections
+}
 
-    let probe_results = match probe {
-        Some(timeout) => Some(run_probes(plan, timeout)?),
-        None => None,
-    };
-
-    let errors = count(&findings, Severity::Error)
-        + probe_results
-            .as_ref()
-            .map_or(0, |p| p.results.iter().filter(|(_, r)| r.is_err()).count());
-    let warnings = count(&findings, Severity::Warning);
-
-    if json {
-        emit_json(
-            &path,
-            &canonical_note,
-            &detections,
-            &findings,
-            probe_results.as_ref(),
-            errors,
-            warnings,
-        )?;
-    } else {
-        render(&path, &canonical_note, &detections, &findings, color);
-        if let Some(probes) = &probe_results {
-            render_probes(probes, color);
-        }
-        println!();
-        summary_line(errors, warnings, color);
-    }
-
-    Ok(u8::from(errors > 0))
+/// mcpgw's record of which client entries it wrote, or an empty one when the
+/// state directory cannot even be resolved.
+fn managed_state() -> ManagedState {
+    mcpgw_core::paths::state_dir()
+        .map(|dir| dir.join("managed.json"))
+        .and_then(|path| ManagedState::load(&path).ok())
+        .unwrap_or_default()
 }
 
 // Pure serialization of already-computed pieces; bundling them into a
@@ -148,6 +234,7 @@ fn emit_json(
     detections: &[(&'static str, String)],
     findings: &[Finding],
     probes: Option<&ProbeReport>,
+    gateway: Option<&GatewayReport>,
     errors: usize,
     warnings: usize,
 ) -> anyhow::Result<()> {
@@ -180,6 +267,44 @@ fn emit_json(
             .collect();
         out["probes"] = serde_json::json!({ "results": entries });
     }
+    if let Some(gateway) = gateway {
+        let entries: Vec<serde_json::Value> = gateway
+            .results
+            .iter()
+            .map(|(target, outcome)| {
+                let mut row = serde_json::json!({
+                    "url": target.url, "entries": target.entries,
+                });
+                if let Some(server) = &target.server {
+                    row["server"] = serde_json::json!(server);
+                }
+                match outcome {
+                    GatewayOutcome::Ok(success) => {
+                        row["ok"] = serde_json::json!(true);
+                        row["server_name"] = serde_json::json!(success.server_name);
+                        row["server_version"] = serde_json::json!(success.server_version);
+                        row["tools"] = serde_json::json!(success.tool_count);
+                    }
+                    GatewayOutcome::Unserved(detail) => {
+                        row["ok"] = serde_json::json!(false);
+                        row["unserved"] = serde_json::json!(true);
+                        row["error"] = serde_json::json!(detail);
+                    }
+                    GatewayOutcome::Failed(err) => {
+                        row["ok"] = serde_json::json!(false);
+                        row["error"] = serde_json::json!(err.to_string());
+                    }
+                }
+                row
+            })
+            .collect();
+        out["gateway"] = serde_json::json!({
+            "base": gateway.base,
+            "reachable": gateway.reachable,
+            "skipped": gateway.skipped,
+            "results": entries,
+        });
+    }
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }
@@ -193,8 +318,11 @@ struct ProbeReport {
     results: Vec<ProbeRow>,
 }
 
-fn run_probes(plan: ProbePlan, timeout: Duration) -> anyhow::Result<ProbeReport> {
-    let runtime = tokio::runtime::Runtime::new()?;
+fn run_probes(
+    runtime: &tokio::runtime::Runtime,
+    plan: ProbePlan,
+    timeout: Duration,
+) -> ProbeReport {
     let mut results = runtime.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         let mut labels: BTreeMap<tokio::task::Id, String> = BTreeMap::new();
@@ -209,7 +337,119 @@ fn run_probes(plan: ProbePlan, timeout: Duration) -> anyhow::Result<ProbeReport>
         collect_probes(set, &labels).await
     });
     results.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(ProbeReport { results })
+    ProbeReport { results }
+}
+
+/// What one managed entry's endpoint answered.
+enum GatewayOutcome {
+    Ok(ProbeSuccess),
+    /// The gateway is up but serves nothing there; the string is its own
+    /// answer, which names what it does serve. Reported as findings rather
+    /// than as a failed row, so it is counted once.
+    Unserved(String),
+    Failed(ProbeError),
+}
+
+struct GatewayReport {
+    base: String,
+    reachable: bool,
+    /// How many endpoints were never dialed because the gateway is down.
+    skipped: usize,
+    results: Vec<(GatewayTarget, GatewayOutcome)>,
+    findings: Vec<Finding>,
+}
+
+impl GatewayReport {
+    fn failures(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|(_, outcome)| matches!(outcome, GatewayOutcome::Failed(_)))
+            .count()
+    }
+}
+
+/// Dials every gateway endpoint the managed client entries point at, the same
+/// way the clients themselves would.
+fn run_gateway_probes(
+    runtime: &tokio::runtime::Runtime,
+    plan: GatewayPlan,
+    timeout: Duration,
+) -> GatewayReport {
+    let mut report = GatewayReport {
+        base: plan.base().to_owned(),
+        reachable: false,
+        skipped: plan.len(),
+        results: Vec::new(),
+        findings: Vec::new(),
+    };
+    let targets = plan.into_targets();
+
+    runtime.block_on(async {
+        report.reachable = gateway_listening(&report.base, REACH_TIMEOUT.min(timeout)).await;
+        if !report.reachable {
+            report.findings.push(gateway_unreachable(&report.base));
+            return;
+        }
+        report.skipped = 0;
+
+        let mut set = tokio::task::JoinSet::new();
+        let mut pending: BTreeMap<tokio::task::Id, GatewayTarget> = BTreeMap::new();
+        for target in targets {
+            let handle = set.spawn({
+                let target = target.clone();
+                async move { (target.clone(), probe_endpoint(&target.url, timeout).await) }
+            });
+            pending.insert(handle.id(), target);
+        }
+        while let Some(joined) = set.join_next_with_id().await {
+            report.results.push(match joined {
+                Ok((_, row)) => row,
+                // Same rule as the direct pass: one broken task costs its own
+                // row, not the report.
+                Err(err) => {
+                    let target = pending.remove(&err.id());
+                    let outcome = GatewayOutcome::Failed(ProbeError::Aborted {
+                        reason: err.to_string(),
+                    });
+                    match target {
+                        Some(target) => (target, outcome),
+                        None => continue,
+                    }
+                }
+            });
+        }
+    });
+
+    report.results.sort_by(|a, b| a.0.url.cmp(&b.0.url));
+    for (target, outcome) in &report.results {
+        if let GatewayOutcome::Unserved(detail) = outcome {
+            report.findings.extend(unserved_endpoint(target, detail));
+        }
+    }
+    report
+}
+
+/// Runs the full client handshake against one gateway endpoint.
+///
+/// No headers are sent: the gateway has no authentication yet (`serve` says
+/// so out loud when bound off loopback), so anything an entry carries is for
+/// an upstream the gateway holds, not for the gateway itself.
+async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutcome {
+    let server = Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: Transport::Http {
+            url: url.to_owned(),
+            headers: BTreeMap::new(),
+        },
+    };
+    match probe_server(&server, timeout).await {
+        Ok(success) => GatewayOutcome::Ok(success),
+        Err(err) => match classify_gateway_failure(&err.to_string()) {
+            GatewayFault::Unserved(detail) => GatewayOutcome::Unserved(detail),
+            GatewayFault::Failed => GatewayOutcome::Failed(err),
+        },
+    }
 }
 
 /// Drains the probe tasks. A task that panics costs its own row, not the
@@ -241,13 +481,37 @@ async fn collect_probes(
     collected
 }
 
+/// Prints `text` as a section heading.
+fn heading(text: &str, color: bool) {
+    if color {
+        println!("{}", text.bold());
+    } else {
+        println!("{text}");
+    }
+}
+
+fn ok_line(line: &str, color: bool) {
+    if color {
+        println!("  {} {line}", "✓".green());
+    } else {
+        println!("  ✓ {line}");
+    }
+}
+
+fn bad_line(line: &str, color: bool) {
+    if color {
+        println!("  {} {line}", "✗".red());
+    } else {
+        println!("  ✗ {line}");
+    }
+}
+
 fn render_probes(probes: &ProbeReport, color: bool) {
     println!();
-    if color {
-        println!("{}", "probes".bold());
-    } else {
-        println!("probes");
-    }
+    // Named "direct" against the gateway section below it: the two dial
+    // different things and fail for different reasons, and which one is red
+    // is the whole diagnosis.
+    heading("probes — direct to each server", color);
     for (label, outcome) in &probes.results {
         match outcome {
             Ok(success) => {
@@ -255,19 +519,55 @@ fn render_probes(probes: &ProbeReport, color: bool) {
                     "{label}: {} {}, {} tools",
                     success.server_name, success.server_version, success.tool_count
                 );
-                if color {
-                    println!("  {} {line}", "✓".green());
-                } else {
-                    println!("  ✓ {line}");
+                ok_line(&line, color);
+            }
+            Err(err) => bad_line(&format!("{label}: {err}"), color),
+        }
+    }
+}
+
+/// The second probe section: the path clients actually take. A server can be
+/// perfectly healthy on the row above and unreachable on this one — a gateway
+/// that is down, an endpoint it never served, a name that went stale — which
+/// is why they are two sections and not one.
+fn render_gateway(report: &GatewayReport, color: bool) {
+    println!();
+    heading(
+        &format!("probes — through the gateway at {}", report.base),
+        color,
+    );
+    if !report.reachable {
+        bad_line(
+            &format!(
+                "not reachable — start it with `mcpgw serve` ({} endpoint(s) not checked)",
+                report.skipped
+            ),
+            color,
+        );
+        return;
+    }
+    for (target, outcome) in &report.results {
+        let where_ = format!("{} ← {}", target.url, target.label());
+        match outcome {
+            GatewayOutcome::Ok(success) => ok_line(
+                &format!(
+                    "{where_}: {} {}, {} tools",
+                    success.server_name, success.server_version, success.tool_count
+                ),
+                color,
+            ),
+            // One line per entry, matching the findings one for one: each is
+            // a different client file, and the summary counts them that way.
+            // Rebuilt from the same function that produced them so the two
+            // renderings cannot drift apart.
+            GatewayOutcome::Unserved(detail) => {
+                for finding in unserved_endpoint(target, detail) {
+                    let client = finding.client.unwrap_or_default();
+                    let entry = finding.server.unwrap_or_default();
+                    bad_line(&format!("{client} {entry:?} {}", finding.message), color);
                 }
             }
-            Err(err) => {
-                if color {
-                    println!("  {} {label}: {err}", "✗".red());
-                } else {
-                    println!("  ✗ {label}: {err}");
-                }
-            }
+            GatewayOutcome::Failed(err) => bad_line(&format!("{where_}: {err}"), color),
         }
     }
 }
@@ -296,23 +596,15 @@ fn render(
     findings: &[Finding],
     color: bool,
 ) {
-    let heading = |text: String| {
-        if color {
-            println!("{}", text.bold());
-        } else {
-            println!("{text}");
-        }
-    };
-
-    heading(format!(
-        "canonical config ({}) — {canonical_note}",
-        path.display()
-    ));
+    heading(
+        &format!("canonical config ({}) — {canonical_note}", path.display()),
+        color,
+    );
     print_findings(findings, None, color);
 
     for (client, state) in detections {
         println!();
-        heading(format!("{client} — {state}"));
+        heading(&format!("{client} — {state}"), color);
         print_findings(findings, Some(client), color);
     }
 }
