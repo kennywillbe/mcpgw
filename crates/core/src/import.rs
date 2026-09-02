@@ -19,6 +19,29 @@ pub struct ImportCandidate {
     pub renamed: bool,
     /// Lossy-read notes (e.g. sse→http) surfaced next to the entry.
     pub notes: Vec<String>,
+    /// The stdio command resolved neither as an absolute path nor on PATH,
+    /// so `server.enabled` was forced off. Importing such an entry enabled
+    /// publishes an endpoint that can never answer, and the next sync spreads
+    /// it to every client — one broken entry becomes one failure per client.
+    pub command_missing: bool,
+    /// An http candidate that addresses something already known under a
+    /// different definition. `None` for everything else.
+    pub same_address: Option<SameAddress>,
+}
+
+/// The entry an http candidate shares an address with, when the only thing
+/// separating them is the value of a header they both carry.
+///
+/// Names the counterpart and nothing else: the values that differ are
+/// credentials, and the whole point of the flag is that the caller can talk
+/// about the difference without printing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SameAddress {
+    /// The entry the candidate matched.
+    pub name: String,
+    /// True when that entry is already in the canonical config, false when
+    /// it is another candidate in this same plan.
+    pub canonical: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -35,10 +58,18 @@ pub struct ImportPlan {
 /// Builds an import plan. `sources` order is significant: on cross-client
 /// name clashes with different definitions, the first client keeps the
 /// name and later ones are suffixed.
+///
+/// `command_exists` is the same PATH lookup `doctor` is given, and it is a
+/// parameter for the same reason: planning stays testable without a real
+/// machine underneath it. Passing it here rather than checking afterwards in
+/// each caller is deliberate — the wizard's import step and `mcpgw import`
+/// both plan through this function, so a check that lives here cannot be the
+/// one a caller forgot.
 #[must_use]
 pub fn plan_import(
     sources: &[(String, ClientRead)],
     canonical: &BTreeMap<String, Server>,
+    command_exists: &dyn Fn(&str) -> bool,
 ) -> ImportPlan {
     let mut candidates: Vec<ImportCandidate> = Vec::new();
 
@@ -102,12 +133,25 @@ pub fn plan_import(
                 (name, true)
             };
 
+            let same_address = same_address(server, canonical, &candidates);
+            let command_missing = match &server.transport {
+                Transport::Stdio { command, .. } => !command_exists(command),
+                Transport::Http { .. } => false,
+            };
+            let mut server = server.clone();
+            // The entry is kept — it is the user's data and the command may
+            // come back — but off, where it reaches neither the gateway nor
+            // any client.
+            server.enabled &= !command_missing;
+
             candidates.push(ImportCandidate {
                 name,
-                server: server.clone(),
+                server,
                 origins: vec![(client_id.clone(), orig_name.clone())],
                 renamed,
                 notes,
+                command_missing,
+                same_address,
             });
         }
     }
@@ -123,6 +167,61 @@ pub fn plan_import(
         }
     }
     plan
+}
+
+/// Whether this candidate is one already-known server wearing a second set of
+/// credentials: same URL, the same header *keys*, different values.
+///
+/// That shape is what a user gets by pasting a remote server into two clients
+/// with two tokens, and treating it as two servers — which is what transport
+/// equality has to do — imports the same thing twice under invented names.
+/// It cannot be merged automatically either: the two definitions may be two
+/// accounts, and picking one silently would change what runs. So it is only
+/// detected, and the caller asks.
+///
+/// A *different* set of header keys is left alone on purpose: one side
+/// sending an extra header is a genuinely different definition, not the same
+/// definition with a different secret in it.
+fn same_address(
+    server: &Server,
+    canonical: &BTreeMap<String, Server>,
+    candidates: &[ImportCandidate],
+) -> Option<SameAddress> {
+    let Transport::Http { url, headers } = &server.transport else {
+        return None;
+    };
+    if headers.is_empty() {
+        return None;
+    }
+    let matches = |other: &Server| match &other.transport {
+        Transport::Http {
+            url: other_url,
+            headers: other_headers,
+        } => {
+            canonical_url(url) == canonical_url(other_url)
+                && other_headers.keys().eq(headers.keys())
+                && other_headers != headers
+        }
+        Transport::Stdio { .. } => false,
+    };
+    // The canonical config first: "the one you already have" is a more useful
+    // thing to be told about than another entry arriving in the same run.
+    canonical
+        .iter()
+        .find(|(_, existing)| matches(existing))
+        .map(|(name, _)| SameAddress {
+            name: name.clone(),
+            canonical: true,
+        })
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|c| matches(&c.server))
+                .map(|c| SameAddress {
+                    name: c.name.clone(),
+                    canonical: false,
+                })
+        })
 }
 
 /// Whether two transports address the same server.

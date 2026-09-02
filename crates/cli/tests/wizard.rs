@@ -22,6 +22,14 @@ fn config() -> String {
     )
 }
 
+/// A command that really resolves on this machine, JSON-quoted so it can be
+/// dropped straight into a client file. The import step now brings in
+/// anything it cannot find on PATH switched off, so a test about dedupe or
+/// about what sync does next has to name a command that is actually there.
+fn real_command() -> String {
+    serde_json::to_string(&fixture_binary().to_string_lossy()).unwrap()
+}
+
 /// A `mcpgw` invocation pointed at `home` and nothing of the real machine:
 /// its own config, its own state directory, and no XDG override leaking in
 /// from the environment the test itself was started in.
@@ -330,18 +338,23 @@ async fn wizard(home: &Path, url: &str, extra: &[&str], input: &str) -> String {
 #[tokio::test]
 async fn import_dedupes_a_server_two_clients_share_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
+    let cmd = real_command();
     write_client(
         dir.path(),
         ".cursor/mcp.json",
-        r#"{"mcpServers": {
-            "github": {"command": "npx", "args": ["server-github"]},
-            "notes": {"command": "notes-mcp"}
-        }}"#,
+        &format!(
+            r#"{{"mcpServers": {{
+            "github": {{"command": {cmd}, "args": ["server-github"]}},
+            "notes": {{"command": {cmd}}}
+        }}}}"#
+        ),
     );
     write_client(
         dir.path(),
         ".claude.json",
-        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {cmd}, "args": ["server-github"]}}}}}}"#
+        ),
     );
 
     let (_held, url) = dead_gateway();
@@ -481,7 +494,10 @@ async fn what_the_import_step_adopts_is_still_pushed_by_the_sync_step() {
     write_client(
         dir.path(),
         ".cursor/mcp.json",
-        r#"{"mcpServers": {"notes": {"command": "notes-mcp"}}}"#,
+        &format!(
+            r#"{{"mcpServers": {{"notes": {{"command": {}}}}}}}"#,
+            real_command()
+        ),
     );
 
     let (_held, url) = dead_gateway();
@@ -805,4 +821,118 @@ async fn a_second_run_has_nothing_left_to_push() {
         }
         assert_no_service(dir.path());
     }
+}
+
+/// Two clients holding one remote server under two tokens: structurally two
+/// servers, in practice one. The step says what it sees before it writes
+/// anything — and never what the tokens are.
+const SHARED_ADDRESS_EXPLANATION: &str = "points at the same address as context7, \
+     also being imported, with different credentials — probably the same server.";
+
+fn shared_address_clients(home: &Path) {
+    write_client(
+        home,
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp",
+            "headers": {"Authorization": "Bearer cursor-secret"}}}}"#,
+    );
+    write_client(
+        home,
+        ".claude.json",
+        r#"{"mcpServers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp",
+            "headers": {"Authorization": "Bearer claude-secret"}}}}"#,
+    );
+}
+
+/// `--yes` cannot ask, so it keeps both — what every earlier release did —
+/// but it still prints the explanation, because a user who is later surprised
+/// by `context7-2` deserves to find the reason in their scrollback.
+#[tokio::test]
+async fn a_shared_address_is_explained_and_yes_keeps_both() {
+    let dir = tempfile::tempdir().unwrap();
+    shared_address_clients(dir.path());
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &["--yes"], "").await;
+
+    assert!(stdout.contains(SHARED_ADDRESS_EXPLANATION), "{stdout}");
+    assert!(stdout.contains("Keep both"), "{stdout}");
+    assert!(!stdout.contains("secret"), "{stdout}");
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("[servers.context7]"), "{config}");
+    assert!(config.contains("[servers.context7-2]"), "{config}");
+}
+
+/// Answered by a human who recognises their own server, the second copy is
+/// left where it is: not written, and not adopted either, so nothing claims
+/// to manage a client entry the user kept for themselves.
+#[tokio::test]
+async fn a_shared_address_answered_keep_one_skips_the_incoming_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    shared_address_clients(dir.path());
+
+    let (_held, url) = dead_gateway();
+    // Yes to the survey, yes to the import, then the second option: keep only
+    // the copy that is already coming in.
+    let stdout = wizard(dir.path(), &url, &[], "y\ny\n2\n").await;
+
+    assert!(stdout.contains(SHARED_ADDRESS_EXPLANATION), "{stdout}");
+    assert!(stdout.contains("Keep just context7 —"), "{stdout}");
+    assert!(stdout.contains("Imported 1 server."), "{stdout}");
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("[servers.context7]"), "{config}");
+    assert!(!config.contains("[servers.context7-2]"), "{config}");
+    // One of the two client entries stays the user's own.
+    let state = std::fs::read_to_string(dir.path().join("state").join("managed.json")).unwrap();
+    assert_eq!(state.matches("context7").count(), 1, "{state}");
+}
+
+/// The first-run bug this step now guards against: a client carrying an entry
+/// for something that is not installed here. Importing it enabled put it in
+/// front of every client and turned one stale entry into one verify failure
+/// per client, so it comes in switched off — and the plan says so before the
+/// question, not afterwards.
+#[tokio::test]
+async fn a_server_this_machine_cannot_start_is_imported_switched_off() {
+    let dir = tempfile::tempdir().unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        &format!(
+            r#"{{"mcpServers": {{
+            "node_repl": {{"command": "/Applications/Gone.app/cua_node/bin/node_repl"}},
+            "notes": {{"command": {}}}
+        }}}}"#,
+            real_command()
+        ),
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &["--yes"], "").await;
+
+    assert!(
+        stdout.contains(
+            "node_repl — command not found on this machine, importing disabled \
+             (enable later: mcpgw toggle node_repl)"
+        ),
+        "{stdout}"
+    );
+    // Explained on its own line, so it is not also listed among the entries
+    // that need no explanation.
+    assert!(
+        stdout.contains("The rest come across as they are: notes."),
+        "{stdout}"
+    );
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("[servers.node_repl]"), "{config}");
+    assert!(config.contains("enabled = false"), "{config}");
+
+    // And the point of all of it: the client is never pointed at an endpoint
+    // the gateway does not publish.
+    let entries = json_at(&dir.path().join(".cursor/mcp.json"))["mcpServers"].clone();
+    assert!(entries["node_repl"].get("url").is_none(), "{entries}");
+    assert_eq!(entries["notes"]["url"], url.replace("/mcp", "/s/notes"));
 }

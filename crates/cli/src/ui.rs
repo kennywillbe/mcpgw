@@ -59,9 +59,6 @@ fn parse_yes_no(line: &str) -> Option<bool> {
 /// # Errors
 ///
 /// Returns the underlying [`std::io::Error`] if the terminal cannot be read.
-// First caller is the wizard's import step (W2), which is the first one with
-// a question that is not yes-or-no.
-#[allow(dead_code)]
 pub fn choose(prompt: &str, options: &[String], default: usize) -> anyhow::Result<usize> {
     for (i, option) in options.iter().enumerate() {
         println!("  {}) {option}", i + 1);

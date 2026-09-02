@@ -121,9 +121,6 @@ impl Ctx {
     ///
     /// Returns the underlying [`std::io::Error`] if the terminal cannot be
     /// read, or an actionable failure when `--yes` meets a `None` default.
-    // First caller is the wizard's import step (W2) — the first step with a
-    // question that is not yes-or-no. See the contract in the module header.
-    #[allow(dead_code)]
     pub fn choose(
         &self,
         prompt: &str,
@@ -152,9 +149,6 @@ impl Ctx {
     ///
     /// Returns a failure only if the config exists but cannot be read; a
     /// missing config stays the empty config.
-    // First caller is the wizard's import step (W2) — detect is read-only,
-    // so W1 has nothing to re-read yet. See the contract in the header.
-    #[allow(dead_code)]
     pub fn refresh(&mut self) -> anyhow::Result<()> {
         self.config = load_config(&self.config_path)?;
         self.state = load_state();

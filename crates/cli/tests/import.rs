@@ -3,6 +3,18 @@ use std::process::Output;
 
 use assert_cmd::Command;
 
+mod util;
+use util::fixture_binary;
+
+/// A command that really resolves on this machine, JSON-quoted so it can be
+/// dropped straight into a client file. Import now brings in anything it
+/// cannot find on PATH switched off, so every test about naming, dedupe or
+/// adoption has to name a command that is actually there — `npx` is on some
+/// runners and not others, which is a coin flip, not a fixture.
+fn real_command() -> String {
+    serde_json::to_string(&fixture_binary().to_string_lossy()).unwrap()
+}
+
 struct Sandbox {
     _dir: tempfile::TempDir,
     home: PathBuf,
@@ -54,16 +66,21 @@ impl Sandbox {
 #[test]
 fn imports_dedups_and_renames_across_clients() {
     let sb = Sandbox::new();
+    let cmd = real_command();
     sb.write_client(
         ".cursor/mcp.json",
-        r#"{"mcpServers": {
-            "github": {"command": "npx", "args": ["server-github"]},
-            "My Notes": {"command": "notes-mcp"}
-        }}"#,
+        &format!(
+            r#"{{"mcpServers": {{
+            "github": {{"command": {cmd}, "args": ["server-github"]}},
+            "My Notes": {{"command": {cmd}}}
+        }}}}"#
+        ),
     );
     sb.write_client(
         ".claude.json",
-        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {cmd}, "args": ["server-github"]}}}}}}"#
+        ),
     );
 
     let out = sb.ok(&["import"]);
@@ -85,7 +102,10 @@ fn import_then_sync_produces_no_conflicts() {
     let sb = Sandbox::new();
     sb.write_client(
         ".cursor/mcp.json",
-        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {}, "args": ["server-github"]}}}}}}"#,
+            real_command()
+        ),
     );
     sb.ok(&["import", "--from", "cursor"]);
 
@@ -110,7 +130,10 @@ fn renamed_import_is_renamed_in_client_by_next_sync() {
     let sb = Sandbox::new();
     sb.write_client(
         ".cursor/mcp.json",
-        r#"{"mcpServers": {"My Notes": {"command": "notes-mcp"}}}"#,
+        &format!(
+            r#"{{"mcpServers": {{"My Notes": {{"command": {}}}}}}}"#,
+            real_command()
+        ),
     );
     sb.ok(&["import", "--from", "cursor"]);
     let out = sb.ok(&["sync", "--client", "cursor"]);
@@ -168,7 +191,10 @@ fn a_lost_adoption_record_never_costs_the_client_entry() {
     let sb = Sandbox::new();
     sb.write_client(
         ".cursor/mcp.json",
-        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {}, "args": ["server-github"]}}}}}}"#,
+            real_command()
+        ),
     );
     sb.ok(&["import", "--from", "cursor"]);
 
@@ -194,15 +220,18 @@ fn import_from_gemini_adopts_and_carries_the_excluded_flag() {
     let sb = Sandbox::new();
     sb.write_client(
         ".gemini/settings.json",
-        r#"{
+        &format!(
+            r#"{{
             "theme": "Default",
-            "mcp": { "excluded": ["notes"] },
-            "mcpServers": {
-                "github": {"command": "npx", "args": ["server-github"], "trust": true},
-                "linear": {"httpUrl": "https://mcp.linear.app/mcp"},
-                "notes": {"command": "notes-mcp"}
-            }
-        }"#,
+            "mcp": {{ "excluded": ["notes"] }},
+            "mcpServers": {{
+                "github": {{"command": {}, "args": ["server-github"], "trust": true}},
+                "linear": {{"httpUrl": "https://mcp.linear.app/mcp"}},
+                "notes": {{"command": "notes-mcp"}}
+            }}
+        }}"#,
+            real_command()
+        ),
     );
     let out = sb.ok(&["import", "--from", "gemini"]);
     assert!(out.contains("+ github"), "{out}");
@@ -229,16 +258,17 @@ fn import_from_codex_reads_toml_and_flags_managed_auth() {
     let sb = Sandbox::new();
     sb.write_client(
         ".codex/config.toml",
-        r#"model = "gpt-5-codex"
+        &format!(
+            r#"model = "gpt-5-codex"
 
 [mcp_servers.github]
-command = "npx"
+command = '{}'
 args = ["server-github"]
 startup_timeout_sec = 20
 
 [mcp_servers.linear]
 url = "https://mcp.linear.app/mcp"
-http_headers = { Authorization = "Bearer t" }
+http_headers = {{ Authorization = "Bearer t" }}
 
 [mcp_servers.figma]
 url = "https://mcp.figma.com/mcp"
@@ -248,6 +278,8 @@ auth = "oauth"
 command = "notes-mcp"
 enabled = false
 "#,
+            fixture_binary().display()
+        ),
     );
     let out = sb.ok(&["import", "--from", "codex"]);
     for name in ["+ github", "+ linear", "+ figma", "+ notes"] {
@@ -452,11 +484,14 @@ fn import_from_cline_adopts_disabled_and_auto_approved_entries() {
 #[test]
 fn import_dedupes_a_server_the_user_has_on_both_cline_surfaces() {
     let sb = Sandbox::new();
-    let entry = r#"{"mcpServers": {
-        "github": {"command": "npx", "args": ["server-github"]}
-    }}"#;
-    sb.write_client(cline_extension_rel(), entry);
-    sb.write_client(".cline/data/settings/cline_mcp_settings.json", entry);
+    let entry = format!(
+        r#"{{"mcpServers": {{
+        "github": {{"command": {}, "args": ["server-github"]}}
+    }}}}"#,
+        real_command()
+    );
+    sb.write_client(cline_extension_rel(), &entry);
+    sb.write_client(".cline/data/settings/cline_mcp_settings.json", &entry);
 
     let out = sb.ok(&["import"]);
     assert!(
@@ -654,4 +689,74 @@ fn nothing_to_import_reports_cleanly() {
     let sb = Sandbox::new();
     let out = sb.ok(&["import"]);
     assert!(out.contains("nothing to import"), "{out}");
+}
+
+/// A stdio entry pointing at something that is not on this machine — the
+/// Codex CLI carries one for an app that may not be installed — is kept, but
+/// switched off, so it reaches neither the gateway nor any client. The line
+/// has to name the command that turns it back on.
+#[test]
+fn an_unresolvable_command_is_imported_disabled_and_says_so() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "node_repl": {"command": "/Applications/Gone.app/cua_node/bin/node_repl"}
+        }}"#,
+    );
+
+    let out = sb.ok(&["import", "--from", "cursor"]);
+    assert!(
+        out.contains(
+            "command not found on this machine, importing disabled \
+             (enable later: mcpgw toggle node_repl)"
+        ),
+        "{out}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(json["servers"]["node_repl"]["enabled"], false);
+
+    // The point of importing it off: sync has nothing to push, so the entry
+    // cannot turn into a failure in every client.
+    let sync = sb.ok(&["sync", "--client", "cursor"]);
+    assert!(!sync.contains("+ node_repl"), "{sync}");
+}
+
+/// Off a terminal there is nobody to ask, so both copies are kept exactly as
+/// before — but the observation is printed, because otherwise the user meets
+/// `context7-2` with nothing to explain it.
+#[test]
+fn a_piped_run_explains_a_shared_address_and_keeps_both() {
+    let sb = Sandbox::new();
+    sb.ok(&[
+        "add",
+        "ctx",
+        "--url",
+        "https://mcp.context7.com/mcp",
+        "--header",
+        "Authorization=Bearer canonical-secret",
+    ]);
+    sb.write_client(
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp",
+            "headers": {"Authorization": "Bearer client-secret"}}}}"#,
+    );
+
+    let out = sb.ok(&["import", "--from", "cursor"]);
+    assert!(
+        out.contains(
+            "context7 in Cursor points at the same address as your existing ctx, \
+             with different credentials — probably the same server."
+        ),
+        "{out}"
+    );
+    assert!(out.contains("+ context7"), "{out}");
+    // Never the values, on any surface: this transcript ends up in bug
+    // reports.
+    assert!(!out.contains("secret"), "{out}");
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert!(json["servers"]["ctx"].is_object());
+    assert!(json["servers"]["context7"].is_object());
 }
