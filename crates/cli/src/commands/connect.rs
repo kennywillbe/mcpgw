@@ -25,7 +25,7 @@ pub struct ConnectArgs {
     )]
     pub url: Option<String>,
     /// Bridge to one server's own endpoint instead of the aggregate, so its
-    /// tools arrive unprefixed (needs `mcpgw serve --per-server`)
+    /// tools arrive unprefixed
     #[arg(long, value_name = "NAME")]
     pub server: Option<String>,
 }

@@ -26,7 +26,6 @@ and reaps the child processes.
 mcpgw serve --port 9000
 mcpgw serve --server github --server linear   # a subset (repeatable)
 mcpgw serve --no-capture                      # don't write the traffic log
-mcpgw serve --per-server                      # also one endpoint per server
 ```
 
 ### Binding
@@ -51,11 +50,12 @@ pipe to that server, tool names untouched.
 
 ## Per-server endpoints
 
-`--per-server` additionally gives every served server its own endpoint, where
-its tools appear under their own names:
+Alongside the aggregate, every served server gets its own endpoint, where its
+tools appear under their own names. No flag — serving one implies serving all
+of them:
 
 ```sh
-mcpgw serve --per-server
+mcpgw serve
 # http://127.0.0.1:8137/mcp      — everything, as server__tool
 # http://127.0.0.1:8137/s/github — github only, tools unprefixed
 # http://127.0.0.1:8137/s/linear — linear only, tools unprefixed
@@ -104,8 +104,6 @@ starting anything twice. A stdio-only client reaches one the same way:
 mcpgw connect --server github
 ```
 
-Off unless asked for; `/mcp` alone is what you get otherwise.
-
 ## Upstream lifecycle
 
 Each server gets one connection, multiplexed across every client session — no
@@ -134,8 +132,8 @@ the move, because it is still the same entry.
 ```
 
 The shape is per client: `httpUrl` for Gemini, `serverUrl` for Windsurf,
-`type: "remote"` for opencode, and so on. Run it against a gateway started with
-`--per-server`.
+`type: "remote"` for opencode, and so on. Any running `mcpgw serve` answers on
+those endpoints.
 
 ```sh
 mcpgw sync --gateway --gateway-url http://127.0.0.1:9000/mcp

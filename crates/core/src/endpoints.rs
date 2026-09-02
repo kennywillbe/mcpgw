@@ -237,7 +237,7 @@ async fn dispatch(
 fn unknown_endpoint(name: &str, table: &EndpointTable) -> Response {
     let known = if table.is_empty() {
         "no per-server endpoints are configured (start the gateway with \
-         `mcpgw serve --per-server`)"
+         `mcpgw serve`)"
             .to_owned()
     } else {
         let paths: Vec<String> = table.names().map(endpoint_path).collect();
