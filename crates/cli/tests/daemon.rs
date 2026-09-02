@@ -161,13 +161,14 @@ fn install_and_start_name_the_port_that_is_already_taken() {
 /// The installers land per-OS later; until then every one of them has to say
 /// so, and point at the thing that does work today.
 ///
-/// Not on macOS, and not on Windows: both installers have shipped, so
+/// Not on macOS, Linux or Windows: all three installers have shipped, so
 /// running this there would bootstrap a real launch agent into the
-/// developer's (or the runner's) own launchd domain, or register a real
-/// service on the machine — a CI runner is elevated, so it would succeed.
-/// `daemon_launchd.rs` and `daemon_windows.rs` drive those cycles
-/// deliberately, and only when asked.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// developer's (or the runner's) own launchd domain, enable a real systemd
+/// user unit, or register a real service on the machine — a CI runner is
+/// elevated, so that would succeed. `daemon_launchd.rs`, `daemon_systemd.rs`
+/// and `daemon_windows.rs` drive those cycles deliberately, and only when
+/// asked.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[test]
 fn the_service_commands_say_which_release_brings_them_and_what_to_do_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
