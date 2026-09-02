@@ -3,11 +3,12 @@
 //! The escape hatch that makes gateway-only mode acceptable. It writes the
 //! canonical config's *original* transports back into every client mcpgw
 //! wrote to — same names, so the gateway entries land as plain updates —
-//! drops the aggregate `mcpgw` entry, and offers to take the daemon with it.
+//! drops the leftover single `mcpgw` entry a 0.3.x `sync --aggregate` wrote,
+//! and offers to take the daemon with it.
 //!
 //! The desired entry set is built here, out of the canonical servers, rather
-//! than by asking `sync` for its direct mode: direct mode is on its way out
-//! of `sync`, and the restore must not go with it. Everything *under* the
+//! than by asking `sync` for its direct mode: `sync` has no direct mode any
+//! more, and the restore must not have gone with it. Everything *under* the
 //! desired map is `sync`'s and unchanged — the codec, the plan, the backup,
 //! the state bookkeeping — so an ejected client is byte-identical to a
 //! directly synced one, and `mcpgw sync --rollback` undoes this run exactly

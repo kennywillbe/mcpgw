@@ -117,7 +117,7 @@ pub struct GatewayEntry {
 pub struct GatewayTarget {
     pub url: String,
     /// The server whose own endpoint this is (`/s/<name>`), or `None` for the
-    /// aggregate face.
+    /// gateway's own `/mcp`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     pub entries: Vec<GatewayEntry>,
@@ -300,7 +300,7 @@ fn host_key(url: &url::Url) -> Option<String> {
 }
 
 /// The server name in a `/s/<name>` endpoint URL, or `None` for any other
-/// path (the aggregate `/mcp` included).
+/// path (`/mcp` included).
 #[must_use]
 pub fn endpoint_server(url: &str) -> Option<String> {
     let path = url::Url::parse(url).ok()?.path().to_owned();

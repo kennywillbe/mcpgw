@@ -24,8 +24,8 @@ pub struct ConnectArgs {
         help = "URL of the running gateway [default: http://127.0.0.1:8137/mcp]"
     )]
     pub url: Option<String>,
-    /// Bridge to one server's own endpoint instead of the aggregate, so its
-    /// tools arrive unprefixed
+    /// Bridge to one server's own endpoint instead of the gateway's `/mcp`,
+    /// so its tools arrive unprefixed
     #[arg(long, value_name = "NAME")]
     pub server: Option<String>,
 }

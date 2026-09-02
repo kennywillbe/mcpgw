@@ -74,7 +74,8 @@ mcpgw watch --json | jq -r 'select(.ok == false) | "\(.server) \(.error)"'
   — it falls back to an id for the gateway *process*, which cannot tell two
   clients apart. Same field, and the ids never collide; just a coarser answer.
 - `endpoint` — which face of the gateway took the request: `mcp` for the
-  aggregate, `s/<server>` for a per-server endpoint. Absent on stdio traffic
+  gateway's own endpoint, `s/<server>` for a per-server one. Absent on stdio
+  traffic
   and on lines written before this field existed.
 - `kind` — which request family the record describes:
 

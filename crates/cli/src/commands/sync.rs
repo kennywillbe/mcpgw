@@ -6,19 +6,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 use mcpgw_core::clients::codec::ClientDocument;
 use mcpgw_core::sync::{
-    GATEWAY_NAME, SyncPlan, apply_plan_to, gateway_server, per_server_gateway_servers,
-    plan_client_context, plan_sync,
+    SyncPlan, apply_plan_to, per_server_gateway_servers, plan_client_context, plan_sync,
 };
 use mcpgw_core::{
     ClientKind, Config, Detection, Error, Server, backup, paths, state::ManagedState,
 };
 use owo_colors::OwoColorize as _;
 
-// The flags are a flat description of a command line, not state to model: how
-// they combine is already spelled out by clap's own `conflicts_with` and
-// `requires`, and hiding them behind an enum would only move that away from
-// the place `--help` is generated from.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(clap::Args)]
 pub struct SyncArgs {
     /// Only sync these clients (repeatable)
@@ -38,10 +32,6 @@ pub struct SyncArgs {
     /// Kept for one release so scripts and docs that spell it keep working.
     #[arg(long, hide = true)]
     pub gateway: bool,
-    /// Write one `mcpgw` entry for the whole gateway instead of one entry per
-    /// server
-    #[arg(long, conflicts_with = "rollback")]
-    pub aggregate: bool,
     /// URL of the gateway the entries point at
     #[arg(long, default_value = super::connect::DEFAULT_URL, value_name = "URL")]
     pub gateway_url: String,
@@ -66,23 +56,18 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         return rollback(&targets, &state_dir);
     }
 
-    // Aggregate mode writes one synthetic entry per client, so the canonical
-    // servers are irrelevant there — an unreadable config must not block it.
-    // Per-server mode mirrors those servers by name and needs them.
-    let canonical = if args.aggregate {
-        BTreeMap::new()
-    } else {
-        let config_path = super::canonical_config_path()?;
-        match Config::load(&config_path) {
-            Ok(config) => config.servers,
-            // An absent canonical config means "manage nothing": previously
-            // managed entries get removed, everything else is untouched.
-            Err(Error::NotFound { .. }) => BTreeMap::new(),
-            Err(err) => return Err(err.into()),
-        }
+    // The entries mirror the canonical servers by name, so the canonical
+    // config is what this run is a function of.
+    let config_path = super::canonical_config_path()?;
+    let canonical = match Config::load(&config_path) {
+        Ok(config) => config.servers,
+        // An absent canonical config means "manage nothing": previously
+        // managed entries get removed, everything else is untouched.
+        Err(Error::NotFound { .. }) => BTreeMap::new(),
+        Err(err) => return Err(err.into()),
     };
 
-    let bridge = announce_mode(args)?;
+    let bridge = announce(args)?;
 
     let state_path = state_dir.join("managed.json");
     // Held across the whole load→modify→save window: a second `mcpgw sync
@@ -318,47 +303,36 @@ pub fn apply_client(
 ///
 /// The bridge is resolved once for the whole run: probing PATH per client
 /// would give the same answer.
-fn announce_mode(args: &SyncArgs) -> anyhow::Result<String> {
-    // Checked before a single client is touched, in both modes: a base URL
-    // that cannot take an endpoint path is wrong for all of them, and failing
-    // halfway would leave some clients rewritten and some not.
+fn announce(args: &SyncArgs) -> anyhow::Result<String> {
+    // Checked before a single client is touched: a base URL that cannot take
+    // an endpoint path is wrong for all of them, and failing halfway would
+    // leave some clients rewritten and some not.
     mcpgw_core::endpoints::per_server_url(&args.gateway_url, "probe")
         .with_context(|| format!("--gateway-url {} is not a URL", args.gateway_url))?;
-    if args.aggregate {
-        println!(
-            "gateway mode — every client gets a single `{GATEWAY_NAME}` entry pointing at {}",
-            args.gateway_url
-        );
-    } else {
-        println!(
-            "gateway mode — every enabled server keeps its name and points at \
-             its own endpoint on the gateway at {} (serve it with `mcpgw \
-             serve`)",
-            args.gateway_url
-        );
-    }
+    // No mode to name: this is the one thing sync does, so the line describes
+    // it rather than announcing which of several shapes was picked.
+    println!(
+        "every enabled server keeps its name and points at its own endpoint \
+         on the gateway at {} (serve it with `mcpgw serve`)",
+        args.gateway_url
+    );
     Ok(bridge_command())
 }
 
 /// The entries a client should hold: every enabled server, reached through
 /// the gateway.
 ///
-/// Per-server they carry the canonical names, so a client that mcpgw synced
-/// before keeps its entry names and the rewrite is plain updates. Aggregate
-/// it is the single synthetic entry, so everything an earlier sync managed —
-/// per-server entries included — falls out as removes.
+/// They carry the canonical names, so a client that mcpgw synced before keeps
+/// its entry names and the rewrite is plain updates — and anything else an
+/// earlier sync managed under a name that is not a canonical server's, the
+/// single `mcpgw` entry a 0.3.x `--aggregate` run wrote included, falls out
+/// of the plan as a remove.
 fn gateway_entries(
     kind: ClientKind,
     args: &SyncArgs,
     canonical: &BTreeMap<String, mcpgw_core::Server>,
     bridge: &str,
 ) -> anyhow::Result<BTreeMap<String, mcpgw_core::Server>> {
-    if args.aggregate {
-        return Ok(BTreeMap::from([(
-            GATEWAY_NAME.to_owned(),
-            gateway_server(kind, &args.gateway_url, bridge),
-        )]));
-    }
     Ok(per_server_gateway_servers(
         kind,
         canonical,

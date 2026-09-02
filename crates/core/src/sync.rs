@@ -235,38 +235,6 @@ pub fn apply_plan(
     codec::edit_json(kind.codec().root, root, &plan.removes, &plan.upserts())
 }
 
-/// The entry name mcpgw owns in every client when syncing in aggregate
-/// gateway mode. Per-server gateway entries are named as their server.
-pub const GATEWAY_NAME: &str = "mcpgw";
-
-/// The synthetic server that points one client at a running gateway's
-/// aggregate face — the single-entry shape behind `sync --aggregate`.
-///
-/// It is a plain [`Server`] so gateway mode reaches the client file through
-/// [`client_entry`] like every other entry — the two shapes cannot drift.
-#[must_use]
-pub fn gateway_server(kind: ClientKind, url: &str, bridge_command: &str) -> Server {
-    let transport = if kind.supports_http_entries() {
-        Transport::Http {
-            url: url.to_owned(),
-            headers: BTreeMap::new(),
-        }
-    } else {
-        Transport::Stdio {
-            command: bridge_command.to_owned(),
-            // The URL is spelled out even when it is the default, so a reader
-            // of the client file can see where the bridge points.
-            args: vec!["connect".to_owned(), "--url".to_owned(), url.to_owned()],
-            env: BTreeMap::new(),
-        }
-    };
-    Server {
-        enabled: true,
-        tags: Vec::new(),
-        transport,
-    }
-}
-
 /// The synthetic server that points one client at *one* server's own gateway
 /// endpoint (`<base>/s/<name>`).
 ///

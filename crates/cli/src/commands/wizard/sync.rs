@@ -266,7 +266,7 @@ fn apply_all(cx: &Ctx, plans: Plans) -> anyhow::Result<()> {
 struct Endpoint {
     url: String,
     /// The server whose own endpoint this is, or `None` for the gateway's
-    /// aggregate face.
+    /// own `/mcp`.
     server: Option<String>,
     entries: Vec<GatewayEntry>,
 }
