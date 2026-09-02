@@ -91,6 +91,14 @@ struct Upstream {
     /// Notified every time the slot leaves `Connecting`, so demands that
     /// arrive mid-ladder can wait for its outcome without holding the lock.
     settled: Notify,
+    /// What this upstream said about itself at its last successful connect.
+    ///
+    /// Kept next to the slot but deliberately outliving it: the downstream
+    /// `initialize` that needs it is a synchronous handler which must not
+    /// start a connect ladder, so the only capabilities it can report are
+    /// remembered ones. Survives a disconnect for the same reason — a server
+    /// that had prompts a second ago still has them while it restarts.
+    info: arc_swap::ArcSwapOption<rmcp::model::ServerPeerInfo>,
 }
 
 /// Owns the `Connecting` claim for one run of the connect ladder.
@@ -152,6 +160,7 @@ impl UpstreamManager {
                         server,
                         slot: Mutex::new(Slot::Idle),
                         settled: Notify::new(),
+                        info: arc_swap::ArcSwapOption::empty(),
                     },
                 )
             })
@@ -195,6 +204,17 @@ impl UpstreamManager {
             Slot::Idle | Slot::Ready(_) | Slot::Connecting(_) => UpstreamStatus::Idle,
             Slot::Failed(message) => UpstreamStatus::Failed(message.clone()),
         })
+    }
+
+    /// What `name` reported at its last successful connect, or `None` if it
+    /// has never been reached in this process.
+    ///
+    /// Synchronous and lock-free on purpose: its one caller is the gateway's
+    /// `initialize` handler, which rmcp calls synchronously and which must
+    /// never be the thing that starts an upstream.
+    #[must_use]
+    pub fn last_server_info(&self, name: &str) -> Option<Arc<rmcp::model::ServerPeerInfo>> {
+        self.upstreams.get(name)?.info.load_full()
     }
 
     /// Returns a live service for `name`, spawning it on first demand.
@@ -294,6 +314,13 @@ impl UpstreamManager {
                         name: name.to_owned(),
                     })
                 } else {
+                    // Snapshot before the slot goes live, so the first
+                    // request through it already sees the real capabilities.
+                    // A handshake that somehow reported nothing leaves the
+                    // previous snapshot alone rather than erasing it.
+                    if let Some(info) = service.peer_info() {
+                        upstream.info.store(Some(info));
+                    }
                     *slot = Slot::Ready(Arc::clone(&service));
                     Ok(service)
                 }

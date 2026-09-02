@@ -514,6 +514,230 @@ async fn per_server_endpoints_serve_their_own_tools_next_to_the_aggregate() {
     manager.shutdown().await;
 }
 
+/// What the fixture serves, spelled out here so a test failure says which
+/// side drifted.
+const RESOURCE_URI: &str = "mem:///greeting.txt";
+const RESOURCE_TEXT: &str = "hello from the fixture";
+
+fn read(uri: &str) -> rmcp_client_http::model::ReadResourceRequestParams {
+    rmcp_client_http::model::ReadResourceRequestParams::new(uri.to_owned())
+}
+
+fn prompt(name: &str, topic: &str) -> rmcp_client_http::model::GetPromptRequestParams {
+    rmcp_client_http::model::GetPromptRequestParams::new(name.to_owned()).with_arguments(
+        serde_json::json!({ "topic": topic })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    )
+}
+
+/// A pipe is not a tools-only bridge: everything a client can ask an MCP
+/// server, it can ask through `/s/<name>`.
+#[tokio::test]
+async fn a_pipe_forwards_resources_and_their_contents() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let fx = client_at(addr, &endpoint_path("fx")).await;
+
+    let resources = fx.list_all_resources().await.unwrap();
+    let uris: Vec<&str> = resources.iter().map(|r| r.uri.as_str()).collect();
+    assert_eq!(uris, [RESOURCE_URI]);
+
+    let templates = fx.list_all_resource_templates().await.unwrap();
+    let patterns: Vec<&str> = templates.iter().map(|t| t.uri_template.as_str()).collect();
+    assert_eq!(patterns, ["mem:///{name}.txt"]);
+
+    // The contents come back byte for byte, not a summary of them.
+    let contents = fx.read_resource(read(RESOURCE_URI)).await.unwrap();
+    let text = format!("{contents:?}");
+    assert!(text.contains(RESOURCE_TEXT), "{text}");
+
+    // And an upstream refusal stays a refusal instead of an empty read.
+    let err = fx.read_resource(read("mem:///nope.txt")).await.unwrap_err();
+    assert!(err.to_string().contains("no such resource"), "{err}");
+
+    fx.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pipe_forwards_prompts_and_their_messages() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let fx = client_at(addr, &endpoint_path("fx")).await;
+
+    let prompts = fx.list_all_prompts().await.unwrap();
+    let names: Vec<&str> = prompts.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["summarize"]);
+
+    // Arguments travel with the request, so the rendered message is the one
+    // the upstream built for them.
+    let got = fx
+        .get_prompt(prompt("summarize", "gateways"))
+        .await
+        .unwrap();
+    let text = format!("{got:?}");
+    assert!(text.contains("summarize gateways"), "{text}");
+
+    fx.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_pipe_forwards_argument_completion() {
+    use rmcp_client_http::model::{ArgumentInfo, CompleteRequestParams, Reference};
+
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let fx = client_at(addr, &endpoint_path("fx")).await;
+
+    let request = CompleteRequestParams::new(
+        Reference::for_prompt("summarize"),
+        ArgumentInfo::new("topic", "gat"),
+    );
+    let completion = fx.complete(request).await.unwrap().completion;
+    assert_eq!(completion.values, ["gateways", "gators"]);
+
+    fx.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// Capabilities are the contract a client reads once, at `initialize`. A pipe
+/// that forwards prompts while claiming only tools is a pipe whose prompts
+/// nobody ever asks for.
+#[tokio::test]
+async fn a_pipe_advertises_what_its_upstream_can_do() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+
+    // Before first contact there is nothing to report, and `initialize` must
+    // not go start the upstream to find out: tools only, honestly.
+    let early = client_at(addr, &endpoint_path("fx")).await;
+    let capabilities = early.peer_info().unwrap().capabilities.clone();
+    assert!(capabilities.tools.is_some());
+    assert!(
+        capabilities.resources.is_none() && capabilities.prompts.is_none(),
+        "pre-contact should not promise what it has not seen: {capabilities:?}"
+    );
+
+    // One request reaches the upstream, and every session opened afterwards
+    // sees the real set.
+    early.list_all_tools().await.unwrap();
+    let later = client_at(addr, &endpoint_path("fx")).await;
+    let capabilities = later.peer_info().unwrap().capabilities.clone();
+    assert!(capabilities.resources.is_some(), "{capabilities:?}");
+    assert!(capabilities.prompts.is_some(), "{capabilities:?}");
+    assert!(capabilities.completions.is_some(), "{capabilities:?}");
+    // Only what the gateway actually implements: nothing here forwards
+    // subscriptions or list-changed notifications.
+    assert!(
+        capabilities.resources.as_ref().unwrap().subscribe != Some(true),
+        "{capabilities:?}"
+    );
+
+    for client in [early, later] {
+        client.cancel().await.unwrap();
+    }
+    manager.shutdown().await;
+}
+
+/// Pinned, because it is a decision rather than an oversight: resource URIs
+/// and prompt names cannot be namespaced the way `server__tool` can, so the
+/// aggregate serves none of them and `/s/<name>` is where they live.
+#[tokio::test]
+async fn the_aggregate_serves_no_resources_or_prompts() {
+    let (client, manager) = aggregate_client(&[("fx1", "healthy"), ("fx2", "healthy")]).await;
+
+    assert!(client.list_all_resources().await.unwrap().is_empty());
+    assert!(
+        client
+            .list_all_resource_templates()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(client.list_all_prompts().await.unwrap().is_empty());
+
+    // Reading or getting one is a plain "not here", not a made-up empty body.
+    assert!(client.read_resource(read(RESOURCE_URI)).await.is_err());
+    assert!(client.get_prompt(prompt("summarize", "x")).await.is_err());
+
+    // And the aggregate advertises exactly what it merges.
+    let capabilities = client.peer_info().unwrap().capabilities.clone();
+    assert!(capabilities.tools.is_some());
+    assert!(capabilities.resources.is_none() && capabilities.prompts.is_none());
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// The forwarded families ride the same request deadline as `tools/call`;
+/// none of them can leave a client waiting on a server that never answers.
+#[tokio::test]
+async fn a_hung_upstream_fails_a_forwarded_request_on_the_deadline() {
+    let manager = Arc::new(
+        UpstreamManager::new(
+            [("fx".to_owned(), stdio_server("slow"))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let gateway = Gateway::new(Arc::clone(&manager), "fx".to_owned())
+        .with_request_timeout(Duration::from_millis(300));
+    let client = connect(gateway).await;
+
+    let started = std::time::Instant::now();
+    let err = client.list_all_prompts().await.unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("fx"), "should name the upstream: {text}");
+    assert!(text.contains("deadline"), "should say why: {text}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited {:?}, so nothing bounded the request",
+        started.elapsed()
+    );
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// Every forwarded family lands in the traffic log under its own kind, so
+/// `watch` and `jq` can tell a prompt fetch from a tool call.
+#[tokio::test]
+async fn forwarded_families_are_captured_under_their_own_kinds() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) = serve_both(&[("fx", "healthy")], Some(&writer)).await;
+    let fx = client_at(addr, &endpoint_path("fx")).await;
+
+    fx.list_all_resources().await.unwrap();
+    fx.read_resource(read(RESOURCE_URI)).await.unwrap();
+    fx.list_all_prompts().await.unwrap();
+    fx.get_prompt(prompt("summarize", "gateways"))
+        .await
+        .unwrap();
+    fx.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    let shape: Vec<(Kind, Option<&str>, bool)> = records
+        .iter()
+        .map(|r| (r.kind, r.tool.as_deref(), r.ok))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (Kind::Resources, None, true),
+            (Kind::ResourceRead, Some(RESOURCE_URI), true),
+            (Kind::Prompts, None, true),
+            (Kind::PromptGet, Some("summarize"), true),
+        ],
+        "{records:#?}"
+    );
+    // The bodies are there too: a captured read is worth having only if the
+    // contents can be read back out of it.
+    let read = &records[1];
+    assert!(read.response.as_deref().unwrap().contains(RESOURCE_TEXT));
+}
+
 #[tokio::test]
 async fn an_unknown_endpoint_is_a_404_that_names_the_real_ones() {
     let (addr, manager) = serve_both(&[("fx1", "healthy"), ("fx2", "healthy")], None).await;

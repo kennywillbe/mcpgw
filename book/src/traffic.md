@@ -59,8 +59,23 @@ mcpgw watch --json | jq -r 'select(.ok == false) | "\(.server) \(.error)"'
 
 - `ts` — when the request *finished*, epoch milliseconds. It started
   `duration_ms` earlier.
-- `kind` — `call` for `tools/call`, `list` for `tools/list`. `tool` is absent
-  on `list`, which names no tool.
+- `kind` — which request family the record describes:
+
+  | `kind` | method |
+  | --- | --- |
+  | `list` | `tools/list` |
+  | `call` | `tools/call` |
+  | `resources` | `resources/list` |
+  | `resource_templates` | `resources/templates/list` |
+  | `resource_read` | `resources/read` |
+  | `prompts` | `prompts/list` |
+  | `prompt_get` | `prompts/get` |
+  | `complete` | `completion/complete` |
+
+  Everything below `call` is written only by a per-server endpoint, which is
+  the shape that forwards those families.
+- `tool` — what the request named: the tool, the prompt, the resource URI or
+  the argument being completed. Absent on the list kinds, which name nothing.
 - `ok` / `error` — `error` carries the full text; `watch`'s one-line view
   truncates it, `--json` doesn't.
 - `args` / `response` — see below.

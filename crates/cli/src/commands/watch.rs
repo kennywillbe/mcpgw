@@ -184,14 +184,18 @@ fn matches(record: &CaptureRecord, server: Option<&str>, tool: Option<&str>) -> 
 
 /// One line of the human stream: age, outcome, target, latency, error.
 fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
-    let target = match record.kind {
-        Kind::Call => format!(
+    let target = match (record.kind, record.tool.as_deref()) {
+        // A tool call is shown under the name a client would type for it.
+        (Kind::Call, tool) => format!(
             "{}{}{}",
             record.server,
             mcpgw_core::gateway::SEPARATOR,
-            record.tool.as_deref().unwrap_or("?")
+            tool.unwrap_or("?")
         ),
-        Kind::List => format!("{} tools/list", record.server),
+        // Everything else is named by its method, plus whatever it addressed
+        // — the prompt, the resource URI, the argument being completed.
+        (kind, Some(subject)) => format!("{} {} {subject}", record.server, kind.method()),
+        (kind, None) => format!("{} {}", record.server, kind.method()),
     };
     let mark = if record.ok { "✓" } else { "✗" };
     let mark = if color {

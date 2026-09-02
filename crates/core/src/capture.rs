@@ -25,6 +25,11 @@ pub const MAX_BODY_BYTES: usize = 2048;
 pub const TRUNCATION_MARKER: &str = "…[truncated]";
 
 /// Which upstream request a record describes.
+///
+/// A family gets its own variant rather than being folded into a neighbour:
+/// a reader that meets a kind it does not know fails loudly on that one line,
+/// where a re-used kind would silently mis-group the traffic. Adding variants
+/// is the additive kind of change the format allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -32,6 +37,40 @@ pub enum Kind {
     List,
     /// `tools/call` against the resolved upstream.
     Call,
+    /// `resources/list`, forwarded by a pipe.
+    Resources,
+    /// `resources/templates/list`, forwarded by a pipe.
+    #[serde(rename = "resource_templates")]
+    ResourceTemplates,
+    /// `resources/read`, forwarded by a pipe; the URI is in `tool`.
+    #[serde(rename = "resource_read")]
+    ResourceRead,
+    /// `prompts/list`, forwarded by a pipe.
+    Prompts,
+    /// `prompts/get`, forwarded by a pipe; the prompt name is in `tool`.
+    #[serde(rename = "prompt_get")]
+    PromptGet,
+    /// `completion/complete`, forwarded by a pipe; the argument name is in
+    /// `tool`.
+    Complete,
+}
+
+impl Kind {
+    /// The MCP method this kind records, for anything rendering a record back
+    /// to a human.
+    #[must_use]
+    pub fn method(self) -> &'static str {
+        match self {
+            Kind::List => "tools/list",
+            Kind::Call => "tools/call",
+            Kind::Resources => "resources/list",
+            Kind::ResourceTemplates => "resources/templates/list",
+            Kind::ResourceRead => "resources/read",
+            Kind::Prompts => "prompts/list",
+            Kind::PromptGet => "prompts/get",
+            Kind::Complete => "completion/complete",
+        }
+    }
 }
 
 /// One captured upstream request.
@@ -44,7 +83,10 @@ pub struct CaptureRecord {
     pub ts: u64,
     pub session: String,
     pub server: String,
-    /// Absent for `tools/list`, which names no tool.
+    /// What the request named: the tool, the prompt, the resource URI or the
+    /// argument being completed. Absent for the list families, which name
+    /// nothing. One field rather than one per family, so `watch --tool` and
+    /// every `jq` line people already wrote keep working.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
     pub kind: Kind,

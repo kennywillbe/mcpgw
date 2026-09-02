@@ -61,9 +61,27 @@ mcpgw serve --per-server
 # http://127.0.0.1:8137/s/linear — linear only, tools unprefixed
 ```
 
-They all share one process and one set of upstream connections, so a client
-can take the whole gateway, a single server, or both at once without starting
-anything twice. A stdio-only client reaches one the same way:
+A per-server endpoint is a plain pipe, so it forwards everything an MCP server
+can offer — tools, resources, resource templates, prompts and argument
+completion — with names, URIs and errors untouched.
+
+`/mcp` serves tools only, and that is deliberate. Tools can be namespaced
+(`github__create_issue`); resource URIs and prompt names cannot. Two servers
+can both offer `file:///README.md` — one name, two different documents — and
+rewriting the URIs would break every link inside the contents that points at
+them. So the aggregate merges what it can merge honestly, and `/s/<name>` is
+where the rest lives.
+
+One caveat: an endpoint reports its server's capabilities as of the last time
+it reached that server. A client connecting to a freshly started gateway,
+before anything has talked to the server yet, is told "tools" — the
+conservative answer — because working it out for real would mean starting the
+server in the middle of a handshake. Anything that connects after the first
+request through the endpoint sees the full set.
+
+The endpoints share one process and one set of upstream connections, so a
+client can take the whole gateway, a single server, or both at once without
+starting anything twice. A stdio-only client reaches one the same way:
 
 ```sh
 mcpgw connect --server github
