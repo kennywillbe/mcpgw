@@ -347,8 +347,12 @@ async fn import_dedupes_a_server_two_clients_share_and_says_so() {
     let (_held, url) = dead_gateway();
     let stdout = wizard(dir.path(), &url, &["--yes"], "").await;
 
+    // One shared server, so the whole sentence has to be in the singular —
+    // this line is on the most-read screen mcpgw has.
     assert!(
-        stdout.contains("the same server configured in more than one place"),
+        stdout.contains(
+            "1 of them is the same server configured in more than one place — I'll keep one copy:"
+        ),
         "{stdout}"
     );
     assert!(stdout.contains("github — from"), "{stdout}");

@@ -124,6 +124,86 @@ async fn status_names_a_running_foreground_gateway_with_no_service_installed() {
     child.kill().await.unwrap();
 }
 
+/// Writes the record `daemon install` leaves behind, without installing a
+/// service: a live install would register a launch agent on whatever machine
+/// ran the suite, and the behaviour under test is entirely about what
+/// `status` and `start` read back out of it.
+fn record_installed_spec(home: &Path, bind: &str, port: u16) {
+    let state = home.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let path = |name: &str| state.join(name).display().to_string();
+    std::fs::write(
+        state.join("daemon.json"),
+        format!(
+            r#"{{"exe":"/usr/local/bin/mcpgw","config_path":{:?},"state_dir":{:?},
+                 "bind":"{bind}","port":{port},
+                 "logs":{{"stdout":{:?},"stderr":{:?}}}}}"#,
+            home.join("config.toml").display().to_string(),
+            state.display().to_string(),
+            path("logs/daemon.out.log"),
+            path("logs/daemon.err.log"),
+        ),
+    )
+    .unwrap();
+}
+
+/// The bug in #104: a service installed on `--port 18137` was reported as a
+/// gateway that is not there, because `status` always dialled the default.
+#[tokio::test]
+async fn status_probes_the_address_the_service_was_installed_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, url) = serve(dir.path()).await;
+    let port: u16 = url
+        .rsplit_once(':')
+        .and_then(|(_, tail)| tail.split('/').next())
+        .unwrap()
+        .parse()
+        .unwrap();
+    record_installed_spec(dir.path(), "127.0.0.1", port);
+
+    let home = dir.path().to_owned();
+    // No --url: the whole point is that the flag is not needed.
+    let output = tokio::task::spawn_blocking(move || daemon(&home, &["status"]))
+        .await
+        .unwrap();
+
+    let text = stdout(&output);
+    assert!(text.contains("gateway   running"), "{text}");
+    assert!(text.contains(&url), "{text}");
+    assert!(!text.contains(":8137"), "probed the default anyway: {text}");
+    assert_eq!(output.status.code(), Some(0), "{text}");
+
+    child.kill().await.unwrap();
+}
+
+/// Every install made before 0.3.1, and every machine with no service at
+/// all: nothing recorded, so the default is what gets probed.
+#[test]
+fn status_falls_back_to_the_default_address_when_nothing_was_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = stdout(&daemon(dir.path(), &["status"]));
+    assert!(text.contains("http://127.0.0.1:8137/mcp"), "{text}");
+}
+
+/// `start` inherits the recorded port too, so a service installed on 18137
+/// comes back up on 18137 rather than on whatever the default is. Proved
+/// through the port-in-use refusal, which names the port it checked.
+#[test]
+fn start_uses_the_port_the_service_was_installed_with() {
+    let dir = tempfile::tempdir().unwrap();
+    // Held for the whole test so the conflict cannot evaporate under us.
+    let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    record_installed_spec(dir.path(), "127.0.0.1", port);
+
+    let output = daemon(dir.path(), &["start"]);
+    let text = stderr(&output);
+    assert!(text.contains("something already listens"), "{text}");
+    assert!(text.contains(&format!("127.0.0.1:{port}")), "{text}");
+    assert!(!output.status.success(), "{text}");
+    drop(held);
+}
+
 #[test]
 fn install_and_start_refuse_a_bind_the_rest_of_the_network_could_reach() {
     let dir = tempfile::tempdir().unwrap();

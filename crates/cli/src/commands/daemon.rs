@@ -43,8 +43,15 @@ pub enum DaemonCommand {
     /// Report what is running, what is installed and where the logs are
     Status {
         /// Gateway URL to probe
-        #[arg(long, default_value = mcpgw_core::endpoints::DEFAULT_URL, value_name = "URL")]
-        url: String,
+        #[arg(
+            long,
+            value_name = "URL",
+            default_value = None,
+            long_help = "Gateway URL to probe.\n\nDefaults to the address the installed service \
+                         was installed with, and to the standard gateway URL when nothing is \
+                         installed."
+        )]
+        url: Option<String>,
     },
     /// Print the service's captured stdout and stderr
     Logs {
@@ -110,16 +117,26 @@ impl SpecArgs {
 }
 
 /// Shared by the two commands that need to know where the gateway listens.
+///
+/// Both halves are optional rather than defaulted by clap so that `start`
+/// can tell "the user asked for 8137" apart from "the user asked for
+/// nothing" — a service installed on another port has to come back up on
+/// that port, not on the default.
 #[derive(clap::Args)]
 pub struct AddressArgs {
-    /// Port the service should listen on
-    #[arg(long, default_value_t = 8137)]
-    pub port: u16,
+    /// Port the service should listen on [default: 8137; `start` falls back
+    /// to the port the service was installed with]
+    #[arg(long)]
+    pub port: Option<u16>,
     /// Address the service should bind. Loopback only — see `mcpgw daemon
-    /// install --help` output on refusal
-    #[arg(long, default_value = "127.0.0.1")]
-    pub bind: String,
+    /// install --help` output on refusal [default: 127.0.0.1]
+    #[arg(long)]
+    pub bind: Option<String>,
 }
+
+/// Where a service listens when nobody says otherwise.
+const DEFAULT_PORT: u16 = 8137;
+const DEFAULT_BIND: &str = "127.0.0.1";
 
 pub fn run(args: &DaemonArgs) -> anyhow::Result<u8> {
     match &args.command {
@@ -127,7 +144,7 @@ pub fn run(args: &DaemonArgs) -> anyhow::Result<u8> {
         DaemonCommand::Uninstall => uninstall().map(|()| 0),
         DaemonCommand::Start(address) => start(address).map(|()| 0),
         DaemonCommand::Stop => stop().map(|()| 0),
-        DaemonCommand::Status { url } => status(url),
+        DaemonCommand::Status { url } => status(url.as_deref()),
         DaemonCommand::Logs { follow, lines } => logs(*follow, *lines).map(|()| 0),
         #[cfg(windows)]
         DaemonCommand::InstallElevated(spec) => install_elevated(spec).map(|()| 0),
@@ -137,10 +154,21 @@ pub fn run(args: &DaemonArgs) -> anyhow::Result<u8> {
 }
 
 fn install(address: &AddressArgs) -> anyhow::Result<()> {
-    let spec = spec(address)?;
+    let spec = spec(address, None)?;
     mcpgw_core::daemon::preflight(&spec)?;
+    warn_about_protected_paths(&spec);
     let service = mcpgw_core::daemon::platform_service();
     let installed = service.install(&spec)?;
+    // Recorded only once the supervisor has accepted the job, and never
+    // fatally: the service exists either way, and the only thing a missing
+    // record costs is `status` falling back to the default address.
+    if let Err(err) = mcpgw_core::daemon::save_spec(&spec) {
+        eprintln!(
+            "warning: could not record the installed address at {}: {err}\n         \
+             `mcpgw daemon status` will probe the default port until you reinstall",
+            mcpgw_core::daemon::spec_path(&spec.state_dir).display()
+        );
+    }
     println!(
         "installed the mcpgw gateway service at {}",
         installed.unit_path.display()
@@ -183,12 +211,25 @@ fn run_service(args: &SpecArgs) -> anyhow::Result<u8> {
 fn uninstall() -> anyhow::Result<()> {
     let service = mcpgw_core::daemon::platform_service();
     service.uninstall()?;
+    // The record describes a service that no longer exists; leaving it would
+    // have `status` probing an address nothing was ever going to answer on.
+    // Reported rather than propagated: the service is gone either way, and
+    // "uninstall failed" would be a worse lie than a stale file.
+    if let Err(err) = state_dir()
+        .map_err(|err| format!("{err:#}"))
+        .and_then(|dir| mcpgw_core::daemon::remove_spec(&dir).map_err(|err| format!("{err:#}")))
+    {
+        eprintln!("warning: the recorded service address could not be removed: {err}");
+    }
     println!("removed the mcpgw gateway service (your config and traffic log are untouched)");
     Ok(())
 }
 
 fn start(address: &AddressArgs) -> anyhow::Result<()> {
-    let spec = spec(address)?;
+    let installed = mcpgw_core::daemon::load_spec(&state_dir()?);
+    // An address the user did not name comes from the record, so a service
+    // installed on 18137 comes back on 18137.
+    let spec = spec(address, installed.as_ref())?;
     mcpgw_core::daemon::preflight(&spec)?;
     let service = mcpgw_core::daemon::platform_service();
     service.start(&spec)?;
@@ -199,13 +240,29 @@ fn start(address: &AddressArgs) -> anyhow::Result<()> {
 fn stop() -> anyhow::Result<()> {
     let service = mcpgw_core::daemon::platform_service();
     service.stop()?;
-    println!("stopped the mcpgw gateway service");
+    // Named when it is known: "the service stopped" and "this URL is now
+    // dead" are the same sentence to whoever has a client pointed at it.
+    match state_dir()
+        .ok()
+        .and_then(|dir| mcpgw_core::daemon::load_spec(&dir))
+    {
+        Some(spec) => println!(
+            "stopped the mcpgw gateway service — nothing answers at {} now",
+            spec.url()
+        ),
+        None => println!("stopped the mcpgw gateway service"),
+    }
     Ok(())
 }
 
 /// Builds the spec, creating the log files as it goes so a platform never
 /// has to (see the ordering contract in [`mcpgw_core::daemon`]).
-fn spec(address: &AddressArgs) -> anyhow::Result<DaemonSpec> {
+///
+/// `installed` is the address the service was recorded with, if there is
+/// one. An address the user did not ask for is taken from there before the
+/// default, so `daemon start` after `daemon install --port 18137` brings the
+/// service back on 18137 rather than somewhere nothing was ever installed.
+fn spec(address: &AddressArgs, installed: Option<&DaemonSpec>) -> anyhow::Result<DaemonSpec> {
     let state_dir = state_dir()?;
     let logs = mcpgw_core::daemon::prepare_logs(&state_dir)?;
     Ok(DaemonSpec {
@@ -214,10 +271,100 @@ fn spec(address: &AddressArgs) -> anyhow::Result<DaemonSpec> {
         exe: std::env::current_exe().context("cannot locate the running mcpgw binary")?,
         config_path: super::canonical_config_path()?,
         state_dir,
-        bind: address.bind.clone(),
-        port: address.port,
+        bind: address
+            .bind
+            .clone()
+            .or_else(|| installed.map(|spec| spec.bind.clone()))
+            .unwrap_or_else(|| DEFAULT_BIND.to_owned()),
+        port: address
+            .port
+            .or_else(|| installed.map(|spec| spec.port))
+            .unwrap_or(DEFAULT_PORT),
         logs,
     })
+}
+
+/// Warns when anything the service will execute sits in a folder macOS keeps
+/// behind a privacy grant.
+///
+/// Shared by `mcpgw daemon install` and the wizard's daemon step, because the
+/// failure it heads off is the same on both paths and it is a silent one: a
+/// launch agent cannot read through `~/Desktop`, `~/Documents` or
+/// `~/Downloads` and has no way to ask, so the process hangs in dyld and the
+/// user is left with a service that reports itself running, writes empty
+/// logs, and never listens.
+///
+/// A warning rather than a refusal: Full Disk Access may already have been
+/// granted, and nothing in the API says whether it was.
+pub(crate) fn warn_about_protected_paths(spec: &DaemonSpec) {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        for line in protected_path_warnings(spec, &home) {
+            println!("{line}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = spec;
+}
+
+/// The warning above, as lines and against an injected home, so the whole of
+/// it can be asserted on without a terminal and without a real `~/Desktop`.
+#[cfg(target_os = "macos")]
+fn protected_path_warnings(spec: &DaemonSpec, home: &Path) -> Vec<String> {
+    let mut hits = Vec::new();
+    if let Some(dir) = mcpgw_core::daemon::tcc_protected_dir(&spec.exe, home) {
+        hits.push(format!(
+            "  the mcpgw binary itself, {} (~/{dir})",
+            spec.exe.display()
+        ));
+    }
+    // A config that will not parse is somebody else's error to report; this
+    // check has nothing to say about it.
+    if let Ok(config) = mcpgw_core::config::Config::load(&spec.config_path) {
+        for (name, server) in &config.servers {
+            let mcpgw_core::config::Transport::Stdio { command, .. } = &server.transport else {
+                continue;
+            };
+            if !server.enabled {
+                continue;
+            }
+            // Resolved rather than string-matched: `~/Desktop/bin/x` and a
+            // bare `x` found on a PATH entry under Desktop hang identically.
+            if let Ok(resolved) = which::which(command)
+                && let Some(dir) = mcpgw_core::daemon::tcc_protected_dir(&resolved, home)
+            {
+                hits.push(format!(
+                    "  {name}, which runs {} (~/{dir})",
+                    resolved.display()
+                ));
+            }
+        }
+    }
+    if hits.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        "warning: this service will run something out of a folder macOS keeps behind a \
+              privacy grant:"
+            .to_owned(),
+    ];
+    lines.extend(hits);
+    lines.push(
+        "launchd has no grant to read through ~/Desktop, ~/Documents or ~/Downloads and no way \
+         to ask for one, so a process started from there hangs before it runs — the service \
+         looks installed and running, with empty logs and nothing listening."
+            .to_owned(),
+    );
+    lines.push(
+        "Move it somewhere unprotected (a Homebrew or `cargo install` path is fine), or grant \
+         Full Disk Access in System Settings › Privacy & Security. Installing anyway."
+            .to_owned(),
+    );
+    lines
 }
 
 fn state_dir() -> anyhow::Result<PathBuf> {
@@ -230,7 +377,23 @@ fn state_dir() -> anyhow::Result<PathBuf> {
 ///
 /// Exits 0 only when a gateway is actually answering — that is the one bit a
 /// script wants out of this command.
-fn status(url: &str) -> anyhow::Result<u8> {
+fn status(url: Option<&str>) -> anyhow::Result<u8> {
+    let state_dir = state_dir()?;
+    // What the service was installed with, when a version that records it
+    // did the installing. Probing the default instead is how a healthy
+    // service on `--port 18137` got reported as a gateway that is not there.
+    let recorded = mcpgw_core::daemon::load_spec(&state_dir);
+    let url = url.map_or_else(
+        || {
+            recorded.as_ref().map_or_else(
+                || mcpgw_core::endpoints::DEFAULT_URL.to_owned(),
+                DaemonSpec::url,
+            )
+        },
+        str::to_owned,
+    );
+    let url = url.as_str();
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -242,17 +405,29 @@ fn status(url: &str) -> anyhow::Result<u8> {
     println!("gateway   {}", describe_reach(reach, url));
     println!("service   {}", describe_service(service.name(), &queried));
 
-    let logs = LogPaths::under_state_dir(&state_dir()?);
+    let logs = LogPaths::under_state_dir(&state_dir);
     println!("logs      {}", describe_log(&logs.stdout));
     println!("          {}", describe_log(&logs.stderr));
 
     // The state nearly every user is in during this release wave, and the
     // one a bare "not installed" would leave them puzzling over.
     let installed = matches!(&queried, Ok(status) if status.installed);
+    let running = matches!(&queried, Ok(status) if status.running);
     if reach.is_up() && !installed {
         println!(
             "\nno service is installed, but a gateway is already answering at {url} — \
              that is a foreground `mcpgw serve`, and it stops when its terminal does"
+        );
+    }
+    // A supervisor holding a healthy job while the probe finds nothing is
+    // almost always this: a pre-0.3.1 install, whose address was never
+    // written down and cannot be read back out of the plist or the unit.
+    if !reach.is_up() && running && recorded.is_none() {
+        println!(
+            "\nthe service is running, but it was installed before 0.3.1 — mcpgw did not record \
+             the address it was installed with, so this probed the default. Pass \
+             `--url` to check another, or reinstall (`mcpgw daemon uninstall` then \
+             `mcpgw daemon install --port <port>`) so status knows where to look"
         );
     }
     Ok(u8::from(!reach.is_up()))
@@ -452,6 +627,39 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The silent-hang guard: a binary under `~/Desktop` has to be named,
+    /// with the reason and a way out, and one on a normal install path has
+    /// to say nothing at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_binary_in_a_protected_folder_is_warned_about_and_one_outside_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let spec = |exe: PathBuf| DaemonSpec {
+            exe,
+            config_path: home.join("config.toml"),
+            state_dir: home.join("state"),
+            bind: "127.0.0.1".to_owned(),
+            port: 8137,
+            logs: LogPaths::under_state_dir(&home.join("state")),
+        };
+
+        let exe = home.join("Desktop/mcpgw/target/release/mcpgw");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+        let lines = protected_path_warnings(&spec(exe.clone()), home).join("\n");
+        assert!(lines.contains("privacy grant"), "{lines}");
+        assert!(lines.contains(&exe.display().to_string()), "{lines}");
+        assert!(lines.contains("(~/Desktop)"), "{lines}");
+        assert!(lines.contains("hangs before it runs"), "{lines}");
+        assert!(lines.contains("Full Disk Access"), "{lines}");
+        // Warned, never refused: the grant may already be there.
+        assert!(lines.contains("Installing anyway"), "{lines}");
+
+        // Where a real install puts it, and where nothing has to be said.
+        assert!(protected_path_warnings(&spec(home.join(".cargo/bin/mcpgw")), home).is_empty());
     }
 
     #[test]

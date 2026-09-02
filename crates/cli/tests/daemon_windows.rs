@@ -138,6 +138,14 @@ fn the_service_installs_runs_stops_and_leaves_nothing_behind() {
     assert!(text.contains(&url), "{text}");
     assert!(registered(), "the service control manager has no mcpgw");
 
+    // The address install was given is recorded under the state dir, by the
+    // unelevated half, so `status` can find the service without being told
+    // where it is (#104).
+    let recorded = home.join("state").join("daemon.json");
+    assert!(recorded.exists(), "{}", recorded.display());
+    let json = std::fs::read_to_string(&recorded).unwrap();
+    assert!(json.contains(&format!("\"port\": {port}")), "{json}");
+
     // Running: the gateway answers on the port it was installed for, and it
     // read the config the *installing* user has rather than LocalSystem's.
     let up = wait_until_up(home, &url);
@@ -194,6 +202,8 @@ fn the_service_installs_runs_stops_and_leaves_nothing_behind() {
         stderr(&removed)
     );
     assert!(!registered(), "the registration survived uninstall");
+    // The record describes a service that no longer exists.
+    assert!(!recorded.exists(), "{} survived", recorded.display());
 
     let gone = daemon(home, &["status", "--url", &url]);
     let text = stdout(&gone);

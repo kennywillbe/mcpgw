@@ -146,6 +146,18 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
     assert!(plist.exists(), "{}", plist.display());
     assert!(loaded(), "launchd did not take the job");
 
+    // The address install was given is recorded under the state dir, so
+    // `status` can find the service without being told where it is (#104).
+    let recorded = home.join("state").join("daemon.json");
+    assert!(recorded.exists(), "{}", recorded.display());
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&recorded).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
+    let json = std::fs::read_to_string(&recorded).unwrap();
+    assert!(json.contains(&format!("\"port\": {port}")), "{json}");
+
     // Running: the gateway answers on the port it was installed for, and
     // `status` says the service and the gateway are the same thing.
     let up = wait_until_up(home, &url);
@@ -153,6 +165,13 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
     assert_eq!(up.status.code(), Some(0), "{text}");
     assert!(text.contains("gateway   running"), "{text}");
     assert!(text.contains("answers (HTTP"), "{text}");
+
+    // The bug this cycle exists to catch: a bare `status`, with no --url,
+    // has to probe the port the service was installed with.
+    let bare = daemon(home, &["status"]);
+    let text = stdout(&bare);
+    assert_eq!(bare.status.code(), Some(0), "{text}");
+    assert!(text.contains(&url), "{text}");
     assert!(text.contains("installed under launchd, running"), "{text}");
     assert!(!text.contains("foreground"), "{text}");
 
@@ -195,6 +214,8 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
     );
     assert!(!plist.exists(), "{} survived", plist.display());
     assert!(!loaded(), "the job is still in the launchd domain");
+    // The record describes a service that no longer exists.
+    assert!(!recorded.exists(), "{} survived", recorded.display());
 
     let gone = daemon(home, &["status", "--url", &url]);
     let text = stdout(&gone);
