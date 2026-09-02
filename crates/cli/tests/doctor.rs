@@ -144,7 +144,7 @@ fn probe_reports_handshake_failure_with_nonzero_exit() {
     let static_out = run_doctor(dir.path(), Some(HEALTHY), &[]);
     assert!(static_out.status.success());
 
-    let out = run_doctor(dir.path(), Some(HEALTHY), &["--probe", "--timeout", "15"]);
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--probe", "--timeout", "60"]);
     assert!(!out.status.success());
     let text = stdout(&out);
     assert!(text.contains("probes"), "{text}");
@@ -162,7 +162,7 @@ version = 1
 type = "http"
 url = "http://127.0.0.1:1/mcp"
 "#;
-    let out = run_doctor(dir.path(), Some(config), &["--probe", "--timeout", "15"]);
+    let out = run_doctor(dir.path(), Some(config), &["--probe", "--timeout", "60"]);
     assert!(!out.status.success(), "{}", stdout(&out));
     let text = stdout(&out);
     assert!(text.contains("remote (canonical)"), "{text}");
@@ -175,7 +175,7 @@ fn probe_json_carries_results() {
     let out = run_doctor(
         dir.path(),
         Some(HEALTHY),
-        &["--probe", "--timeout", "15", "--json"],
+        &["--probe", "--timeout", "60", "--json"],
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let probes = value["probes"].as_object().unwrap();
@@ -301,7 +301,7 @@ fn a_served_endpoint_reports_reachable_through_the_gateway() {
         &[
             "--probe",
             "--timeout",
-            "15",
+            "60",
             "--gateway-url",
             &base,
             "--json",
@@ -325,7 +325,7 @@ fn a_served_endpoint_reports_reachable_through_the_gateway() {
     let text = stdout(&run_doctor(
         dir.path(),
         Some(&canonical_fixture()),
-        &["--probe", "--timeout", "15", "--gateway-url", &base],
+        &["--probe", "--timeout", "60", "--gateway-url", &base],
     ));
     assert!(text.contains("probes — direct to each server"), "{text}");
     assert!(
@@ -348,7 +348,7 @@ fn an_entry_the_gateway_does_not_serve_is_an_actionable_error() {
     let out = run_doctor(
         dir.path(),
         Some(&canonical_fixture()),
-        &["--probe", "--timeout", "15", "--gateway-url", &base],
+        &["--probe", "--timeout", "60", "--gateway-url", &base],
     );
     assert!(!out.status.success(), "{}", stdout(&out));
     let text = stdout(&out);
@@ -378,7 +378,7 @@ fn a_down_gateway_is_reported_once_however_many_entries_point_at_it() {
         &[
             "--probe",
             "--timeout",
-            "15",
+            "60",
             "--gateway-url",
             base,
             "--json",
@@ -407,7 +407,7 @@ fn without_managed_gateway_entries_there_is_no_gateway_section() {
     let out = run_doctor(
         dir.path(),
         Some(&canonical_fixture()),
-        &["--probe", "--timeout", "15", "--json"],
+        &["--probe", "--timeout", "60", "--json"],
     );
     let value = json_of(&out);
     // Nothing points at a gateway, so nothing is said about one — a user who

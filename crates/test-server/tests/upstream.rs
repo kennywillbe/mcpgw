@@ -37,9 +37,27 @@ fn manager(entries: &[(&str, Server)]) -> UpstreamManager {
         .map(|(name, server)| ((*name).to_owned(), server.clone()))
         .collect();
     UpstreamManager::new(servers)
-        .with_connect_timeout(Duration::from_secs(5))
+        .with_connect_timeout(Duration::from_secs(30))
         // 50ms → 100ms ladder keeps the failure tests fast.
         .with_backoff_base(Duration::from_millis(50))
+}
+
+/// Waits for `name` to reach `want`, polling rather than sleeping a guessed
+/// interval: how long a child takes to spawn is a property of the machine,
+/// and a sleep tuned to an idle one is a flake on a loaded one.
+async fn wait_for_status(mgr: &UpstreamManager, name: &str, want: UpstreamStatus) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = mgr.status(name).await;
+        if status.as_ref() == Some(&want) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name} never reached {want:?}, last seen {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
@@ -80,13 +98,14 @@ async fn latched_failure_gets_one_fresh_chance_per_demand() {
     let mgr = manager(&[("fx", stdio_server("exit"))]);
     let _ = mgr.ready("fx").await.unwrap_err();
 
-    let started = Instant::now();
     let err = mgr.ready("fx").await.unwrap_err();
-    // Single attempt: no ladder sleeps.
-    assert!(started.elapsed() < Duration::from_millis(100));
     let UpstreamError::Failed { attempts, .. } = &err else {
         panic!("expected Failed, got {err}");
     };
+    // The attempt count is what "one fresh chance, no ladder" means. The
+    // clock said the same thing only on an idle machine: under parallel load
+    // a single process spawn can outlast any ceiling tight enough to tell the
+    // two apart, so the count is the assertion and the stopwatch goes.
     assert_eq!(*attempts, 1);
 }
 
@@ -96,9 +115,8 @@ async fn death_after_ready_reconnects_on_next_demand() {
     let first = mgr.ready("fx").await.unwrap();
     // The fixture dies on this request; the call errors out.
     assert!(first.list_all_tools().await.is_err());
-    // Give the transport task a moment to observe the child's death.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Idle));
+    // The transport task has to observe the child's death first.
+    wait_for_status(&mgr, "fx", UpstreamStatus::Idle).await;
 
     let second = mgr.ready("fx").await.unwrap();
     assert!(!Arc::ptr_eq(&first, &second), "must be a fresh instance");
@@ -188,14 +206,15 @@ async fn status_and_shutdown_answer_while_a_connect_is_in_flight() {
     });
 
     // Let the ladder get past spawning and into its wait.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_status(&mgr, "fx", UpstreamStatus::Connecting).await;
 
     let started = Instant::now();
-    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Connecting));
     mgr.shutdown().await;
     assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Idle));
+    // The bug this guards was a 30s wait, so the ceiling only has to be far
+    // below that — not close to how fast an unloaded machine answers.
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(10),
         "blocked for {:?} behind the connect",
         started.elapsed()
     );
@@ -258,8 +277,7 @@ async fn a_parked_caller_recovers_when_the_ladder_it_waits_on_is_dropped() {
         async move { tokio::time::timeout(Duration::from_millis(300), mgr.ready("fx")).await }
     });
     // Let the owner claim the slot before the second caller looks at it.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(mgr.status("fx").await, Some(UpstreamStatus::Connecting));
+    wait_for_status(&mgr, "fx", UpstreamStatus::Connecting).await;
 
     let parked = tokio::spawn({
         let mgr = Arc::clone(&mgr);

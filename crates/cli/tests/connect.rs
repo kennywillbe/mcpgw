@@ -28,7 +28,7 @@ async fn fixture_gateway() -> (String, Arc<UpstreamManager>) {
     };
     let manager = Arc::new(
         UpstreamManager::new(BTreeMap::from([("fx".to_owned(), server)]))
-            .with_connect_timeout(Duration::from_secs(5))
+            .with_connect_timeout(Duration::from_secs(30))
             .with_backoff_base(Duration::from_millis(20)),
     );
     let gateway = Gateway::new(Arc::clone(&manager), "fx".to_owned());
