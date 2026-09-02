@@ -25,6 +25,10 @@ None of this is in 0.1.0.
   argument lands in the traffic file. It's mode `0600`, and `--no-capture`
   turns it off.
 - **No linux-arm64 prebuilt binary yet.** `cargo install mcpgw` works there.
+- **The aggregate endpoint serves tools only.** Resources and prompts reach a
+  client through a per-server endpoint (`serve --per-server`), because their
+  names cannot be namespaced across servers the way tool names can. See
+  [Gateway](./gateway.md).
 
 ## Asking for things
 

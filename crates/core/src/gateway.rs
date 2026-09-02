@@ -1,7 +1,8 @@
-//! The gateway's downstream face: an rmcp server that forwards tool
-//! requests to upstreams managed by [`UpstreamManager`]. Two shapes:
-//! a pure pipe to a single upstream (tool names untouched) and the
-//! aggregate mode that merges N upstreams under `server__tool` names.
+//! The gateway's downstream face: an rmcp server that forwards MCP requests
+//! to upstreams managed by [`UpstreamManager`]. Two shapes: a pure pipe to a
+//! single upstream (names untouched, every request family forwarded) and the
+//! aggregate mode that merges the tools of N upstreams under `server__tool`
+//! names.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,8 +10,12 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult, ErrorData,
+    GetPromptRequestMethod, GetPromptRequestParams, GetPromptResponse, Implementation,
+    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+    PaginatedRequestParams, PromptsCapability, ReadResourceRequestMethod,
+    ReadResourceRequestParams, ReadResourceResponse, ResourcesCapability, ServerCapabilities,
+    ServerInfo, Tool, ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
 
@@ -156,6 +161,87 @@ impl Gateway {
         })
     }
 
+    /// The single upstream a request belongs to, or `None` in aggregate mode.
+    ///
+    /// Only a pipe can answer the resource, prompt and completion families,
+    /// and that is a decision rather than a gap: those families are addressed
+    /// by opaque strings with no namespace to prefix the way `server__tool`
+    /// does. Two servers can both serve `file:///README.md` — one name, two
+    /// different documents — and rewriting the URIs would break every link
+    /// inside the contents that refer to them. So the aggregate keeps merging
+    /// tools only, and `/s/<name>` is where a client goes for the rest.
+    fn pipe_upstream(&self) -> Option<&str> {
+        match &self.mode {
+            Mode::Pipe(upstream) => Some(upstream),
+            Mode::Aggregate(_) => None,
+        }
+    }
+
+    /// What this face advertises at `initialize`.
+    ///
+    /// A pipe reports the upstream's own capabilities (narrowed by
+    /// [`forwarded`]), because it forwards every family and guessing costs
+    /// either way: claim too much and a client asks a tools-only server for
+    /// resources, claim too little and a server's prompts stay invisible.
+    ///
+    /// The source is the snapshot from the last successful connect, never a
+    /// fresh one: rmcp calls this synchronously while answering `initialize`,
+    /// so reaching the upstream here would mean running a connect ladder
+    /// inside a handshake — up to a minute and a half of a client waiting to
+    /// be told what this gateway can do. Before first contact there is no
+    /// snapshot, and the honest answer is the conservative one: tools only.
+    /// A client that initialized in that window sees the rest after it
+    /// reconnects, which is the same cost as a client that connected before
+    /// the upstream had started.
+    fn capabilities(&self) -> ServerCapabilities {
+        let Some(upstream) = self.pipe_upstream() else {
+            return tools_only();
+        };
+        self.manager
+            .last_server_info(upstream)
+            .map_or_else(tools_only, |info| forwarded(&info.capabilities))
+    }
+
+    /// Forwards one request to `upstream` under the request deadline and
+    /// records the attempt.
+    ///
+    /// `subject` is what the request named — a prompt, a resource URI, an
+    /// argument — for the capture record; the list families name nothing.
+    /// `describe` renders the successful answer for the same record.
+    async fn forward<T, F>(
+        &self,
+        upstream: &str,
+        kind: Kind,
+        subject: Option<String>,
+        call: impl FnOnce(Arc<crate::upstream::UpstreamService>) -> F,
+        describe: impl FnOnce(&T) -> String,
+    ) -> Result<T, ErrorData>
+    where
+        F: Future<Output = Result<T, rmcp::service::ServiceError>>,
+    {
+        let started = Instant::now();
+        let result = self
+            .within_deadline(upstream, async {
+                let service = self.upstream_service(upstream).await?;
+                call(service)
+                    .await
+                    .map_err(|err| ErrorData::internal_error(err.to_string(), None))
+            })
+            .await;
+        let elapsed = started.elapsed();
+        self.record(|session| {
+            let mut record = CaptureRecord::new(session, upstream, kind, elapsed);
+            if let Some(subject) = subject {
+                record = record.with_tool(subject);
+            }
+            match &result {
+                Ok(value) => record.with_response(describe(value)),
+                Err(err) => record.with_error(&err.message),
+            }
+        });
+        result
+    }
+
     /// Lists every upstream's tools in parallel and merges them under their
     /// `server__` prefixes. An upstream that cannot answer is reported on
     /// the gateway console and omitted: degraded, but never silent and never
@@ -248,10 +334,41 @@ pub fn resolve<'a>(name: &'a str, servers: &'a [String]) -> Option<(&'a str, &'a
         .max_by_key(|(server, _)| server.len())
 }
 
+/// The conservative answer for a face that cannot know better yet: tools are
+/// the one family both gateway shapes always serve.
+fn tools_only() -> ServerCapabilities {
+    ServerCapabilities::builder().enable_tools().build()
+}
+
+/// The upstream's capabilities, narrowed to the families a pipe actually
+/// forwards.
+///
+/// Copying the upstream's set verbatim would over-claim: `resources.subscribe`
+/// and the `listChanged` flags promise subscriptions and notifications that
+/// stop at the gateway, and a client that took them at their word would sit
+/// waiting for updates that never arrive. What is advertised here is exactly
+/// what [`Gateway`] implements.
+fn forwarded(upstream: &ServerCapabilities) -> ServerCapabilities {
+    let mut capabilities = ServerCapabilities::default();
+    if upstream.tools.is_some() {
+        capabilities.tools = Some(ToolsCapability::default());
+    }
+    if upstream.resources.is_some() {
+        capabilities.resources = Some(ResourcesCapability::default());
+    }
+    if upstream.prompts.is_some() {
+        capabilities.prompts = Some(PromptsCapability::default());
+    }
+    if upstream.completions.is_some() {
+        capabilities.completions = Some(serde_json::Map::new());
+    }
+    capabilities
+}
+
 impl ServerHandler for Gateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = self.capabilities();
         info.server_info = Implementation::new("mcpgw", env!("CARGO_PKG_VERSION"));
         info
     }
@@ -346,6 +463,138 @@ impl ServerHandler for Gateway {
             }
         });
         response
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let Some(upstream) = self.pipe_upstream() else {
+            return Ok(ListResourcesResult::default());
+        };
+        // Pagination is forwarded rather than collapsed the way tools/list
+        // does it: the cursor a pipe hands back came from the one upstream
+        // that will be asked for the next page, so it stays meaningful.
+        self.forward(
+            upstream,
+            Kind::Resources,
+            None,
+            |service| async move { service.list_resources(request).await },
+            |result| format!("{} resource(s)", result.resources.len()),
+        )
+        .await
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        let Some(upstream) = self.pipe_upstream() else {
+            return Ok(ListResourceTemplatesResult::default());
+        };
+        self.forward(
+            upstream,
+            Kind::ResourceTemplates,
+            None,
+            |service| async move { service.list_resource_templates(request).await },
+            |result| format!("{} template(s)", result.resource_templates.len()),
+        )
+        .await
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let Some(upstream) = self.pipe_upstream() else {
+            // The aggregate serves no resources, so the honest answer is the
+            // one rmcp's default handler gives: the method is not here.
+            return Err(ErrorData::method_not_found::<ReadResourceRequestMethod>());
+        };
+        let uri = request.uri.clone();
+        // The `_once` form forwards an `input_required` answer downstream
+        // instead of trying to satisfy it here: the client on the other side
+        // is the one that can ask a human, and a pipe must not swallow a
+        // round it cannot complete.
+        self.forward(
+            upstream,
+            Kind::ResourceRead,
+            Some(uri),
+            |service| async move { service.read_resource_once(request).await },
+            |response| match response {
+                ReadResourceResponse::Complete(result) => crate::capture::body(
+                    &serde_json::to_value(result).unwrap_or_else(|_| format!("{result:?}").into()),
+                ),
+                other => crate::capture::truncate(&format!("{other:?}")),
+            },
+        )
+        .await
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        let Some(upstream) = self.pipe_upstream() else {
+            return Ok(ListPromptsResult::default());
+        };
+        self.forward(
+            upstream,
+            Kind::Prompts,
+            None,
+            |service| async move { service.list_prompts(request).await },
+            |result| format!("{} prompt(s)", result.prompts.len()),
+        )
+        .await
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let Some(upstream) = self.pipe_upstream() else {
+            return Err(ErrorData::method_not_found::<GetPromptRequestMethod>());
+        };
+        let name = request.name.clone();
+        self.forward(
+            upstream,
+            Kind::PromptGet,
+            Some(name),
+            |service| async move { service.get_prompt_once(request).await },
+            |response| match response {
+                GetPromptResponse::Complete(result) => crate::capture::body(
+                    &serde_json::to_value(result).unwrap_or_else(|_| format!("{result:?}").into()),
+                ),
+                other => crate::capture::truncate(&format!("{other:?}")),
+            },
+        )
+        .await
+    }
+
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, ErrorData> {
+        let Some(upstream) = self.pipe_upstream() else {
+            // An empty completion, which is what rmcp's default answers and
+            // what the spec expects of a server with nothing to suggest.
+            return Ok(CompleteResult::default());
+        };
+        let argument = request.argument.name.clone();
+        self.forward(
+            upstream,
+            Kind::Complete,
+            Some(argument),
+            |service| async move { service.complete(request).await },
+            |result| format!("{} completion(s)", result.completion.values.len()),
+        )
+        .await
     }
 }
 

@@ -58,9 +58,10 @@ fn tables_the_tools_a_live_server_advertises() {
     assert!(text.contains("mcpgw-test-server 9.9.9"), "{text}");
     assert!(text.contains("echo") && text.contains("reverse"), "{text}");
     assert!(text.contains("echoes input"), "{text}");
-    // The fixture advertises tools only, which must read as a plain fact
-    // rather than as a failed listing.
-    assert!(text.contains("resources: not supported"), "{text}");
+    // The fixture serves resources as well, so inspect tables them beside
+    // the tools instead of reporting the family as absent.
+    assert!(text.contains("resources (1)"), "{text}");
+    assert!(text.contains("mem:///greeting.txt"), "{text}");
 }
 
 #[test]
@@ -72,8 +73,9 @@ fn json_carries_the_full_listing() {
     assert_eq!(value["server_name"], "mcpgw-test-server");
     assert_eq!(value["tools"].as_array().unwrap().len(), 2);
     assert_eq!(value["tools"][0]["name"], "echo");
-    assert_eq!(value["supports_resources"], false);
-    assert_eq!(value["resources"].as_array().unwrap().len(), 0);
+    assert_eq!(value["supports_resources"], true);
+    assert_eq!(value["resources"].as_array().unwrap().len(), 1);
+    assert_eq!(value["resources"][0]["uri"], "mem:///greeting.txt");
 }
 
 #[test]
