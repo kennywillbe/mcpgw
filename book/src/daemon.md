@@ -7,22 +7,10 @@ in the morning is ask for a tool list, and nothing is there to answer.
 `mcpgw daemon` is the answer — the gateway supervised by the machine's own
 service manager, started at login and restarted when it dies.
 
-## Status of this feature
-
-The per-OS installers are landing one at a time in this release wave:
-
-| Command                         | State                                      |
-| ------------------------------- | ------------------------------------------ |
-| `mcpgw daemon status`           | works now                                  |
-| `mcpgw daemon logs [--follow]`  | works now                                  |
-| `mcpgw daemon install`          | macOS and Windows now; Linux in this wave  |
-| `mcpgw daemon uninstall`        | ditto                                      |
-| `mcpgw daemon start` / `stop`   | ditto                                      |
-
-Until your platform's installer ships, `install`, `start`, `stop` and
-`uninstall` tell you so and point you at `mcpgw serve`. `status` and `logs`
-already work everywhere, and `status` reports on a foreground `mcpgw serve`
-exactly as it will on a supervised one.
+Every command works on all three platforms, each through that platform's own
+supervisor: a launch agent on macOS, a systemd user unit on Linux, a service
+on Windows. The three sections below are what is different about each; the
+ones after them are the same everywhere.
 
 ## macOS: the launch agent
 
@@ -74,6 +62,112 @@ mcpgw daemon uninstall   # unloads it and deletes the plist
 is a gateway that did not exit successfully — which is exactly what
 `KeepAlive` restarts on. `start` runs the plist as it stands, so changing the
 port means running `install` again rather than `start --port`.
+
+## Linux: the systemd user unit
+
+```sh
+mcpgw daemon install            # or --port 9000 --bind ::1
+```
+
+```text
+installed the mcpgw gateway service at ~/.config/systemd/user/mcpgw.service
+  user lingering is off, so the gateway stops when your last session ends —
+  `loginctl enable-linger you` changes that, and mcpgw does not run it for you
+  because it outlives every user service you have, not just this one
+  it serves ~/.config/mcpgw/config.toml and runs with the PATH you installed from,
+  so re-run `mcpgw daemon install` if either moves
+  its output goes to the daemon logs — `mcpgw daemon logs --follow` reads both streams
+it will answer on http://127.0.0.1:8137/mcp
+```
+
+It is a *user* unit, not a system one: the gateway runs your MCP servers with
+your environment and reads config out of your home directory, so nothing
+about it wants root. Everything is `systemctl --user`, which means
+`systemctl --user status mcpgw.service` and `journalctl --user -u mcpgw` work
+on it exactly as you would expect. Install writes the unit, reloads the user
+manager and `enable --now`s it, so the gateway is up before the command
+returns and comes back at your next login.
+
+The unit is short and worth reading:
+
+```ini
+[Unit]
+Description=mcpgw MCP gateway
+Documentation=https://github.com/kennywillbe/mcpgw
+
+[Service]
+Type=simple
+Environment=MCPGW_CONFIG=/home/you/.config/mcpgw/config.toml
+Environment=MCPGW_STATE_DIR=/home/you/.local/share/mcpgw
+Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/you/.local/bin/mcpgw serve --bind 127.0.0.1 --port 8137
+Restart=on-failure
+RestartSec=2
+StandardOutput=append:/home/you/.local/share/mcpgw/logs/daemon.out.log
+StandardError=append:/home/you/.local/share/mcpgw/logs/daemon.err.log
+
+[Install]
+WantedBy=default.target
+```
+
+Three of those lines are decisions rather than defaults:
+
+- **`Type=simple`, and no readiness notification.** sd-notify would mean a
+  dependency and a socket protocol to assert something `mcpgw daemon status`
+  already checks better — by asking the gateway for an HTTP response on the
+  address it was installed for.
+- **`Restart=on-failure`, not `always`.** A gateway that crashes comes
+  straight back; a gateway you stopped stays stopped.
+- **`PATH` is captured at install time.** A user unit otherwise starts with
+  the manager's own minimal `PATH`, and almost every stdio MCP server is an
+  `npx`, `uvx` or `bunx` living under `~/.local/bin` or a version manager's
+  shim directory — so the gateway would come up with every stdio server
+  failing to spawn. The cost is that the `PATH` is frozen: change it, or move
+  your config, and re-run `install`.
+
+`stop` and `start` are `systemctl --user stop` / `start` on that unit, and
+`uninstall` disables it, deletes the file and reloads. Uninstalling something
+that is not installed succeeds — the end state is what was asked for.
+
+### Logging out stops it, unless you linger
+
+A user manager normally shuts down with your last session, which takes the
+gateway with it. `mcpgw daemon install` and `mcpgw daemon status` both report
+which side of that you are on:
+
+```text
+service   installed under systemd --user, running
+          (~/.config/systemd/user/mcpgw.service) — enabled, so it comes back
+          at login; user lingering is off, so the gateway stops when your last
+          session ends …
+```
+
+mcpgw does not run `enable-linger` for you. It is an account-wide switch:
+afterwards *every* user service you have keeps running while you are logged
+out, which is a decision about the machine and not about this gateway. If
+that is what you want — a headless box, or a gateway that answers over an SSH
+tunnel with no desktop session — run it once yourself:
+
+```sh
+loginctl enable-linger "$USER"
+```
+
+If `loginctl` is not there at all, the note says the question could not be
+answered rather than guessing at it.
+
+### Distributions without systemd
+
+On a machine with no `systemctl` on `PATH`, `install`, `start`, `stop` and
+`uninstall` say so and point at the alternative rather than failing with an
+errno:
+
+```text
+Error: systemd --user: cannot run `systemctl` (No such file or directory) —
+this build installs the gateway as a systemd user unit, and this machine does
+not appear to be running systemd. Start it with `mcpgw serve` under whatever
+supervisor you do have (an OpenRC, runit or s6 service), and `mcpgw daemon
+status` will still report on it
+```
 
 ## Windows: the service
 

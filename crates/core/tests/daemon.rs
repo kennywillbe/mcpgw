@@ -163,9 +163,11 @@ async fn a_silent_listener_probes_as_not_http() {
 /// the three is compiled into any build, by design — and a platform drops
 /// out of the list once its installer ships, because a real implementation
 /// talks to a real supervisor and this would then register a service on
-/// whatever machine ran it. macOS left with the launch agent
-/// (`daemon_launchd.rs` covers it); Windows with the service.
-#[cfg(not(any(target_os = "macos", windows)))]
+/// whatever machine ran it. All three have now shipped — launch agent,
+/// systemd user unit, Windows service — so this asserts on nothing any
+/// supported target still compiles, and `daemon_launchd.rs`,
+/// `daemon_systemd.rs` and `daemon_windows.rs` cover the real ones.
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 #[test]
 fn the_platform_stub_names_its_supervisor_and_the_workaround() {
     use mcpgw_core::daemon::{ServiceManager as _, platform_service};
@@ -184,16 +186,6 @@ fn the_platform_stub_names_its_supervisor_and_the_workaround() {
     for message in &messages {
         assert!(message.contains("not in this release yet"), "{message}");
         assert!(message.contains("mcpgw serve"), "{message}");
-    }
-
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        assert_eq!(service.name(), "systemd --user");
-        assert!(
-            messages[0].contains("systemd --user unit"),
-            "{}",
-            messages[0]
-        );
     }
 }
 
