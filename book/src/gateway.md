@@ -26,6 +26,7 @@ and reaps the child processes.
 mcpgw serve --port 9000
 mcpgw serve --server github --server linear   # a subset (repeatable)
 mcpgw serve --no-capture                      # don't write the traffic log
+mcpgw serve --per-server                      # also one endpoint per server
 ```
 
 ### Binding
@@ -47,6 +48,28 @@ that referenced it.
 
 The exception: `--server` with exactly one name turns the gateway into a plain
 pipe to that server, tool names untouched.
+
+## Per-server endpoints
+
+`--per-server` additionally gives every served server its own endpoint, where
+its tools appear under their own names:
+
+```sh
+mcpgw serve --per-server
+# http://127.0.0.1:8137/mcp      — everything, as server__tool
+# http://127.0.0.1:8137/s/github — github only, tools unprefixed
+# http://127.0.0.1:8137/s/linear — linear only, tools unprefixed
+```
+
+They all share one process and one set of upstream connections, so a client
+can take the whole gateway, a single server, or both at once without starting
+anything twice. A stdio-only client reaches one the same way:
+
+```sh
+mcpgw connect --server github
+```
+
+Off unless asked for; `/mcp` alone is what you get otherwise.
 
 ## Upstream lifecycle
 
@@ -83,6 +106,7 @@ the other:
 ```sh
 mcpgw connect
 mcpgw connect --url http://127.0.0.1:9000/mcp
+mcpgw connect --server github    # one server's endpoint, tools unprefixed
 ```
 
 `sync --gateway` writes this for you; you rarely type it. If the gateway isn't
