@@ -89,6 +89,10 @@ Clients that only speak stdio (Claude Desktop) get `mcpgw connect`, a stdio↔HT
 bridge to the running gateway. `sync --gateway` picks the right shape per
 client for you.
 
+Not a one-way door: `mcpgw eject` writes your original server definitions back
+into every client, drops the gateway entry, removes the daemon, and prints what
+is left to delete. Your clients then work without mcpgw installed at all.
+
 ## Watch what's actually happening
 
 While the gateway is serving, it appends every request to a daily JSONL file
