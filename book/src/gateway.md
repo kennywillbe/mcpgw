@@ -106,14 +106,38 @@ they're indistinguishable.
 mcpgw sync --gateway
 ```
 
-Replaces the per-server entries with a single `mcpgw` entry per client, and
-picks the right shape for each one. HTTP-capable clients get the URL directly.
+Every enabled server keeps its entry and its name; only the transport changes,
+to that server's own `/s/<name>` endpoint. So the client's list of servers
+looks the same before and after, tools stay unprefixed, and anything the client
+keeps beside the entry — Cline's off switch, its auto-approved tools — survives
+the move, because it is still the same entry.
+
+```text
+"github": { "type": "http", "url": "http://127.0.0.1:8137/s/github" }
+```
+
+The shape is per client: `httpUrl` for Gemini, `serverUrl` for Windsurf,
+`type: "remote"` for opencode, and so on. Run it against a gateway started with
+`--per-server`.
 
 ```sh
 mcpgw sync --gateway --gateway-url http://127.0.0.1:9000/mcp
 mcpgw sync --gateway --dry-run
 mcpgw sync --rollback              # back to whatever was there before
 ```
+
+### One entry for the whole gateway
+
+```sh
+mcpgw sync --gateway --aggregate
+```
+
+Replaces the per-server entries with a single `mcpgw` entry pointing at `/mcp`,
+where every tool is namespaced `server__tool`. One entry per client instead of
+a dozen, at the price of prefixed tool names and no resources or prompts (see
+above). Switching between the two modes is a normal sync either way: the
+entries the other mode wrote are mcpgw's, so they are replaced, not left
+behind.
 
 ## stdio-only clients
 
@@ -125,7 +149,12 @@ the other:
 mcpgw connect
 mcpgw connect --url http://127.0.0.1:9000/mcp
 mcpgw connect --server github    # one server's endpoint, tools unprefixed
+mcpgw connect --server github --url http://127.0.0.1:9000/mcp
 ```
+
+`--url` alone is the gateway, verbatim. With `--server` it says where the
+gateway is and the server's endpoint is resolved on it — which is what
+`sync --gateway` writes for a stdio-only client.
 
 `sync --gateway` writes this for you; you rarely type it. If the gateway isn't
 running, the client sees a plain message saying so and telling you to start it

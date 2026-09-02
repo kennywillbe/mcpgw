@@ -3,7 +3,8 @@ use std::path::Path;
 
 use mcpgw_core::state::ManagedState;
 use mcpgw_core::sync::{
-    apply_plan, apply_plan_to, client_entry, gateway_server, plan_client_context, plan_sync,
+    apply_plan, apply_plan_to, client_entry, gateway_server, per_server_gateway_server,
+    per_server_gateway_servers, plan_client_context, plan_sync,
 };
 use mcpgw_core::{ClientKind, Config, backup};
 
@@ -525,6 +526,207 @@ fn gateway_entry_shapes_per_client() {
             kind != ClientKind::ClaudeDesktop
         );
     }
+}
+
+/// The whole per-server emission, one golden entry per client kind. Written
+/// out rather than field-probed: the failure this guards against is a client
+/// gaining or losing a field, which a probe for the fields we thought of
+/// cannot see.
+#[test]
+fn per_server_gateway_entry_shapes_per_client() {
+    let base = "http://127.0.0.1:8137/mcp";
+    let url = "http://127.0.0.1:8137/s/github";
+    let canonical = canonical();
+    let http = |extra: serde_json::Value| {
+        let mut entry = serde_json::json!({ "url": url });
+        for (key, value) in extra.as_object().unwrap() {
+            entry[key] = value.clone();
+        }
+        entry
+    };
+    let expected = |kind| match kind {
+        // Claude Desktop cannot take a URL at all, so it gets the bridge —
+        // naming the server, with the gateway's own base URL beside it.
+        ClientKind::ClaudeDesktop => serde_json::json!({
+            "command": "mcpgw",
+            "args": ["connect", "--server", "github", "--url", base],
+        }),
+        ClientKind::ClaudeCode | ClientKind::Cursor | ClientKind::VsCode => {
+            http(serde_json::json!({ "type": "http" }))
+        }
+        ClientKind::Gemini => serde_json::json!({ "httpUrl": url }),
+        ClientKind::Codex | ClientKind::Amp => http(serde_json::json!({})),
+        ClientKind::Opencode => http(serde_json::json!({ "type": "remote" })),
+        ClientKind::Windsurf => serde_json::json!({ "serverUrl": url }),
+        ClientKind::Zed => http(serde_json::json!({ "source": "custom" })),
+        ClientKind::Cline | ClientKind::ClineCli => {
+            http(serde_json::json!({ "type": "streamableHttp" }))
+        }
+        ClientKind::ZooCode => http(serde_json::json!({ "type": "streamable-http" })),
+    };
+
+    for kind in ClientKind::ALL {
+        let server =
+            per_server_gateway_server(kind, "github", &canonical["github"], base, "mcpgw").unwrap();
+        assert_eq!(client_entry(kind, &server), expected(kind), "{}", kind.id());
+    }
+
+    // A gateway on another port moves the endpoint with it, path and all.
+    let moved = per_server_gateway_server(
+        ClientKind::Cursor,
+        "github",
+        &canonical["github"],
+        "http://127.0.0.1:9000",
+        "mcpgw",
+    )
+    .unwrap();
+    assert_eq!(
+        client_entry(ClientKind::Cursor, &moved)["url"],
+        "http://127.0.0.1:9000/s/github"
+    );
+    assert!(
+        per_server_gateway_server(
+            ClientKind::Cursor,
+            "github",
+            &canonical["github"],
+            "not a url",
+            "mcpgw"
+        )
+        .is_err()
+    );
+}
+
+/// The point of naming per-server entries after their server: flipping a
+/// client from direct to gateway mode rewrites entries mcpgw already manages,
+/// so it is a set of updates. Under any other naming they would be adds
+/// beside stale removes — or, worse, conflicts.
+#[test]
+fn flipping_to_per_server_gateway_mode_updates_the_same_names() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    // What a direct sync left behind, plus an entry of the user's own.
+    let current = serde_json::json!({
+        "github": client_entry(ClientKind::Cursor, &canonical["github"]),
+        "linear": client_entry(ClientKind::Cursor, &canonical["linear"]),
+        "users-own": { "command": "deno" },
+    });
+    let desired =
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw").unwrap();
+    let plan = plan_sync(
+        ClientKind::Cursor,
+        current.as_object().unwrap(),
+        &desired,
+        &managed(&["github", "linear"]),
+    );
+    assert_eq!(plan.updates, ["github", "linear"]);
+    assert!(plan.adds.is_empty(), "{plan:?}");
+    assert!(plan.conflicts.is_empty(), "{plan:?}");
+    assert_eq!(plan.foreign, ["users-own"]);
+    // The disabled canonical server is in the desired map but not mirrored:
+    // per-server mode inherits direct mode's rule rather than restating it.
+    assert!(!desired["parked"].enabled);
+    assert_eq!(plan.managed_after(), managed(&["github", "linear"]));
+
+    let mut root = serde_json::json!({ "mcpServers": current });
+    apply_plan(ClientKind::Cursor, &mut root, &plan).unwrap();
+    let entries = &root["mcpServers"];
+    assert_eq!(entries["github"]["url"], "http://127.0.0.1:8137/s/github");
+    assert_eq!(entries["linear"]["url"], "http://127.0.0.1:8137/s/linear");
+    assert_eq!(entries["users-own"]["command"], "deno");
+
+    // And the second run has nothing to do.
+    let again = plan_sync(
+        ClientKind::Cursor,
+        entries.as_object().unwrap(),
+        &desired,
+        &plan.managed_after(),
+    );
+    assert!(!again.has_changes(), "{again:?}");
+}
+
+/// The migration off the old single-entry gateway shape: `mcpgw` was managed,
+/// so it is a plain remove, and the per-server names come in beside it.
+#[test]
+fn migrating_off_the_aggregate_entry_removes_it() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let current = serde_json::json!({
+        "mcpgw": client_entry(
+            ClientKind::Cursor,
+            &gateway_server(ClientKind::Cursor, base, "mcpgw"),
+        ),
+    });
+    let desired =
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw").unwrap();
+    let plan = plan_sync(
+        ClientKind::Cursor,
+        current.as_object().unwrap(),
+        &desired,
+        &managed(&["mcpgw"]),
+    );
+    assert_eq!(plan.adds, ["github", "linear"]);
+    assert_eq!(plan.removes, ["mcpgw"]);
+    assert!(plan.conflicts.is_empty(), "{plan:?}");
+}
+
+/// A per-server gateway entry is the same server under the same name, so the
+/// switch the user flipped inside the client applies to it as it did to the
+/// direct entry: mode is mcpgw's decision, "off" is theirs.
+#[test]
+fn per_server_gateway_entries_keep_the_fields_the_client_owns() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let mut on_disk = client_entry(ClientKind::Cline, &canonical["github"]);
+    on_disk["disabled"] = true.into();
+    on_disk["autoApprove"] = serde_json::json!(["list_issues"]);
+    let current = serde_json::json!({ "github": on_disk });
+
+    let desired = per_server_gateway_servers(ClientKind::Cline, &canonical, base, "mcpgw").unwrap();
+    let plan = plan_sync(
+        ClientKind::Cline,
+        current.as_object().unwrap(),
+        &desired,
+        &managed(&["github"]),
+    );
+    assert_eq!(plan.updates, ["github"]);
+    let mut root = serde_json::json!({ "mcpServers": current });
+    apply_plan(ClientKind::Cline, &mut root, &plan).unwrap();
+    let written = &root["mcpServers"]["github"];
+    assert_eq!(written["url"], "http://127.0.0.1:8137/s/github");
+    assert_eq!(written["type"], "streamableHttp");
+    assert!(written.get("command").is_none());
+    assert_eq!(written["disabled"], true);
+    assert_eq!(written["autoApprove"], serde_json::json!(["list_issues"]));
+}
+
+/// Per-server mode reaches Gemini's out-of-entry state through the same pass
+/// direct mode does — the names are the same, so there is nothing to special
+/// case, only something to keep true.
+#[test]
+fn per_server_gateway_sync_unexcludes_its_own_names_in_gemini() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let document = serde_json::json!({
+        "mcp": { "excluded": ["github", "users-own"] },
+        "mcpServers": {
+            "github": client_entry(ClientKind::Gemini, &canonical["github"]),
+            "users-own": { "command": "deno" },
+        }
+    });
+    let desired =
+        per_server_gateway_servers(ClientKind::Gemini, &canonical, base, "mcpgw").unwrap();
+    let mut plan = plan_sync(
+        ClientKind::Gemini,
+        document["mcpServers"].as_object().unwrap(),
+        &desired,
+        &managed(&["github"]),
+    );
+    plan_client_context(ClientKind::Gemini, &document, &mut plan);
+    assert_eq!(plan.unexclude, ["github"]);
+    assert_eq!(
+        client_entry(ClientKind::Gemini, &desired["github"])["httpUrl"],
+        "http://127.0.0.1:8137/s/github"
+    );
 }
 
 #[test]
