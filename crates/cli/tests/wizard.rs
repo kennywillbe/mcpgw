@@ -113,10 +113,15 @@ async fn init_yes_walks_every_step_without_reading_stdin() {
         stdout.contains("Nothing is written until you say yes"),
         "{stdout}"
     );
-    // The config already has a server, so the survey is skipped and the
-    // three stubs each name the command that does their job today.
+    // The config already has a server, so the survey is skipped.
     assert!(stdout.contains("skipping the survey"), "{stdout}");
-    assert!(stdout.contains("mcpgw daemon install"), "{stdout}");
+    // The daemon step announces itself and then declines to fight for a port
+    // somebody else holds — or, on a platform whose installer has not shipped,
+    // says so. Both end at the same offer, which is the assertion that holds
+    // on every runner in the matrix.
+    assert!(stdout.contains("keep the gateway running"), "{stdout}");
+    assert!(stdout.contains("mcpgw serve"), "{stdout}");
+    assert!(!stdout.contains("installed at"), "{stdout}");
     assert!(stdout.contains("mcpgw sync"), "{stdout}");
     // Nothing was written on a --yes run of a wizard whose writing steps
     // are all still stubs.
@@ -165,6 +170,100 @@ async fn an_already_finished_machine_gets_the_status_card() {
     assert!(stdout.contains("Cursor"), "{stdout}");
     for suggestion in ["mcpgw list", "mcpgw watch", "mcpgw doctor --probe"] {
         assert!(stdout.contains(suggestion), "{stdout}");
+    }
+}
+
+/// A gateway that is already answering is one the wizard has nothing to add
+/// to: the daemon step does not run, and `--yes` does not turn "already
+/// working" into a login item nobody asked for.
+#[tokio::test]
+async fn a_running_gateway_is_left_alone_and_no_service_is_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config()).unwrap();
+
+    // No `managed.json`, so the last step still has something to say and the
+    // wizard walks its steps rather than printing the status card.
+    let mut gateway = command(dir.path())
+        .args(["serve", "--port", "0", "--no-capture"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let url = gateway_url(&mut gateway).await;
+
+    let child = command(dir.path())
+        .args(["init", "--yes", "--gateway-url", &url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = finish(child, "`mcpgw init --yes` beside a running gateway").await;
+    gateway.kill().await.unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("the gateway is already answering"),
+        "{stdout}"
+    );
+    // Not even the offer: the step is skipped outright.
+    assert!(!stdout.contains("keep the gateway running"), "{stdout}");
+    assert_no_service(dir.path());
+}
+
+/// "No" to the login service is an answer, not an error: the step prints the
+/// alternative and the wizard carries on.
+#[tokio::test]
+async fn declining_the_service_prints_the_alternative_and_is_not_a_failure() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config()).unwrap();
+
+    // An address the OS handed out and nothing holds, so the step gets as far
+    // as its offer on a platform whose installer has shipped. Asked for rather
+    // than picked: a fixed port is a race against the rest of the suite
+    // (#54, #83).
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let url = format!("http://{free}/mcp");
+
+    let mut child = command(dir.path())
+        .args(["init", "--gateway-url", &url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // More noes than there are questions, deliberately: an exhausted stdin
+    // takes the recommended answer, and the recommended answer here installs
+    // a real login service on the machine running the tests.
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all("n\n".repeat(8).as_bytes()).await.unwrap();
+    drop(stdin);
+    let output = finish(child, "`mcpgw init` answered with no").await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("keep the gateway running"), "{stdout}");
+    // Whichever way the step ended — declined, or a platform that cannot
+    // install one — the user leaves knowing how to run the gateway anyway.
+    assert!(stdout.contains("mcpgw serve"), "{stdout}");
+    assert!(!stdout.contains("installed at"), "{stdout}");
+    assert_no_service(dir.path());
+}
+
+/// No test may leave a real login service behind, so every run that could
+/// have installed one checks the sandbox home it would have gone into.
+/// Installing for real is the platform milestone's own env-gated test.
+fn assert_no_service(home: &Path) {
+    for candidate in [
+        home.join("Library").join("LaunchAgents"),
+        home.join(".config").join("systemd"),
+    ] {
+        assert!(!candidate.exists(), "{} was written", candidate.display());
     }
 }
 
