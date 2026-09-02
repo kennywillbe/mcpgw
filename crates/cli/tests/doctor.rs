@@ -411,7 +411,7 @@ fn without_managed_gateway_entries_there_is_no_gateway_section() {
     );
     let value = json_of(&out);
     // Nothing points at a gateway, so nothing is said about one — a user who
-    // never ran `sync --gateway` gets no new noise.
+    // never ran `sync` gets no new noise.
     assert!(value.get("gateway").is_none(), "{value}");
     assert_eq!(value["errors"], 0);
 }

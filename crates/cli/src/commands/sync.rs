@@ -28,10 +28,6 @@ pub struct SyncArgs {
     /// Restore each selected client's config from its most recent backup
     #[arg(long, conflicts_with = "dry_run")]
     pub rollback: bool,
-    /// Accepted and ignored: syncing through the gateway is the only mode.
-    /// Kept for one release so scripts and docs that spell it keep working.
-    #[arg(long, hide = true)]
-    pub gateway: bool,
     /// URL of the gateway the entries point at
     #[arg(long, default_value = super::connect::DEFAULT_URL, value_name = "URL")]
     pub gateway_url: String,
@@ -41,16 +37,6 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     let targets = super::select_clients(&args.clients)?;
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
-
-    if args.gateway {
-        println!(
-            "{}",
-            crate::ui::dim(
-                "note: --gateway is the only mode now; the flag does nothing and will be removed",
-                color
-            )
-        );
-    }
 
     if args.rollback {
         return rollback(&targets, &state_dir);
