@@ -101,9 +101,15 @@ this is safe in CI.
 mcpgw doctor --probe
 ```
 
-The live pass. It spawns or dials every server, runs the MCP handshake and
-`tools/list`, and reports name, version and tool count. Probes run in parallel
-with a per-server timeout (`--timeout SECS`, default 10).
+The live pass, in two sections. *Direct* spawns or dials every server, runs the
+MCP handshake and `tools/list`, and reports name, version and tool count.
+*Through the gateway* does the same against the endpoints your synced client
+entries actually point at — the path a client takes, which a direct probe says
+nothing about. Probes run in parallel with a per-server timeout
+(`--timeout SECS`, default 10).
+
+The second section appears once `sync --gateway` has written entries pointing
+at a gateway; see [Gateway](./gateway.md#checking-the-path-clients-take).
 
 For one server in detail, without a gateway:
 
