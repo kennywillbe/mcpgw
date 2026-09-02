@@ -51,5 +51,6 @@ gives you aggregation and a web UI, in exchange for a Node and Docker stack you
 have to keep alive. mcpgw is a static binary with no runtime dependencies doing
 the boring local job: one config, every client, real traffic.
 
-Start with [Installation](./installation.md), then the
-[Quickstart](./quickstart.md).
+Start with [Installation](./installation.md), then run `mcpgw` with no
+arguments — on a terminal that opens the setup wizard, which walks the
+[Quickstart](./quickstart.md) for you one confirmed step at a time.

@@ -11,11 +11,16 @@ pub mod serve;
 pub mod sync;
 pub mod toggle;
 pub mod watch;
+pub mod wizard;
 
-use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
+
+// `confirm` moved to `crate::ui` when the wizard needed more shapes of
+// question than one; re-exported so the three commands that ask a plain y/N
+// keep saying `super::confirm`.
+pub use crate::ui::confirm;
 
 pub fn canonical_config_path() -> anyhow::Result<PathBuf> {
     mcpgw_core::paths::config_path()
@@ -43,14 +48,4 @@ pub fn select_clients(ids: &[String]) -> anyhow::Result<Vec<mcpgw_core::ClientKi
             })
         })
         .collect()
-}
-
-/// Asks a y/N question on the terminal. Callers must first check that stdin
-/// is a TTY; piped invocations should require an explicit flag instead.
-pub fn confirm(question: &str) -> anyhow::Result<bool> {
-    print!("{question} [y/N] ");
-    std::io::stdout().flush()?;
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
