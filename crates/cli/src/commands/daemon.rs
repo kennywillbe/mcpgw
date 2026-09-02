@@ -55,6 +55,58 @@ pub enum DaemonCommand {
         #[arg(long, short = 'n', default_value_t = DEFAULT_LINES, value_name = "N")]
         lines: usize,
     },
+    /// The elevated half of `install`. Not for typing: it is what the UAC
+    /// prompt raised by `mcpgw daemon install` approves.
+    #[cfg(windows)]
+    #[command(name = mcpgw_core::daemon::windows::INSTALL_ELEVATED_COMMAND, hide = true)]
+    InstallElevated(SpecArgs),
+    /// The service itself. Not for typing: the Windows service manager runs
+    /// this, and outside it there is no service controller to connect to.
+    #[cfg(windows)]
+    #[command(name = mcpgw_core::daemon::windows::RUN_SERVICE_COMMAND, hide = true)]
+    RunService(SpecArgs),
+}
+
+/// A whole [`DaemonSpec`] on the command line.
+///
+/// The two hidden Windows entry points run in processes that share neither
+/// a console nor a user profile with the one that computed the spec — the
+/// service manager starts one as `LocalSystem`, and an over-the-shoulder
+/// elevation starts the other as a different user entirely. Passing the
+/// spec rather than letting them re-derive one is what keeps all three
+/// pointed at the same config and the same log files.
+#[cfg(windows)]
+#[derive(clap::Args)]
+pub struct SpecArgs {
+    #[arg(long)]
+    pub bind: String,
+    #[arg(long)]
+    pub port: u16,
+    #[arg(long, value_name = "PATH")]
+    pub config: PathBuf,
+    #[arg(long, value_name = "DIR")]
+    pub state_dir: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    pub stdout: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    pub stderr: PathBuf,
+}
+
+#[cfg(windows)]
+impl SpecArgs {
+    fn spec(&self) -> anyhow::Result<DaemonSpec> {
+        Ok(DaemonSpec {
+            exe: std::env::current_exe().context("cannot locate the running mcpgw binary")?,
+            config_path: self.config.clone(),
+            state_dir: self.state_dir.clone(),
+            bind: self.bind.clone(),
+            port: self.port,
+            logs: LogPaths {
+                stdout: self.stdout.clone(),
+                stderr: self.stderr.clone(),
+            },
+        })
+    }
 }
 
 /// Shared by the two commands that need to know where the gateway listens.
@@ -77,6 +129,10 @@ pub fn run(args: &DaemonArgs) -> anyhow::Result<u8> {
         DaemonCommand::Stop => stop().map(|()| 0),
         DaemonCommand::Status { url } => status(url),
         DaemonCommand::Logs { follow, lines } => logs(*follow, *lines).map(|()| 0),
+        #[cfg(windows)]
+        DaemonCommand::InstallElevated(spec) => install_elevated(spec).map(|()| 0),
+        #[cfg(windows)]
+        DaemonCommand::RunService(spec) => run_service(spec),
     }
 }
 
@@ -94,6 +150,34 @@ fn install(address: &AddressArgs) -> anyhow::Result<()> {
     }
     println!("it will answer on {}", spec.url());
     Ok(())
+}
+
+/// Performs the registration this process was elevated in order to perform.
+///
+/// The preflight and the log files are the unelevated half's work and have
+/// already happened — see the ordering contract in [`mcpgw_core::daemon`] —
+/// and repeating them here would be repeating them as the wrong user.
+#[cfg(windows)]
+fn install_elevated(args: &SpecArgs) -> anyhow::Result<()> {
+    let installed = mcpgw_core::daemon::windows::install_here(&args.spec()?)?;
+    // This console closes the moment the process does, so the output is for
+    // the operator who ran the elevated command by hand. The unelevated
+    // parent prints the copy anyone else will read.
+    println!(
+        "installed the mcpgw gateway service at {}",
+        installed.unit_path.display()
+    );
+    Ok(())
+}
+
+/// Runs this process as the Windows service, returning when it is stopped.
+#[cfg(windows)]
+fn run_service(args: &SpecArgs) -> anyhow::Result<u8> {
+    mcpgw_core::daemon::windows::run_service(&args.spec()?)?;
+    // Exited rather than returned: the service manager has already been told
+    // the service stopped, and returning through `main` would run the daily
+    // update check — a network call, as LocalSystem, with no one to read it.
+    std::process::exit(0);
 }
 
 fn uninstall() -> anyhow::Result<()> {

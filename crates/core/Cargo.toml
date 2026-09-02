@@ -35,3 +35,24 @@ reqwest.workspace = true
 
 [lints]
 workspace = true
+
+# Windows-only: a service registration means nothing on the other targets,
+# and neither should pay for the dependency.
+[target."cfg(windows)".dependencies]
+# Covers both halves of what a Windows service needs — registering one
+# (create, change_config, failure actions) and *being* one. The second half
+# is the reason there is no hand-rolled alternative: a service process must
+# hand a control dispatcher to the SCM within 30 seconds of launch or the
+# start fails with error 1053.
+windows-service = "0.8.1"
+# Elevation only (ShellExecuteExW "runas" and the wait on its process).
+# `windows-service` already resolves this exact version, so these features
+# are additive rather than a second dependency tree.
+# `Win32_System_Registry` is never called into: `SHELLEXECUTEINFOW` has an
+# `HKEY` field and is compiled out without it.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }

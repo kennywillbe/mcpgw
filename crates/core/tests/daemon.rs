@@ -160,9 +160,12 @@ async fn a_silent_listener_probes_as_not_http() {
 }
 
 /// The stub each per-OS milestone replaces. Cfg-gated because exactly one of
-/// the three is compiled into any build, by design — and macOS is out of the
-/// list because its launch agent has shipped; `daemon_launchd.rs` covers it.
-#[cfg(not(target_os = "macos"))]
+/// the three is compiled into any build, by design — and a platform drops
+/// out of the list once its installer ships, because a real implementation
+/// talks to a real supervisor and this would then register a service on
+/// whatever machine ran it. macOS left with the launch agent
+/// (`daemon_launchd.rs` covers it); Windows with the service.
+#[cfg(not(any(target_os = "macos", windows)))]
 #[test]
 fn the_platform_stub_names_its_supervisor_and_the_workaround() {
     use mcpgw_core::daemon::{ServiceManager as _, platform_service};
@@ -192,9 +195,26 @@ fn the_platform_stub_names_its_supervisor_and_the_workaround() {
             messages[0]
         );
     }
-    #[cfg(windows)]
-    {
-        assert_eq!(service.name(), "the Windows service manager");
-        assert!(messages[0].contains("Windows service"), "{}", messages[0]);
+}
+
+/// What replaces the stub test above on Windows.
+///
+/// A live install is never attempted from the suite: it needs administrator
+/// rights, it would leave a registered service behind on a developer's
+/// machine, and on a CI runner — which is elevated — it would succeed.
+/// Querying is the one operation that needs no rights and changes nothing,
+/// so it is the one that can be run for real, and on a machine without the
+/// service it has to answer "not installed" rather than fail.
+#[cfg(windows)]
+#[test]
+fn windows_answers_a_query_without_rights_and_without_changing_anything() {
+    use mcpgw_core::daemon::{ServiceManager as _, platform_service};
+
+    let service = platform_service();
+    assert_eq!(service.name(), "the Windows service manager");
+    let status = service.query().expect("the service database can be read");
+    if !status.installed {
+        assert!(!status.running);
+        assert!(status.unit_path.is_none());
     }
 }

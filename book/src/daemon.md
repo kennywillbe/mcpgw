@@ -15,7 +15,7 @@ The per-OS installers are landing one at a time in this release wave:
 | ------------------------------- | ------------------------------------------ |
 | `mcpgw daemon status`           | works now                                  |
 | `mcpgw daemon logs [--follow]`  | works now                                  |
-| `mcpgw daemon install`          | macOS now; Linux and Windows in this wave  |
+| `mcpgw daemon install`          | macOS and Windows now; Linux in this wave  |
 | `mcpgw daemon uninstall`        | ditto                                      |
 | `mcpgw daemon start` / `stop`   | ditto                                      |
 
@@ -74,6 +74,76 @@ mcpgw daemon uninstall   # unloads it and deletes the plist
 is a gateway that did not exit successfully — which is exactly what
 `KeepAlive` restarts on. `start` runs the plist as it stands, so changing the
 port means running `install` again rather than `start --port`.
+
+## Windows: the service
+
+`mcpgw daemon install` registers a real Windows service called `mcpgw`
+("mcpgw gateway" in the Services console), set to start automatically — at
+boot, before anyone logs in — and to be restarted by the service manager if
+it dies.
+
+```sh
+mcpgw daemon install
+```
+
+### The administrator prompt
+
+Registering, starting, stopping and removing a service all need
+administrator rights. mcpgw tells you why before Windows asks:
+
+```text
+Windows needs administrator rights to install a service. It is about to ask
+you to approve one elevated `mcpgw daemon install`, which does that and
+nothing else. If you say no, nothing changes.
+```
+
+Then the UAC dialog appears. Approving it runs that one command elevated and
+nothing else; mcpgw waits for it, asks the service manager what actually
+happened, and reports that. Declining it is a normal answer, not an error to
+decipher:
+
+```text
+Windows needs administrator rights to install a service. You said no, so
+nothing was installed and nothing was changed. Two ways forward: open a
+terminal as administrator and run `mcpgw daemon install` again, or skip the
+service and run `mcpgw serve` in a terminal — same gateway, it just stops
+when the terminal does.
+```
+
+`mcpgw daemon status` and `mcpgw daemon logs` never prompt: reading the
+service database needs no rights at all.
+
+### What the service actually runs
+
+A Windows service is not an ordinary program — the service manager expects
+the process it starts to report in as a service within thirty seconds, and
+`mcpgw serve` is an ordinary program. So the registered command is an
+internal one that exists only to be a service: it starts `mcpgw serve` as its
+child, redirects that child's output into the two log files `mcpgw daemon
+logs` reads, and stops it when Windows asks the service to stop. If the
+gateway dies, the service ends with its exit code, which is what makes the
+restart actions fire — three restarts within an hour before Windows gives up.
+
+There is no unit file to look at. The registration lives in
+`HKLM\SYSTEM\CurrentControlSet\Services\mcpgw`, which is what
+`mcpgw daemon status` prints.
+
+### It runs as LocalSystem
+
+This is the one thing worth knowing before it surprises you. A Windows
+service runs under a machine account, not yours — running it as you would
+mean mcpgw asking for and storing your password, which it will not do. So:
+
+- The gateway is pointed at **your** config file and **your** log directory
+  explicitly, at install time. It reads the config you edit, not one under
+  `C:\Windows\System32`.
+- But the MCP servers it launches run as `SYSTEM` too. A server that needs
+  something only your account has — an entry on your `PATH`, a credential in
+  your user profile, a tool installed per-user — will not find it there. If a
+  server works under `mcpgw serve` and not under the service, this is why.
+
+If that trade is wrong for you, `mcpgw serve` in a terminal is the same
+gateway with none of it.
 
 ## Status
 
