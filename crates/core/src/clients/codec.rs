@@ -312,13 +312,23 @@ impl EntrySchema {
                 }
             }
         }
-        if matches!(self, Self::Zed) {
-            // Zed drops a context server that carries no `source` without
-            // saying anything — the commonest reason a hand-added server
-            // never shows up in it. `custom` is the value for one the user
-            // configured, and it is the only one mcpgw ever writes: any
-            // other source claims the entry came from an extension Zed
-            // would then load code from (GHSA-cv6g-cmxc-vw8j).
+        // Stdio only, and deliberately not on a remote entry.
+        //
+        // Zed's settings enum was tagged on `source`, and an entry without it
+        // was dropped without a word — the commonest reason a hand-added
+        // server never showed up. `custom` is the value for one the user
+        // configured, and it is the only one mcpgw ever writes: any other
+        // source claims the entry came from an extension Zed would then load
+        // code from (GHSA-cv6g-cmxc-vw8j).
+        //
+        // The enum is untagged now, with a remote variant whose whole shape
+        // is `{url, headers}`. `source` is not one of its fields, and a
+        // discriminator naming the variant that carries `command` is at best
+        // ignored on a `url` entry and at worst the reason it does not
+        // deserialize at all — a synced server Zed silently never loads. So
+        // it stays on the stdio shape it was always about, where a Zed old
+        // enough to need it still gets it and a current one ignores it.
+        if matches!(self, Self::Zed) && matches!(server.transport, Transport::Stdio { .. }) {
             obj.insert("source".to_owned(), "custom".into());
         }
         Value::Object(obj)

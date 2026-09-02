@@ -309,16 +309,26 @@ fn entry_shapes_per_client() {
     assert!(windsurf_http.get("url").is_none());
     assert!(windsurf_http.get("type").is_none());
 
-    // Zed is the shared shape plus the `source` Zed silently requires; an
-    // entry written without it is one Zed drops on the floor.
+    // Zed is the shared stdio shape plus the `source` a Zed old enough to
+    // discriminate on it requires — an entry written without it is one that
+    // Zed drops on the floor. A remote entry gets no `source`: Zed's remote
+    // shape is a bare `{url, headers}`, and a discriminator naming the
+    // variant that carries `command` has no business on one that carries a
+    // URL instead.
     let zed_stdio = client_entry(ClientKind::Zed, &canonical["github"]);
     let zed_http = client_entry(ClientKind::Zed, &canonical["linear"]);
     assert_eq!(zed_stdio["source"], "custom");
-    assert_eq!(zed_http["source"], "custom");
     assert_eq!(zed_stdio["command"], "npx");
     assert_eq!(zed_stdio["env"]["TOKEN"], "t");
+    assert!(zed_http.get("source").is_none(), "{zed_http}");
     assert_eq!(zed_http["url"], "https://mcp.linear.app/mcp");
     assert!(zed_http.get("type").is_none());
+    // Which leaves it byte-identical to Amp's remote shape, and that is the
+    // shape Zed documents.
+    assert_eq!(
+        zed_http,
+        client_entry(ClientKind::Amp, &canonical["linear"])
+    );
 
     // Cline is the shared stdio shape; a remote entry needs its camelCase
     // `type`, because an untyped one means the legacy SSE transport there.
@@ -453,10 +463,10 @@ fn per_server_gateway_entry_shapes_per_client() {
             http(serde_json::json!({ "type": "http" }))
         }
         ClientKind::Gemini => serde_json::json!({ "httpUrl": url }),
-        ClientKind::Codex | ClientKind::Amp => http(serde_json::json!({})),
+        // A gateway entry is remote, so Zed's `source` is not on it either.
+        ClientKind::Codex | ClientKind::Amp | ClientKind::Zed => http(serde_json::json!({})),
         ClientKind::Opencode => http(serde_json::json!({ "type": "remote" })),
         ClientKind::Windsurf => serde_json::json!({ "serverUrl": url }),
-        ClientKind::Zed => http(serde_json::json!({ "source": "custom" })),
         ClientKind::Cline | ClientKind::ClineCli => {
             http(serde_json::json!({ "type": "streamableHttp" }))
         }
@@ -697,4 +707,46 @@ fn client_ids_round_trip() {
         assert_eq!(ClientKind::from_id(kind.id()), Some(kind));
     }
     assert_eq!(ClientKind::from_id("emacs"), None);
+}
+
+/// Zed's `source` is the discriminator of a shape that carries `command`.
+/// Putting it on a `url` entry described a variant the entry does not match,
+/// and an entry Zed cannot deserialize is one it drops without a word — a
+/// server synced and then silently never loaded.
+#[test]
+fn zed_writes_source_on_stdio_entries_only() {
+    let stdio = mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: vec!["server-github".to_owned()],
+            env: std::collections::BTreeMap::new(),
+        },
+    };
+    let remote = mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [("Authorization".to_owned(), "Bearer t".to_owned())]
+                .into_iter()
+                .collect(),
+        },
+    };
+
+    let written = client_entry(ClientKind::Zed, &stdio);
+    assert_eq!(written["source"], "custom");
+
+    let written = client_entry(ClientKind::Zed, &remote);
+    assert!(written.get("source").is_none(), "{written}");
+    // And nothing else was traded away for it: the documented remote shape is
+    // exactly these two keys.
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "url": "https://mcp.linear.app/mcp",
+            "headers": {"Authorization": "Bearer t"},
+        })
+    );
 }
