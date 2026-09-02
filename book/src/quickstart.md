@@ -3,6 +3,33 @@
 Five minutes, start to finish. Nothing here touches a client file until you run
 `sync`, and `sync` shows you the diff first if you ask.
 
+## 0. Or let the wizard drive
+
+```sh
+mcpgw            # on a terminal, this is `mcpgw init`
+mcpgw init       # the same thing, spelled out
+```
+
+Run on a terminal with no arguments, mcpgw walks you through the rest of this
+page one step at a time: what it found on your machine, what it would adopt,
+whether to run the gateway in the background, and which clients to point at it.
+It asks before every change and writes nothing until you say yes.
+
+`mcpgw init --yes` never prompts and takes the recommended answer at each step,
+for scripts and for agents. It still prints the whole plan, and where a step
+needs a decision that cannot be made for you it stops and says which command to
+run instead.
+
+Off a terminal — in a pipe, a CI job, a `Dockerfile` — a bare `mcpgw` prints
+help and exits 2 rather than opening a wizard nobody can answer.
+
+Once everything is set up, a bare `mcpgw` stops being a wizard and becomes a
+status card: how many servers, whether the gateway is answering, which clients
+are synced.
+
+The steps below are what the wizard does, and remain the way to do any one of
+them on its own.
+
 ## 1. Adopt what you already have
 
 ```sh

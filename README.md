@@ -38,6 +38,12 @@ Installed from the script or an archive? `mcpgw self-update` replaces the
 binary with the latest release (checksum-verified); package-manager installs
 are left to `brew upgrade` / `cargo install`.
 
+Then run `mcpgw` with no arguments. On a terminal that opens the setup wizard,
+which walks the steps below one at a time, asking before every change. `mcpgw
+init --yes` does the same without prompting, and still prints the whole plan.
+
+Or do it by hand:
+
 ```sh
 mcpgw import                                              # adopt what your clients already have
 mcpgw add github -- npx -y @modelcontextprotocol/server-github
