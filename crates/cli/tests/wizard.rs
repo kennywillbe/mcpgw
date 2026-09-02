@@ -122,9 +122,10 @@ async fn init_yes_walks_every_step_without_reading_stdin() {
     assert!(stdout.contains("keep the gateway running"), "{stdout}");
     assert!(stdout.contains("mcpgw serve"), "{stdout}");
     assert!(!stdout.contains("installed at"), "{stdout}");
-    assert!(stdout.contains("mcpgw sync"), "{stdout}");
-    // Nothing was written on a --yes run of a wizard whose writing steps
-    // are all still stubs.
+    // No client is installed under this sandbox home, so the sync step has
+    // nowhere to push and writes nothing — but it still closes the wizard.
+    assert!(stdout.contains("no MCP client here"), "{stdout}");
+    assert!(stdout.contains("Restart your clients"), "{stdout}");
     assert!(!dir.path().join("state").join("managed.json").exists());
 }
 
@@ -281,4 +282,239 @@ async fn gateway_url(child: &mut tokio::process::Child) -> String {
         .to_owned();
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
     url
+}
+
+/// A Cursor config with an entry mcpgw did not write. It has to survive the
+/// wizard untouched and be named as somebody else's on the way past.
+const CURSOR_WITH_A_HAND_MADE_ENTRY: &str = r#"{
+  "mcpServers": {
+    "notes": { "command": "notes-mcp" }
+  }
+}"#;
+
+/// Mirrors `ClientKind::config_path` for Claude Desktop under the sandbox
+/// environment [`command`] builds.
+fn claude_desktop_config(home: &Path) -> std::path::PathBuf {
+    let app_data = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support")
+    } else if cfg!(windows) {
+        home.join("AppData")
+    } else {
+        home.join(".config")
+    };
+    app_data.join("Claude/claude_desktop_config.json")
+}
+
+/// Two clients on the machine: Cursor, which holds http entries and already
+/// has a hand-made one, and Claude Desktop, which cannot and gets the stdio
+/// bridge. Claude Desktop is installed but unconfigured, so the wizard has to
+/// create its file as well as write into one.
+fn install_two_clients(home: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cursor = home.join(".cursor/mcp.json");
+    std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
+    std::fs::write(&cursor, CURSOR_WITH_A_HAND_MADE_ENTRY).unwrap();
+
+    let claude = claude_desktop_config(home);
+    std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    (cursor, claude)
+}
+
+fn json_at(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The whole point of the step, end to end: every client ends up pointing at
+/// the gateway by the server's own name, and the wizard proves it by dialing
+/// the endpoint the clients were just told to use.
+#[tokio::test]
+async fn the_sync_step_points_every_client_at_a_live_gateway_and_checks_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config()).unwrap();
+    let (cursor, claude) = install_two_clients(dir.path());
+
+    let mut gateway = command(dir.path())
+        .args(["serve", "--port", "0", "--no-capture"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let url = gateway_url(&mut gateway).await;
+
+    let child = command(dir.path())
+        .args(["init", "--yes", "--gateway-url", &url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = finish(child, "`mcpgw init --yes` with two clients installed").await;
+    gateway.kill().await.unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // The plan, per client, by name — and the entry that is not mcpgw's.
+    assert!(
+        stdout.contains("Pointing your clients at the gateway"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("+ fx1"), "{stdout}");
+    assert!(stdout.contains("Claude Desktop"), "{stdout}");
+    assert!(
+        stdout.contains("notes (not mine — left untouched)"),
+        "{stdout}"
+    );
+
+    // The reassurance, then exactly one question for the whole set.
+    assert!(
+        stdout.contains("Each server keeps its name and its entry"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Tool names don't change"), "{stdout}");
+    assert!(stdout.contains("mcpgw sync --rollback"), "{stdout}");
+    assert_eq!(stdout.matches("[Y/n] y").count(), 1, "{stdout}");
+
+    let endpoint = url.replace("/mcp", "/s/fx1");
+    let entries = json_at(&cursor)["mcpServers"].clone();
+    assert_eq!(entries["fx1"]["url"], endpoint);
+    assert_eq!(entries["fx1"]["type"], "http");
+    // The hand-made entry is exactly as it was left.
+    assert_eq!(entries["notes"]["command"], "notes-mcp");
+
+    // Claude Desktop holds no http entry, so it gets the bridge — the
+    // gateway's own URL plus the server name, not a path shape.
+    let bridged = json_at(&claude)["mcpServers"]["fx1"].clone();
+    assert!(
+        bridged["command"].as_str().unwrap().contains("mcpgw"),
+        "{bridged}"
+    );
+    assert_eq!(
+        bridged["args"],
+        serde_json::json!(["connect", "--server", "fx1", "--url", url])
+    );
+
+    // mcpgw's own record of what it wrote, which is what `sync` and `doctor`
+    // read to tell its entries from the user's.
+    let state = json_at(&dir.path().join("state/managed.json"));
+    assert_eq!(state["clients"]["cursor"], serde_json::json!(["fx1"]));
+    assert_eq!(
+        state["clients"]["claude-desktop"],
+        serde_json::json!(["fx1"])
+    );
+
+    // And the half that decides whether any of it worked: the gateway
+    // answering, the server's endpoint answering through it, and both
+    // clients landing on it.
+    assert!(
+        stdout.contains("Checking that it actually works"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("gateway answering at"), "{stdout}");
+    assert!(stdout.contains(&format!("{endpoint} — ")), "{stdout}");
+    assert!(stdout.contains("tools"), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("pointing at an endpoint that answers")
+            .count(),
+        2,
+        "{stdout}"
+    );
+
+    // The line whose absence turns every first run into a bug report.
+    assert!(
+        stdout.contains("Done. Restart your clients to pick up the new config."),
+        "{stdout}"
+    );
+    for suggestion in [
+        "mcpgw watch",
+        "mcpgw add",
+        "mcpgw doctor --probe",
+        "mcpgw eject",
+    ] {
+        assert!(stdout.contains(suggestion), "{stdout}");
+    }
+}
+
+/// The daemon step was skipped, so there is nothing to check against. The
+/// config the wizard wrote is still correct, and saying so — with the two
+/// commands that finish the job — beats failing a run that did its work.
+#[tokio::test]
+async fn a_gateway_that_is_down_is_reported_honestly_and_does_not_fail_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config()).unwrap();
+    let (cursor, _claude) = install_two_clients(dir.path());
+
+    // A port held open by a socket that never answers HTTP, so "down" is a
+    // state this test owns rather than whatever is running on the machine.
+    let blocked = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", blocked.local_addr().unwrap());
+
+    let child = command(dir.path())
+        .args(["init", "--yes", "--gateway-url", &url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = finish(child, "`mcpgw init --yes` against a gateway that is down").await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Written anyway: the entries are right, they simply have nothing to
+    // reach yet.
+    assert_eq!(
+        json_at(&cursor)["mcpServers"]["fx1"]["url"],
+        url.replace("/mcp", "/s/fx1")
+    );
+
+    assert!(
+        stdout.contains("Checking that it actually works"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("nothing is answering at"), "{stdout}");
+    assert!(stdout.contains("mcpgw daemon install"), "{stdout}");
+    assert!(stdout.contains("mcpgw serve"), "{stdout}");
+    // No endpoint was dialed, so nothing may claim one answered.
+    assert!(!stdout.contains("tools"), "{stdout}");
+    assert!(stdout.contains("Restart your clients"), "{stdout}");
+}
+
+/// Second time round there is nothing left to push, and the wizard says so in
+/// one dim line rather than walking the step again.
+#[tokio::test]
+async fn a_second_run_has_nothing_left_to_push() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), config()).unwrap();
+    install_two_clients(dir.path());
+
+    let mut gateway = command(dir.path())
+        .args(["serve", "--port", "0", "--no-capture"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let url = gateway_url(&mut gateway).await;
+
+    for run in 1..=2 {
+        let child = command(dir.path())
+            .args(["init", "--yes", "--gateway-url", &url])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = finish(child, "`mcpgw init --yes`").await;
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+
+        if run == 1 {
+            assert!(stdout.contains("+ fx1"), "{stdout}");
+        } else {
+            // The hand-made Cursor entry keeps the import step pending, so
+            // the wizard still walks — and the sync step is the one with
+            // nothing to say.
+            assert!(stdout.contains("nothing to push"), "{stdout}");
+            assert!(!stdout.contains("Point them at the gateway?"), "{stdout}");
+        }
+    }
+    gateway.kill().await.unwrap();
 }
