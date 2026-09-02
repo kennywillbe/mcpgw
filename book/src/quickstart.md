@@ -102,10 +102,18 @@ mcpgw import --yes              # never prompt; keep canonical on conflict
 ```
 
 A client entry that differs from a canonical entry you already wrote is a
-conflict, and `import` asks what to do with it. `--yes` answers "keep the
-canonical entry" without asking, so scripts and agents can run `import`
-knowing it will neither block nor overwrite anything you wrote by hand. The
-skipped entries are still listed in the output.
+conflict, and `import` asks what to do with it. There are three answers: keep
+the canonical entry as it is, keep both — the canonical entry is untouched and
+the client's copy comes in as `<name>-2`, so the gateway serves that one too —
+or overwrite the canonical entry with the client's copy. Keeping both is the
+answer when the two really are different servers that happen to share a name:
+keeping only yours leaves that client's entry unmanaged, talking to its server
+directly rather than through the gateway.
+
+`--yes` answers "keep the canonical entry" without asking, and so does a run
+whose stdin is not a terminal, so scripts and agents can run `import` knowing
+it will neither block nor overwrite anything you wrote by hand. The skipped
+entries are still listed in the output.
 
 Client ids are `claude-desktop`, `claude-code`, `cursor`, `vscode`, `gemini`,
 `codex`, `opencode`, `windsurf`, `zed`, `cline`, `cline-cli`, `amp`, `zoo` —

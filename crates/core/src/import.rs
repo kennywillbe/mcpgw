@@ -27,6 +27,15 @@ pub struct ImportCandidate {
     /// An http candidate that addresses something already known under a
     /// different definition. `None` for everything else.
     pub same_address: Option<SameAddress>,
+    /// For a conflict, the free name this entry can be adopted under while
+    /// the canonical entry keeps its own — the "keep both" outcome. `None`
+    /// for anything that is not a conflict, because nothing else needs a
+    /// second name.
+    ///
+    /// Chosen here rather than by the caller so that two conflicts in one run
+    /// cannot be offered the same name: only the planner sees every candidate
+    /// and every canonical entry at once.
+    pub adopt_as: Option<String>,
 }
 
 /// The entry an http candidate shares an address with, when the only thing
@@ -52,6 +61,8 @@ pub struct ImportPlan {
     /// are still adopted to avoid the perpetual sync conflict.
     pub already: Vec<ImportCandidate>,
     /// Same canonical name, different definition: needs a user decision.
+    /// Each carries an [`ImportCandidate::adopt_as`] name, so the decision is
+    /// three-way — keep canonical, overwrite it, or keep both.
     pub conflicts: Vec<ImportCandidate>,
 }
 
@@ -124,12 +135,9 @@ pub fn plan_import(
                 } else {
                     slugify(orig_name)
                 };
-                let mut name = base.clone();
-                let mut i = 1;
-                while claimed(&name) || (canonical.contains_key(&name) && name != *orig_name) {
-                    i += 1;
-                    name = format!("{base}-{i}");
-                }
+                let name = next_free(&base, |name| {
+                    claimed(name) || (canonical.contains_key(name) && name != orig_name)
+                });
                 (name, true)
             };
 
@@ -152,9 +160,16 @@ pub fn plan_import(
                 notes,
                 command_missing,
                 same_address,
+                adopt_as: None,
             });
         }
     }
+
+    // Every name the run must not hand out twice: what the canonical config
+    // already holds, what this plan is about to write, and — added as they
+    // are chosen — the second names offered to conflicts.
+    let mut taken: std::collections::BTreeSet<String> = canonical.keys().cloned().collect();
+    taken.extend(candidates.iter().map(|c| c.name.clone()));
 
     let mut plan = ImportPlan::default();
     for candidate in candidates {
@@ -163,10 +178,32 @@ pub fn plan_import(
             Some(existing) if same_transport(&existing.transport, &candidate.server.transport) => {
                 plan.already.push(candidate);
             }
-            Some(_) => plan.conflicts.push(candidate),
+            Some(_) => {
+                let adopt_as = next_free(&candidate.name, |name| taken.contains(name));
+                taken.insert(adopt_as.clone());
+                plan.conflicts.push(ImportCandidate {
+                    adopt_as: Some(adopt_as),
+                    ..candidate
+                });
+            }
         }
     }
     plan
+}
+
+/// `base`, or the first of `base-2`, `base-3` … that `taken` says is free.
+///
+/// The one place a suffix is invented, so `context7-2` means the same thing
+/// wherever it turns up: a name clash between two clients, and a conflict
+/// kept alongside the canonical entry it disagrees with.
+fn next_free(base: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut name = base.to_owned();
+    let mut i = 1;
+    while taken(&name) {
+        i += 1;
+        name = format!("{base}-{i}");
+    }
+    name
 }
 
 /// Whether this candidate is one already-known server wearing a second set of

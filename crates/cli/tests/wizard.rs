@@ -557,6 +557,81 @@ async fn import_never_overwrites_what_the_config_already_says() {
     assert!(config.contains("[servers.notes]"), "{config}");
 }
 
+/// The third answer #82 added: keep the canonical entry *and* bring the
+/// client's differing one in beside it, so the client stops being an
+/// unmanaged entry talking to its origin behind the gateway's back.
+#[tokio::test]
+async fn a_conflict_can_be_kept_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"]},
+            "notes": {"command": "notes-mcp"}
+        }}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    // Yes to the survey, yes to the import, then the second option: keep both.
+    let stdout = wizard(dir.path(), &url, &[], "y\ny\n2\n").await;
+
+    assert!(
+        stdout.contains("Keep both — bring your client's copy in as github-2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("github-2 brought in — your github is untouched"),
+        "{stdout}"
+    );
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("command = \"mine\""), "{config}");
+    assert!(config.contains("[servers.github-2]"), "{config}");
+    assert!(config.contains("server-github"), "{config}");
+    // Adopted, which is the whole point: the next sync owns that entry and
+    // points it at the gateway.
+    let state = std::fs::read_to_string(dir.path().join("state").join("managed.json")).unwrap();
+    assert!(state.contains("github"), "{state}");
+}
+
+/// The same question's third answer, which is the one that loses data — so
+/// it is last in the list and has to be picked on purpose.
+#[tokio::test]
+async fn a_conflict_can_be_overwritten_on_purpose() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"]},
+            "notes": {"command": "notes-mcp"}
+        }}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &[], "y\ny\n3\n").await;
+
+    assert!(
+        stdout.contains("github replaced with your client's copy"),
+        "{stdout}"
+    );
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("server-github"), "{config}");
+    assert!(!config.contains("command = \"mine\""), "{config}");
+    assert!(!config.contains("[servers.github-2]"), "{config}");
+}
+
 /// Reads the served address out of the gateway's own banner and keeps
 /// draining its stdout, so a later banner line cannot hit a closed pipe.
 async fn gateway_url(child: &mut tokio::process::Child) -> String {

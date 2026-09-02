@@ -22,7 +22,8 @@ use mcpgw_core::{ClientKind, ClientRead, ConfigStore, Detection, Server, Transpo
 
 use super::{Ctx, Outcome};
 use crate::commands::import::{
-    SAME_ADDRESS_PROMPT, command_missing_line, same_address_line, same_address_options,
+    ConflictChoice, SAME_ADDRESS_PROMPT, adopt_as, command_missing_line, conflict_choice,
+    conflict_options, conflict_prompt, same_address_line, same_address_options,
     same_address_questions,
 };
 use crate::ui;
@@ -91,6 +92,25 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
         }
     }
 
+    // The other per-entry question: a client entry that disagrees with a
+    // canonical one. Earlier releases only ever left these alone, which kept
+    // the wizard's promise not to touch what you already have but also left
+    // the client talking to its origin behind the gateway's back. Keeping
+    // both honours the promise and ends the split brain, so it is offered
+    // here — with keeping canonical still the default, and `--yes` still
+    // taking it.
+    let mut conflicts: BTreeMap<String, ConflictChoice> = BTreeMap::new();
+    for candidate in &plan.conflicts {
+        let adopt_as = adopt_as(candidate);
+        let picked = cx.choose(
+            &conflict_prompt(&candidate.name),
+            &conflict_options(&candidate.name, &adopt_as),
+            Some(0),
+            "mcpgw import",
+        )?;
+        conflicts.insert(candidate.name.clone(), conflict_choice(picked));
+    }
+
     // Everything the user struck out is removed at the source, not at the
     // plan: dropping a candidate would leave its client entries unadopted
     // *and* let a name it was holding stay taken, so the survivors keep
@@ -110,7 +130,7 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
         })
         .collect();
 
-    apply(cx, &kept)?;
+    apply(cx, &kept, &conflicts)?;
     cx.refresh()?;
     Ok(Outcome::Handled)
 }
@@ -231,8 +251,8 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
     if !plan.conflicts.is_empty() {
         let names: Vec<&str> = plan.conflicts.iter().map(|c| c.name.as_str()).collect();
         bullets.push(format!(
-            "{} differ from what your config already says — yours wins, I won't touch \
-             them: {}.",
+            "{} differ from what your config already says — I'll ask about each one, \
+             and yours wins unless you say otherwise: {}.",
             plan.conflicts.len(),
             names.join(", ")
         ));
@@ -418,7 +438,11 @@ fn ask(cx: &Ctx, question: &str, offered: &[String]) -> anyhow::Result<Option<BT
 /// long as the terminal goes unanswered. So the plan that is *applied* is
 /// built again from the same sources against the config the lock protects,
 /// exactly as `mcpgw import` does it.
-fn apply(cx: &Ctx, sources: &[(String, ClientRead)]) -> anyhow::Result<()> {
+fn apply(
+    cx: &Ctx,
+    sources: &[(String, ClientRead)],
+    conflicts: &BTreeMap<String, ConflictChoice>,
+) -> anyhow::Result<()> {
     let mut store = ConfigStore::edit_or_create(&cx.config_path)?;
     let plan = plan_import(
         sources,
@@ -439,10 +463,37 @@ fn apply(cx: &Ctx, sources: &[(String, ClientRead)]) -> anyhow::Result<()> {
     for candidate in &plan.already {
         adopt(&mut state, candidate);
     }
-    // Conflicts are never resolved here. The wizard's promise is that it does
-    // not touch what you already have, and overwriting a canonical entry is
-    // the one import outcome that loses something — `mcpgw import` is where
-    // that decision is offered, entry by entry.
+    // Whatever was decided above, re-read against the plan the lock protects:
+    // an answer about a name that stopped being a conflict is an answer about
+    // something that no longer exists, and falls back to keeping canonical.
+    let mut resolved: Vec<String> = Vec::new();
+    let mut left_alone: Vec<&str> = Vec::new();
+    for candidate in &plan.conflicts {
+        match conflicts
+            .get(&candidate.name)
+            .copied()
+            .unwrap_or(ConflictChoice::KeepCanonical)
+        {
+            ConflictChoice::KeepBoth => {
+                let second = adopt_as(candidate);
+                store.upsert_server(&second, &candidate.server, false)?;
+                adopt(&mut state, candidate);
+                resolved.push(format!(
+                    "  {second} brought in — your {} is untouched",
+                    candidate.name
+                ));
+            }
+            ConflictChoice::Overwrite => {
+                store.upsert_server(&candidate.name, &candidate.server, true)?;
+                adopt(&mut state, candidate);
+                resolved.push(format!(
+                    "  {} replaced with your client's copy",
+                    candidate.name
+                ));
+            }
+            ConflictChoice::KeepCanonical => left_alone.push(&candidate.name),
+        }
+    }
 
     // Canonical config first, adoption record second: a state file claiming
     // client entries that no canonical server backs is read by the next sync
@@ -456,15 +507,15 @@ fn apply(cx: &Ctx, sources: &[(String, ClientRead)]) -> anyhow::Result<()> {
     )?;
 
     println!();
-    for candidate in &plan.conflicts {
-        println!(
-            "  {} left alone — your config already has something else under that name",
-            candidate.name
-        );
+    for name in left_alone {
+        println!("  {name} left alone — your config already has something else under that name");
+    }
+    for line in &resolved {
+        println!("{line}");
     }
     println!(
         "  Imported {}. Your config now has {}.",
-        servers(plan.new.len()),
+        servers(plan.new.len() + resolved.len()),
         servers(store.config().servers.len())
     );
     Ok(())

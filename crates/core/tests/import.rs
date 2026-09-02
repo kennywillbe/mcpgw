@@ -408,3 +408,84 @@ fn identical_headers_dedupe_rather_than_asking() {
     assert_eq!(plan.new.len(), 1);
     assert_eq!(plan.new[0].same_address, None);
 }
+
+/// The third outcome a conflict can have: keep the canonical entry and adopt
+/// the client's differing one beside it. The planner is what names it, so
+/// the name has to be there on every conflict.
+#[test]
+fn a_conflict_offers_a_second_name_to_adopt_it_under() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"context7": {"url": "https://client/mcp"}}}"#,
+    );
+    let canonical = canonical(
+        r#"
+version = 1
+[servers.context7]
+type = "stdio"
+command = "npx"
+args = ["context7"]
+"#,
+    );
+    let plan = plan_import(&[("cursor".into(), cursor)], &canonical, &resolves);
+    assert_eq!(plan.conflicts.len(), 1);
+    assert_eq!(plan.conflicts[0].adopt_as.as_deref(), Some("context7-2"));
+    // Nothing else needs a second name, and offering one would read as a
+    // rename that is about to happen.
+    assert!(plan.new.iter().all(|c| c.adopt_as.is_none()));
+    assert!(plan.already.iter().all(|c| c.adopt_as.is_none()));
+}
+
+/// The second name is the first *free* one: a canonical `-2` that already
+/// exists cannot be the name the run offers to write.
+#[test]
+fn the_second_name_steps_over_what_is_already_taken() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"context7": {"url": "https://client/mcp"}}}"#,
+    );
+    let canonical = canonical(
+        r#"
+version = 1
+[servers.context7]
+type = "stdio"
+command = "npx"
+args = ["context7"]
+[servers."context7-2"]
+type = "stdio"
+command = "npx"
+args = ["something-else"]
+"#,
+    );
+    let plan = plan_import(&[("cursor".into(), cursor)], &canonical, &resolves);
+    assert_eq!(plan.conflicts[0].adopt_as.as_deref(), Some("context7-3"));
+}
+
+/// The second name has to dodge what this same run is about to write, not
+/// just what the config already holds: a client entry named `context7-2` is
+/// a new import, and handing its name to a conflict would be two writes to
+/// one name.
+#[test]
+fn the_second_name_dodges_the_rest_of_the_plan() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {
+            "context7": {"url": "https://client/mcp"},
+            "context7-2": {"url": "https://other/mcp"}
+        }}"#,
+    );
+    let canonical = canonical(
+        r#"
+version = 1
+[servers.context7]
+type = "stdio"
+command = "npx"
+args = ["context7"]
+"#,
+    );
+    let plan = plan_import(&[("cursor".into(), cursor)], &canonical, &resolves);
+    assert_eq!(plan.new.len(), 1);
+    assert_eq!(plan.new[0].name, "context7-2");
+    assert_eq!(plan.conflicts.len(), 1);
+    assert_eq!(plan.conflicts[0].adopt_as.as_deref(), Some("context7-3"));
+}
