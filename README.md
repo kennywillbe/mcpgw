@@ -68,12 +68,14 @@ Instead of every client talking to every server, they can all talk to mcpgw:
 ```
 
 ```sh
-mcpgw serve                # all enabled servers behind one endpoint
-mcpgw sync --gateway       # point every client at it
+mcpgw serve --per-server   # all enabled servers, each on its own endpoint
+mcpgw sync --gateway       # point every client at it, one entry per server
 ```
 
-Tools are exposed as `server__tool`, so adding a server never renames an
-existing tool. Each upstream gets one connection, multiplexed across clients —
+Every server keeps its name and its own entry in the client — only the
+transport changes — so tool names stay as they are. `--aggregate` writes the
+whole gateway as one entry instead, where tools are exposed as `server__tool`
+so adding a server never renames an existing tool. Each upstream gets one connection, multiplexed across clients —
 no process per session. If an upstream dies it's restarted with backoff, and if
 it keeps failing you get a loud error instead of a silently shorter tool list.
 
