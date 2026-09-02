@@ -54,7 +54,7 @@ If a gateway service is installed, eject names it and offers to remove it in
 the same run:
 
 ```text
-A gateway service is installed under launchd (~/Library/LaunchAgents/dev.mcpgw.gateway.plist).
+A gateway service is installed under launchd (~/Library/LaunchAgents/io.mcpgw.gateway.plist).
 remove it as well? [Y/n] y
   removed it — your config and captured traffic are untouched
 ```

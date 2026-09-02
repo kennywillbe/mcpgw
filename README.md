@@ -22,8 +22,8 @@ Then the harder half: once they're wired up, you have no idea what's happening.
 Which tool did the agent actually call? How long did it take? What arguments
 went out? Did that server fail, or did it just quietly return nothing?
 
-mcpgw keeps one list of servers, pushes it into every client, and — if you want
-it to — sits in the middle of the traffic so you can watch it.
+mcpgw keeps one list of servers, points every client at itself, and forwards
+the calls — so the list is in one place and so is the traffic.
 
 ## Quickstart
 
@@ -34,23 +34,32 @@ brew install kennywillbe/tap/mcpgw
 cargo install mcpgw
 ```
 
-Installed from the script or an archive? `mcpgw self-update` replaces the
-binary with the latest release (checksum-verified); package-manager installs
-are left to `brew upgrade` / `cargo install`.
+Then type `mcpgw`. That's the whole setup:
 
-Then run `mcpgw` with no arguments. On a terminal that opens the setup wizard,
-which walks the steps below one at a time, asking before every change. `mcpgw
-init --yes` does the same without prompting, and still prints the whole plan.
+```sh
+mcpgw
+```
 
-Or do it by hand:
+On a terminal, a bare `mcpgw` is the wizard. It finds the MCP clients you have,
+offers to adopt the servers they already hold, offers to keep the gateway
+running in the background, points every client at it, and then checks that the
+path actually works — asking before each of those, and writing nothing until
+you say yes. `mcpgw init --yes` is the same run with the recommended answer
+everywhere, for scripts and agents; it still prints the whole plan.
+
+Once everything is set up, a bare `mcpgw` stops being a wizard and becomes a
+status card: how many servers, whether the gateway is answering, which clients
+are synced.
+
+Piece by piece, if you'd rather:
 
 ```sh
 mcpgw import                                              # adopt what your clients already have
 mcpgw add github -- npx -y @modelcontextprotocol/server-github
 mcpgw add linear --url https://mcp.linear.app/mcp
 mcpgw list
-mcpgw sync --dry-run                                      # see the diff first
-mcpgw sync                                                # write it to every client
+mcpgw daemon install                                      # keep the gateway running
+mcpgw sync                                                # point every client at it
 mcpgw doctor --probe                                      # does any of it actually connect?
 ```
 
@@ -62,9 +71,13 @@ run.
 The list lives in `~/.config/mcpgw/config.toml` and is meant to be edited by
 hand. Your comments and ordering survive every write.
 
-## Gateway
+Installed from the script or an archive? `mcpgw self-update` replaces the
+binary with the latest release (checksum-verified); package-manager installs
+are left to `brew upgrade` / `cargo install`.
 
-Instead of every client talking to every server, they can all talk to mcpgw:
+## How it works
+
+Every client talks to mcpgw, and mcpgw talks to the servers:
 
 ```
   Claude Code  ─┐                        ┌─ github    (stdio)
@@ -74,24 +87,56 @@ Instead of every client talking to every server, they can all talk to mcpgw:
 ```
 
 ```sh
-mcpgw serve            # all enabled servers, each also on its own endpoint
+mcpgw serve            # every enabled server, each also on its own endpoint
 mcpgw sync             # point every client at it, one entry per server
 ```
 
 Every server keeps its name and its own entry in the client — only the
-transport changes — so tool names stay as they are. `--aggregate` writes the
-whole gateway as one entry instead, where tools are exposed as `server__tool`
-so adding a server never renames an existing tool. Each upstream gets one connection, multiplexed across clients —
-no process per session. If an upstream dies it's restarted with backoff, and if
-it keeps failing you get a loud error instead of a silently shorter tool list.
+transport changes, to that server's own `/s/<name>` endpoint on the gateway —
+so tool names stay as they are and anything the client keeps beside the entry
+survives the move. `mcpgw sync --aggregate` writes the whole gateway as one
+entry instead, where tools are exposed as `server__tool` so adding a server
+never renames an existing tool.
+
+Each upstream gets one connection, multiplexed across clients — no process per
+session. If an upstream dies it's restarted with backoff, and if it keeps
+failing you get a loud error instead of a silently shorter tool list. A running
+gateway also follows the config file: `mcpgw add` shows up in every client
+within a couple of seconds, with nothing restarted and nothing disconnected.
 
 Clients that only speak stdio (Claude Desktop) get `mcpgw connect`, a stdio↔HTTP
 bridge to the running gateway. `sync` picks the right shape per client for
 you.
 
-Not a one-way door: `mcpgw eject` writes your original server definitions back
-into every client, drops the gateway entry, removes the daemon, and prints what
-is left to delete. Your clients then work without mcpgw installed at all.
+### Keeping it running
+
+`mcpgw serve` holds a terminal, which is fine until you depend on it — the
+first thing a client does in the morning is ask for a tool list, and nothing is
+there to answer. `mcpgw daemon` hands the gateway to the machine's own service
+manager: a launch agent on macOS, a systemd user unit on Linux, a service on
+Windows.
+
+```sh
+mcpgw daemon install     # starts at login, comes back if it crashes
+mcpgw daemon status      # what's running, what's installed, where the logs are
+mcpgw daemon logs -f
+```
+
+It refuses to install on a non-loopback address, because an unattended
+unauthenticated gateway on your network is a different thing from a warning you
+read in a terminal.
+
+### Not a one-way door
+
+```sh
+mcpgw eject
+```
+
+Eject writes your original server definitions back into every client under the
+same names, removes the gateway entries, offers to remove the daemon, and
+prints what is left for you to delete. Your clients then work with mcpgw
+uninstalled — which is the point: nothing here is a decision you can't take
+back.
 
 ## Watch what's actually happening
 
@@ -131,10 +176,16 @@ one config, every client, real traffic.
 
 ## Security
 
-Honest limits, since this handles your tool traffic:
+Every client entry mcpgw writes points at the gateway, so one process now holds
+every server's credentials and one log records every call. The
+[trust model](https://kennywillbe.github.io/mcpgw/trust-model.html) is the full
+version of what that does and does not protect. The short one:
 
-- The gateway binds to `127.0.0.1` by default. `--bind` opens it up and warns
-  you loudly; there is no authentication yet.
+- The gateway binds to `127.0.0.1` by default and has no authentication:
+  anything running as you can call every server you have configured. That was
+  already true of the client config files those credentials sit in — loopback
+  is the boundary, and it is your user account. `--bind` past loopback opens it
+  up and warns loudly; a daemon refuses the same address outright.
 - Requests carrying an `Origin` header that isn't a loopback page are refused
   with 403, so a website cannot drive your gateway by rebinding its own domain
   to `127.0.0.1`. MCP clients send no `Origin` and are unaffected.
@@ -148,19 +199,22 @@ Honest limits, since this handles your tool traffic:
 - `mcpgw watch --json` masks the captured `args` and `response` values, so
   piping the stream somewhere doesn't spread what's in the file; pass
   `--show-secrets` to see them. The human `watch` view never printed them.
-- Redaction, tool allowlists and OAuth are on the roadmap below, not in 0.1.0.
+- Redaction, tool allowlists and an OAuth broker are on the roadmap below, not
+  shipped.
 
 ## Roadmap
 
-Post-launch, ordered by what feedback says first:
+Ordered by what feedback asks for first:
 
 - tool allowlist, deny-by-default
 - tool-definition drift detection (a server quietly changing what a tool does)
 - log redaction
 - rate limiting
-- OAuth 2.1 with DCR and PKCE
+- OAuth 2.1 with DCR and PKCE — for remote servers, and with it authentication
+  on the gateway itself
 - a full TUI for `watch`
-- `mcpgw connect` starting a managed gateway daemon on its own
+- `mcpgw connect` starting a managed gateway on its own, when no daemon is
+  installed
 
 ## Contributing
 

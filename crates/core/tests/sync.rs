@@ -767,6 +767,21 @@ fn state_round_trips_and_tolerates_missing_file() {
     assert_eq!(ManagedState::load(&path).unwrap(), state);
 }
 
+/// Every state file on disk today was written before `migrated` existed.
+/// Reading one has to keep working, and has to read as "not told yet" — the
+/// installs with an old state file are exactly the ones the migration notice
+/// is for.
+#[test]
+fn a_state_file_written_before_the_migrated_flag_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("managed.json");
+    std::fs::write(&path, r#"{"clients":{"cursor":["github"]}}"#).unwrap();
+
+    let state = ManagedState::load(&path).unwrap();
+    assert_eq!(state.clients["cursor"], managed(&["github"]));
+    assert!(!state.migrated);
+}
+
 #[test]
 fn client_ids_round_trip() {
     for kind in ClientKind::ALL {

@@ -91,6 +91,10 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     let _state_lock = ManagedState::lock(&state_path)?;
     let mut state = ManagedState::load(&state_path)?;
 
+    // Set at the end of the run rather than after the first client: two
+    // clients flipped by one command both deserve the explanation, and the
+    // flag is what stops the *next* run from repeating it.
+    let mut notified = false;
     for kind in targets {
         let heading = |text: &str| {
             if color {
@@ -119,13 +123,51 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             continue;
         }
 
-        if let Applied::Refused(reason) =
-            apply_client(&mut planned, &mut state, &state_dir, &state_path)?
-        {
-            println!("  {reason}");
+        // Asked before the plan is applied: afterwards the document holds the
+        // gateway entries and every answer is "already there".
+        let migrating = !state.migrated && planned.migrates_to_gateway(&args.gateway_url);
+
+        match apply_client(&mut planned, &mut state, &state_dir, &state_path)? {
+            Applied::Refused(reason) => println!("  {reason}"),
+            Applied::Written if migrating => {
+                print_migration_notice(color);
+                notified = true;
+            }
+            Applied::Written => {}
         }
     }
+
+    if notified {
+        state.migrated = true;
+        state.save(&state_path)?;
+    }
     Ok(())
+}
+
+/// The one-time explanation of what just happened to a client's entries.
+///
+/// A user who never opted into a gateway sees their harness config rewritten
+/// to point at a process they have not heard of; this is the paragraph that
+/// makes that legible, names the one way it can now fail, and gives the way
+/// back. It is deliberately printed by `sync` and not only by the wizard —
+/// most existing installs will meet the flip through a plain `mcpgw sync`.
+fn print_migration_notice(color: bool) {
+    println!();
+    for line in [
+        "These entries used to point straight at the servers. They now point at mcpgw,",
+        "which forwards to the same servers — same names, same tools.",
+        "",
+        "One thing changed: if the gateway isn't running, they won't answer.",
+        "`mcpgw daemon status` tells you, `mcpgw daemon install` keeps it running.",
+        "",
+        "Undo everything this run did: mcpgw sync --rollback",
+    ] {
+        if line.is_empty() {
+            println!();
+        } else {
+            println!("  {}", crate::ui::dim(line, color));
+        }
+    }
 }
 
 /// One client's sync, read and planned but not yet applied.
@@ -200,6 +242,30 @@ pub fn plan_client(
         doc,
         plan,
     })))
+}
+
+impl PlannedClient {
+    /// Whether applying this plan moves entries that dial their servers
+    /// directly onto the gateway.
+    ///
+    /// Only updates can: an add writes an entry that was not there (a fresh
+    /// install, nothing to explain) and a remove takes one away. Must be
+    /// asked before [`apply_client`] — afterwards the document holds the new
+    /// entries and every one of them aims at the gateway.
+    #[must_use]
+    pub fn migrates_to_gateway(&self, gateway_url: &str) -> bool {
+        let codec = self.kind.codec();
+        let current = self.doc.entries(codec.root);
+        self.plan.updates.iter().any(|name| {
+            current.get(name).is_some_and(|entry| {
+                // An entry mcpgw cannot read back is left out rather than
+                // guessed at: the notice describes a move we can see.
+                codec.entries.parse(entry).is_ok_and(|(server, _)| {
+                    !mcpgw_core::doctor::aims_at_gateway(&server, gateway_url)
+                })
+            })
+        })
+    }
 }
 
 /// What applying a planned client did.

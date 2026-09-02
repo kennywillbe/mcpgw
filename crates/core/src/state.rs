@@ -14,6 +14,15 @@ use crate::error::Error;
 pub struct ManagedState {
     #[serde(default)]
     pub clients: BTreeMap<String, BTreeSet<String>>,
+    /// Whether this install has already been told that its client entries now
+    /// reach the servers through the gateway.
+    ///
+    /// The notice explains a change the user did not ask for, so it is worth
+    /// interrupting them once and never again. Absent from every state file
+    /// written before the field existed, which deserializes as "not told
+    /// yet" — exactly right for the installs the notice is for.
+    #[serde(default)]
+    pub migrated: bool,
 }
 
 impl ManagedState {

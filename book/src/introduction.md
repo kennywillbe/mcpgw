@@ -1,9 +1,8 @@
 # Introduction
 
-mcpgw is a single binary that keeps one list of your MCP servers, pushes that
-list into every client that wants its own copy, and — when you ask it to —
-stands in the middle of the traffic so you can see what your agents are
-actually calling.
+mcpgw is a single binary that keeps one list of your MCP servers, points every
+client at itself, and forwards the calls — so the list lives in one place, and
+so does the traffic.
 
 ## Two problems, one binary
 
@@ -16,14 +15,18 @@ mcpgw makes `~/.config/mcpgw/config.toml` the canonical list and syncs it
 outward. It only ever rewrites entries it wrote itself; anything you added by
 hand is left alone and reported back to you as unmanaged. Every client file is
 backed up before it's touched, and one command puts the previous version back.
+Nothing about that is a one-way door: `mcpgw eject` writes your original
+definitions back into every client and leaves you able to uninstall mcpgw
+entirely.
 
 **The second is visibility.** Once the servers are wired up, you have no idea
 what's happening through them. Which tool did the agent pick? What arguments
 went out? Did that call fail, or did the server quietly return nothing?
 
-Run `mcpgw serve` and every client talks to one endpoint instead of to each
-server directly. The gateway writes every request to a daily JSONL file, and
-`mcpgw watch` follows it live:
+The entries mcpgw writes point at mcpgw, so every client's calls pass through
+one process — `mcpgw serve` in a terminal, or the same gateway supervised by
+your machine's service manager via `mcpgw daemon install`. It writes every
+request to a daily JSONL file, and `mcpgw watch` follows it live:
 
 ```text
 $ mcpgw watch
@@ -51,6 +54,8 @@ gives you aggregation and a web UI, in exchange for a Node and Docker stack you
 have to keep alive. mcpgw is a static binary with no runtime dependencies doing
 the boring local job: one config, every client, real traffic.
 
-Start with [Installation](./installation.md), then run `mcpgw` with no
-arguments — on a terminal that opens the setup wizard, which walks the
-[Quickstart](./quickstart.md) for you one confirmed step at a time.
+Start with [Installation](./installation.md), then type `mcpgw` — on a terminal
+that opens the setup wizard, which walks the [Quickstart](./quickstart.md) for
+you one confirmed step at a time. Before you point your whole machine at it,
+the [Trust model](./trust-model.md) is what having one process in the middle
+does and does not protect.

@@ -66,8 +66,20 @@ impl Sandbox {
     /// entry nothing claims reads as foreign and sync leaves it alone, so the
     /// claim is what makes such a fixture a migration rather than a stranger.
     fn claim(&self, client: &str, names: &[&str]) {
+        self.claim_clients(&[(client, names)]);
+    }
+
+    /// [`claim`](Self::claim) for a fixture where a previous mcpgw synced
+    /// more than one client.
+    fn claim_clients(&self, clients: &[(&str, &[&str])]) {
         std::fs::create_dir_all(&self.state).unwrap();
-        let state = serde_json::json!({ "clients": { client: names } });
+        let clients: serde_json::Map<String, serde_json::Value> = clients
+            .iter()
+            .map(|(client, names)| ((*client).to_owned(), serde_json::json!(names)))
+            .collect();
+        // Deliberately without `migrated`: this is a state file an older
+        // mcpgw wrote, and the field did not exist then.
+        let state = serde_json::json!({ "clients": clients });
         std::fs::write(
             self.state.join("managed.json"),
             serde_json::to_string(&state).unwrap(),
@@ -807,6 +819,70 @@ fn a_directly_synced_client_comes_over_as_plain_updates() {
 
     let again = sb.ok(&sync(&["--client", "cursor"]));
     assert!(again.contains("no changes"), "{again}");
+}
+
+/// The line a user who never asked for a gateway needs to read: their entries
+/// moved, nothing about the servers or the tools did, and here is the way
+/// back. It fires from `sync` itself because that — not the wizard — is how
+/// most existing installs will meet the flip.
+#[test]
+fn moving_direct_entries_onto_the_gateway_explains_itself_once() {
+    let sb = Sandbox::new();
+    sb.install_cursor(Some(CURSOR_DIRECT));
+    sb.install_claude_desktop();
+    std::fs::write(
+        sb.claude_desktop_path(),
+        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+    )
+    .unwrap();
+    sb.claim_clients(&[
+        ("cursor", &["github", "linear"]),
+        ("claude-desktop", &["github"]),
+    ]);
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&sync(&["--client", "cursor"]));
+    assert!(
+        out.contains("used to point straight at the servers"),
+        "{out}"
+    );
+    assert!(out.contains("same names, same tools"), "{out}");
+    assert!(out.contains("mcpgw daemon status"), "{out}");
+    assert!(out.contains("mcpgw sync --rollback"), "{out}");
+
+    // Once ever, not once per run: the second client is flipped by a later
+    // run and gets the entries without the speech.
+    let again = sb.ok(&sync(&["--client", "claude-desktop"]));
+    assert!(
+        !again.contains("used to point straight at the servers"),
+        "{again}"
+    );
+    assert!(again.contains("~ github"), "{again}");
+}
+
+/// Nothing to explain when nothing moved: a client mcpgw sets up from scratch
+/// only ever had gateway entries, so the notice would be describing a past it
+/// does not have.
+#[test]
+fn a_fresh_client_never_sees_the_migration_notice() {
+    let sb = Sandbox::new();
+    sb.install_cursor(None);
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+
+    let out = sb.ok(&sync(&["--client", "cursor"]));
+    assert!(out.contains("+ github"), "{out}");
+    assert!(
+        !out.contains("used to point straight at the servers"),
+        "{out}"
+    );
+
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.state.join("managed.json")).unwrap())
+            .unwrap();
+    // Still unspent: a later run that does move direct entries must be able
+    // to say so.
+    assert_eq!(state["migrated"], serde_json::json!(false));
 }
 
 /// A config synced with the old single-entry shape and then synced again with

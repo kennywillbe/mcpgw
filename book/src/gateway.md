@@ -1,7 +1,7 @@
 # Gateway
 
-Syncing gives every client its own copy of the server list. The gateway does
-the opposite: every client talks to mcpgw, and mcpgw talks to the servers.
+The gateway is how mcpgw works, not a mode you turn on. `mcpgw sync` points
+every client at it: each client talks to mcpgw, and mcpgw talks to the servers.
 
 ```text
   Claude Code  ─┐                        ┌─ github    (stdio)
@@ -11,7 +11,18 @@ the opposite: every client talks to mcpgw, and mcpgw talks to the servers.
 ```
 
 Two things fall out of that shape: one connection per upstream instead of one
-per client, and a single place where all the traffic is visible.
+per client, and a single place where all the traffic is visible. A third is the
+cost — the gateway has to be running for a client to reach anything, which is
+what [Running as a daemon](./daemon.md) is for, and one process now holds every
+server's credentials, which is what the [Trust model](./trust-model.md) is
+about.
+
+Earlier versions could also write each server into each client directly,
+gateway or no gateway. That choice is gone: entries written straight at the
+servers were a second shape to test, a second thing for `doctor` to reason
+about, and the source of a silent breakage on clients that cannot hold an HTTP
+entry at all. `mcpgw sync` writes gateway entries, and `mcpgw eject` writes the
+originals back if you want out.
 
 ## Serving
 
@@ -39,7 +50,8 @@ mcpgw serve --bind 0.0.0.0    # warns loudly; keep it behind something
 ```
 
 A gateway under a service manager refuses the same address outright — see
-[Running as a daemon](./daemon.md#binding-loopback-only).
+[Running as a daemon](./daemon.md#binding-loopback-only). What loopback does
+and does not buy you is spelled out in the [Trust model](./trust-model.md).
 
 ## Tool names
 
@@ -171,18 +183,23 @@ mcpgw sync --dry-run
 mcpgw sync --rollback              # back to whatever was there before
 ```
 
-### One entry for the whole gateway
+### The other shape: one entry for the whole gateway
 
 ```sh
 mcpgw sync --aggregate
 ```
 
-Replaces the per-server entries with a single `mcpgw` entry pointing at `/mcp`,
-where every tool is namespaced `server__tool`. One entry per client instead of
-a dozen, at the price of prefixed tool names and no resources or prompts (see
-above). Switching between the two modes is a normal sync either way: the
-entries the other mode wrote are mcpgw's, so they are replaced, not left
-behind.
+The alternative to one entry per server: a single `mcpgw` entry pointing at
+`/mcp`, where every tool is namespaced `server__tool`. One entry per client
+instead of a dozen, at the price of prefixed tool names and no resources or
+prompts (see above). Worth it when a client charges you per entry — a UI that
+lists servers, a harness with a low limit — and not otherwise, which is why
+per-server is the default.
+
+Switching between the two is a normal sync either way: the entries the other
+shape wrote are mcpgw's own, so they are replaced rather than left behind.
+Aggregate mode also does not need the canonical config to be readable, since
+the one entry it writes says nothing about which servers exist.
 
 ### Checking the path clients take
 
