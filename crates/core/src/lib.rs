@@ -7,7 +7,7 @@ pub mod error;
 pub mod gateway;
 pub mod import;
 pub mod paths;
-mod private;
+pub mod private;
 pub mod probe;
 pub mod state;
 pub mod store;
