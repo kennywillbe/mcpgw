@@ -3,6 +3,11 @@
 //! touched: `MCPGW_UPDATE_BASE_URL` moves both the API and the download URLs
 //! onto the tiny server below, which speaks just enough HTTP/1.1 to answer
 //! the three GETs the binary makes.
+//!
+//! That seam only exists in debug builds, and the binary under test shares
+//! this target's profile — so under `cargo test --release` the suite stands
+//! down rather than letting the tests reach github.com for real.
+#![cfg(debug_assertions)]
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Write as _};
