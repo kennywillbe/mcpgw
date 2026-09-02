@@ -212,13 +212,27 @@ fn entry_shapes_per_client() {
     assert!(amp_http.get("source").is_none());
     assert!(amp_stdio.get("disabled").is_none());
 
+    // Zoo Code is Cline's shape with the one spelling its schema accepts:
+    // hyphenated, where Cline's is camelCase. Writing Cline's here would be
+    // a value Zoo Code's own validator rejects.
+    let zoo_stdio = client_entry(ClientKind::ZooCode, &canonical["github"]);
+    let zoo_http = client_entry(ClientKind::ZooCode, &canonical["linear"]);
+    assert_eq!(zoo_stdio, cursor_stdio);
+    assert_eq!(zoo_http["type"], "streamable-http");
+    assert_eq!(zoo_http["url"], "https://mcp.linear.app/mcp");
+    assert_ne!(zoo_http["type"], cline_http["type"]);
+    // Zoo Code's own bookkeeping fields are never written by mcpgw.
+    assert!(zoo_http.get("disabled").is_none());
+    assert!(zoo_stdio.get("alwaysAllow").is_none());
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
 }
 
 /// The clients whose entry shape is rewritten rather than passed through:
 /// opencode splits and rejoins the `command` array, Windsurf renames the
 /// remote URL, Zed adds a `source` its reader has to ignore, Cline spells the
-/// remote type its own way, Amp drops the `type` the shared shape carries.
+/// remote type its own way, Amp drops the `type` the shared shape carries,
+/// and Zoo Code spells that type a third way again.
 /// Emitting and re-reading has to give back the server that went in — for
 /// every client, but for these it is load bearing rather than incidental.
 #[test]
@@ -260,6 +274,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
         ClientKind::Cline,
         ClientKind::ClineCli,
         ClientKind::Amp,
+        ClientKind::ZooCode,
     ] {
         let entries = kind.codec().entries;
         for server in &servers {
@@ -359,6 +374,16 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(amp["url"], url);
     assert!(amp.get("type").is_none());
     assert!(amp.get("command").is_none());
+
+    // Zoo Code inherited that same SSE-by-default reading, so the gateway
+    // carries a type there too — spelled the way Zoo Code accepts.
+    let zoo = client_entry(
+        ClientKind::ZooCode,
+        &gateway_server(ClientKind::ZooCode, url, "mcpgw"),
+    );
+    assert_eq!(zoo["url"], url);
+    assert_eq!(zoo["type"], "streamable-http");
+    assert!(zoo.get("command").is_none());
 
     for kind in ClientKind::ALL {
         assert_eq!(

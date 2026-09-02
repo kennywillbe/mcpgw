@@ -1,0 +1,39 @@
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "ghp_example" },
+      "cwd": "/srv/projects",
+      "timeout": 120,
+      "watchPaths": ["/srv/projects/build/index.js"],
+      "alwaysAllow": ["search_repositories"],
+      "disabledTools": ["delete_repository"]
+    },
+    "browser": {
+      "command": "npx",
+      "args": ["-y", "@browsermcp/mcp"],
+      "disabled": true
+    },
+    "legacy": {
+      "url": "https://legacy.example/sse",
+      "type": "sse"
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/mcp",
+      "type": "streamable-http",
+      "headers": { "Authorization": "Bearer token" },
+      "alwaysAllow": []
+    },
+    "inherited": {
+      "url": "https://inherited.example/mcp",
+      "type": "streamableHttp"
+    },
+    "untyped": {
+      "url": "https://notes.example/sse"
+    },
+    "husk": {
+      "alwaysAllow": ["everything"]
+    }
+  }
+}

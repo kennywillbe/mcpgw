@@ -244,6 +244,28 @@ impl Sandbox {
         serde_json::from_str(&self.cline_text(kind)).unwrap()
     }
 
+    /// Zoo Code's globalStorage dir, a sibling of Cline's under VS Code's.
+    fn zoo_dir(&self) -> PathBuf {
+        self.app_data()
+            .join("Code/User/globalStorage/zoocodeorganization.zoo-code/settings")
+    }
+
+    /// `None` installs the directory alone (Zoo Code present, unconfigured).
+    fn install_zoo(&self, settings: Option<&str>) {
+        std::fs::create_dir_all(self.zoo_dir()).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(self.zoo_dir().join("mcp_settings.json"), text).unwrap();
+        }
+    }
+
+    fn zoo_text(&self) -> String {
+        std::fs::read_to_string(self.zoo_dir().join("mcp_settings.json")).unwrap()
+    }
+
+    fn zoo_json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.zoo_text()).unwrap()
+    }
+
     fn windsurf_json(&self) -> serde_json::Value {
         let text =
             std::fs::read_to_string(self.home.join(".codeium/windsurf/mcp_config.json")).unwrap();
@@ -336,6 +358,23 @@ const CLINE_SETTINGS: &str = r#"{
       "command": "notes-mcp",
       "disabled": true,
       "autoApprove": ["list_notes", "read_note"]
+    }
+  }
+}"#;
+
+/// A Zoo Code file whose foreign entry carries the whole Roo-era tail —
+/// `cwd`, `timeout`, `watchPaths`, `alwaysAllow`, `disabledTools` — none of
+/// which mcpgw models. A sync has to leave every one of them where it is.
+const ZOO_SETTINGS: &str = r#"{
+  "mcpServers": {
+    "notes": {
+      "command": "notes-mcp",
+      "cwd": "/srv/notes",
+      "timeout": 60,
+      "watchPaths": ["/srv/notes/dist/index.js"],
+      "disabled": true,
+      "alwaysAllow": ["list_notes", "read_note"],
+      "disabledTools": ["delete_note"]
     }
   }
 }"#;
@@ -1073,6 +1112,81 @@ fn the_two_cline_surfaces_are_synced_independently() {
             "https://mcp.linear.app/mcp"
         );
     }
+}
+
+#[test]
+fn zoo_sync_types_remote_entries_and_keeps_the_roo_extras() {
+    let sb = Sandbox::new();
+    sb.install_zoo(Some(ZOO_SETTINGS));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "zoo"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("? notes"), "{out}");
+
+    let json = sb.zoo_json();
+    // Every field of the entry mcpgw does not own survives untouched, extras
+    // that have no canonical counterpart included.
+    let notes = &json["mcpServers"]["notes"];
+    assert_eq!(notes["disabled"], true);
+    assert_eq!(notes["cwd"], "/srv/notes");
+    assert_eq!(notes["timeout"], 60);
+    assert_eq!(
+        notes["watchPaths"],
+        serde_json::json!(["/srv/notes/dist/index.js"])
+    );
+    assert_eq!(
+        notes["alwaysAllow"],
+        serde_json::json!(["list_notes", "read_note"])
+    );
+    assert_eq!(notes["disabledTools"], serde_json::json!(["delete_note"]));
+
+    assert_eq!(json["mcpServers"]["github"]["command"], "npx");
+    assert_eq!(json["mcpServers"]["github"]["env"]["TOKEN"], "t");
+    // The hyphenated spelling is the only one Zoo Code's schema accepts, and
+    // without a type at all it would treat the URL as an SSE endpoint.
+    assert_eq!(json["mcpServers"]["linear"]["type"], "streamable-http");
+    assert_eq!(
+        json["mcpServers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+
+    let text = sb.zoo_text();
+    let again = sb.ok(&["sync", "--client", "zoo"]);
+    assert!(again.contains("no changes"), "{again}");
+    assert_eq!(sb.zoo_text(), text);
+}
+
+/// Zoo Code and Cline share a config lineage but not a file: each writes its
+/// own globalStorage dir, and syncing one must not create the other's.
+#[test]
+fn zoo_gateway_entry_carries_the_hyphenated_streamable_type() {
+    let sb = Sandbox::new();
+    sb.install_zoo(None);
+    let out = sb.ok(&["sync", "--client", "zoo", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.zoo_json()["mcpServers"]["mcpgw"].clone();
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
+    assert_eq!(entry["type"], "streamable-http");
+    assert!(entry.get("command").is_none());
+
+    // Cline's sibling dir stays untouched: a Zoo Code sync is not a Cline one.
+    assert!(
+        !sb.cline_dir(mcpgw_core::ClientKind::Cline)
+            .join("cline_mcp_settings.json")
+            .exists()
+    );
 }
 
 #[test]
