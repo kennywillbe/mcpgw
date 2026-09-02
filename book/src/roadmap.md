@@ -26,7 +26,7 @@ None of this is in 0.1.0.
   turns it off.
 - **No linux-arm64 prebuilt binary yet.** `cargo install mcpgw` works there.
 - **The aggregate endpoint serves tools only.** Resources and prompts reach a
-  client through a per-server endpoint (`serve --per-server`), because their
+  client through a per-server endpoint (`/s/<name>`), because their
   names cannot be namespaced across servers the way tool names can. See
   [Gateway](./gateway.md).
 

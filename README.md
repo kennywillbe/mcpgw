@@ -68,8 +68,8 @@ Instead of every client talking to every server, they can all talk to mcpgw:
 ```
 
 ```sh
-mcpgw serve --per-server   # all enabled servers, each on its own endpoint
-mcpgw sync --gateway       # point every client at it, one entry per server
+mcpgw serve            # all enabled servers, each also on its own endpoint
+mcpgw sync --gateway   # point every client at it, one entry per server
 ```
 
 Every server keeps its name and its own entry in the client — only the
