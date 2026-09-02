@@ -170,6 +170,50 @@ fn built_binary() -> PathBuf {
     assert_cmd::cargo::cargo_bin("mcpgw")
 }
 
+/// What the stand-in release binary prints, whatever it is asked.
+#[cfg(unix)]
+const STAND_IN_OUTPUT: &str = "the downloaded binary";
+
+/// A few hundred kilobytes of real machine code to ship inside the fake
+/// release, compiled here rather than taken from `target/`.
+///
+/// The payload used to be the binary under test, which read well — the
+/// replacement was byte-identical to what it replaced — until the Linux
+/// debug build grew past the 64 MiB cap `release::fetch` puts on a download
+/// and every branch in flight started failing with "the response body is
+/// larger than request limit". That cap is a real defence and a real
+/// release archive is a stripped release build an order of magnitude under
+/// it, so the fixture moves rather than the limit. Nothing in the path
+/// under test reads the payload's contents; what matters is that the file
+/// that lands is executable, and a hello-world proves that as well as a
+/// 250 MB debug build while staying the same size forever.
+#[cfg(unix)]
+fn stand_in_binary(dir: &Path) -> Vec<u8> {
+    let source = dir.join("stand-in.rs");
+    std::fs::write(
+        &source,
+        format!("fn main() {{ println!(\"{STAND_IN_OUTPUT}\"); }}"),
+    )
+    .unwrap();
+
+    // Whatever compiled this test is what compiles the stand-in: cargo sets
+    // RUSTC for the session, and a session that got this far has one.
+    let out = dir.join("stand-in");
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+    let result = std::process::Command::new(rustc)
+        .args(["-O", "-C", "strip=symbols", "-o"])
+        .arg(&out)
+        .arg(&source)
+        .output()
+        .expect("rustc");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::read(&out).unwrap()
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8(out.stdout.clone()).unwrap()
 }
@@ -274,9 +318,9 @@ fn a_standalone_install_on_the_latest_release_changes_nothing() {
     );
 }
 
-/// The whole download-verify-replace path, against a "release" built from
-/// the binary under test: the replacement is byte-identical to what it
-/// replaces, so the test can assert the result still runs. Unix only —
+/// The whole download-verify-replace path, against a "release" carrying a
+/// real executable: the file left behind is run afterwards, and what it
+/// prints is something only the downloaded bytes could print. Unix only —
 /// replacing a running image on Windows is a different dance and CI is the
 /// wrong place to discover its edge cases.
 #[cfg(unix)]
@@ -292,7 +336,7 @@ fn a_verified_archive_replaces_the_running_binary() {
     let exe = bin.join("mcpgw");
     std::fs::copy(built_binary(), &exe).unwrap();
 
-    let payload = std::fs::read(built_binary()).unwrap();
+    let payload = stand_in_binary(dir.path());
     let archive = release_archive(NEWER, &payload);
     let asset = asset_name(NEWER);
     let sums = format!(
@@ -320,10 +364,16 @@ fn a_verified_archive_replaces_the_running_binary() {
         stdout(&out)
     );
 
-    // The replaced file is still an executable mcpgw, and nothing was left
-    // staged beside it.
+    // The replaced file is an executable that runs, and it is the one that
+    // came down the wire — an assertion the old payload could not make,
+    // being a copy of the binary that was already sitting there.
     let version = Command::new(&exe).arg("--version").output().unwrap();
     assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        STAND_IN_OUTPUT
+    );
+    // Nothing was left staged beside it.
     let leftovers: Vec<_> = std::fs::read_dir(&bin)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
