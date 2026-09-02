@@ -297,7 +297,7 @@ impl Hangups {
     }
 
     async fn next(&mut self) {
-        std::future::pending().await
+        std::future::pending::<()>().await;
     }
 }
 
