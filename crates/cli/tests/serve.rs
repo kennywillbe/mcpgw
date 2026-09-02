@@ -73,6 +73,11 @@ async fn serve_config(
         .and_then(|rest| rest.split("/mcp").next())
         .unwrap_or_else(|| panic!("no address in banner: {listening}"))
         .to_owned();
+    // Kept draining for the life of the gateway. Dropping the read end here
+    // would leave the child writing into a closed pipe, and a `println!` that
+    // hits EPIPE panics — which killed the gateway mid-test whenever the
+    // third banner line happened to land after this function returned.
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
     (child, addr, endpoints)
 }
 
