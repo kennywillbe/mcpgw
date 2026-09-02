@@ -242,6 +242,23 @@ impl Gateway {
             .map_or_else(tools_only, |info| forwarded(&info.capabilities))
     }
 
+    /// Who this face says it is at `initialize`.
+    ///
+    /// A pipe answers with the upstream's own name and version once it has
+    /// heard them: a harness shows this to the user, and one gateway serving
+    /// N servers under N endpoints all called "mcpgw" tells them nothing
+    /// about which server they are looking at. The source is the same
+    /// snapshot [`Gateway::capabilities`] uses, and for the same reason —
+    /// this runs inside the handshake, so it may not go and ask. Before
+    /// first contact, and for the aggregate, the honest answer is that this
+    /// is mcpgw.
+    fn identity(&self) -> Implementation {
+        self.pipe_upstream()
+            .and_then(|upstream| self.manager.last_server_info(upstream))
+            .and_then(|info| info.server_info.clone())
+            .unwrap_or_else(|| Implementation::new("mcpgw", env!("CARGO_PKG_VERSION")))
+    }
+
     /// Forwards one request to `upstream` under the request deadline and
     /// records the attempt.
     ///
@@ -414,7 +431,7 @@ impl ServerHandler for Gateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = self.capabilities();
-        info.server_info = Implementation::new("mcpgw", env!("CARGO_PKG_VERSION"));
+        info.server_info = self.identity();
         info
     }
 

@@ -80,7 +80,11 @@ it reached that server. A client connecting to a freshly started gateway,
 before anything has talked to the server yet, is told "tools" — the
 conservative answer — because working it out for real would mean starting the
 server in the middle of a handshake. Anything that connects after the first
-request through the endpoint sees the full set.
+request through the endpoint sees the full set. The name an endpoint reports at
+`initialize` follows the same rule: once the gateway has met the server it
+answers with that server's own name and version (`Context7 4.0.4`), which is
+what a client shows the user; before first contact, and on `/mcp`, it is
+`mcpgw`.
 
 The endpoints share one process and one set of upstream connections, so a
 client can take the whole gateway, a single server, or both at once without

@@ -83,7 +83,8 @@ async fn pipes_tools_list_from_upstream() {
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(names, ["echo", "reverse"]);
 
-    // The gateway identifies itself, not the upstream.
+    // This session was opened before the upstream had ever been reached, so
+    // the gateway had nothing to mirror and named itself.
     let info = client.peer_info().unwrap();
     assert_eq!(info.server_info.as_ref().unwrap().name, "mcpgw");
     manager.shutdown().await;
@@ -1077,5 +1078,34 @@ async fn fields_outside_the_mcp_schema_do_not_survive_the_hop() {
         result["tools"][0].get("x-fixture-tool").is_none(),
         "{result}"
     );
+    manager.shutdown().await;
+}
+
+/// Issue #63: a per-server pipe is a view onto one server, and telling the
+/// user it is "mcpgw" N times over N endpoints tells them nothing. The
+/// identity comes from the same post-first-contact snapshot the capabilities
+/// do, so `initialize` still never starts an upstream.
+#[tokio::test]
+async fn a_pipe_names_its_upstream_once_it_has_met_it() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+
+    let early = client_at(addr, &endpoint_path("fx")).await;
+    let identity = early.peer_info().unwrap().server_info.clone().unwrap();
+    assert_eq!(identity.name, "mcpgw", "pre-contact: {identity:?}");
+
+    early.list_all_tools().await.unwrap();
+    let later = client_at(addr, &endpoint_path("fx")).await;
+    let identity = later.peer_info().unwrap().server_info.clone().unwrap();
+    assert_eq!(identity.name, "mcpgw-test-server", "{identity:?}");
+    assert_eq!(identity.version, "9.9.9", "{identity:?}");
+
+    // The aggregate is nobody's proxy in particular: it stays mcpgw.
+    let aggregate = client_at(addr, "/mcp").await;
+    let identity = aggregate.peer_info().unwrap().server_info.clone().unwrap();
+    assert_eq!(identity.name, "mcpgw", "{identity:?}");
+
+    for client in [early, later, aggregate] {
+        client.cancel().await.unwrap();
+    }
     manager.shutdown().await;
 }
