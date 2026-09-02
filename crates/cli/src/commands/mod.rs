@@ -1,5 +1,6 @@
 pub mod add;
 pub mod connect;
+pub mod daemon;
 pub mod doctor;
 pub mod import;
 pub mod inspect;

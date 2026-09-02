@@ -51,6 +51,9 @@ enum Command {
     Serve(commands::serve::ServeArgs),
     /// Bridge a stdio-only client to a running gateway over HTTP
     Connect(commands::connect::ConnectArgs),
+    /// Run the gateway as a background service, and report on it
+    #[command(subcommand_help_heading = "Daemon commands")]
+    Daemon(commands::daemon::DaemonArgs),
     /// Show what one server offers: identity, tools and resources
     Inspect(commands::inspect::InspectArgs),
     /// Follow the gateway's captured traffic live
@@ -108,6 +111,7 @@ fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
         Command::Sync(args) => commands::sync::run(&args, color).map(|()| 0),
         Command::Serve(args) => commands::serve::run(&args).map(|()| 0),
         Command::Connect(args) => commands::connect::run(&args).map(|()| 0),
+        Command::Daemon(args) => commands::daemon::run(&args),
         Command::Inspect(args) => commands::inspect::run(&args, color).map(|()| 0),
         Command::Watch(args) => commands::watch::run(&args, color).map(|()| 0),
         Command::Doctor {

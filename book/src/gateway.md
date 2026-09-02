@@ -38,6 +38,9 @@ your MCP servers:
 mcpgw serve --bind 0.0.0.0    # warns loudly; keep it behind something
 ```
 
+A gateway under a service manager refuses the same address outright — see
+[Running as a daemon](./daemon.md#binding-loopback-only).
+
 ## Tool names
 
 Tools are exposed as `server__tool` — `github__create_issue`,
