@@ -10,7 +10,7 @@
 //! keep — comments and formatting for JSONC and TOML — and edits only the
 //! entries a plan owns.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value};
 
@@ -135,6 +135,34 @@ pub enum EntrySchema {
     ZooCode,
 }
 
+/// A write that refused rather than replace what it found.
+///
+/// The read side reports a root key holding something that is not an object
+/// as a [`Problem`](crate::clients::Problem) and returns no servers. Before
+/// this existed the write side walked the same shape and overwrote it, so the
+/// two halves disagreed about whether the file was usable and a hand-written
+/// value was destroyed without a word. Refusing is the symmetric answer:
+/// nothing on that path can be a server map, and only the user knows what
+/// they meant by it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotAnObject {
+    /// Dotted path of the offending key; empty for the document root.
+    pub path: String,
+}
+
+impl std::fmt::Display for NotAnObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.path.is_empty() {
+            // The same wording `ClientKind::read_text` uses for this shape.
+            f.write_str("root is not an object")
+        } else {
+            write!(f, "`{}` is not an object", self.path)
+        }
+    }
+}
+
+impl std::error::Error for NotAnObject {}
+
 impl EntrySchema {
     /// Converts one client entry into a canonical server.
     ///
@@ -166,6 +194,42 @@ impl EntrySchema {
             // it by the shared rules costs nothing and gains leniency: a
             // hand-written `type` is understood rather than rejected.
             Self::McpServers | Self::VsCode | Self::Zed | Self::Amp => parse_mcp_servers(obj),
+        }
+    }
+
+    /// Fields on an entry that belong to the client, not to mcpgw.
+    ///
+    /// [`EntrySchema::emit`] builds an entry from the canonical server alone,
+    /// and sync writes that value over whatever was there. For most clients
+    /// that is right — every field they define has a canonical counterpart.
+    /// These do not: the user sets them from inside the client and mcpgw has
+    /// nothing to say about them, so a rewrite carries them over instead of
+    /// resetting them. The line is switches the user flips (the off switch,
+    /// the per-tool permission lists), not server configuration a canonical
+    /// field could one day express.
+    #[must_use]
+    pub fn preserved_fields(self) -> &'static [&'static str] {
+        match self {
+            // `disabled` is Cline's off switch and `autoApprove` the list of
+            // tools it runs without asking. Emitting neither turned a server
+            // the user had switched off back on, every single sync.
+            Self::Cline => &["disabled", "autoApprove"],
+            // Zoo Code inherited Cline's two through Roo Code and kept Roo's
+            // spelling of the allow list beside them, plus its deny list; a
+            // file carried over from either fork may use any of them.
+            Self::ZooCode => &["disabled", "autoApprove", "alwaysAllow", "disabledTools"],
+            // Amp documents the off switch and no permission list.
+            Self::Amp => &["disabled"],
+            // Cursor spells its off switch `disabled` too, but this stays
+            // empty until that is asked for: the shared schema is four
+            // clients wide and only one of them defines the field.
+            Self::McpServers
+            | Self::VsCode
+            | Self::Gemini
+            | Self::Codex
+            | Self::Opencode
+            | Self::Windsurf
+            | Self::Zed => &[],
         }
     }
 
@@ -666,18 +730,31 @@ pub enum ClientDocument {
 }
 
 impl ClientDocument {
+    /// The whole document as canonical JSON.
+    ///
+    /// Almost everything sync needs is inside the server map, which is why
+    /// [`ClientDocument::entries`] is the usual read. A client that keeps
+    /// part of a server's state elsewhere in the file — Gemini's
+    /// `mcp.excluded` — needs the rest of it too.
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Json(value) => value.clone(),
+            Self::Jsonc(node) => node.to_serde_value().unwrap_or_default(),
+            Self::Toml(doc) => toml_to_json(doc.as_item()),
+        }
+    }
+
     /// The client's server map as canonical JSON.
     ///
     /// An absent or wrongly typed map reads as empty: sync only ever adds to
     /// it, so "no map" and "not a map" lead to the same plan.
     #[must_use]
     pub fn entries(&self, root: RootPath) -> Map<String, Value> {
-        let value = match self {
-            Self::Json(value) => return json_entries(root, value),
-            Self::Jsonc(node) => node.to_serde_value().unwrap_or_default(),
-            Self::Toml(doc) => toml_to_json(doc.as_item()),
-        };
-        json_entries(root, &value)
+        match self {
+            Self::Json(value) => json_entries(root, value),
+            other => json_entries(root, &other.to_value()),
+        }
     }
 
     /// Upserts `upserts` and deletes `removes` inside the server map,
@@ -685,11 +762,84 @@ impl ClientDocument {
     ///
     /// Entries not named here are never rewritten — that is what keeps a
     /// foreign entry's own formatting, and in JSONC/TOML its comments.
-    pub fn edit(&mut self, root: RootPath, removes: &[String], upserts: &[(&str, &Value)]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotAnObject`] when a key on the way to the server map holds
+    /// something that is not one. Nothing is written in that case: see the
+    /// type's own docs for why refusing beats replacing.
+    pub fn edit(
+        &mut self,
+        root: RootPath,
+        removes: &[String],
+        upserts: &[(&str, &Value)],
+    ) -> Result<(), NotAnObject> {
         match self {
             Self::Json(value) => edit_json(root, value, removes, upserts),
             Self::Jsonc(node) => edit_jsonc(root, node, removes, upserts),
             Self::Toml(doc) => edit_toml(root, doc, removes, upserts),
+        }
+    }
+
+    /// Drops every string in `names` from the array at `path`.
+    ///
+    /// A missing key, a missing array or a non-string element is left alone:
+    /// the array is the client's own state, so this only ever takes names out
+    /// of a list that is already there — it never creates one, never reorders
+    /// what stays, and never touches a name the caller did not ask for.
+    pub fn remove_from_string_array(&mut self, path: &[&str], names: &BTreeSet<String>) {
+        if names.is_empty() {
+            return;
+        }
+        match self {
+            Self::Json(value) => {
+                let Some(array) = path
+                    .iter()
+                    .try_fold(&mut *value, |node, key| node.get_mut(*key))
+                    .and_then(Value::as_array_mut)
+                else {
+                    return;
+                };
+                array.retain(|item| !item.as_str().is_some_and(|s| names.contains(s)));
+            }
+            Self::Jsonc(node) => {
+                let Some((last, parents)) = path.split_last() else {
+                    return;
+                };
+                let Some(object) = node.object_value() else {
+                    return;
+                };
+                let Some(object) = parents
+                    .iter()
+                    .try_fold(object, |object, key| object.object_value(key))
+                else {
+                    return;
+                };
+                let Some(array) = object.array_value(last) else {
+                    return;
+                };
+                for element in array.elements() {
+                    if element
+                        .as_string_lit()
+                        .and_then(|lit| lit.decoded_value().ok())
+                        .is_some_and(|value| names.contains(&value))
+                    {
+                        element.remove();
+                    }
+                }
+            }
+            Self::Toml(doc) => {
+                let Some(array) = path
+                    .iter()
+                    .try_fold(doc.as_item_mut(), |item, key| {
+                        item.as_table_like_mut()?.get_mut(key)
+                    })
+                    .and_then(toml_edit::Item::as_array_mut)
+                else {
+                    return;
+                };
+                array.retain(|item| !item.as_str().is_some_and(|s| names.contains(s)));
+            }
         }
     }
 
@@ -734,24 +884,26 @@ fn json_entries(root: RootPath, value: &Value) -> Map<String, Value> {
 }
 
 /// Walks (creating as it goes) to the server map inside a JSON document.
-/// Anything in the way that is not an object is replaced: it cannot be a
-/// server map, and refusing to write would strand the client forever.
-fn json_map_mut(root: RootPath, value: &mut Value) -> &mut Map<String, Value> {
+///
+/// A *missing* key along the path is created — that is how a client with no
+/// MCP config yet gets one. A key that exists but holds something other than
+/// an object is refused, mirroring [`RootPath::locate_in`] exactly; see
+/// [`NotAnObject`].
+fn json_map_mut(root: RootPath, value: &mut Value) -> Result<&mut Map<String, Value>, NotAnObject> {
     let mut node = value;
-    for segment in root.segments() {
-        if !node.is_object() {
-            *node = Value::Object(Map::new());
-        }
-        node = node
-            .as_object_mut()
-            .expect("normalized to an object above")
+    for (depth, segment) in root.segments().iter().enumerate() {
+        let Some(object) = node.as_object_mut() else {
+            return Err(NotAnObject {
+                path: root.segments()[..depth].join("."),
+            });
+        };
+        node = object
             .entry((*segment).to_owned())
             .or_insert_with(|| Value::Object(Map::new()));
     }
-    if !node.is_object() {
-        *node = Value::Object(Map::new());
-    }
-    node.as_object_mut().expect("normalized to an object above")
+    node.as_object_mut().ok_or_else(|| NotAnObject {
+        path: root.display(),
+    })
 }
 
 pub(crate) fn edit_json(
@@ -759,14 +911,15 @@ pub(crate) fn edit_json(
     value: &mut Value,
     removes: &[String],
     upserts: &[(&str, &Value)],
-) {
-    let entries = json_map_mut(root, value);
+) -> Result<(), NotAnObject> {
+    let entries = json_map_mut(root, value)?;
     for name in removes {
         entries.remove(name);
     }
     for (name, entry) in upserts {
         entries.insert((*name).to_owned(), (*entry).clone());
     }
+    Ok(())
 }
 
 fn edit_jsonc(
@@ -774,10 +927,18 @@ fn edit_jsonc(
     node: &jsonc_parser::cst::CstRootNode,
     removes: &[String],
     upserts: &[(&str, &Value)],
-) {
-    let mut entries = node.object_value_or_set();
-    for segment in root.segments() {
-        entries = entries.object_value_or_set(segment);
+) -> Result<(), NotAnObject> {
+    // `_or_create` rather than `_or_set`: the first creates a missing key and
+    // returns `None` for one that is not an object, the second overwrites it.
+    let mut entries = node.object_value_or_create().ok_or_else(|| NotAnObject {
+        path: String::new(),
+    })?;
+    for (depth, segment) in root.segments().iter().enumerate() {
+        entries = entries
+            .object_value_or_create(segment)
+            .ok_or_else(|| NotAnObject {
+                path: root.segments()[..=depth].join("."),
+            })?;
     }
     for name in removes {
         if let Some(prop) = entries.get(name) {
@@ -793,6 +954,7 @@ fn edit_jsonc(
             }
         }
     }
+    Ok(())
 }
 
 fn edit_toml(
@@ -800,16 +962,36 @@ fn edit_toml(
     doc: &mut toml_edit::DocumentMut,
     removes: &[String],
     upserts: &[(&str, &Value)],
-) {
+) -> Result<(), NotAnObject> {
     let mut entries = doc.as_table_mut();
-    for segment in root.segments() {
+    for (depth, segment) in root.segments().iter().enumerate() {
+        // `mcp_servers = { linear = { url = "…" } }` is a legitimate server
+        // map — valid TOML the reader accepts and reports entry by entry, so
+        // replacing it deleted foreign entries sync had just called
+        // untouched. An inline table cannot hold the section tables written
+        // below, so normalize it into one instead, keeping every entry
+        // (the canonical store does the same to its own `servers` key).
+        let mut normalized = false;
+        if let Some(item) = entries.get_mut(segment)
+            && let toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)) = item
+        {
+            *item = toml_edit::Item::Table(std::mem::take(inline).into_table());
+            normalized = true;
+        }
+        // The key kept the spacing it had as an assignment, which reads
+        // `[mcp_servers ]` once it is a section header.
+        if normalized && let Some(mut key) = entries.key_mut(segment) {
+            key.leaf_decor_mut().clear();
+        }
         let item = entries
             .entry(segment)
             .or_insert_with(|| toml_edit::Item::Table(implicit_table()));
-        if !item.is_table() {
-            *item = toml_edit::Item::Table(implicit_table());
-        }
-        entries = item.as_table_mut().expect("normalized to a table above");
+        let Some(table) = item.as_table_mut() else {
+            return Err(NotAnObject {
+                path: root.segments()[..=depth].join("."),
+            });
+        };
+        entries = table;
     }
     for name in removes {
         entries.remove(name);
@@ -826,6 +1008,7 @@ fn edit_toml(
         }
         entries.insert(name, toml_edit::Item::Table(table));
     }
+    Ok(())
 }
 
 /// A parent table that only prints its own header once it holds direct

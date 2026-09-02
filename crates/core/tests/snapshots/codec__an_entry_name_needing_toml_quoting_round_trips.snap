@@ -1,0 +1,12 @@
+---
+source: crates/core/tests/codec.rs
+expression: text
+---
+[mcp_servers."my.server"]
+command = "npx"
+
+[mcp_servers."my server"]
+command = "npx"
+
+[mcp_servers.'quote"d']
+command = "npx"

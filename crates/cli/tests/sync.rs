@@ -381,6 +381,32 @@ const ZOO_SETTINGS: &str = r#"{
   }
 }"#;
 
+/// The same file after Cline has been at it: mcpgw's own entry, switched off
+/// from inside Cline and carrying the auto-approved tool list Cline keeps.
+const CLINE_AFTER_THE_USER: &str = r#"{
+  // Switched off from inside Cline, on purpose.
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["server-github"],
+      "disabled": true,
+      "autoApprove": ["list_issues"],
+    },
+  },
+}
+"#;
+
+/// An Amp settings file the way Amp's own docs show one: VS Code-shaped
+/// settings with a comment in them, which the strict-JSON reader refused.
+const AMP_COMMENTED_SETTINGS: &str = r#"{
+  // My Amp settings — do not reformat.
+  "amp.notifications.enabled": true,
+  "amp.mcpServers": {
+    "notes": { "command": "notes-mcp", "disabled": true }
+  }
+}
+"#;
+
 /// An Amp settings file with everything a sync has to leave alone: settings
 /// that are not MCP at all, an entry mcpgw does not own, and — the one that
 /// only Amp can get wrong — a genuinely nested `amp` object, which is a
@@ -1239,6 +1265,195 @@ fn amp_sync_writes_the_namespaced_key_and_leaves_the_nested_one_alone() {
     let again = sb.ok(&["sync", "--client", "amp"]);
     assert!(again.contains("no changes"), "{again}");
     assert_eq!(sb.amp_text(), text);
+}
+
+/// Amp's settings file is the whole of the tool's VS Code-style settings, so
+/// a comment in it is ordinary. Under the strict-JSON reader that comment
+/// made the file unparseable and the client was skipped outright; a file
+/// without one was reserialized whole on every write.
+#[test]
+fn amp_settings_survive_their_own_comments_and_formatting() {
+    let sb = Sandbox::new();
+    sb.install_amp(Some(AMP_COMMENTED_SETTINGS));
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "amp"]);
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(!out.contains("skipped"), "{out}");
+
+    let text = sb.amp_text();
+    assert!(
+        text.contains("// My Amp settings — do not reformat."),
+        "{text}"
+    );
+    // The untouched entry keeps its own single-line spelling, which a
+    // reserialize-everything write would have expanded.
+    assert!(
+        text.contains(r#""notes": { "command": "notes-mcp", "disabled": true }"#),
+        "{text}"
+    );
+    let json = mcpgw_core::ClientKind::Amp
+        .codec()
+        .parse_value(&text)
+        .unwrap();
+    assert_eq!(
+        json["amp.mcpServers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+
+    let again = sb.ok(&["sync", "--client", "amp"]);
+    assert!(again.contains("no changes"), "{again}");
+    assert_eq!(sb.amp_text(), text);
+}
+
+/// An entry mcpgw manages is still the user's to switch off from inside
+/// Cline. Sync used to write the emitted entry over the whole object, so the
+/// server came back on and the auto-approved tool list was gone — and the
+/// entry re-diffed on every run after that.
+#[test]
+fn a_managed_cline_entry_keeps_the_switch_the_user_flipped() {
+    let sb = Sandbox::new();
+    let kind = mcpgw_core::ClientKind::Cline;
+    sb.install_cline(kind, None);
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    // A first sync claims `github`, then the user switches it off inside
+    // Cline and auto-approves a tool on it.
+    sb.ok(&["sync", "--client", kind.id()]);
+    std::fs::write(
+        sb.cline_dir(kind).join("cline_mcp_settings.json"),
+        CLINE_AFTER_THE_USER,
+    )
+    .unwrap();
+
+    // Nothing about the server changed, so nothing is rewritten: the two
+    // fields alone must not read as a diff, or the entry churns forever.
+    let out = sb.ok(&["sync", "--client", kind.id()]);
+    assert!(out.contains("no changes"), "{out}");
+    assert_eq!(sb.cline_text(kind), CLINE_AFTER_THE_USER);
+
+    // Now the canonical server really does change, so the entry is rewritten
+    // — and the rewrite has to carry both fields over.
+    sb.ok(&[
+        "add",
+        "github",
+        "--force",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    let out = sb.ok(&["sync", "--client", kind.id()]);
+    assert!(out.contains("~ github"), "{out}");
+
+    let text = sb.cline_text(kind);
+    assert!(
+        text.contains("// Switched off from inside Cline, on purpose."),
+        "{text}"
+    );
+    let json = mcpgw_core::ClientKind::Cline
+        .codec()
+        .parse_value(&text)
+        .unwrap();
+    let entry = &json["mcpServers"]["github"];
+    // The canonical fields win — those are mcpgw's — and Cline's own two
+    // survive the rewrite that changed them.
+    assert_eq!(entry["env"]["TOKEN"], "t");
+    assert_eq!(entry["disabled"], true);
+    assert_eq!(entry["autoApprove"], serde_json::json!(["list_issues"]));
+
+    let again = sb.ok(&["sync", "--client", kind.id()]);
+    assert!(again.contains("no changes"), "{again}");
+    assert_eq!(sb.cline_text(kind), text);
+}
+
+/// Gemini refuses to start anything named in `mcp.excluded`, whatever its
+/// entry says. Sync used to write the entry, report `+ name` and leave the
+/// list alone — and the next run then saw the entry already correct, so the
+/// wrong state was stable and invisible.
+#[test]
+fn gemini_sync_frees_the_servers_it_manages_from_the_excluded_list() {
+    let sb = Sandbox::new();
+    sb.install_gemini(Some(
+        r#"{
+  "theme": "Default",
+  "mcp": { "excluded": ["github", "notes"] },
+  "mcpServers": {
+    "notes": { "command": "notes-mcp" }
+  }
+}"#,
+    ));
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+
+    let out = sb.ok(&["sync", "--client", "gemini"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("to un-exclude"), "{out}");
+
+    let json = sb.gemini_json();
+    // Only the name mcpgw manages leaves the list; the user's exclusion of
+    // an entry mcpgw does not own is their decision and stays.
+    assert_eq!(json["mcp"]["excluded"], serde_json::json!(["notes"]));
+    assert_eq!(json["theme"], "Default");
+    assert_eq!(json["mcpServers"]["github"]["command"], "npx");
+
+    let again = sb.ok(&["sync", "--client", "gemini"]);
+    assert!(again.contains("no changes"), "{again}");
+
+    // Disabling the server removes its entry, and its name goes with it —
+    // left behind it would silently switch off a server re-added by hand.
+    sb.ok(&["disable", "github"]);
+    let out = sb.ok(&["sync", "--client", "gemini"]);
+    assert!(out.contains("- github"), "{out}");
+    assert_eq!(
+        sb.gemini_json()["mcp"]["excluded"],
+        serde_json::json!(["notes"])
+    );
+}
+
+/// A root key holding something that is not a server map is what the reader
+/// calls a problem. The writer used to replace it without a word, destroying
+/// whatever the user had put there.
+#[test]
+fn a_non_map_root_key_is_refused_rather_than_overwritten() {
+    let sb = Sandbox::new();
+    sb.install_cursor(Some(r#"{"mcpServers": 5}"#));
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "cursor"]);
+    assert!(out.contains("refused"), "{out}");
+    assert!(out.contains("`mcpServers` is not an object"), "{out}");
+    assert_eq!(sb.cursor_json(), serde_json::json!({ "mcpServers": 5 }));
+    // Nothing was claimed either, so a later fix syncs as a plain add.
+    assert!(!sb.state.join("backups").exists());
+}
+
+/// A TOML server map spelled inline is one the reader accepts and sync
+/// reports entry by entry — so a write that replaced it deleted foreign
+/// entries the CLI had just promised to leave alone.
+#[test]
+fn an_inline_codex_server_map_keeps_its_foreign_entries() {
+    let sb = Sandbox::new();
+    sb.install_codex(Some(
+        "model = \"gpt-5-codex\"\nmcp_servers = { notes = { command = \"notes-mcp\" } }\n",
+    ));
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+
+    let out = sb.ok(&["sync", "--client", "codex"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("? notes"), "{out}");
+
+    let json = sb.codex_toml();
+    assert_eq!(json["model"], "gpt-5-codex");
+    assert_eq!(
+        json["mcp_servers"]["notes"]["command"],
+        "notes-mcp",
+        "the foreign entry the CLI called untouched was destroyed:\n{}",
+        sb.codex_text()
+    );
+    assert_eq!(json["mcp_servers"]["github"]["command"], "npx");
+
+    let again = sb.ok(&["sync", "--client", "codex"]);
+    assert!(again.contains("no changes"), "{again}");
 }
 
 #[test]

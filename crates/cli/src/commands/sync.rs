@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
-use mcpgw_core::sync::{GATEWAY_NAME, apply_plan_to, gateway_server, plan_sync};
+use mcpgw_core::sync::{
+    GATEWAY_NAME, apply_plan_to, gateway_server, plan_client_context, plan_sync,
+};
 use mcpgw_core::{ClientKind, Config, Detection, Error, backup, paths, state::ManagedState};
 use owo_colors::OwoColorize as _;
 
@@ -81,19 +84,12 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
                 println!("{} — {text}", kind.display_name());
             }
         };
-        let (path, exists) = match kind.detect() {
-            Detection::NotInstalled => {
-                heading("not found, skipped");
+        let (path, exists) = match resolve_target(kind) {
+            Ok(target) => target,
+            Err(reason) => {
+                heading(reason);
                 continue;
             }
-            Detection::Installed => {
-                let Some(path) = kind.config_path() else {
-                    heading("cannot resolve config path, skipped");
-                    continue;
-                };
-                (path, false)
-            }
-            Detection::Configured(path) => (path, true),
         };
 
         let codec = kind.codec();
@@ -128,7 +124,8 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             )])
         });
         let desired = gateway_desired.as_ref().unwrap_or(&canonical);
-        let plan = plan_sync(kind, &current, desired, &managed);
+        let mut plan = plan_sync(kind, &current, desired, &managed);
+        plan_client_context(kind, &doc.to_value(), &mut plan);
 
         heading(&describe(&plan));
         print_plan_lines(&plan, color);
@@ -140,6 +137,15 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             continue;
         }
 
+        // In memory and before anything on disk moves, so a refusal costs
+        // neither a backup nor a state entry claiming what was never written.
+        if let Err(err) = apply_plan_to(kind, &mut doc, &plan) {
+            println!(
+                "  refused: {err} in {} — nothing written; `mcpgw doctor` reports the same problem",
+                path.display()
+            );
+            continue;
+        }
         if exists {
             backup::backup_file(&state_dir, kind.id(), &path)?;
         }
@@ -153,10 +159,22 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             .clients
             .insert(kind.id().to_owned(), plan.managed_after());
         state.save(&state_path)?;
-        apply_plan_to(kind, &mut doc, &plan);
         write_text(&path, &doc.to_text()?)?;
     }
     Ok(())
+}
+
+/// The file this client's sync reads and writes, and whether it is there
+/// already — or the reason there is nothing to sync.
+fn resolve_target(kind: ClientKind) -> Result<(std::path::PathBuf, bool), &'static str> {
+    match kind.detect() {
+        Detection::NotInstalled => Err("not found, skipped"),
+        Detection::Installed => kind
+            .config_path()
+            .map(|path| (path, false))
+            .ok_or("cannot resolve config path, skipped"),
+        Detection::Configured(path) => Ok((path, true)),
+    }
 }
 
 /// What the client should run to reach the gateway over stdio.
@@ -172,16 +190,21 @@ fn bridge_command() -> String {
 }
 
 fn describe(plan: &mcpgw_core::sync::SyncPlan) -> String {
-    if plan.has_changes() {
-        format!(
-            "{} to add, {} to update, {} to remove",
-            plan.adds.len(),
-            plan.updates.len(),
-            plan.removes.len()
-        )
-    } else {
-        "no changes".to_owned()
+    if !plan.has_changes() {
+        return "no changes".to_owned();
     }
+    let mut text = format!(
+        "{} to add, {} to update, {} to remove",
+        plan.adds.len(),
+        plan.updates.len(),
+        plan.removes.len()
+    );
+    // Only when there is one: every other client has no exclusion list, and
+    // a permanent ", 0 to un-exclude" would be noise in all of them.
+    if !plan.unexclude.is_empty() {
+        let _ = write!(text, ", {} to un-exclude", plan.unexclude.len());
+    }
+    text
 }
 
 fn print_plan_lines(plan: &mcpgw_core::sync::SyncPlan, color: bool) {
@@ -200,6 +223,14 @@ fn print_plan_lines(plan: &mcpgw_core::sync::SyncPlan, color: bool) {
     }
     for name in &plan.removes {
         line("-", name, "", |m| m.red().to_string());
+    }
+    for name in &plan.unexclude {
+        line(
+            "~",
+            name,
+            " taken out of the client's exclusion list (it would refuse to start it)",
+            |m| m.yellow().to_string(),
+        );
     }
     for name in &plan.conflicts {
         line(

@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use mcpgw_core::state::ManagedState;
-use mcpgw_core::sync::{apply_plan, client_entry, gateway_server, plan_sync};
+use mcpgw_core::sync::{
+    apply_plan, apply_plan_to, client_entry, gateway_server, plan_client_context, plan_sync,
+};
 use mcpgw_core::{ClientKind, Config, backup};
 
 fn canonical() -> BTreeMap<String, mcpgw_core::Server> {
@@ -76,7 +78,7 @@ fn plan_is_idempotent_after_apply() {
         &managed(&[]),
     );
     assert_eq!(plan.adds, ["github", "linear"]);
-    apply_plan(ClientKind::Cursor, &mut root, &plan);
+    apply_plan(ClientKind::Cursor, &mut root, &plan).unwrap();
 
     // Foreign entry and unrelated root keys survive.
     assert_eq!(root["otherSetting"], true);
@@ -93,6 +95,138 @@ fn plan_is_idempotent_after_apply() {
     assert!(!again.has_changes());
 }
 
+/// Cline's `disabled` and `autoApprove` are the user's, set from inside
+/// Cline and unexpressible canonically. Sync used to write the emitted entry
+/// straight over them, so a managed server the user had switched off came
+/// back on — and the entry differed from the file again the next run, and the
+/// one after that, forever.
+#[test]
+fn a_managed_entry_keeps_the_fields_the_client_owns() {
+    let canonical = canonical();
+    let mut on_disk = client_entry(ClientKind::Cline, &canonical["github"]);
+    on_disk["disabled"] = true.into();
+    on_disk["autoApprove"] = serde_json::json!(["list_issues"]);
+    let current = serde_json::json!({ "github": on_disk });
+
+    // Nothing to do to it: the entry is what mcpgw would write plus what
+    // Cline owns, which is exactly the state the previous sync left behind.
+    // Without the carry-over it re-diffed on this run and every one after.
+    let plan = plan_sync(
+        ClientKind::Cline,
+        current.as_object().unwrap(),
+        &canonical,
+        &managed(&["github"]),
+    );
+    assert!(plan.updates.is_empty(), "{plan:?}");
+
+    // And when the canonical server really has changed, the rewrite carries
+    // both fields over rather than resetting them.
+    let mut stale = current.clone();
+    stale["github"]["command"] = "old".into();
+    let plan = plan_sync(
+        ClientKind::Cline,
+        stale.as_object().unwrap(),
+        &canonical,
+        &managed(&["github"]),
+    );
+    assert_eq!(plan.updates, ["github"]);
+    let mut root = serde_json::json!({ "mcpServers": stale });
+    apply_plan(ClientKind::Cline, &mut root, &plan).unwrap();
+    let written = &root["mcpServers"]["github"];
+    assert_eq!(written["command"], "npx");
+    assert_eq!(written["disabled"], true);
+    assert_eq!(written["autoApprove"], serde_json::json!(["list_issues"]));
+
+    // A client that defines none of those fields is unaffected: its entry is
+    // the emitted value and nothing else, so the stray fields are a diff.
+    let plan = plan_sync(
+        ClientKind::Cursor,
+        current.as_object().unwrap(),
+        &canonical,
+        &managed(&["github"]),
+    );
+    assert_eq!(plan.updates, ["github"]);
+}
+
+/// Amp and Zoo Code carry their own subsets of the same fields, and every
+/// other client carries none — a client that gained one silently would start
+/// echoing back a field mcpgw does not understand.
+#[test]
+fn the_fields_each_client_owns_are_what_they_were() {
+    let owned: Vec<(&str, Vec<&str>)> = ClientKind::ALL
+        .into_iter()
+        .map(|kind| (kind.id(), kind.codec().entries.preserved_fields().to_vec()))
+        .collect();
+    insta::assert_debug_snapshot!(owned);
+}
+
+/// Gemini has no per-entry off switch: a name in `mcp.excluded` stops the
+/// server whatever its entry says. Writing the entry and leaving the list
+/// alone reported `+ name` for a server Gemini refuses to start, and the next
+/// plan then saw the entry already correct and nothing left to do.
+#[test]
+fn gemini_takes_only_its_own_names_out_of_the_excluded_list() {
+    let canonical = canonical();
+    let document = serde_json::json!({
+        "mcp": { "excluded": ["github", "parked", "users-own", "github"] },
+        "mcpServers": {
+            "github": client_entry(ClientKind::Gemini, &canonical["github"]),
+            "parked": { "command": "npx" },
+            "users-own": { "command": "deno" },
+        }
+    });
+    let mut plan = plan_sync(
+        ClientKind::Gemini,
+        document["mcpServers"].as_object().unwrap(),
+        &canonical,
+        &managed(&["github", "parked"]),
+    );
+    // `github` already matches byte for byte — that is the case which used
+    // to stay silently wrong forever, because nothing else in the plan
+    // touched it either.
+    assert!(!plan.updates.contains(&"github".to_owned()));
+    plan_client_context(ClientKind::Gemini, &document, &mut plan);
+
+    // A managed server that has to run, and a managed name whose entry is
+    // going away — leaving that one listed would silently disable a server
+    // the user later re-added by hand. Deduplicated, and the user's own
+    // exclusion of an entry mcpgw does not manage is left where it is.
+    assert_eq!(plan.unexclude, ["github", "parked"]);
+    assert!(plan.has_changes());
+
+    let mut doc = mcpgw_core::clients::codec::ClientDocument::Json(document);
+    apply_plan_to(ClientKind::Gemini, &mut doc, &plan).unwrap();
+    assert_eq!(
+        doc.to_value()["mcp"]["excluded"],
+        serde_json::json!(["users-own"])
+    );
+
+    // A second plan over the written state has nothing left to do.
+    let written = doc.to_value();
+    let mut again = plan_sync(
+        ClientKind::Gemini,
+        written["mcpServers"].as_object().unwrap(),
+        &canonical,
+        &plan.managed_after(),
+    );
+    plan_client_context(ClientKind::Gemini, &written, &mut again);
+    assert!(!again.has_changes(), "{again:?}");
+}
+
+/// Only Gemini keeps part of a server's state outside its entry; for every
+/// other client the pass is a no-op whatever the document holds.
+#[test]
+fn no_other_client_has_an_exclusion_list_to_reconcile() {
+    for kind in ClientKind::ALL {
+        assert_eq!(
+            kind.exclusion_list().is_some(),
+            kind == ClientKind::Gemini,
+            "{}",
+            kind.id()
+        );
+    }
+}
+
 #[test]
 fn apply_creates_root_key_in_empty_document() {
     let mut root = serde_json::json!({});
@@ -102,7 +236,7 @@ fn apply_creates_root_key_in_empty_document() {
         &canonical(),
         &managed(&[]),
     );
-    apply_plan(ClientKind::VsCode, &mut root, &plan);
+    apply_plan(ClientKind::VsCode, &mut root, &plan).unwrap();
     assert!(root["servers"]["github"].is_object());
 }
 
