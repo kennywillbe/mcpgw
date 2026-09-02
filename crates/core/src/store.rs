@@ -3,7 +3,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use fs4::fs_std::FileExt as _;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::config::{Config, Server, Transport, validate_name};
@@ -219,8 +218,11 @@ pub(crate) fn acquire_lock(config: &Path) -> Result<File, Error> {
         .write(true)
         .open(&path)
         .map_err(io_err(&path))?;
-    // Blocks until any other mcpgw process releases the config.
-    file.lock_exclusive().map_err(io_err(&path))?;
+    // Blocks until any other mcpgw process releases the config. This used
+    // to go through the `fs4` crate, but `std::fs::File::lock` now covers
+    // the same flock/LockFileEx-backed blocking exclusive lock directly, so
+    // the extra dependency was dropped rather than chasing its 1.x rename.
+    file.lock().map_err(io_err(&path))?;
     Ok(file)
 }
 
