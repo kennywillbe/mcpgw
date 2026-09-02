@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use mcpgw_core::capture::{
-    CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER, daily_path, truncate,
+    CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER, daily_path,
+    session_fingerprint, truncate,
 };
 
 fn record() -> CaptureRecord {
@@ -34,6 +35,53 @@ fn records_round_trip_through_json() {
         serde_json::from_str::<CaptureRecord>(&line).unwrap(),
         record()
     );
+}
+
+/// A line exactly as the gateway wrote it before the `endpoint` field
+/// existed, pasted verbatim rather than generated: the point of the test is
+/// that a file on someone's disk today keeps parsing after they upgrade, and
+/// a fixture built from the current struct could never prove that.
+const PRE_N13_LINE: &str = r#"{"ts":1767225600123,"session":"1a2b3c4d","server":"github","tool":"create_issue","kind":"call","duration_ms":42,"ok":true,"args":"{\"title\":\"bug\"}","response":"{\"content\":[]}"}"#;
+
+#[test]
+fn a_line_written_before_endpoints_still_parses() {
+    let record: CaptureRecord = serde_json::from_str(PRE_N13_LINE).unwrap();
+    assert_eq!(record.session, "1a2b3c4d");
+    assert_eq!(record.server, "github");
+    assert_eq!(record.tool.as_deref(), Some("create_issue"));
+    assert_eq!(record.kind, Kind::Call);
+    // Absent, not empty: nothing about an old line says which face took it.
+    assert_eq!(record.endpoint, None);
+    // And it round-trips back to the same bytes, so re-emitting a parsed old
+    // line (which `watch --json` does) neither invents nor drops a field.
+    assert_eq!(serde_json::to_string(&record).unwrap(), PRE_N13_LINE);
+}
+
+#[test]
+fn an_endpoint_survives_the_round_trip() {
+    let record = record().with_endpoint("s/github");
+    let line = serde_json::to_string(&record).unwrap();
+    assert!(line.contains(r#""endpoint":"s/github""#), "{line}");
+    assert_eq!(
+        serde_json::from_str::<CaptureRecord>(&line).unwrap(),
+        record
+    );
+}
+
+#[test]
+fn a_session_fingerprint_is_stable_and_hides_its_input() {
+    let raw = "9a3f1c88-4d0e-4a6b-9f2e-1c5d7b3a0e64";
+    let digest = session_fingerprint(raw);
+    assert_eq!(digest.len(), 8);
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()), "{digest}");
+    // Same session, same id — that is the whole of attribution.
+    assert_eq!(digest, session_fingerprint(raw));
+    // Different sessions do not collide, and the credential never appears.
+    assert_ne!(
+        digest,
+        session_fingerprint("9a3f1c88-4d0e-4a6b-9f2e-1c5d7b3a0e65")
+    );
+    assert!(!raw.contains(&digest));
 }
 
 #[test]

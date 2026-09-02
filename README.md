@@ -89,14 +89,14 @@ and `mcpgw watch` follows it:
 ```
 $ mcpgw watch
 watching /Users/you/.local/share/mcpgw/traffic (Ctrl-C to stop)
-  now  ✓  github__create_issue               87ms
-  12s  ✓  linear tools/list                   4ms
-  30s  ✗  github__search_code               210ms  upstream "github" failed after 3 attempt(s)
+  now  ✓  [mcp] github__create_issue         87ms
+  12s  ✓  [s/linear] linear tools/list        4ms
+  30s  ✗  [mcp] github__search_code         210ms  upstream "github" failed after 3 attempt(s)
 ```
 
-Filter with `--server` / `--tool`, or take the lines with `--json` and pipe them
-into `jq`. Because it's a file, `watch` works on a gateway that was already
-running, and on yesterday's traffic.
+Filter with `--server` / `--tool` / `--endpoint` / `--session`, or take the
+lines with `--json` and pipe them into `jq`. Because it's a file, `watch` works
+on a gateway that was already running, and on yesterday's traffic.
 
 This is the gap the official MCP Inspector leaves: Inspector connects to a
 server *as its own client*, so what you see is the traffic Inspector itself

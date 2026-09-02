@@ -322,9 +322,13 @@ async fn capture_records_every_upstream_list_and_call() {
         "{records:#?}"
     );
 
-    // Every record is stamped with the writer's session, and calls carry
-    // both sides of the exchange.
-    assert!(records.iter().all(|r| r.session == writer.session()));
+    // One client means one downstream session: every record carries the same
+    // id, and it is the client's, not the gateway process's fallback.
+    let session = records[0].session.clone();
+    assert!(records.iter().all(|r| r.session == session), "{records:#?}");
+    assert_ne!(session, writer.session());
+
+    // Calls carry both sides of the exchange.
     let good_call = &records[2];
     assert_eq!(good_call.args.as_deref(), Some(r#"{"message":"hi"}"#));
     assert!(good_call.response.as_deref().unwrap().contains("hi"));
@@ -774,6 +778,85 @@ async fn per_server_traffic_is_captured_under_the_right_server() {
     assert_eq!(
         shape,
         [(Kind::Call, "fx2", Some("echo"), true)],
+        "{records:#?}"
+    );
+    assert_eq!(records[0].endpoint.as_deref(), Some("s/fx2"));
+}
+
+/// The reason N13 exists: a daemon serving several harnesses at once has to
+/// be able to say which of them made a call. Two clients on two endpoints
+/// must not share a session id, and each record must name the face it
+/// arrived on.
+#[tokio::test]
+async fn concurrent_clients_are_attributed_to_their_own_sessions_and_endpoints() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) =
+        serve_both(&[("fx1", "healthy"), ("fx2", "healthy")], Some(&writer)).await;
+
+    let one = client_at(addr, &endpoint_path("fx1")).await;
+    let two = client_at(addr, &endpoint_path("fx2")).await;
+    let aggregate = client_at(addr, "/mcp").await;
+    let (first, second, third) = tokio::join!(
+        one.call_tool(call("echo", "from one")),
+        two.call_tool(call("echo", "from two")),
+        aggregate.call_tool(call("fx1__echo", "from the aggregate")),
+    );
+    first.unwrap();
+    second.unwrap();
+    third.unwrap();
+    for client in [one, two, aggregate] {
+        client.cancel().await.unwrap();
+    }
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    let by_endpoint: BTreeMap<&str, &CaptureRecord> = records
+        .iter()
+        .map(|r| (r.endpoint.as_deref().unwrap_or("<none>"), r))
+        .collect();
+    assert_eq!(
+        by_endpoint.keys().copied().collect::<Vec<_>>(),
+        ["mcp", "s/fx1", "s/fx2"],
+        "{records:#?}"
+    );
+    // The aggregate still resolves the prefix to the real upstream, so the
+    // endpoint and the server are independent facts about one call.
+    assert_eq!(by_endpoint["mcp"].server, "fx1");
+    assert_eq!(by_endpoint["s/fx1"].server, "fx1");
+    assert_eq!(by_endpoint["s/fx2"].server, "fx2");
+
+    // Three connections, three distinct sessions, none of them the
+    // per-process fallback.
+    let sessions: std::collections::BTreeSet<&str> =
+        records.iter().map(|r| r.session.as_str()).collect();
+    assert_eq!(sessions.len(), 3, "{records:#?}");
+    assert!(!sessions.contains(writer.session()), "{records:#?}");
+}
+
+/// The id follows the transport session, not the client: reconnecting is a
+/// new session and reads as one, which is what makes "who is calling right
+/// now" answerable at all.
+#[tokio::test]
+async fn reconnecting_starts_a_new_session() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) = serve_both(&[("fx", "healthy")], Some(&writer)).await;
+
+    for message in ["first", "second"] {
+        let client = client_at(addr, &endpoint_path("fx")).await;
+        client.call_tool(call("echo", message)).await.unwrap();
+        client.cancel().await.unwrap();
+    }
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    assert_eq!(records.len(), 2, "{records:#?}");
+    assert_ne!(records[0].session, records[1].session, "{records:#?}");
+    assert!(
+        records
+            .iter()
+            .all(|r| r.endpoint.as_deref() == Some("s/fx")),
         "{records:#?}"
     );
 }

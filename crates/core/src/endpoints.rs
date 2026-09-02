@@ -37,6 +37,23 @@ pub fn endpoint_path(name: &str) -> String {
     format!("{PREFIX}/{name}")
 }
 
+/// How the aggregate face names itself in capture records.
+pub const AGGREGATE_LABEL: &str = "mcp";
+
+/// How `name`'s endpoint names itself in capture records: the path without
+/// its leading slash, e.g. `s/github`.
+///
+/// Slash-free would be prettier in a column, but a label that is one keystroke
+/// away from the URL people paste into a client config is the one they will
+/// guess when typing `watch --endpoint`.
+#[must_use]
+pub fn endpoint_label(name: &str) -> String {
+    endpoint_path(name)
+        .strip_prefix('/')
+        .unwrap_or(name)
+        .to_owned()
+}
+
 /// Rewrites `base`'s path to `name`'s endpoint, keeping scheme, host and
 /// port. Used to turn the default gateway URL into a per-server one.
 ///
@@ -66,6 +83,10 @@ impl EndpointTable {
         let services = gateways
             .into_iter()
             .map(|(name, gateway)| {
+                // Stamped here rather than by the caller: the table is what
+                // decides which path a gateway answers on, so it is the only
+                // place the label cannot drift away from the route.
+                let gateway = gateway.with_endpoint(endpoint_label(&name));
                 let service = StreamableHttpService::new(
                     move || Ok(gateway.clone()),
                     LocalSessionManager::default().into(),

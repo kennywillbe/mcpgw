@@ -1,0 +1,5 @@
+---
+source: crates/cli/src/commands/watch.rs
+expression: "render_line(&call().with_endpoint(\"s/github\"), NOW, false)"
+---
+  12s  ✓  [s/github] github__create_issue    87ms

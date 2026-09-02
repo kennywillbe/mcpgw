@@ -30,6 +30,14 @@ pub struct WatchArgs {
     /// Only show traffic for this tool (bare name, without the server prefix)
     #[arg(long, value_name = "NAME")]
     pub tool: Option<String>,
+    /// Only show traffic that arrived on this gateway endpoint (e.g. s/github
+    /// or mcp; a leading slash is accepted)
+    #[arg(long, value_name = "ENDPOINT")]
+    pub endpoint: Option<String>,
+    /// Only show traffic from this downstream session (the `session` field of
+    /// a captured line)
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
     /// Stream the JSONL lines instead of the rendered stream
     #[arg(long)]
     pub json: bool,
@@ -46,6 +54,7 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
         println!("watching {} (Ctrl-C to stop)", dir.display());
     }
 
+    let filters = Filters::new(args);
     let mut tail = Tail::new(daily_path(&dir, now_millis()));
     loop {
         // Re-resolved every round: at midnight the gateway starts a new file
@@ -60,7 +69,7 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
                 // format) is skipped rather than ending the stream.
                 continue;
             };
-            if !matches(&record, args.server.as_deref(), args.tool.as_deref()) {
+            if !filters.matches(&record) {
                 continue;
             }
             if args.json {
@@ -175,14 +184,50 @@ fn json_line(record: &CaptureRecord) -> String {
         .unwrap_or_else(|err| format!(r#"{{"error":"unserializable capture record: {err}"}}"#))
 }
 
-/// Whether a record passes the `--server` / `--tool` filters. A tool filter
-/// excludes `tools/list` records, which name no tool.
-fn matches(record: &CaptureRecord, server: Option<&str>, tool: Option<&str>) -> bool {
-    server.is_none_or(|want| record.server == want)
-        && tool.is_none_or(|want| record.tool.as_deref() == Some(want))
+/// The `--server` / `--tool` / `--endpoint` / `--session` narrowing, all of
+/// which have to pass for a record to be shown.
+#[derive(Default)]
+struct Filters<'a> {
+    server: Option<&'a str>,
+    tool: Option<&'a str>,
+    endpoint: Option<&'a str>,
+    session: Option<&'a str>,
 }
 
-/// One line of the human stream: age, outcome, target, latency, error.
+impl<'a> Filters<'a> {
+    fn new(args: &'a WatchArgs) -> Self {
+        Self {
+            server: args.server.as_deref(),
+            tool: args.tool.as_deref(),
+            // The label in a record has no leading slash, but the thing a user
+            // has in front of them is the URL path they pasted into a client
+            // config, so `/s/github` has to mean what `s/github` means.
+            endpoint: args
+                .endpoint
+                .as_deref()
+                .map(|want| want.strip_prefix('/').unwrap_or(want)),
+            session: args.session.as_deref(),
+        }
+    }
+
+    /// Whether `record` passes every active filter. A tool filter excludes
+    /// `tools/list` records, which name no tool; an endpoint filter likewise
+    /// excludes lines written before endpoints were recorded, since there is
+    /// no honest way to guess which face they arrived on.
+    fn matches(&self, record: &CaptureRecord) -> bool {
+        self.server.is_none_or(|want| record.server == want)
+            && self
+                .tool
+                .is_none_or(|want| record.tool.as_deref() == Some(want))
+            && self
+                .endpoint
+                .is_none_or(|want| record.endpoint.as_deref() == Some(want))
+            && self.session.is_none_or(|want| record.session == want)
+    }
+}
+
+/// One line of the human stream: age, outcome, endpoint, target, latency,
+/// error.
 fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
     let target = match (record.kind, record.tool.as_deref()) {
         // A tool call is shown under the name a client would type for it.
@@ -196,6 +241,15 @@ fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
         // — the prompt, the resource URI, the argument being completed.
         (kind, Some(subject)) => format!("{} {} {subject}", record.server, kind.method()),
         (kind, None) => format!("{} {}", record.server, kind.method()),
+    };
+    // Bracketed in front of the target rather than given a column of its own:
+    // the widths a real log mixes (`mcp`, `s/github`, nothing at all) would
+    // make a fixed column either ragged or wasteful, and the existing pad
+    // absorbs the prefix for free. Lines with no endpoint — stdio traffic and
+    // anything captured before N13 — render exactly as they always did.
+    let target = match &record.endpoint {
+        Some(endpoint) => format!("[{endpoint}] {target}"),
+        None => target,
     };
     let mark = if record.ok { "✓" } else { "✗" };
     let mark = if color {
@@ -310,13 +364,61 @@ mod tests {
     #[test]
     fn filters_narrow_by_server_and_tool() {
         let call = call();
-        assert!(matches(&call, None, None));
-        assert!(matches(&call, Some("github"), Some("create_issue")));
-        assert!(!matches(&call, Some("linear"), None));
-        assert!(!matches(&call, None, Some("other")));
+        let filters = |server, tool| Filters {
+            server,
+            tool,
+            ..Filters::default()
+        };
+        assert!(filters(None, None).matches(&call));
+        assert!(filters(Some("github"), Some("create_issue")).matches(&call));
+        assert!(!filters(Some("linear"), None).matches(&call));
+        assert!(!filters(None, Some("other")).matches(&call));
         // tools/list names no tool, so a tool filter hides it.
-        assert!(matches(&list(), Some("linear"), None));
-        assert!(!matches(&list(), None, Some("create_issue")));
+        assert!(filters(Some("linear"), None).matches(&list()));
+        assert!(!filters(None, Some("create_issue")).matches(&list()));
+    }
+
+    #[test]
+    fn filters_narrow_by_endpoint() {
+        let on_endpoint = call().with_endpoint("s/github");
+        let filters = |endpoint| Filters {
+            endpoint,
+            ..Filters::default()
+        };
+        assert!(filters(Some("s/github")).matches(&on_endpoint));
+        assert!(!filters(Some("s/linear")).matches(&on_endpoint));
+        assert!(!filters(Some("mcp")).matches(&on_endpoint));
+        // A record from before the field existed cannot claim an endpoint.
+        assert!(!filters(Some("s/github")).matches(&call()));
+        assert!(filters(None).matches(&call()));
+    }
+
+    #[test]
+    fn an_endpoint_filter_takes_the_path_the_user_pasted() {
+        let args = WatchArgs {
+            server: None,
+            tool: None,
+            endpoint: Some("/s/github".to_owned()),
+            session: None,
+            json: false,
+            show_secrets: false,
+        };
+        assert!(Filters::new(&args).matches(&call().with_endpoint("s/github")));
+    }
+
+    #[test]
+    fn filters_narrow_by_session() {
+        let filters = |session| Filters {
+            session,
+            ..Filters::default()
+        };
+        assert!(filters(Some("s3ss")).matches(&call()));
+        assert!(!filters(Some("0ther")).matches(&call()));
+    }
+
+    #[test]
+    fn the_endpoint_shows_in_the_rendered_line() {
+        insta::assert_snapshot!(render_line(&call().with_endpoint("s/github"), NOW, false));
     }
 
     #[test]

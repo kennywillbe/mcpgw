@@ -50,6 +50,7 @@ pub struct Gateway {
     mode: Mode,
     unavailable_hint: Option<String>,
     capture: Option<Arc<CaptureWriter>>,
+    endpoint: Option<String>,
     request_timeout: Duration,
 }
 
@@ -63,6 +64,7 @@ impl Gateway {
             mode: Mode::Pipe(upstream),
             unavailable_hint: None,
             capture: None,
+            endpoint: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -77,6 +79,7 @@ impl Gateway {
             mode: Mode::Aggregate(upstreams),
             unavailable_hint: None,
             capture: None,
+            endpoint: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
@@ -100,6 +103,15 @@ impl Gateway {
         self
     }
 
+    /// Names the face this gateway serves — `s/github`, `mcp` — so every
+    /// record it writes says which endpoint the request arrived on. Left
+    /// unset for the stdio face, which has no path to name.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
     /// Overrides [`DEFAULT_REQUEST_TIMEOUT`] for this gateway. Exists so the
     /// deployment can tighten or relax the ceiling (and so the suite can make
     /// it tiny); no CLI flag surfaces it yet.
@@ -114,13 +126,41 @@ impl Gateway {
         &self.manager
     }
 
+    /// Which downstream client a request belongs to, or `None` when the
+    /// transport cannot say.
+    ///
+    /// rmcp's Streamable HTTP service injects the HTTP [`http::request::Parts`]
+    /// into every request's extensions, which is where the `Mcp-Session-Id`
+    /// its session manager minted at `initialize` is legible from a handler.
+    /// That id — not the MCP protocol, which dropped sessions in 2026-07-28
+    /// (SEP-2567) — is the only thing that survives to identify one downstream
+    /// connection, so it is what attribution is built on. It is fingerprinted
+    /// rather than stored, because the raw value is a session credential; see
+    /// [`session_fingerprint`](crate::capture::session_fingerprint).
+    ///
+    /// `None` covers the stdio face and any HTTP client negotiating a version
+    /// with no sessions: those requests are attributed to the gateway process
+    /// instead, which is the pre-N13 behaviour and cannot separate clients.
+    fn session_of(context: &RequestContext<RoleServer>) -> Option<String> {
+        let parts = context.extensions.get::<http::request::Parts>()?;
+        let id = parts.headers.get("mcp-session-id")?.to_str().ok()?;
+        Some(crate::capture::session_fingerprint(id))
+    }
+
     /// Writes one record, if capture is on. Deliberately a blocking append
     /// on the request path: a record is a few hundred bytes to an appended
     /// file, which costs far less than the channel and flush machinery that
     /// moving it off-thread would need. Capture never fails a request.
-    fn record(&self, build: impl FnOnce(&str) -> CaptureRecord) {
+    ///
+    /// `session` is the downstream session from [`Gateway::session_of`]; the
+    /// writer's per-process id stands in when there was none.
+    fn record(&self, session: Option<&str>, build: impl FnOnce(&str) -> CaptureRecord) {
         let Some(writer) = &self.capture else { return };
-        if let Err(err) = writer.append(&build(writer.session())) {
+        let mut record = build(session.unwrap_or_else(|| writer.session()));
+        // Stamped centrally: the endpoint is a property of this gateway, not
+        // of any one request, so no call site can forget it.
+        record.endpoint.clone_from(&self.endpoint);
+        if let Err(err) = writer.append(&record) {
             eprintln!("warning: could not write traffic capture: {err}");
         }
     }
@@ -210,6 +250,7 @@ impl Gateway {
     /// `describe` renders the successful answer for the same record.
     async fn forward<T, F>(
         &self,
+        session: Option<&str>,
         upstream: &str,
         kind: Kind,
         subject: Option<String>,
@@ -229,7 +270,7 @@ impl Gateway {
             })
             .await;
         let elapsed = started.elapsed();
-        self.record(|session| {
+        self.record(session, |session| {
             let mut record = CaptureRecord::new(session, upstream, kind, elapsed);
             if let Some(subject) = subject {
                 record = record.with_tool(subject);
@@ -246,7 +287,11 @@ impl Gateway {
     /// `server__` prefixes. An upstream that cannot answer is reported on
     /// the gateway console and omitted: degraded, but never silent and never
     /// fatal for the healthy upstreams.
-    async fn aggregate_tools(&self, upstreams: &[String]) -> ListToolsResult {
+    async fn aggregate_tools(
+        &self,
+        session: Option<&str>,
+        upstreams: &[String],
+    ) -> ListToolsResult {
         let mut tasks = tokio::task::JoinSet::new();
         for name in upstreams {
             let manager = Arc::clone(&self.manager);
@@ -284,7 +329,7 @@ impl Gateway {
             };
             // Every upstream attempt is recorded, failures included — a
             // degraded merge is exactly what `watch` needs to show.
-            self.record(|session| {
+            self.record(session, |session| {
                 let record = CaptureRecord::new(session, &name, Kind::List, elapsed);
                 match &tools {
                     Ok(tools) => record.with_response(format!("{} tool(s)", tools.len())),
@@ -376,8 +421,9 @@ impl ServerHandler for Gateway {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let session = Self::session_of(&context);
         match &self.mode {
             Mode::Pipe(upstream) => {
                 let started = Instant::now();
@@ -391,7 +437,7 @@ impl ServerHandler for Gateway {
                     })
                     .await;
                 let elapsed = started.elapsed();
-                self.record(|session| {
+                self.record(session.as_deref(), |session| {
                     let record = CaptureRecord::new(session, upstream, Kind::List, elapsed);
                     match &tools {
                         Ok(tools) => record.with_response(format!("{} tool(s)", tools.len())),
@@ -403,15 +449,18 @@ impl ServerHandler for Gateway {
                     ..ListToolsResult::default()
                 })
             }
-            Mode::Aggregate(upstreams) => Ok(self.aggregate_tools(upstreams).await),
+            Mode::Aggregate(upstreams) => {
+                Ok(self.aggregate_tools(session.as_deref(), upstreams).await)
+            }
         }
     }
 
     async fn call_tool(
         &self,
         mut request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let session = Self::session_of(&context);
         let upstream = match &self.mode {
             Mode::Pipe(upstream) => upstream.clone(),
             Mode::Aggregate(upstreams) => {
@@ -451,7 +500,7 @@ impl ServerHandler for Gateway {
             .await;
         let elapsed = started.elapsed();
 
-        self.record(|session| {
+        self.record(session.as_deref(), |session| {
             let mut record =
                 CaptureRecord::new(session, &upstream, Kind::Call, elapsed).with_tool(&tool);
             if let Some(args) = args.clone() {
@@ -468,7 +517,7 @@ impl ServerHandler for Gateway {
     async fn list_resources(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
             return Ok(ListResourcesResult::default());
@@ -477,6 +526,7 @@ impl ServerHandler for Gateway {
         // does it: the cursor a pipe hands back came from the one upstream
         // that will be asked for the next page, so it stays meaningful.
         self.forward(
+            Self::session_of(&context).as_deref(),
             upstream,
             Kind::Resources,
             None,
@@ -489,12 +539,13 @@ impl ServerHandler for Gateway {
     async fn list_resource_templates(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
             return Ok(ListResourceTemplatesResult::default());
         };
         self.forward(
+            Self::session_of(&context).as_deref(),
             upstream,
             Kind::ResourceTemplates,
             None,
@@ -507,7 +558,7 @@ impl ServerHandler for Gateway {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
             // The aggregate serves no resources, so the honest answer is the
@@ -520,6 +571,7 @@ impl ServerHandler for Gateway {
         // is the one that can ask a human, and a pipe must not swallow a
         // round it cannot complete.
         self.forward(
+            Self::session_of(&context).as_deref(),
             upstream,
             Kind::ResourceRead,
             Some(uri),
@@ -537,12 +589,13 @@ impl ServerHandler for Gateway {
     async fn list_prompts(
         &self,
         request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
             return Ok(ListPromptsResult::default());
         };
         self.forward(
+            Self::session_of(&context).as_deref(),
             upstream,
             Kind::Prompts,
             None,
@@ -555,13 +608,14 @@ impl ServerHandler for Gateway {
     async fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
             return Err(ErrorData::method_not_found::<GetPromptRequestMethod>());
         };
         let name = request.name.clone();
         self.forward(
+            Self::session_of(&context).as_deref(),
             upstream,
             Kind::PromptGet,
             Some(name),
@@ -579,7 +633,7 @@ impl ServerHandler for Gateway {
     async fn complete(
         &self,
         request: CompleteRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
             // An empty completion, which is what rmcp's default answers and
@@ -588,6 +642,7 @@ impl ServerHandler for Gateway {
         };
         let argument = request.argument.name.clone();
         self.forward(
+            Self::session_of(&context).as_deref(),
             upstream,
             Kind::Complete,
             Some(argument),
@@ -652,6 +707,9 @@ pub async fn serve_http_with(
         StreamableHttpServerConfig, StreamableHttpService,
     };
 
+    // The aggregate learns its own name here for the same reason the endpoint
+    // table stamps its pipes: this function owns the `/mcp` route.
+    let gateway = gateway.with_endpoint(crate::endpoints::AGGREGATE_LABEL);
     let service = StreamableHttpService::new(
         move || Ok(gateway.clone()),
         LocalSessionManager::default().into(),
