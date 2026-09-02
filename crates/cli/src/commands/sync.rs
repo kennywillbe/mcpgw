@@ -1,14 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
+use mcpgw_core::clients::codec::ClientDocument;
 use mcpgw_core::sync::{
-    GATEWAY_NAME, apply_plan_to, gateway_server, per_server_gateway_servers, plan_client_context,
-    plan_sync,
+    GATEWAY_NAME, SyncPlan, apply_plan_to, gateway_server, per_server_gateway_servers,
+    plan_client_context, plan_sync,
 };
-use mcpgw_core::{ClientKind, Config, Detection, Error, backup, paths, state::ManagedState};
+use mcpgw_core::{
+    ClientKind, Config, Detection, Error, Server, backup, paths, state::ManagedState,
+};
 use owo_colors::OwoColorize as _;
 
 // The flags are a flat description of a command line, not state to model: how
@@ -86,77 +89,153 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
                 println!("{} — {text}", kind.display_name());
             }
         };
-        let (path, exists) = match resolve_target(kind) {
-            Ok(target) => target,
-            Err(reason) => {
-                heading(reason);
+        let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
+        let gateway_desired = gateway_entries(kind, args, &canonical, bridge.as_deref())?;
+        let desired = gateway_desired.as_ref().unwrap_or(&canonical);
+        let mut planned = match plan_client(kind, desired, &managed)? {
+            Planned::Ready(planned) => planned,
+            Planned::Skipped(reason) => {
+                heading(&reason);
                 continue;
             }
         };
 
-        let codec = kind.codec();
-        let mut doc = if exists {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("cannot read {}", path.display()))?;
-            match codec.parse_document(&text) {
-                Ok(doc) => doc,
-                // Hand-broken, or JSONC in a client whose format is strict
-                // JSON: refuse to rewrite what we cannot faithfully parse.
-                Err(err) => {
-                    heading(&format!(
-                        "skipped: {} is not {} ({err}); fix or sync it manually",
-                        path.display(),
-                        codec.format_name()
-                    ));
-                    continue;
-                }
-            }
-        } else {
-            codec.empty_document()
-        };
+        heading(&describe(&planned.plan));
+        print_plan_lines(&planned.plan, color);
 
-        let current = doc.entries(codec.root);
-        let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
-        let gateway_desired = gateway_entries(kind, args, &canonical, bridge.as_deref())?;
-        let desired = gateway_desired.as_ref().unwrap_or(&canonical);
-        let mut plan = plan_sync(kind, &current, desired, &managed);
-        plan_client_context(kind, &doc.to_value(), &mut plan);
-
-        heading(&describe(&plan));
-        print_plan_lines(&plan, color);
-
-        if !plan.has_changes() {
+        if !planned.plan.has_changes() {
             continue;
         }
         if args.dry_run {
             continue;
         }
 
-        // In memory and before anything on disk moves, so a refusal costs
-        // neither a backup nor a state entry claiming what was never written.
-        if let Err(err) = apply_plan_to(kind, &mut doc, &plan) {
-            println!(
-                "  refused: {err} in {} — nothing written; `mcpgw doctor` reports the same problem",
-                path.display()
-            );
-            continue;
+        if let Applied::Refused(reason) =
+            apply_client(&mut planned, &mut state, &state_dir, &state_path)?
+        {
+            println!("  {reason}");
         }
-        if exists {
-            backup::backup_file(&state_dir, kind.id(), &path)?;
-        }
-        // Intent first: the state file records what this run is about to
-        // write *before* the client file is touched. A crash in between then
-        // leaves entries claimed but absent, which the next sync sees as
-        // plain adds and repairs. The reverse order fails the other way —
-        // entries in the client file that mcpgw never claimed are foreign
-        // forever, and sync refuses to touch them.
-        state
-            .clients
-            .insert(kind.id().to_owned(), plan.managed_after());
-        state.save(&state_path)?;
-        write_text(&path, &doc.to_text()?)?;
     }
     Ok(())
+}
+
+/// One client's sync, read and planned but not yet applied.
+///
+/// It exists so the wizard's sync step can show a plan for every client, ask
+/// once for the whole set, and then apply exactly what `mcpgw sync` applies —
+/// backups, state bookkeeping and all — rather than growing a second copy of
+/// any of it.
+pub struct PlannedClient {
+    pub kind: ClientKind,
+    pub path: PathBuf,
+    /// Whether the file was already there. One that was not is created, and
+    /// there is nothing to back up.
+    exists: bool,
+    doc: ClientDocument,
+    pub plan: SyncPlan,
+}
+
+/// The outcome of reading and planning one client.
+pub enum Planned {
+    Ready(Box<PlannedClient>),
+    /// Why this client has nothing to plan, in the words `sync` prints.
+    Skipped(String),
+}
+
+/// Reads one client and plans `desired` over what it holds.
+///
+/// # Errors
+///
+/// Returns a failure only if a client file that is there cannot be read; a
+/// file that cannot be *parsed* is a skip rather than an error, because the
+/// remaining clients are still worth syncing.
+pub fn plan_client(
+    kind: ClientKind,
+    desired: &BTreeMap<String, Server>,
+    managed: &BTreeSet<String>,
+) -> anyhow::Result<Planned> {
+    let (path, exists) = match resolve_target(kind) {
+        Ok(target) => target,
+        Err(reason) => return Ok(Planned::Skipped(reason.to_owned())),
+    };
+
+    let codec = kind.codec();
+    let doc = if exists {
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        match codec.parse_document(&text) {
+            Ok(doc) => doc,
+            // Hand-broken, or JSONC in a client whose format is strict
+            // JSON: refuse to rewrite what we cannot faithfully parse.
+            Err(err) => {
+                return Ok(Planned::Skipped(format!(
+                    "skipped: {} is not {} ({err}); fix or sync it manually",
+                    path.display(),
+                    codec.format_name()
+                )));
+            }
+        }
+    } else {
+        codec.empty_document()
+    };
+
+    let current = doc.entries(codec.root);
+    let mut plan = plan_sync(kind, &current, desired, managed);
+    plan_client_context(kind, &doc.to_value(), &mut plan);
+
+    Ok(Planned::Ready(Box::new(PlannedClient {
+        kind,
+        path,
+        exists,
+        doc,
+        plan,
+    })))
+}
+
+/// What applying a planned client did.
+pub enum Applied {
+    Written,
+    /// The plan could not be applied to the parsed document, so nothing was
+    /// written; the string says why, ready to print.
+    Refused(String),
+}
+
+/// Writes one planned client: the document, then a backup of what is on
+/// disk, then the state claim, then the file itself.
+///
+/// # Errors
+///
+/// Returns a failure if the backup, the state file or the client file cannot
+/// be written.
+pub fn apply_client(
+    planned: &mut PlannedClient,
+    state: &mut ManagedState,
+    state_dir: &Path,
+    state_path: &Path,
+) -> anyhow::Result<Applied> {
+    // In memory and before anything on disk moves, so a refusal costs
+    // neither a backup nor a state entry claiming what was never written.
+    if let Err(err) = apply_plan_to(planned.kind, &mut planned.doc, &planned.plan) {
+        return Ok(Applied::Refused(format!(
+            "refused: {err} in {} — nothing written; `mcpgw doctor` reports the same problem",
+            planned.path.display()
+        )));
+    }
+    if planned.exists {
+        backup::backup_file(state_dir, planned.kind.id(), &planned.path)?;
+    }
+    // Intent first: the state file records what this run is about to write
+    // *before* the client file is touched. A crash in between then leaves
+    // entries claimed but absent, which the next sync sees as plain adds and
+    // repairs. The reverse order fails the other way — entries in the client
+    // file that mcpgw never claimed are foreign forever, and sync refuses to
+    // touch them.
+    state
+        .clients
+        .insert(planned.kind.id().to_owned(), planned.plan.managed_after());
+    state.save(state_path)?;
+    write_text(&planned.path, &planned.doc.to_text()?)?;
+    Ok(Applied::Written)
 }
 
 /// Prints what this run is about to do and resolves the stdio bridge command
@@ -219,7 +298,7 @@ fn gateway_entries(
 
 /// The file this client's sync reads and writes, and whether it is there
 /// already — or the reason there is nothing to sync.
-fn resolve_target(kind: ClientKind) -> Result<(std::path::PathBuf, bool), &'static str> {
+fn resolve_target(kind: ClientKind) -> Result<(PathBuf, bool), &'static str> {
     match kind.detect() {
         Detection::NotInstalled => Err("not found, skipped"),
         Detection::Installed => kind
@@ -235,7 +314,8 @@ fn resolve_target(kind: ClientKind) -> Result<(std::path::PathBuf, bool), &'stat
 /// The bare name keeps working across upgrades and is what a user reading the
 /// client file expects; the absolute path is the fallback for an mcpgw that
 /// was never put on PATH (a downloaded binary run in place).
-fn bridge_command() -> String {
+#[must_use]
+pub fn bridge_command() -> String {
     if which::which("mcpgw").is_ok() {
         return "mcpgw".to_owned();
     }

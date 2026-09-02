@@ -341,7 +341,7 @@ fn run_probes(
 }
 
 /// What one managed entry's endpoint answered.
-enum GatewayOutcome {
+pub(super) enum GatewayOutcome {
     Ok(ProbeSuccess),
     /// The gateway is up but serves nothing there; the string is its own
     /// answer, which names what it does serve. Reported as findings rather
@@ -434,7 +434,7 @@ fn run_gateway_probes(
 /// No headers are sent: the gateway has no authentication yet (`serve` says
 /// so out loud when bound off loopback), so anything an entry carries is for
 /// an upstream the gateway holds, not for the gateway itself.
-async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutcome {
+pub(super) async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutcome {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
@@ -490,7 +490,7 @@ fn heading(text: &str, color: bool) {
     }
 }
 
-fn ok_line(line: &str, color: bool) {
+pub(super) fn ok_line(line: &str, color: bool) {
     if color {
         println!("  {} {line}", "✓".green());
     } else {
@@ -498,7 +498,7 @@ fn ok_line(line: &str, color: bool) {
     }
 }
 
-fn bad_line(line: &str, color: bool) {
+pub(super) fn bad_line(line: &str, color: bool) {
     if color {
         println!("  {} {line}", "✗".red());
     } else {
