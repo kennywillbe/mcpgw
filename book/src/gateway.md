@@ -68,6 +68,16 @@ the server wrote them: caching metadata, `_meta`, and pagination cursors all
 survive the hop, and a client pages through a long `tools/list` against the
 server's own cursors instead of being handed one list the gateway assembled.
 
+The one thing the gateway does adjust is the protocol revision, because the two
+sides of it need not agree. A current client speaks MCP 2026-07-28, where every
+result carries `resultType` and lists carry `ttlMs` and `cacheScope`; the server
+behind the gateway may predate all three. The gateway fills in what the client's
+revision requires and never overwrites what the server actually said, so each
+client gets a reply that is valid for the revision it negotiated. A server that
+gave no freshness hint is reported as `ttlMs: 0`, `cacheScope: private` — "ask
+again, and do not share it": the gateway will not invent a caching policy on a
+server's behalf, and the answer was fetched with your credentials.
+
 `/mcp` serves tools only, and that is deliberate. Tools can be namespaced
 (`github__create_issue`); resource URIs and prompt names cannot. Two servers
 can both offer `file:///README.md` — one name, two different documents — and

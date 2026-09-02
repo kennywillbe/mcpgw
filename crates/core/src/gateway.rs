@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult, ErrorData,
-    GetPromptRequestMethod, GetPromptRequestParams, GetPromptResponse, Implementation,
+    CacheScope, CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult,
+    ErrorData, GetPromptRequestMethod, GetPromptRequestParams, GetPromptResponse, Implementation,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, PromptsCapability, ReadResourceRequestMethod,
-    ReadResourceRequestParams, ReadResourceResponse, ResourcesCapability, ServerCapabilities,
-    ServerInfo, Tool, ToolsCapability,
+    PaginatedRequestParams, PromptsCapability, ProtocolVersion, ReadResourceRequestMethod,
+    ReadResourceRequestParams, ReadResourceResponse, ResourcesCapability, ResultType,
+    ServerCapabilities, ServerInfo, Tool, ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
 
@@ -427,6 +427,120 @@ fn forwarded(upstream: &ServerCapabilities) -> ServerCapabilities {
     capabilities
 }
 
+/// The revision that made `resultType` required on every result (SEP-2322)
+/// and `ttlMs`/`cacheScope` required on the cacheable ones (SEP-2549).
+const STRICT_RESULTS: ProtocolVersion = ProtocolVersion::V_2026_07_28;
+
+/// Makes `result` self-consistent with the revision the *downstream* session
+/// negotiated — which is the only revision it has to be consistent with,
+/// whoever actually produced it.
+///
+/// A pipe holds two protocol conversations and nothing makes them agree. A
+/// client reaches us over the 2026-07-28 lifecycle (no handshake: the
+/// revision travels in each request's `_meta`), while the upstream
+/// connection behind it negotiated 2025-11-25, because that is the newest
+/// revision rmcp still has an `initialize` handshake for. Relaying that
+/// reply untouched hands a 2026-07-28 client a result shaped for the older
+/// revision — no `resultType`, no `ttlMs`/`cacheScope` — and a client that
+/// validates against the revision it negotiated rejects the whole answer.
+/// That is what "Connected · tools fetch failed" looked like in the field,
+/// with the upstream perfectly healthy and the request logged as a success.
+///
+/// Only absent fields are filled: an upstream that speaks 2026-07-28 already
+/// said what it meant, and a pipe does not second-guess it. Nothing is
+/// stripped on the way to an older client either — results are open to
+/// fields a client does not know, and a client of an earlier revision
+/// ignores them, so removing them would only lose information.
+fn bridged<T: SelfConsistent>(context: &RequestContext<RoleServer>, mut result: T) -> T {
+    if context
+        .protocol_version()
+        .is_some_and(|version| version >= STRICT_RESULTS)
+    {
+        result.fill_required_fields();
+    }
+    result
+}
+
+/// A reply that can fill in the fields 2026-07-28 made mandatory.
+trait SelfConsistent {
+    fn fill_required_fields(&mut self);
+}
+
+/// `resultType` for the results that carry nothing else new.
+///
+/// `"complete"` is not a guess: the spec's own rule is that a result from an
+/// earlier-revision server which omits the field means `"complete"`. The
+/// pipe applies that reading on the client's behalf, because from where the
+/// client stands mcpgw is not an earlier-revision server and the exemption
+/// does not cover it.
+macro_rules! completes {
+    ($($result:ty),+ $(,)?) => {$(
+        impl SelfConsistent for $result {
+            fn fill_required_fields(&mut self) {
+                self.result_type.get_or_insert(ResultType::COMPLETE);
+            }
+        }
+    )+};
+}
+
+completes!(
+    CompleteResult,
+    rmcp::model::GetPromptResult,
+    rmcp::model::CallToolResult
+);
+
+/// The same, plus the SEP-2549 caching fields the revision requires on
+/// `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`
+/// and `resources/read`.
+///
+/// An upstream that never said how long its answer stays fresh has not given
+/// the pipe one to pass on, and inventing a freshness window would be the
+/// gateway making a promise the server never made: `ttlMs: 0` is the
+/// spec's "already stale", which asks the client to come back rather than
+/// reuse this. `private` because a pipe answers with the operator's own
+/// credentials attached — whatever comes back was fetched as one particular
+/// user, and no shared intermediary may hand it to another.
+macro_rules! completes_and_cacheable {
+    ($($result:ty),+ $(,)?) => {$(
+        impl SelfConsistent for $result {
+            fn fill_required_fields(&mut self) {
+                self.result_type.get_or_insert(ResultType::COMPLETE);
+                self.ttl_ms.get_or_insert(0);
+                self.cache_scope.get_or_insert(CacheScope::Private);
+            }
+        }
+    )+};
+}
+
+completes_and_cacheable!(
+    ListToolsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    ListPromptsResult,
+    rmcp::model::ReadResourceResult,
+);
+
+/// The multi-round-trip responses: only the completed branch is a result of
+/// an earlier revision's shape. `input_required` and task acknowledgements
+/// exist solely in 2026-07-28 and carry their own discriminator already.
+macro_rules! completes_when_complete {
+    ($($response:ty => $variant:path),+ $(,)?) => {$(
+        impl SelfConsistent for $response {
+            fn fill_required_fields(&mut self) {
+                if let $variant(result) = self {
+                    result.fill_required_fields();
+                }
+            }
+        }
+    )+};
+}
+
+completes_when_complete!(
+    CallToolResponse => CallToolResponse::Complete,
+    ReadResourceResponse => ReadResourceResponse::Complete,
+    GetPromptResponse => GetPromptResponse::Complete,
+);
+
 impl ServerHandler for Gateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
@@ -441,7 +555,7 @@ impl ServerHandler for Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let session = Self::session_of(&context);
-        match &self.mode {
+        let result = match &self.mode {
             // One request, one answer, handed back exactly as the upstream
             // wrote it. The pipe used to collect every page with
             // `list_all_tools` and rebuild the result around the tools it
@@ -463,7 +577,8 @@ impl ServerHandler for Gateway {
             Mode::Aggregate(upstreams) => {
                 Ok(self.aggregate_tools(session.as_deref(), upstreams).await)
             }
-        }
+        };
+        Ok(bridged(&context, result?))
     }
 
     async fn call_tool(
@@ -522,7 +637,7 @@ impl ServerHandler for Gateway {
                 Err(err) => record.with_error(&err.message),
             }
         });
-        response
+        Ok(bridged(&context, response?))
     }
 
     async fn list_resources(
@@ -531,7 +646,7 @@ impl ServerHandler for Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
-            return Ok(ListResourcesResult::default());
+            return Ok(bridged(&context, ListResourcesResult::default()));
         };
         // Pagination is forwarded rather than collapsed the way tools/list
         // does it: the cursor a pipe hands back came from the one upstream
@@ -545,6 +660,7 @@ impl ServerHandler for Gateway {
             |result| format!("{} resource(s)", result.resources.len()),
         )
         .await
+        .map(|result| bridged(&context, result))
     }
 
     async fn list_resource_templates(
@@ -553,7 +669,7 @@ impl ServerHandler for Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
-            return Ok(ListResourceTemplatesResult::default());
+            return Ok(bridged(&context, ListResourceTemplatesResult::default()));
         };
         self.forward(
             Self::session_of(&context).as_deref(),
@@ -564,6 +680,7 @@ impl ServerHandler for Gateway {
             |result| format!("{} template(s)", result.resource_templates.len()),
         )
         .await
+        .map(|result| bridged(&context, result))
     }
 
     async fn read_resource(
@@ -595,6 +712,7 @@ impl ServerHandler for Gateway {
             },
         )
         .await
+        .map(|result| bridged(&context, result))
     }
 
     async fn list_prompts(
@@ -603,7 +721,7 @@ impl ServerHandler for Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
         let Some(upstream) = self.pipe_upstream() else {
-            return Ok(ListPromptsResult::default());
+            return Ok(bridged(&context, ListPromptsResult::default()));
         };
         self.forward(
             Self::session_of(&context).as_deref(),
@@ -614,6 +732,7 @@ impl ServerHandler for Gateway {
             |result| format!("{} prompt(s)", result.prompts.len()),
         )
         .await
+        .map(|result| bridged(&context, result))
     }
 
     async fn get_prompt(
@@ -639,6 +758,7 @@ impl ServerHandler for Gateway {
             },
         )
         .await
+        .map(|result| bridged(&context, result))
     }
 
     async fn complete(
@@ -649,7 +769,7 @@ impl ServerHandler for Gateway {
         let Some(upstream) = self.pipe_upstream() else {
             // An empty completion, which is what rmcp's default answers and
             // what the spec expects of a server with nothing to suggest.
-            return Ok(CompleteResult::default());
+            return Ok(bridged(&context, CompleteResult::default()));
         };
         let argument = request.argument.name.clone();
         self.forward(
@@ -661,6 +781,7 @@ impl ServerHandler for Gateway {
             |result| format!("{} completion(s)", result.completion.values.len()),
         )
         .await
+        .map(|result| bridged(&context, result))
     }
 }
 

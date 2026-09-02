@@ -392,7 +392,7 @@ async fn raw_post(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
 /// test can read the body as well as the status line.
 async fn raw_post_to(addr: std::net::SocketAddr, path: &str, origin: Option<&str>) -> String {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-    raw_post_body(addr, path, origin, None, body).await
+    raw_post_body(addr, path, origin, &[], body).await
 }
 
 /// One raw POST with a caller-supplied body and optional session header,
@@ -402,7 +402,7 @@ async fn raw_post_body(
     addr: std::net::SocketAddr,
     path: &str,
     origin: Option<&str>,
-    session: Option<&str>,
+    extra: &[(&str, &str)],
     body: &str,
 ) -> String {
     use std::fmt::Write as _;
@@ -418,8 +418,8 @@ async fn raw_post_body(
     if let Some(origin) = origin {
         let _ = write!(request, "Origin: {origin}\r\n");
     }
-    if let Some(session) = session {
-        let _ = write!(request, "Mcp-Session-Id: {session}\r\n");
+    for (name, value) in extra {
+        let _ = write!(request, "{name}: {value}\r\n");
     }
     request.push_str("\r\n");
     request.push_str(body);
@@ -938,7 +938,13 @@ impl RawSession {
     }
 
     async fn post(&self, body: &str) -> String {
-        raw_post_body(self.addr, &self.path, None, self.session.as_deref(), body).await
+        let session: Vec<(&str, &str)> = self
+            .session
+            .as_deref()
+            .map(|id| ("Mcp-Session-Id", id))
+            .into_iter()
+            .collect();
+        raw_post_body(self.addr, &self.path, None, &session, body).await
     }
 
     /// Sends one request and returns its `result` object verbatim.
@@ -1107,5 +1113,199 @@ async fn a_pipe_names_its_upstream_once_it_has_met_it() {
     for client in [early, later, aggregate] {
         client.cancel().await.unwrap();
     }
+    manager.shutdown().await;
+}
+
+/// A downstream client on the 2026-07-28 lifecycle, which has no handshake
+/// at all: there is no `initialize`, no session, and every request carries
+/// the revision it speaks in its own `_meta` (SEP-2575) alongside the
+/// standard MCP headers (SEP-2243). This is how a current client reaches the
+/// gateway, and the reason a pipe cannot assume its two sides agree on a
+/// revision — the upstream connection behind it still handshakes at
+/// 2025-11-25, which is the newest revision that has a handshake.
+struct InlineSession {
+    addr: std::net::SocketAddr,
+    path: String,
+    id: u32,
+}
+
+impl InlineSession {
+    const VERSION: &'static str = "2026-07-28";
+
+    fn new(addr: std::net::SocketAddr, path: &str) -> Self {
+        Self {
+            addr,
+            path: path.to_owned(),
+            id: 0,
+        }
+    }
+
+    /// Sends one request and returns its `result` object verbatim.
+    async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.id += 1;
+        let mut params = params;
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": Self::VERSION,
+            "io.modelcontextprotocol/clientInfo": { "name": "inline", "version": "1" },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": self.id, "method": method, "params": params
+        })
+        .to_string();
+        // SEP-2243: a request that names a subject repeats it in a header, so
+        // an intermediary can route on it without reading the body.
+        let subject = match method {
+            "tools/call" | "prompts/get" => params["name"].as_str(),
+            "resources/read" => params["uri"].as_str(),
+            _ => None,
+        };
+        let mut headers = vec![
+            ("MCP-Protocol-Version", Self::VERSION),
+            ("Mcp-Method", method),
+        ];
+        if let Some(subject) = subject {
+            headers.push(("Mcp-Name", subject));
+        }
+        let response = raw_post_body(self.addr, &self.path, None, &headers, &body).await;
+        let message = response
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .find(|value| value.get("id").is_some())
+            .or_else(|| {
+                let body = response.split("\r\n\r\n").nth(1)?;
+                serde_json::from_str::<serde_json::Value>(body).ok()
+            })
+            .unwrap_or_else(|| panic!("no JSON-RPC answer in: {response}"));
+        assert!(message.get("error").is_none(), "{method} failed: {message}");
+        message["result"].clone()
+    }
+}
+
+/// The 2026-07-28 revision requires `resultType` on every result and
+/// `ttlMs`/`cacheScope` on the cacheable ones. An upstream written before
+/// that revision sends none of them, and relaying its answer untouched to a
+/// client that negotiated the newer revision produces a reply that client
+/// refuses to read — "Connected, tools fetch failed", with the upstream
+/// healthy and the request logged as a success.
+#[tokio::test]
+async fn a_newer_client_gets_the_fields_its_revision_requires() {
+    let (addr, manager) = serve_both(&[("fx", "legacy")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+
+    let result = fx.request("tools/list", serde_json::json!({})).await;
+    assert_eq!(names_in(&result), ["echo", "reverse"], "{result}");
+    assert_eq!(result["resultType"], "complete", "{result}");
+    // The upstream never said how fresh its answer is, and a pipe does not
+    // invent a freshness window on its behalf: 0 is "already stale".
+    assert_eq!(result["ttlMs"], 0, "{result}");
+    // The answer was fetched with the operator's credentials, so no shared
+    // intermediary may serve it to anyone else.
+    assert_eq!(result["cacheScope"], "private", "{result}");
+
+    // resultType is required on every result, cacheable or not.
+    let call = fx
+        .request(
+            "tools/call",
+            serde_json::json!({ "name": "echo", "arguments": { "message": "hi" } }),
+        )
+        .await;
+    assert_eq!(call["resultType"], "complete", "{call}");
+    manager.shutdown().await;
+}
+
+/// The bridge fills gaps; it does not overwrite. An upstream that does speak
+/// the newer revision has already said what it means, and its own caching
+/// policy is what the client must see.
+#[tokio::test]
+async fn an_upstream_that_speaks_the_newer_revision_keeps_its_own_answer() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+
+    let result = fx.request("tools/list", serde_json::json!({})).await;
+
+    assert_eq!(result["ttlMs"], 4242, "{result}");
+    assert_eq!(result["cacheScope"], "public", "{result}");
+    assert_eq!(result["resultType"], "complete", "{result}");
+    manager.shutdown().await;
+}
+
+/// The other half of the rule: what a reply must be consistent with is the
+/// revision the *downstream* negotiated, not the newest one in existence. A
+/// client on the handshake lifecycle negotiates 2025-11-25, where none of
+/// these fields exist, so nothing is added for it — and `resultType`, which
+/// strict older clients reject, is not sent either.
+#[tokio::test]
+async fn an_older_client_is_not_handed_fields_from_a_revision_it_did_not_ask_for() {
+    let (addr, manager) = serve_both(&[("fx", "legacy")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    let result = fx.request("tools/list", serde_json::json!({})).await;
+
+    assert_eq!(names_in(&result), ["echo", "reverse"], "{result}");
+    assert!(result.get("resultType").is_none(), "{result}");
+    assert!(result.get("ttlMs").is_none(), "{result}");
+    assert!(result.get("cacheScope").is_none(), "{result}");
+    manager.shutdown().await;
+}
+
+/// The aggregate answers a newer client too, and it builds its merged result
+/// itself — so it needs the same fields, from the same rule.
+#[tokio::test]
+async fn the_aggregate_answers_a_newer_client_in_its_own_revision() {
+    let (addr, manager) = serve_both(&[("fx", "legacy")], None).await;
+    let mut aggregate = InlineSession::new(addr, "/mcp");
+
+    let result = aggregate.request("tools/list", serde_json::json!({})).await;
+
+    assert_eq!(names_in(&result), ["fx__echo", "fx__reverse"], "{result}");
+    assert_eq!(result["resultType"], "complete", "{result}");
+    assert_eq!(result["ttlMs"], 0, "{result}");
+    assert_eq!(result["cacheScope"], "private", "{result}");
+    manager.shutdown().await;
+}
+
+/// Every forwarded family, not just tools: the revision's requirement is on
+/// results, and a pipe answers for all of them.
+#[tokio::test]
+async fn the_other_forwarded_families_are_bridged_as_well() {
+    let (addr, manager) = serve_both(&[("fx", "legacy")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+
+    // Cacheable: prompts/list, resources/list and resources/read.
+    for method in ["prompts/list", "resources/list", "resources/templates/list"] {
+        let result = fx.request(method, serde_json::json!({})).await;
+        assert_eq!(result["resultType"], "complete", "{method}: {result}");
+        assert_eq!(result["ttlMs"], 0, "{method}: {result}");
+        assert_eq!(result["cacheScope"], "private", "{method}: {result}");
+    }
+    let read = fx
+        .request(
+            "resources/read",
+            serde_json::json!({ "uri": "mem:///greeting.txt" }),
+        )
+        .await;
+    assert_eq!(read["resultType"], "complete", "{read}");
+    assert_eq!(read["ttlMs"], 0, "{read}");
+
+    // Not cacheable, but still a result: prompts/get and completion.
+    let prompt = fx
+        .request(
+            "prompts/get",
+            serde_json::json!({ "name": "summarize", "arguments": { "topic": "gateways" } }),
+        )
+        .await;
+    assert_eq!(prompt["resultType"], "complete", "{prompt}");
+    let completion = fx
+        .request(
+            "completion/complete",
+            serde_json::json!({
+                "ref": { "type": "ref/prompt", "name": "summarize" },
+                "argument": { "name": "topic", "value": "gat" }
+            }),
+        )
+        .await;
+    assert_eq!(completion["resultType"], "complete", "{completion}");
     manager.shutdown().await;
 }

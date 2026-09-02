@@ -11,7 +11,8 @@
 //! (handshakes fine, then dies on the first tools/list — exercises
 //! died-after-ready reconnection), `paged` (serves its tools over two
 //! cursored pages — exercises a pipe forwarding pagination rather than
-//! collapsing it).
+//! collapsing it), `legacy` (answers the way every server predating
+//! 2026-07-28 does: no `resultType`, no caching fields).
 //!
 //! `healthy` decorates its answers with the caching fields a 2026-07-28
 //! server sends (`ttlMs`, `cacheScope`) and with `_meta`, because a pipe
@@ -135,6 +136,18 @@ fn tools(mode: &str, method: &str, params: &serde_json::Value) -> serde_json::Va
     if method == "tools/list" {
         if mode == "paged" {
             return paged_tools(params);
+        }
+        // What every server written before 2026-07-28 sends: the tools, and
+        // nothing the newer revision made mandatory. A pipe with a client on
+        // the newer revision has to answer for this server without inventing
+        // anything it did not say.
+        if mode == "legacy" {
+            return serde_json::json!({
+                "tools": [
+                    tool("echo", "echoes input"),
+                    tool("reverse", "reverses input")
+                ]
+            });
         }
         return serde_json::json!({
             "tools": [
