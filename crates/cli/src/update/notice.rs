@@ -19,7 +19,13 @@ const STAMP_FILE: &str = "update-check.json";
 
 /// One check a day. The point is to notice a release within a day or so of
 /// it landing, not to track the repository.
-const INTERVAL: Duration = Duration::from_hours(24);
+// Spelled in seconds rather than with `Duration::from_hours`, which is what
+// clippy asks for here: that constructor was stabilised very recently and
+// the workspace pins no rust-version, so it would turn an older-but-
+// otherwise-fine toolchain into a bare "no function in `Duration`" error
+// instead of cargo's MSRV message. Readability is not worth that.
+#[allow(clippy::duration_suboptimal_units)]
+const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Hard deadline on the whole check. The command's own work has already
 /// finished by the time this runs, so the worst case is the shell prompt

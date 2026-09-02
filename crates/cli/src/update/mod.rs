@@ -43,17 +43,29 @@ pub fn install_method(exe: &Path) -> InstallMethod {
     if path.contains("/.cargo/bin/") {
         return InstallMethod::Cargo;
     }
-    // Homebrew keeps the real binary under `Cellar` and links it from
-    // `homebrew` (Apple silicon, /opt/homebrew) or `linuxbrew`; a
-    // `current_exe` can be either, since it resolves symlinks on Linux but
-    // not always on macOS.
-    if ["/Cellar/", "/homebrew/", "/linuxbrew/"]
-        .iter()
-        .any(|marker| path.contains(marker))
-    {
+    if is_homebrew(&path) {
         return InstallMethod::Homebrew;
     }
     InstallMethod::Standalone
+}
+
+/// Whether a normalised path sits inside a Homebrew installation.
+///
+/// Homebrew keeps the real binary under a `Cellar` directory and links it
+/// into the prefix's `bin`; a `current_exe` can be either, since it resolves
+/// symlinks on Linux but not always on macOS. Both markers are anchored to
+/// the layout rather than matched as loose substrings: `/opt/homebrew` is
+/// only Homebrew's when it is the whole prefix, so a checkout at
+/// `~/src/homebrew/mcpgw` is a standalone binary and self-update may replace
+/// it. Getting this wrong is not dangerous — a false Homebrew reading only
+/// refuses the update — but it refuses it with advice (`brew upgrade`) that
+/// cannot work.
+fn is_homebrew(path: &str) -> bool {
+    // The Apple-silicon prefix, and the two spellings of the Linux one
+    // (`/home/linuxbrew/.linuxbrew` is the official location, `~/.linuxbrew`
+    // the supported alternative). A custom `HOMEBREW_PREFIX` is caught by
+    // the `Cellar` segment instead.
+    path.starts_with("/opt/homebrew/") || path.contains("/.linuxbrew/") || path.contains("/Cellar/")
 }
 
 /// Parses a plain `x.y.z` version, with or without a leading `v`.
@@ -156,12 +168,35 @@ mod tests {
     fn homebrew_installs_are_recognised_from_either_prefix() {
         for path in [
             "/opt/homebrew/bin/mcpgw",
+            "/opt/homebrew/Cellar/mcpgw/0.1.0/bin/mcpgw",
             "/usr/local/Cellar/mcpgw/0.1.0/bin/mcpgw",
             "/home/linuxbrew/.linuxbrew/bin/mcpgw",
+            "/home/u/.linuxbrew/bin/mcpgw",
+            // A custom HOMEBREW_PREFIX still lays out a Cellar.
+            "/srv/brew/Cellar/mcpgw/0.1.0/bin/mcpgw",
         ] {
             assert_eq!(
                 install_method(Path::new(path)),
                 InstallMethod::Homebrew,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_merely_named_homebrew_is_not_a_homebrew_install() {
+        // Homebrew's prefix is `/opt/homebrew`, not any `homebrew` anywhere
+        // on the path: these are ordinary binaries and refusing to update
+        // them with "run brew upgrade" would be advice that cannot work.
+        for path in [
+            "/home/u/src/homebrew/mcpgw",
+            "/home/u/homebrew/bin/mcpgw",
+            "/tmp/opt/homebrew/bin/mcpgw",
+            r"C:\Users\u\homebrew\mcpgw.exe",
+        ] {
+            assert_eq!(
+                install_method(Path::new(path)),
+                InstallMethod::Standalone,
                 "{path}"
             );
         }

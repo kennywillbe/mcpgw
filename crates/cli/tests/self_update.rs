@@ -233,7 +233,10 @@ fn a_cargo_install_is_sent_back_to_cargo() {
 #[test]
 fn a_homebrew_install_is_sent_back_to_brew() {
     let dir = tempfile::tempdir().unwrap();
-    let bin = dir.path().join("homebrew/bin");
+    // A Cellar layout, not a directory called `homebrew`: the prefix
+    // markers are anchored to absolute paths a tempdir cannot reproduce,
+    // and only the Cellar segment travels.
+    let bin = dir.path().join("Cellar/mcpgw/0.1.0/bin");
     std::fs::create_dir_all(&bin).unwrap();
     let exe = bin.join(format!("mcpgw{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(built_binary(), &exe).unwrap();
