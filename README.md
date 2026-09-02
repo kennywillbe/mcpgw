@@ -34,6 +34,10 @@ brew install kennywillbe/tap/mcpgw
 cargo install mcpgw
 ```
 
+Installed from the script or an archive? `mcpgw self-update` replaces the
+binary with the latest release (checksum-verified); package-manager installs
+are left to `brew upgrade` / `cargo install`.
+
 ```sh
 mcpgw import                                              # adopt what your clients already have
 mcpgw add github -- npx -y @modelcontextprotocol/server-github

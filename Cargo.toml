@@ -70,6 +70,28 @@ tokio = { version = "1", features = [
     "io-util",
 ] }
 owo-colors = "4"
+# `self-update` needs a blocking HTTP client for two GETs against
+# github.com. rmcp pulls reqwest in, but that is rmcp's own dependency and
+# reaching into it would mean declaring reqwest here as well *and* driving a
+# tokio runtime for a plain download. ureq is blocking, small, and its
+# default TLS is rustls — the same backend the rmcp comment above argues
+# for. Left on default features: that is rustls with the bundled webpki
+# roots, which is all github.com needs, and it skips the extra
+# platform-verifier dependency.
+ureq = "3"
+# Replacing the running executable is a platform minefield (Windows refuses
+# to unlink a mapped image; a plain rename across filesystems fails). This
+# crate is the one small, focused answer — the popular `self_update` crate
+# does the same job but drags in its own HTTP client, archive readers and
+# release-host abstractions.
+self-replace = "1"
+sha2 = "0.11"
+flate2 = "1"
+tar = "0.4"
+# Only the Windows release ships a zip; every other target gets a tarball,
+# so the zip reader is target-gated in crates/cli/Cargo.toml rather than
+# compiled into every build.
+zip = { version = "8", default-features = false, features = ["deflate"] }
 insta = "1"
 assert_cmd = "2"
 

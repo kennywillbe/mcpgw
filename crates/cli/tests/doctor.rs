@@ -12,6 +12,8 @@ fn run_doctor(home: &Path, config_text: Option<&str>, args: &[&str]) -> Output {
     }
     Command::cargo_bin("mcpgw")
         .unwrap()
+        // Hermetic: no test may phone home for a version notice.
+        .env("MCPGW_NO_UPDATE_CHECK", "1")
         .arg("doctor")
         .args(args)
         .env("MCPGW_CONFIG", &config)

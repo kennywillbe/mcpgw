@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::ExitCode;
 use std::time::Duration;
 
 use mcpgw_core::doctor::{Finding, Severity, check_server, classify_problems};
@@ -41,7 +40,7 @@ impl ProbePlan {
     }
 }
 
-pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<ExitCode> {
+pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<u8> {
     let command_exists = |cmd: &str| which::which(cmd).is_ok();
     let mut findings: Vec<Finding> = Vec::new();
     let mut plan = ProbePlan::default();
@@ -137,11 +136,7 @@ pub fn run(json: bool, color: bool, probe: Option<Duration>) -> anyhow::Result<E
         summary_line(errors, warnings, color);
     }
 
-    Ok(if errors > 0 {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    })
+    Ok(u8::from(errors > 0))
 }
 
 // Pure serialization of already-computed pieces; bundling them into a

@@ -19,11 +19,28 @@ owo-colors.workspace = true
 which.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
+ureq.workspace = true
+self-replace.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+tar.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+zip.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
 assert_cmd.workspace = true
 rmcp.workspace = true
+# The self-update end-to-end test builds the release archive it then serves,
+# so it needs the same writers the command reads with. Already in the tree,
+# so this costs no extra resolution.
+flate2.workspace = true
+tar.workspace = true
+sha2.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+zip.workspace = true
 
 [lints]
 workspace = true

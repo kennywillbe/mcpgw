@@ -131,10 +131,11 @@ recent per client are kept; `mcpgw sync --rollback` restores the newest.
 | --- | --- |
 | `MCPGW_CONFIG` | full path to the canonical config file |
 | `MCPGW_STATE_DIR` | overrides the state directory |
+| `MCPGW_NO_UPDATE_CHECK` | any non-empty value switches the version notice off |
 | `XDG_CONFIG_HOME` | base for the config path when `MCPGW_CONFIG` is unset |
 | `XDG_DATA_HOME` | base for the state dir when `MCPGW_STATE_DIR` is unset |
 
-Both mcpgw-specific variables are ignored when set to the empty string. Setting
+The mcpgw-specific variables are ignored when set to the empty string. Setting
 the pair of them is the clean way to run mcpgw against a scratch environment:
 
 ```sh
