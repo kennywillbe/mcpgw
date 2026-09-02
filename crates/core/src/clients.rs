@@ -195,17 +195,25 @@ impl ClientKind {
                 entries: EntrySchema::Zed,
             },
             // Both Cline surfaces write the same file format under the same
-            // name; only the directory differs.
+            // name; only the directory differs. JSONC rather than strict
+            // JSON: the file is VS Code-shaped, so a `//` comment in it is
+            // plausible and under the strict reader would have skipped the
+            // client outright.
             Self::Cline | Self::ClineCli => Codec {
-                format: Format::Json,
+                format: Format::Jsonc,
                 root: RootPath::new(&["mcpServers"]),
                 entries: EntrySchema::Cline,
             },
             // The dot is part of Amp's key: its settings file holds one
             // `"amp.mcpServers"` property, not an `amp` object with a
             // `mcpServers` inside it. One literal segment says exactly that.
+            //
+            // JSONC for the same reason Zed is: this file is the whole of
+            // Amp's VS Code-style settings, hand-edited and commentable, and
+            // the strict reader both refused a commented one and reformatted
+            // the rest of it on every successful write.
             Self::Amp => Codec {
-                format: Format::Json,
+                format: Format::Jsonc,
                 root: RootPath::new(&["amp.mcpServers"]),
                 entries: EntrySchema::Amp,
             },
@@ -214,11 +222,41 @@ impl ClientKind {
                 root: RootPath::new(&["mcpServers"]),
                 entries: EntrySchema::ZooCode,
             },
-            _ => Codec {
+            // Exhaustive rather than a catch-all: a new client that forgot
+            // its codec would otherwise inherit this one silently and write
+            // the wrong shape, where a missing arm is a compile error.
+            Self::ClaudeDesktop | Self::ClaudeCode | Self::Cursor => Codec {
                 format: Format::Json,
                 root: RootPath::new(&["mcpServers"]),
                 entries: EntrySchema::McpServers,
             },
+        }
+    }
+
+    /// Where the client keeps a list of server names it refuses to start,
+    /// as a path of literal object keys.
+    ///
+    /// Gemini CLI is the only one: it has no per-entry enabled flag, so a
+    /// server is switched off by naming it in `mcp.excluded`. That makes the
+    /// list part of a server's state, and a write that ignored it would
+    /// report `+ name` for a server Gemini will not run — with the next plan
+    /// seeing the entry already correct and nothing left to do.
+    #[must_use]
+    pub fn exclusion_list(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Gemini => Some(&["mcp", "excluded"]),
+            Self::ClaudeDesktop
+            | Self::ClaudeCode
+            | Self::Cursor
+            | Self::VsCode
+            | Self::Codex
+            | Self::Opencode
+            | Self::Windsurf
+            | Self::Zed
+            | Self::Cline
+            | Self::ClineCli
+            | Self::Amp
+            | Self::ZooCode => None,
         }
     }
 
@@ -437,20 +475,20 @@ impl ClientKind {
     /// gets this hook rather than a wider codec that every other client
     /// would have to ignore.
     fn apply_document_context(self, root: &serde_json::Value, read: &mut ClientRead) {
-        if self != Self::Gemini {
+        let Some(path) = self.exclusion_list() else {
             return;
-        }
-        // Gemini CLI has no per-server enabled flag: a server is switched
-        // off by naming it in the sibling `mcp.excluded` list. The list (and
-        // its `mcp.allowed` counterpart) is foreign state mcpgw only reads —
-        // disabling a server canonically removes the entry instead.
-        let Some(excluded) = root.get("mcp").and_then(|mcp| mcp.get("excluded")) else {
+        };
+        // A server named in the list is off however its entry reads. mcpgw
+        // never adds a name to the list — disabling a server canonically
+        // removes its entry instead — and only ever takes out names it
+        // manages, so the user's own choices there survive a sync.
+        let Some(excluded) = value_at(root, path) else {
             return;
         };
         let Some(names) = excluded.as_array() else {
             read.problems.push(Problem {
                 server: None,
-                message: "`mcp.excluded` is not an array".to_owned(),
+                message: format!("`{}` is not an array", path.join(".")),
             });
             return;
         };
@@ -460,6 +498,16 @@ impl ClientKind {
             }
         }
     }
+}
+
+/// Walks a path of literal object keys, the way [`codec::RootPath`] does for
+/// the server map — the key spelling is the client's, so no dot is ever read
+/// as a separator.
+pub(crate) fn value_at<'a>(
+    root: &'a serde_json::Value,
+    path: &[&str],
+) -> Option<&'a serde_json::Value> {
+    path.iter().try_fold(root, |node, key| node.get(*key))
 }
 
 fn home_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {

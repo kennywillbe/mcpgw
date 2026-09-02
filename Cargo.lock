@@ -1124,6 +1124,7 @@ dependencies = [
  "http",
  "insta",
  "jsonc-parser",
+ "reqwest",
  "rmcp",
  "serde",
  "serde_json",

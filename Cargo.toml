@@ -49,10 +49,20 @@ rmcp = { version = "3", features = [
     # http://127.0.0.1, so nothing caught it. `reqwest` maps to
     # reqwest/rustls — rustls keeps the single-static-binary story, and its
     # platform verifier trusts the OS store, so corporate and proxy roots
-    # work without shipping our own CA bundle.
+    # work without shipping our own CA bundle. crates/core/tests/tls.rs is
+    # the guard that stops this line being deleted again.
     "reqwest",
 ] }
-rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
+# `reqwest` is spelled out here as well as on the entry above rather than
+# left to cargo unifying the two: this alias is what the test-server crate
+# builds against, and a graph that resolved it on its own would hand the
+# tests a client with no TLS backend while the shipped binary had one.
+rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+# Dev-only, and deliberately declared with no TLS features of its own: what
+# it sees is exactly what cargo unified from the `rmcp` entry above, so the
+# guard in crates/core/tests/tls.rs stops compiling the moment that entry
+# loses `reqwest`. Naming a TLS feature here would defeat the whole point.
+reqwest = { version = "0.13", default-features = false }
 axum = "0.8"
 # The per-server endpoint table is read on every request and replaced whole
 # when the config reloads. `ArcSwap` is the read-mostly shape for exactly

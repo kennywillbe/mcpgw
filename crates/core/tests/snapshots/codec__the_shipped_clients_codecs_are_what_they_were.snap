@@ -41,15 +41,15 @@ expression: matrix
     ),
     (
         "cline",
-        "Json / mcpServers / Cline",
+        "Jsonc / mcpServers / Cline",
     ),
     (
         "cline-cli",
-        "Json / mcpServers / Cline",
+        "Jsonc / mcpServers / Cline",
     ),
     (
         "amp",
-        "Json / amp.mcpServers / Amp",
+        "Jsonc / amp.mcpServers / Amp",
     ),
     (
         "zoo",

@@ -1,0 +1,11 @@
+---
+source: crates/core/tests/codec.rs
+expression: text
+---
+model = "x"
+
+[mcp_servers]
+linear = { url = "https://mcp.linear.app/mcp" }
+
+[mcp_servers.github]
+command = "npx"

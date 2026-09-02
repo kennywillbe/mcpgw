@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::clients::ClientKind;
 use crate::clients::codec::{self, ClientDocument};
+use crate::clients::{self, ClientKind};
 use crate::config::{Server, Transport};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,13 @@ pub struct SyncPlan {
     pub conflicts: Vec<String>,
     /// Client-only entries mcpgw does not manage; left untouched.
     pub foreign: Vec<String>,
+    /// Names to drop from the client's own exclusion list — see
+    /// [`ClientKind::exclusion_list`]. Only ever names mcpgw manages: the
+    /// list is the user's, and a foreign name in it is their decision.
+    ///
+    /// Filled by [`plan_client_context`], which needs the whole document;
+    /// empty for every client that has no such list.
+    pub unexclude: Vec<String>,
     /// The full managed target set (enabled canonical servers minus
     /// conflicts) in the client's entry shape.
     desired: BTreeMap<String, serde_json::Value>,
@@ -30,7 +37,13 @@ pub struct SyncPlan {
 impl SyncPlan {
     #[must_use]
     pub fn has_changes(&self) -> bool {
-        !(self.adds.is_empty() && self.updates.is_empty() && self.removes.is_empty())
+        // `unexclude` counts: without it a managed server that is enabled,
+        // written and named in `mcp.excluded` is a stable wrong state — the
+        // entry already matches, so nothing else in the plan ever fires.
+        !(self.adds.is_empty()
+            && self.updates.is_empty()
+            && self.removes.is_empty()
+            && self.unexclude.is_empty())
     }
 
     /// The names mcpgw manages in this client once the plan is applied.
@@ -63,6 +76,13 @@ impl SyncPlan {
 /// (section vs inline table, single vs double quotes, trailing commas, key
 /// order, a comment in the middle) — comparing text there would report an
 /// update every run and rewrite the user's file into mcpgw's spelling.
+///
+/// What the plan would write is the emitted entry *plus* whatever the entry
+/// already on disk holds in the client's own fields (see
+/// [`codec::EntrySchema::preserved_fields`]), and the comparison is against
+/// that —
+/// so preserving a field cannot make the entry differ from itself and
+/// re-diff forever.
 #[must_use]
 pub fn plan_sync(
     kind: ClientKind,
@@ -76,6 +96,7 @@ pub fn plan_sync(
         removes: Vec::new(),
         conflicts: Vec::new(),
         foreign: Vec::new(),
+        unexclude: Vec::new(),
         desired: BTreeMap::new(),
     };
 
@@ -90,7 +111,8 @@ pub fn plan_sync(
             plan.conflicts.push(name.clone());
             continue;
         }
-        let emitted = client_entry(kind, server);
+        let mut emitted = client_entry(kind, server);
+        carry_over_client_fields(kind, current.get(name), &mut emitted);
         if !exists {
             plan.adds.push(name.clone());
         } else if current.get(name) != Some(&emitted) {
@@ -112,16 +134,105 @@ pub fn plan_sync(
     plan
 }
 
+/// Copies the client's own fields off the entry already on disk onto the one
+/// mcpgw is about to write.
+///
+/// `emit` builds an entry from the canonical server, which knows nothing
+/// about a switch the user flipped inside the client. Writing that value
+/// straight over the old entry reset every such field on every sync — the
+/// user's "off" became "on" again and the entry re-diffed forever.
+fn carry_over_client_fields(
+    kind: ClientKind,
+    existing: Option<&serde_json::Value>,
+    emitted: &mut serde_json::Value,
+) {
+    let fields = kind.codec().entries.preserved_fields();
+    if fields.is_empty() {
+        return;
+    }
+    let (Some(existing), Some(target)) = (
+        existing.and_then(serde_json::Value::as_object),
+        emitted.as_object_mut(),
+    ) else {
+        return;
+    };
+    for field in fields {
+        // Only what is missing: a field mcpgw does emit is one it owns.
+        if let Some(value) = existing.get(*field)
+            && !target.contains_key(*field)
+        {
+            target.insert((*field).to_owned(), value.clone());
+        }
+    }
+}
+
+/// Folds the client's out-of-entry state into a finished plan.
+///
+/// [`plan_sync`] sees the server map alone, which is all any client but
+/// Gemini keeps a server's state in. Gemini's `mcp.excluded` is the
+/// exception, and it needs the whole document — so it is a second pass here
+/// rather than a wider signature every other client would ignore. Symmetric
+/// with the read side's own document-context pass.
+pub fn plan_client_context(kind: ClientKind, document: &serde_json::Value, plan: &mut SyncPlan) {
+    let Some(path) = kind.exclusion_list() else {
+        return;
+    };
+    let Some(excluded) = clients::value_at(document, path).and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    // Every name mcpgw is responsible for after this run: the managed target
+    // set, which must actually start, plus the entries being removed, whose
+    // name would otherwise linger in the list and silently disable a server
+    // the user later re-adds by hand. Conflicts and foreign entries are
+    // deliberately absent — those exclusions are the user's.
+    let mine: BTreeSet<&str> = plan
+        .desired
+        .keys()
+        .chain(&plan.removes)
+        .map(String::as_str)
+        .collect();
+    plan.unexclude = excluded
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|name| mine.contains(name))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+}
+
 /// Applies a plan to a parsed client document of any format, touching only
 /// the entries the plan owns. Everything else — other root keys, foreign
 /// entries, and whatever the format preserves around them — is left alone.
-pub fn apply_plan_to(kind: ClientKind, doc: &mut ClientDocument, plan: &SyncPlan) {
-    doc.edit(kind.codec().root, &plan.removes, &plan.upserts());
+///
+/// # Errors
+///
+/// Returns [`codec::NotAnObject`] when a key on the way to the server map
+/// holds something that is not one; the document is then left untouched.
+pub fn apply_plan_to(
+    kind: ClientKind,
+    doc: &mut ClientDocument,
+    plan: &SyncPlan,
+) -> Result<(), codec::NotAnObject> {
+    doc.edit(kind.codec().root, &plan.removes, &plan.upserts())?;
+    if let Some(path) = kind.exclusion_list() {
+        doc.remove_from_string_array(path, &plan.unexclude.iter().cloned().collect());
+    }
+    Ok(())
 }
 
 /// [`apply_plan_to`] for a client document already in hand as JSON.
-pub fn apply_plan(kind: ClientKind, root: &mut serde_json::Value, plan: &SyncPlan) {
-    codec::edit_json(kind.codec().root, root, &plan.removes, &plan.upserts());
+///
+/// # Errors
+///
+/// Same failure as [`apply_plan_to`].
+pub fn apply_plan(
+    kind: ClientKind,
+    root: &mut serde_json::Value,
+    plan: &SyncPlan,
+) -> Result<(), codec::NotAnObject> {
+    codec::edit_json(kind.codec().root, root, &plan.removes, &plan.upserts())
 }
 
 /// The entry name mcpgw owns in every client when syncing in gateway mode.

@@ -4,7 +4,9 @@
 //! root path, an entry schema — on top of a seam that is already covered.
 
 use mcpgw_core::ClientKind;
-use mcpgw_core::clients::codec::{ClientDocument, Codec, EntrySchema, Format, RootPath};
+use mcpgw_core::clients::codec::{
+    ClientDocument, Codec, EntrySchema, Format, NotAnObject, RootPath,
+};
 use serde_json::{Value, json};
 
 /// A codec for a client that does not exist yet, so the machinery is tested
@@ -17,10 +19,19 @@ fn codec(format: Format, root: RootPath) -> Codec {
     }
 }
 
-fn edit(doc: &mut ClientDocument, root: RootPath, removes: &[&str], upserts: &[(&str, Value)]) {
+fn try_edit(
+    doc: &mut ClientDocument,
+    root: RootPath,
+    removes: &[&str],
+    upserts: &[(&str, Value)],
+) -> Result<(), NotAnObject> {
     let removes: Vec<String> = removes.iter().map(|&n| n.to_owned()).collect();
     let upserts: Vec<(&str, &Value)> = upserts.iter().map(|(n, v)| (*n, v)).collect();
-    doc.edit(root, &removes, &upserts);
+    doc.edit(root, &removes, &upserts)
+}
+
+fn edit(doc: &mut ClientDocument, root: RootPath, removes: &[&str], upserts: &[(&str, Value)]) {
+    try_edit(doc, root, removes, upserts).unwrap();
 }
 
 const JSONC: &str = r#"// Hand-written config, comments and all.
@@ -130,6 +141,146 @@ fn toml_edits_are_idempotent_on_the_values_not_the_text() {
     let again = codec.parse_document(&text).unwrap();
     assert_eq!(again.entries(root)["added"], entry);
     assert_eq!(again.entries(root)["mine"], json!({ "command": "deno" }));
+}
+
+/// `mcp_servers = { … }` is valid TOML, and the read side accepts it — so
+/// sync reports the entries in it as foreign and promises to leave them
+/// alone. Replacing the inline table with a fresh one broke that promise
+/// silently: the foreign entry was gone from the file the CLI had just said
+/// it would not touch.
+#[test]
+fn an_inline_table_root_map_keeps_the_entries_already_in_it() {
+    let root = RootPath::new(&["mcp_servers"]);
+    let codec = codec(Format::Toml, root);
+    let source = r#"model = "x"
+mcp_servers = { linear = { url = "https://mcp.linear.app/mcp" } }
+"#;
+    let mut doc = codec.parse_document(source).unwrap();
+    assert_eq!(doc.entries(root).len(), 1);
+
+    edit(
+        &mut doc,
+        root,
+        &[],
+        &[("github", json!({ "command": "npx" }))],
+    );
+    let text = doc.to_text().unwrap();
+
+    let reread = codec.parse_document(&text).unwrap();
+    let entries = reread.entries(root);
+    assert_eq!(
+        entries["linear"],
+        json!({ "url": "https://mcp.linear.app/mcp" }),
+        "the foreign entry was destroyed:\n{text}"
+    );
+    assert_eq!(entries["github"], json!({ "command": "npx" }), "{text}");
+    // The sibling key is untouched, and the map is a section table now
+    // because an inline one cannot hold the section entries written into it.
+    assert_eq!(reread.to_value()["model"], "x", "{text}");
+    insta::assert_snapshot!(text);
+}
+
+/// The write side agrees with the read side about an unusable file: a root
+/// key holding something that is not a map is a problem, not something to
+/// overwrite. Both halves used to disagree — the reader refused to read it
+/// and the writer replaced it without a word.
+#[test]
+fn a_non_object_root_key_is_refused_rather_than_overwritten() {
+    for (format, source) in [
+        (Format::Json, r#"{"mcp": 5}"#),
+        (Format::Jsonc, "{\n  // not a map\n  \"mcp\": 5,\n}\n"),
+        (Format::Toml, "mcp = 5\n"),
+    ] {
+        let root = RootPath::new(&["mcp"]);
+        let codec = codec(format, root);
+        let mut doc = codec.parse_document(source).unwrap();
+
+        let Err(err) = try_edit(&mut doc, root, &[], &[("added", json!({"command": "x"}))]) else {
+            panic!("{format:?} overwrote a root key that is not a map");
+        };
+        assert_eq!(
+            err,
+            NotAnObject {
+                path: "mcp".to_owned()
+            }
+        );
+        assert_eq!(err.to_string(), "`mcp` is not an object");
+        // Refused means refused: the value the user put there is still it.
+        // Compared as values, not text — the strict-JSON writer reformats
+        // whatever it serializes, which is orthogonal to this.
+        assert_eq!(
+            codec.parse_value(&doc.to_text().unwrap()).unwrap(),
+            codec.parse_value(source).unwrap(),
+            "{format:?}"
+        );
+    }
+}
+
+/// The same refusal one level in, where the offending key is a parent of the
+/// server map rather than the map itself.
+#[test]
+fn a_non_object_parent_key_is_refused_too() {
+    let root = RootPath::new(&["tools", "servers"]);
+    let codec = codec(Format::Json, root);
+    let mut doc = codec.parse_document(r#"{"tools": "none"}"#).unwrap();
+    let err = try_edit(&mut doc, root, &[], &[("added", json!({"command": "x"}))]).unwrap_err();
+    assert_eq!(
+        err,
+        NotAnObject {
+            path: "tools".to_owned()
+        }
+    );
+}
+
+/// Windsurf resolves an entry carrying both target fields the way Windsurf
+/// itself does — `serverUrl` wins — and an entry that pairs it with a
+/// `command` is genuinely ambiguous, so it is a problem rather than a guess.
+#[test]
+fn a_windsurf_entry_with_both_target_fields_resolves_or_refuses() {
+    let both_urls = EntrySchema::Windsurf
+        .parse(&json!({ "serverUrl": "https://a.example/mcp", "url": "https://b.example/mcp" }))
+        .unwrap();
+    assert!(matches!(
+        &both_urls.0.transport,
+        mcpgw_core::Transport::Http { url, .. } if url == "https://a.example/mcp"
+    ));
+    assert_eq!(
+        both_urls.1.as_deref(),
+        Some("`url` ignored: `serverUrl` takes precedence")
+    );
+
+    let with_command = EntrySchema::Windsurf
+        .parse(&json!({ "serverUrl": "https://a.example/mcp", "command": "x" }));
+    assert_eq!(
+        with_command.unwrap_err(),
+        "has both `command` and `url`",
+        "a serverUrl beside a command is not a transport we can pick"
+    );
+}
+
+/// An entry name that is not a bare TOML key has to survive the round trip
+/// under whatever quoting the writer picks — the name is the canonical
+/// server's, and the next plan looks it up by exactly that string.
+#[test]
+fn an_entry_name_needing_toml_quoting_round_trips() {
+    let root = RootPath::new(&["mcp_servers"]);
+    let codec = codec(Format::Toml, root);
+    let mut doc = codec.empty_document();
+    let entry = json!({ "command": "npx" });
+    for name in ["my.server", "my server", "quote\"d"] {
+        edit(&mut doc, root, &[], &[(name, entry.clone())]);
+    }
+
+    let text = doc.to_text().unwrap();
+    let reread = codec.parse_document(&text).unwrap();
+    let entries = reread.entries(root);
+    for name in ["my.server", "my server", "quote\"d"] {
+        assert_eq!(entries[name], entry, "{name:?} did not survive:\n{text}");
+    }
+    // A dotted name is one key, not a nested table: reading it as two would
+    // silently split the entry across a table mcpgw does not manage.
+    assert_eq!(entries.len(), 3, "{text}");
+    insta::assert_snapshot!(text);
 }
 
 #[test]
