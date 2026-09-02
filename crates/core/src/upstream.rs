@@ -86,7 +86,18 @@ impl Slot {
 }
 
 struct Upstream {
-    server: Server,
+    /// Swapped rather than owned so a config reload can update an entry's
+    /// metadata — `enabled`, tags — without disturbing the live connection
+    /// underneath it. The transport half never changes in place: a transport
+    /// edit retires the whole upstream and installs a fresh one, because a
+    /// running child cannot be re-pointed at a different command.
+    server: arc_swap::ArcSwap<Server>,
+    /// Set when a reload takes this upstream out of the map. Everything that
+    /// could still reach it does so through an [`Arc`] captured before the
+    /// swap, and this is how those late callers learn the entry is gone:
+    /// without it a `ready()` that looked the name up a moment before the
+    /// reload would spawn a child nothing owns any more.
+    retired: std::sync::atomic::AtomicBool,
     slot: Mutex<Slot>,
     /// Notified every time the slot leaves `Connecting`, so demands that
     /// arrive mid-ladder can wait for its outcome without holding the lock.
@@ -99,6 +110,36 @@ struct Upstream {
     /// remembered ones. Survives a disconnect for the same reason — a server
     /// that had prompts a second ago still has them while it restarts.
     info: arc_swap::ArcSwapOption<rmcp::model::ServerPeerInfo>,
+}
+
+impl Upstream {
+    fn retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    /// Takes this upstream out of service: no new ladder may start on it, and
+    /// the connection it holds is released.
+    ///
+    /// Released, not killed. Dropping the manager's `Arc` leaves any request
+    /// that already took one holding the service alive; rmcp closes it when
+    /// the last handle goes, which is after that request finishes. This is
+    /// the whole reload invariant in three lines — a live connection is never
+    /// mutated in place, it is unpublished and reaped by refcount — and it is
+    /// why a `tools/call` running across a reload still gets its answer from
+    /// the server it started on.
+    ///
+    /// A ladder in flight is not waited for: it finds the slot no longer its
+    /// own (and the retired flag set) when it lands, and throws its
+    /// connection away rather than installing it.
+    async fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        let mut slot = self.slot.lock().await;
+        *slot = Slot::Idle;
+        drop(slot);
+        // Callers parked on a ladder this retirement just disowned: wake them
+        // so they re-read the slot, see the flag and get an answer.
+        self.settled.notify_waiters();
+    }
 }
 
 /// Owns the `Connecting` claim for one run of the connect ladder.
@@ -142,31 +183,86 @@ enum Claim {
     Own(u32, Arc<AtomicBool>),
 }
 
+/// The server map, keyed by name. Replaced whole on a reload.
+type Upstreams = BTreeMap<String, Arc<Upstream>>;
+
+/// What one [`UpstreamManager::apply`] changed. Empty for a reload that
+/// found the same servers it was already running.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// Names the config gained. Lazy: nothing is connected until demanded.
+    pub added: Vec<String>,
+    /// Names whose transport changed, so the old child was retired and a
+    /// fresh upstream took its place.
+    pub replaced: Vec<String>,
+    /// Names the config lost.
+    pub removed: Vec<String>,
+    /// Names still configured but flipped to `enabled = false`; their
+    /// connection is retired and further demands are refused.
+    pub stopped: Vec<String>,
+}
+
+impl Changes {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.replaced.is_empty()
+            && self.removed.is_empty()
+            && self.stopped.is_empty()
+    }
+}
+
+impl std::fmt::Display for Changes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        for (label, names) in [
+            ("added", &self.added),
+            ("replaced", &self.replaced),
+            ("removed", &self.removed),
+            ("stopped", &self.stopped),
+        ] {
+            if !names.is_empty() {
+                parts.push(format!("{label} {}", names.join(", ")));
+            }
+        }
+        if parts.is_empty() {
+            return f.write_str("no server changes");
+        }
+        f.write_str(&parts.join("; "))
+    }
+}
+
 pub struct UpstreamManager {
-    upstreams: BTreeMap<String, Upstream>,
+    /// Read on every request and replaced whole by a reload, so readers are
+    /// lock-free and can never queue behind one. Writers serialize on
+    /// `reloading` instead: the swap is a read-modify-write over the old map
+    /// and two concurrent ones would lose an entry.
+    upstreams: arc_swap::ArcSwap<Upstreams>,
+    reloading: Mutex<()>,
     connect_timeout: Duration,
     backoff_base: Duration,
+}
+
+fn upstream(server: Server) -> Arc<Upstream> {
+    Arc::new(Upstream {
+        server: arc_swap::ArcSwap::from_pointee(server),
+        retired: std::sync::atomic::AtomicBool::new(false),
+        slot: Mutex::new(Slot::Idle),
+        settled: Notify::new(),
+        info: arc_swap::ArcSwapOption::empty(),
+    })
 }
 
 impl UpstreamManager {
     #[must_use]
     pub fn new(servers: BTreeMap<String, Server>) -> Self {
-        let upstreams = servers
+        let upstreams: Upstreams = servers
             .into_iter()
-            .map(|(name, server)| {
-                (
-                    name,
-                    Upstream {
-                        server,
-                        slot: Mutex::new(Slot::Idle),
-                        settled: Notify::new(),
-                        info: arc_swap::ArcSwapOption::empty(),
-                    },
-                )
-            })
+            .map(|(name, server)| (name, upstream(server)))
             .collect();
         Self {
-            upstreams,
+            upstreams: arc_swap::ArcSwap::from_pointee(upstreams),
+            reloading: Mutex::new(()),
             connect_timeout: Duration::from_secs(30),
             backoff_base: Duration::from_millis(500),
         }
@@ -185,15 +281,26 @@ impl UpstreamManager {
         self
     }
 
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.upstreams.keys().map(String::as_str)
+    /// The configured names, in path order. Returns owned strings rather
+    /// than borrows because the map behind them can be replaced by a reload
+    /// at any moment.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.upstreams.load().keys().cloned().collect()
+    }
+
+    /// The entry for `name` as of right now. The [`Arc`] keeps it alive for
+    /// the caller even if a reload removes it a microsecond later — see
+    /// [`Upstream::retired`] for what that caller is then obliged to check.
+    fn get(&self, name: &str) -> Option<Arc<Upstream>> {
+        self.upstreams.load().get(name).cloned()
     }
 
     /// Current status without touching the upstream. The slot lock is never
     /// held across a connect, so this answers immediately even while an
     /// upstream is halfway through its ladder.
     pub async fn status(&self, name: &str) -> Option<UpstreamStatus> {
-        let upstream = self.upstreams.get(name)?;
+        let upstream = self.get(name)?;
         let slot = upstream.slot.lock().await;
         Some(match &*slot {
             // A Ready slot whose transport died counts as Idle-with-history;
@@ -214,7 +321,7 @@ impl UpstreamManager {
     /// never be the thing that starts an upstream.
     #[must_use]
     pub fn last_server_info(&self, name: &str) -> Option<Arc<rmcp::model::ServerPeerInfo>> {
-        self.upstreams.get(name)?.info.load_full()
+        self.get(name)?.info.load_full()
     }
 
     /// Returns a live service for `name`, spawning it on first demand.
@@ -239,13 +346,12 @@ impl UpstreamManager {
     /// Returns [`UpstreamError`] for unknown/disabled upstreams, exhausted
     /// connect attempts, and a shutdown that lands mid-connect.
     pub async fn ready(&self, name: &str) -> Result<Arc<UpstreamService>, UpstreamError> {
-        let upstream = self
-            .upstreams
-            .get(name)
-            .ok_or_else(|| UpstreamError::Unknown {
-                name: name.to_owned(),
-            })?;
-        if !upstream.server.enabled {
+        let upstream = self.get(name).ok_or_else(|| UpstreamError::Unknown {
+            name: name.to_owned(),
+        })?;
+        let upstream = &*upstream;
+        let server = upstream.server.load_full();
+        if !server.enabled {
             return Err(UpstreamError::Disabled {
                 name: name.to_owned(),
             });
@@ -262,6 +368,16 @@ impl UpstreamManager {
 
             let claim = {
                 let mut slot = upstream.slot.lock().await;
+                // Checked under the slot lock, which is also what `retire`
+                // takes: either this caller claims the slot and `retire`
+                // then finds a `Connecting` claim to revoke, or it reads the
+                // flag `retire` already set. There is no ordering in which a
+                // ladder starts on an upstream nobody owns any more.
+                if upstream.retired() {
+                    return Err(UpstreamError::ShutDown {
+                        name: name.to_owned(),
+                    });
+                }
                 match &*slot {
                     Slot::Ready(service) if !dead(service) => Claim::Live(Arc::clone(service)),
                     // Someone else owns the ladder; wait for its outcome
@@ -295,16 +411,17 @@ impl UpstreamManager {
             upstream,
             live: Arc::clone(&live),
         };
-        let outcome = self
-            .connect_with_backoff(name, &upstream.server, attempts)
-            .await;
+        let outcome = self.connect_with_backoff(name, &server, attempts).await;
 
         let mut slot = upstream.slot.lock().await;
         // A shutdown during the ladder left the slot Idle, and a demand that
         // found the claim revoked may have started a ladder of its own.
         // Either way this connection must not be installed behind their
-        // backs — discard it instead.
-        let abandoned = !matches!(&*slot, Slot::Connecting(owner) if Arc::ptr_eq(owner, &live));
+        // backs — discard it instead. A reload that retired the upstream
+        // mid-ladder counts the same way: installing here would leave a
+        // child running under an entry no longer in the map.
+        let abandoned = upstream.retired()
+            || !matches!(&*slot, Slot::Connecting(owner) if Arc::ptr_eq(owner, &live));
         let result = match outcome {
             Ok(service) => {
                 let service = Arc::new(service);
@@ -341,11 +458,77 @@ impl UpstreamManager {
         result
     }
 
+    /// Makes `servers` the live set, keeping every upstream that did not
+    /// change — same entry, same slot, same child process.
+    ///
+    /// The rules, in the order a reload cares about them:
+    /// - an entry whose [`Server`] is byte-identical is not touched at all;
+    /// - one whose metadata changed but whose transport did not keeps its
+    ///   connection and gets the new [`Server`] swapped in, because
+    ///   `enabled` and tags say nothing about the process that is running;
+    /// - one whose transport changed is retired and replaced by a fresh,
+    ///   unconnected entry: a running child cannot be re-pointed;
+    /// - one that vanished, or that just went `enabled = false`, is retired.
+    ///
+    /// Retiring never kills a connection out from under a request — see
+    /// [`Upstream::retire`].
+    pub async fn apply(&self, servers: BTreeMap<String, Server>) -> Changes {
+        // One reload at a time: the map swap below is a read-modify-write and
+        // two of them racing would drop whichever entries the loser added.
+        let _reloading = self.reloading.lock().await;
+
+        let current = self.upstreams.load_full();
+        let mut next = Upstreams::new();
+        let mut changes = Changes::default();
+        let mut retire = Vec::new();
+
+        for (name, server) in servers {
+            let Some(existing) = current.get(&name) else {
+                changes.added.push(name.clone());
+                next.insert(name, upstream(server));
+                continue;
+            };
+            let old = existing.server.load_full();
+            if *old == server {
+                next.insert(name, Arc::clone(existing));
+                continue;
+            }
+            if old.transport == server.transport {
+                let stopped = old.enabled && !server.enabled;
+                existing.server.store(Arc::new(server));
+                if stopped {
+                    changes.stopped.push(name.clone());
+                    retire.push(Arc::clone(existing));
+                }
+                next.insert(name, Arc::clone(existing));
+                continue;
+            }
+            changes.replaced.push(name.clone());
+            retire.push(Arc::clone(existing));
+            next.insert(name, upstream(server));
+        }
+        for (name, existing) in current.iter() {
+            if !next.contains_key(name) {
+                changes.removed.push(name.clone());
+                retire.push(Arc::clone(existing));
+            }
+        }
+
+        // Published before anything is retired, so the window in which a
+        // demand could reach a doomed entry through the map is closed first.
+        self.upstreams.store(Arc::new(next));
+        for upstream in retire {
+            upstream.retire().await;
+        }
+        changes
+    }
+
     /// Stops every running upstream (children die with their transports).
     /// Never waits for a connect in flight: that ladder finds the slot no
     /// longer its own when it lands and throws its connection away.
     pub async fn shutdown(&self) {
-        for upstream in self.upstreams.values() {
+        let upstreams = self.upstreams.load_full();
+        for upstream in upstreams.values() {
             let mut slot = upstream.slot.lock().await;
             if let Slot::Ready(service) = &*slot {
                 service.cancellation_token().cancel();

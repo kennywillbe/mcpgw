@@ -12,7 +12,10 @@
 //! died-after-ready reconnection), `paged` (serves its tools over two
 //! cursored pages — exercises a pipe forwarding pagination rather than
 //! collapsing it), `legacy` (answers the way every server predating
-//! 2026-07-28 does: no `resultType`, no caching fields).
+//! 2026-07-28 does: no `resultType`, no caching fields), `pid` (one tool
+//! that names this process, slowly — what config reload is checked with,
+//! since it has to prove both that an untouched server keeps the *same*
+//! child and that a call already in flight still lands on it).
 //!
 //! `healthy` decorates its answers with the caching fields a 2026-07-28
 //! server sends (`ttlMs`, `cacheScope`) and with `_meta`, because a pipe
@@ -132,7 +135,22 @@ fn tool(name: &str, description: &str) -> serde_json::Value {
     })
 }
 
+/// How long a `pid` call takes to answer. Long enough that a test can swap
+/// the config out from under a call in flight and still be inside it.
+const PID_CALL: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn tools(mode: &str, method: &str, params: &serde_json::Value) -> serde_json::Value {
+    if mode == "pid" {
+        if method == "tools/list" {
+            return serde_json::json!({
+                "tools": [tool("pid", "reports this fixture process's id")]
+            });
+        }
+        std::thread::sleep(PID_CALL);
+        return serde_json::json!({
+            "content": [{ "type": "text", "text": std::process::id().to_string() }]
+        });
+    }
     if method == "tools/list" {
         if mode == "paged" {
             return paged_tools(params);
