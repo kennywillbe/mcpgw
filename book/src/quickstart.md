@@ -85,6 +85,16 @@ server it finds into the canonical config. Names
 that aren't valid mcpgw names get slugified, and every rename is printed. The
 same server configured in three clients is imported once.
 
+Two entries come in with a note attached. A stdio server whose command is not
+on this machine — an absolute path into an app you have since removed, say —
+is imported **disabled**, so it never reaches the gateway or your clients;
+`mcpgw toggle <name>` switches it on once the command is back. And a remote
+server that turns out to be at the same URL as one you already have, differing
+only in what its headers are set to, is almost always the same server with a
+second token: `import` says so and asks whether to keep both copies or just
+the one you have. Off a terminal, and under `--yes`, it keeps both — the
+answer that cannot cost you an account — and prints the reason anyway.
+
 ```sh
 mcpgw import --dry-run          # look before you leap
 mcpgw import --from cursor      # only one client (repeatable)

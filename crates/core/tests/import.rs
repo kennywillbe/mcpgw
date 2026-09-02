@@ -8,6 +8,13 @@ fn read(kind: ClientKind, json: &str) -> ClientRead {
     kind.read_text(json, Path::new("x.json")).unwrap()
 }
 
+/// Every command resolves. These cases are about naming, dedupe and
+/// classification, not about what happens to be installed on the machine
+/// running the suite.
+fn resolves(_command: &str) -> bool {
+    true
+}
+
 fn canonical(toml: &str) -> BTreeMap<String, mcpgw_core::Server> {
     Config::parse(toml, Path::new("c.toml")).unwrap().servers
 }
@@ -33,6 +40,7 @@ fn identical_definitions_dedup_across_clients() {
     let plan = plan_import(
         &[("cursor".into(), cursor), ("vscode".into(), vscode)],
         &BTreeMap::new(),
+        &resolves,
     );
     assert_eq!(plan.new.len(), 1);
     assert_eq!(plan.new[0].origins.len(), 2);
@@ -55,6 +63,7 @@ fn dedup_merges_metadata_instead_of_keeping_only_the_first_source() {
     let plan = plan_import(
         &[("cursor".into(), cursor), ("vscode".into(), vscode)],
         &BTreeMap::new(),
+        &resolves,
     );
 
     assert_eq!(plan.new.len(), 1);
@@ -79,6 +88,7 @@ fn cross_client_name_clash_suffixes_the_later_one() {
     let plan = plan_import(
         &[("cursor".into(), cursor), ("vscode".into(), vscode)],
         &BTreeMap::new(),
+        &resolves,
     );
     let names: Vec<&str> = plan.new.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["tools", "tools-2"]);
@@ -99,7 +109,7 @@ type = "http"
 url = "https://occupied/mcp"
 "#,
     );
-    let plan = plan_import(&[("cursor".into(), cursor)], &canonical);
+    let plan = plan_import(&[("cursor".into(), cursor)], &canonical, &resolves);
     assert_eq!(plan.new.len(), 1);
     assert_eq!(plan.new[0].name, "my-server-2");
     assert!(plan.new[0].renamed);
@@ -128,7 +138,7 @@ command = "npx"
 args = ["canonical-version"]
 "#,
     );
-    let plan = plan_import(&[("cursor".into(), cursor)], &canonical);
+    let plan = plan_import(&[("cursor".into(), cursor)], &canonical, &resolves);
     assert_eq!(plan.already.len(), 1);
     assert_eq!(plan.already[0].name, "same");
     assert_eq!(plan.conflicts.len(), 1);
@@ -143,7 +153,7 @@ fn sse_note_travels_with_the_candidate() {
         ClientKind::Cursor,
         r#"{"mcpServers": {"linear": {"type": "sse", "url": "https://l/sse"}}}"#,
     );
-    let plan = plan_import(&[("cursor".into(), cursor)], &BTreeMap::new());
+    let plan = plan_import(&[("cursor".into(), cursor)], &BTreeMap::new(), &resolves);
     assert_eq!(plan.new[0].notes.len(), 1);
     assert!(plan.new[0].notes[0].contains("sse"));
 }
@@ -164,6 +174,7 @@ fn http_urls_that_differ_only_in_case_or_a_trailing_slash_dedup() {
     let plan = plan_import(
         &[("cursor".into(), cursor), ("vscode".into(), vscode)],
         &BTreeMap::new(),
+        &resolves,
     );
 
     assert_eq!(plan.new.len(), 1);
@@ -194,6 +205,7 @@ fn urls_that_differ_past_the_host_stay_separate() {
         let plan = plan_import(
             &[("cursor".into(), cursor), ("vscode".into(), vscode)],
             &BTreeMap::new(),
+            &resolves,
         );
         assert_eq!(plan.new.len(), 2, "{a} and {b} were merged");
     }
@@ -217,6 +229,7 @@ fn header_differences_survive_url_canonicalization() {
     let plan = plan_import(
         &[("cursor".into(), cursor), ("vscode".into(), vscode)],
         &BTreeMap::new(),
+        &resolves,
     );
     assert_eq!(plan.new.len(), 2);
 }
@@ -237,6 +250,161 @@ fn stdio_is_untouched_by_url_canonicalization() {
     let plan = plan_import(
         &[("cursor".into(), cursor), ("vscode".into(), vscode)],
         &BTreeMap::new(),
+        &resolves,
     );
     assert_eq!(plan.new.len(), 2);
+}
+
+/// A stdio entry whose command is not on this machine comes in switched off.
+/// Importing it enabled publishes an endpoint that can never answer and then
+/// spreads it to every client on the next sync, which is how one pre-existing
+/// broken entry turns into one failure per client.
+#[test]
+fn a_command_that_does_not_resolve_is_imported_disabled() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {
+            "node_repl": {"command": "/Applications/Gone.app/bin/node_repl"},
+            "notes": {"command": "notes-mcp"}
+        }}"#,
+    );
+    let plan = plan_import(&[("cursor".into(), cursor)], &BTreeMap::new(), &|command| {
+        command == "notes-mcp"
+    });
+
+    let by_name = |name: &str| {
+        plan.new
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} not planned"))
+    };
+    assert!(by_name("node_repl").command_missing);
+    assert!(!by_name("node_repl").server.enabled);
+    // The entry that can run is untouched: this is a check, not a policy of
+    // importing everything off.
+    assert!(!by_name("notes").command_missing);
+    assert!(by_name("notes").server.enabled);
+}
+
+/// Resolvability is asked about stdio only — an http entry has no command to
+/// look for, and a lookup that returns false for everything must not switch
+/// off every remote server on the machine.
+#[test]
+fn an_http_entry_is_never_disabled_for_a_missing_command() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"linear": {"type": "http", "url": "https://mcp.linear.app/mcp"}}}"#,
+    );
+    let plan = plan_import(&[("cursor".into(), cursor)], &BTreeMap::new(), &|_| false);
+
+    assert!(!plan.new[0].command_missing);
+    assert!(plan.new[0].server.enabled);
+}
+
+/// The same remote server with a second token is not two servers, and the
+/// plan says so rather than inventing `context7-2` in silence.
+#[test]
+fn the_same_url_with_a_different_token_is_flagged_against_the_canonical_entry() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp",
+            "headers": {"Authorization": "Bearer incoming-secret"}}}}"#,
+    );
+    let canonical = canonical(
+        "version = 1\n\n[servers.ctx]\ntype = \"http\"\n\
+         url = \"https://mcp.context7.com/mcp\"\n\
+         headers = { Authorization = \"Bearer canonical-secret\" }\n",
+    );
+    let plan = plan_import(&[("cursor".into(), cursor)], &canonical, &resolves);
+
+    let same = plan.new[0].same_address.as_ref().expect("not flagged");
+    assert_eq!(same.name, "ctx");
+    assert!(same.canonical);
+    // The flag exists so the caller can talk about the difference without
+    // printing it: neither token may travel with it.
+    let described = format!("{same:?}");
+    assert!(!described.contains("secret"), "{described}");
+}
+
+/// Two clients holding one server under two tokens is the case that started
+/// this: the second one matches the first candidate, not the config.
+#[test]
+fn the_same_url_with_a_different_token_is_flagged_against_an_earlier_candidate() {
+    let codex = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp",
+            "headers": {"Authorization": "Bearer one"}}}}"#,
+    );
+    let opencode = read(
+        ClientKind::VsCode,
+        r#"{"servers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp",
+            "headers": {"Authorization": "Bearer two"}}}}"#,
+    );
+    let plan = plan_import(
+        &[("cursor".into(), codex), ("vscode".into(), opencode)],
+        &BTreeMap::new(),
+        &resolves,
+    );
+
+    assert_eq!(plan.new.len(), 2, "the two definitions still both survive");
+    assert_eq!(plan.new[0].same_address, None);
+    let same = plan.new[1].same_address.as_ref().expect("not flagged");
+    assert_eq!(same.name, "context7");
+    assert!(!same.canonical);
+    for token in ["one", "two"] {
+        let described = format!("{same:?}");
+        assert!(
+            !described.contains(&format!("Bearer {token}")),
+            "{described}"
+        );
+    }
+}
+
+/// A header the other side does not send at all is a genuinely different
+/// definition — a proxy header, a version pin — not one server wearing a
+/// second credential. Those keep the old silent behaviour.
+#[test]
+fn a_different_set_of_header_keys_is_not_a_credentials_difference() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"a": {"type": "http", "url": "https://h/mcp",
+            "headers": {"Authorization": "Bearer one", "X-Tenant": "acme"}}}}"#,
+    );
+    let vscode = read(
+        ClientKind::VsCode,
+        r#"{"servers": {"b": {"type": "http", "url": "https://h/mcp",
+            "headers": {"Authorization": "Bearer two"}}}}"#,
+    );
+    let plan = plan_import(
+        &[("cursor".into(), cursor), ("vscode".into(), vscode)],
+        &BTreeMap::new(),
+        &resolves,
+    );
+
+    assert_eq!(plan.new.len(), 2);
+    assert!(plan.new.iter().all(|c| c.same_address.is_none()));
+}
+
+/// Identical headers are the dedupe case and must not be dressed up as a
+/// question: there is nothing for the user to decide.
+#[test]
+fn identical_headers_dedupe_rather_than_asking() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"a": {"type": "http", "url": "https://h/mcp",
+            "headers": {"Authorization": "Bearer one"}}}}"#,
+    );
+    let vscode = read(
+        ClientKind::VsCode,
+        r#"{"servers": {"b": {"type": "http", "url": "https://h/mcp",
+            "headers": {"Authorization": "Bearer one"}}}}"#,
+    );
+    let plan = plan_import(
+        &[("cursor".into(), cursor), ("vscode".into(), vscode)],
+        &BTreeMap::new(),
+        &resolves,
+    );
+
+    assert_eq!(plan.new.len(), 1);
+    assert_eq!(plan.new[0].same_address, None);
 }

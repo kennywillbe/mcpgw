@@ -3,10 +3,12 @@
 //! The step where the wizard first writes something, so it is the step where
 //! "show and confirm" has to earn its keep. `mcpgw import` reports what it
 //! did after the fact, in one line per entry; here the whole plan is laid out
-//! *before* the question, and the two things a plan can do that surprise
-//! someone — quietly merging two entries into one, and quietly renaming one
-//! of two entries that share a name — each get their own announcement rather
-//! than a parenthetical.
+//! *before* the question, and everything a plan can do that surprises someone
+//! — quietly merging two entries into one, quietly renaming one of two
+//! entries that share a name, bringing an entry in switched off because
+//! nothing here can start it, adopting what is probably a second copy of a
+//! server the user already has — gets its own announcement rather than a
+//! parenthetical.
 //!
 //! See the contract in [`super`]: this module is `pending` + `run`.
 
@@ -19,6 +21,10 @@ use mcpgw_core::state::ManagedState;
 use mcpgw_core::{ClientKind, ClientRead, ConfigStore, Detection, Server, Transport, paths};
 
 use super::{Ctx, Outcome};
+use crate::commands::import::{
+    SAME_ADDRESS_PROMPT, command_missing_line, same_address_line, same_address_options,
+    same_address_questions,
+};
 use crate::ui;
 
 /// True when some configured client holds a server the canonical config has
@@ -37,7 +43,11 @@ pub fn pending(cx: &Ctx) -> bool {
 /// config or the adoption record cannot be written.
 pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
     let (sources, unreadable) = sources(cx);
-    let plan = plan_import(&sources, &cx.config.servers);
+    let plan = plan_import(
+        &sources,
+        &cx.config.servers,
+        &crate::commands::command_exists,
+    );
 
     // `pending` said there was something here, but it answers from the
     // client files alone; the plan is what knows whether any of it survives
@@ -57,9 +67,29 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
     );
 
     let names: Vec<String> = plan.new.iter().map(|c| c.name.clone()).collect();
-    let Some(leave_out) = ask(cx, &question(cx, &plan), &names)? else {
+    let Some(mut leave_out) = ask(cx, &question(cx, &plan), &names)? else {
         return Ok(Outcome::Handled);
     };
+
+    // The one question this step asks per entry rather than once for the set:
+    // an entry that looks like a second copy of one the user already has.
+    // Asked after the big yes, and never about an entry that yes already
+    // struck out. `--yes` answers it the way every earlier release behaved —
+    // keep both — having printed the observation above either way.
+    for shared in same_address_questions(&plan) {
+        if leave_out.contains(&shared.planned) {
+            continue;
+        }
+        let picked = cx.choose(
+            SAME_ADDRESS_PROMPT,
+            &same_address_options(&shared),
+            Some(0),
+            "mcpgw import",
+        )?;
+        if picked == 1 {
+            leave_out.insert(shared.planned);
+        }
+    }
 
     // Everything the user struck out is removed at the source, not at the
     // plan: dropping a candidate would leave its client entries unadopted
@@ -163,10 +193,17 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
         }
     }
 
+    bullets.extend(hygiene(plan));
+
     let rest: Vec<String> = plan
         .new
         .iter()
-        .filter(|c| c.origins.len() == 1 && !clashing.contains(c.name.as_str()))
+        .filter(|c| {
+            c.origins.len() == 1
+                && !clashing.contains(c.name.as_str())
+                && !c.command_missing
+                && c.same_address.is_none()
+        })
         .map(|c| {
             if c.renamed {
                 format!("{} (from {:?})", c.name, c.origins[0].1)
@@ -206,6 +243,23 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
             cx.color,
         ));
     }
+    bullets
+}
+
+/// The two things the plan does that a list of names cannot show: an entry
+/// coming in switched off because nothing on this machine can start it, and
+/// an entry that is very likely a second copy of one the user already has.
+///
+/// Both are kept out of the "the rest come across as they are" list, which is
+/// by definition the entries that need no explanation.
+fn hygiene(plan: &ImportPlan) -> Vec<String> {
+    let mut bullets: Vec<String> = plan
+        .new
+        .iter()
+        .filter(|c| c.command_missing)
+        .map(|c| format!("{} — {}", c.name, command_missing_line(&c.name)))
+        .collect();
+    bullets.extend(same_address_questions(plan).iter().map(same_address_line));
     bullets
 }
 
@@ -366,7 +420,11 @@ fn ask(cx: &Ctx, question: &str, offered: &[String]) -> anyhow::Result<Option<BT
 /// exactly as `mcpgw import` does it.
 fn apply(cx: &Ctx, sources: &[(String, ClientRead)]) -> anyhow::Result<()> {
     let mut store = ConfigStore::edit_or_create(&cx.config_path)?;
-    let plan = plan_import(sources, &store.config().servers);
+    let plan = plan_import(
+        sources,
+        &store.config().servers,
+        &crate::commands::command_exists,
+    );
 
     let state_path = paths::state_dir()
         .context("cannot determine a home directory for the state dir")?

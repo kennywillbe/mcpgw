@@ -56,7 +56,7 @@ pub fn run(
     probe: Option<Duration>,
     gateway_url: &str,
 ) -> anyhow::Result<u8> {
-    let command_exists = |cmd: &str| which::which(cmd).is_ok();
+    let command_exists = |cmd: &str| super::command_exists(cmd);
     let mut findings: Vec<Finding> = Vec::new();
     let mut plan = ProbePlan::default();
     let mut gateway_plan = GatewayPlan::new(gateway_url);

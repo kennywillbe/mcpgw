@@ -2,9 +2,9 @@ use std::collections::BTreeSet;
 use std::io::IsTerminal as _;
 
 use anyhow::Context as _;
-use mcpgw_core::import::{ImportCandidate, plan_import};
+use mcpgw_core::import::{ImportCandidate, ImportPlan, SameAddress, plan_import};
 use mcpgw_core::state::ManagedState;
-use mcpgw_core::{ConfigStore, Detection, paths};
+use mcpgw_core::{ClientKind, ConfigStore, Detection, paths};
 
 #[derive(clap::Args)]
 pub struct ImportArgs {
@@ -44,12 +44,22 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     // store now supplies both the planning input and the write handle, so
     // they cannot describe different files.
     let store = ConfigStore::edit_or_create(&config_path)?;
-    let plan = plan_import(&sources, &store.config().servers);
+    let plan = plan_import(&sources, &store.config().servers, &super::command_exists);
 
     if plan.new.is_empty() && plan.already.is_empty() && plan.conflicts.is_empty() {
         println!("nothing to import");
         return Ok(());
     }
+    // Said before anything is asked, and said in every mode — dry run, piped,
+    // `--yes`: a run that cannot ask still owes the reader the observation,
+    // because "why do I have context7 and context7-2" is a question they will
+    // otherwise ask themselves later with nothing in the transcript to
+    // answer it.
+    let addresses = same_address_questions(&plan);
+    for shared in &addresses {
+        println!("{}", same_address_line(shared));
+    }
+
     if args.dry_run {
         report_dry(&plan);
         return Ok(());
@@ -75,18 +85,21 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     // fallback alone leaves scripted callers unable to promise they will not
     // block.
     let non_interactive = args.yes || !std::io::stdin().is_terminal();
-    let (mut store, plan, overwrite) = if plan.conflicts.is_empty() || non_interactive {
-        // Nothing to ask, so nothing to release: the plan already under
-        // the lock is the one that gets applied.
-        (store, plan, BTreeSet::new())
-    } else {
-        let questions: Vec<String> = plan.conflicts.iter().map(|c| c.name.clone()).collect();
-        drop(store);
-        let overwrite = ask(&questions)?;
-        let store = ConfigStore::edit_or_create(&config_path)?;
-        let plan = plan_import(&sources, &store.config().servers);
-        (store, plan, overwrite)
-    };
+    let conflicts: Vec<String> = plan.conflicts.iter().map(|c| c.name.clone()).collect();
+    let (mut store, plan, overwrite, skip) =
+        if (conflicts.is_empty() && addresses.is_empty()) || non_interactive {
+            // Nothing to ask, so nothing to release: the plan already under
+            // the lock is the one that gets applied. Under `--yes` that means
+            // keeping both copies — the answer that loses nothing.
+            (store, plan, BTreeSet::new(), BTreeSet::new())
+        } else {
+            drop(store);
+            let overwrite = ask(&conflicts)?;
+            let skip = ask_same_address(&addresses)?;
+            let store = ConfigStore::edit_or_create(&config_path)?;
+            let plan = plan_import(&sources, &store.config().servers, &super::command_exists);
+            (store, plan, overwrite, skip)
+        };
 
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
@@ -99,6 +112,19 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     let mut skipped = 0;
 
     for candidate in &plan.new {
+        // Honoured only where the fresh plan still sees the same shared
+        // address: a name that stopped matching under the prompt was answered
+        // about something that no longer exists.
+        if let Some(same) = &candidate.same_address
+            && skip.contains(&candidate.name)
+        {
+            skipped += 1;
+            println!(
+                "- {} skipped — keeping {} instead (your client entry is untouched)",
+                candidate.name, same.name
+            );
+            continue;
+        }
         store.upsert_server(&candidate.name, &candidate.server, false)?;
         adopt(&mut state, candidate);
         imported += 1;
@@ -171,6 +197,95 @@ fn ask(names: &[String]) -> anyhow::Result<BTreeSet<String>> {
     Ok(overwrite)
 }
 
+/// Why an entry is coming in switched off, and what turns it back on. Shared
+/// with the wizard's import step so both surfaces say it the same way.
+pub fn command_missing_line(name: &str) -> String {
+    format!(
+        "command not found on this machine, importing disabled \
+         (enable later: mcpgw toggle {name})"
+    )
+}
+
+/// One candidate that addresses something already known and differs from it
+/// only in what its headers are set to.
+pub struct SharedAddress {
+    /// The name the plan would file it under.
+    pub planned: String,
+    /// The name it has in the client it came from. Preferred in prose: on the
+    /// run this exists for, the planned name is the invented `context7-2`,
+    /// and "context7-2 looks like context7" explains nothing. What the user
+    /// recognises is the entry they wrote themselves.
+    pub original: String,
+    pub client: String,
+    pub same: SameAddress,
+}
+
+pub fn same_address_questions(plan: &ImportPlan) -> Vec<SharedAddress> {
+    plan.new
+        .iter()
+        .filter_map(|candidate| {
+            let same = candidate.same_address.clone()?;
+            let (client_id, original) = candidate.origins.first()?;
+            Some(SharedAddress {
+                planned: candidate.name.clone(),
+                original: original.clone(),
+                client: display(client_id),
+                same,
+            })
+        })
+        .collect()
+}
+
+/// What the run saw, in a sentence — the fact that two definitions differ,
+/// never the values that differ, because this line ends up in bug reports.
+pub fn same_address_line(shared: &SharedAddress) -> String {
+    let other = if shared.same.canonical {
+        format!("your existing {}", shared.same.name)
+    } else {
+        format!("{}, also being imported", shared.same.name)
+    };
+    format!(
+        "{} in {} points at the same address as {other}, \
+         with different credentials — probably the same server.",
+        shared.original, shared.client
+    )
+}
+
+/// The question a shared address raises. Keeping both comes first because it
+/// is the recommended answer: it is what every earlier release did, and it is
+/// the one that cannot cost the user an account. Merging is the choice with a
+/// consequence, so it is the one that has to be picked.
+pub const SAME_ADDRESS_PROMPT: &str = "Which would you like?";
+
+#[must_use]
+pub fn same_address_options(shared: &SharedAddress) -> Vec<String> {
+    vec![
+        format!("Keep both — bring it in as {}", shared.planned),
+        format!(
+            "Keep just {} — leave {:?} where it is",
+            shared.same.name, shared.original
+        ),
+    ]
+}
+
+/// Asks, per shared address, and returns the planned names to leave out.
+fn ask_same_address(questions: &[SharedAddress]) -> anyhow::Result<BTreeSet<String>> {
+    let mut skip = BTreeSet::new();
+    for shared in questions {
+        if crate::ui::choose(SAME_ADDRESS_PROMPT, &same_address_options(shared), 0)? == 1 {
+            skip.insert(shared.planned.clone());
+        }
+    }
+    Ok(skip)
+}
+
+fn display(client_id: &str) -> String {
+    ClientKind::from_id(client_id).map_or_else(
+        || client_id.to_owned(),
+        |kind| kind.display_name().to_owned(),
+    )
+}
+
 fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
     for (client_id, original) in &candidate.origins {
         state
@@ -189,6 +304,9 @@ fn describe(candidate: &ImportCandidate) -> String {
         .map(|(id, _)| id.as_str())
         .collect();
     parts.push(format!("from {}", clients.join(", ")));
+    if candidate.command_missing {
+        parts.push(command_missing_line(&candidate.name));
+    }
     if candidate.renamed {
         parts.push(format!("renamed from {:?}", candidate.origins[0].1));
     }

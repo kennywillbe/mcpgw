@@ -23,6 +23,15 @@ use anyhow::Context as _;
 // keep saying `super::confirm`.
 pub use crate::ui::confirm;
 
+/// Whether a stdio command can actually be started on this machine: an
+/// absolute path that exists and is executable, or a bare name PATH resolves.
+///
+/// Shared by `doctor` and by import planning so the two cannot drift — an
+/// entry import refuses to switch on is exactly the one doctor would flag.
+pub fn command_exists(command: &str) -> bool {
+    which::which(command).is_ok()
+}
+
 pub fn canonical_config_path() -> anyhow::Result<PathBuf> {
     mcpgw_core::paths::config_path()
         .context("cannot determine a home directory to resolve the config path")
