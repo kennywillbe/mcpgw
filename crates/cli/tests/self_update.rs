@@ -142,14 +142,28 @@ fn release_archive(version: &str, binary: &[u8]) -> Vec<u8> {
 
 /// Runs the mcpgw at `exe` with the release host and state directory pinned
 /// into the sandbox.
+///
+/// Several tests copy the binary into their tempdir and exec the copy. A
+/// sibling test forking while that copy's write handle is still open leaves
+/// the kernel holding the file as busy, so the spawn can lose the race with
+/// ETXTBSY; it clears on its own once the descriptor is gone.
 fn run(exe: &Path, base: &str, state: &Path, args: &[&str]) -> Output {
-    Command::new(exe)
-        .args(args)
-        .env("MCPGW_UPDATE_BASE_URL", base)
-        .env("MCPGW_STATE_DIR", state)
-        .env_remove("MCPGW_NO_UPDATE_CHECK")
-        .output()
-        .unwrap()
+    for attempt in 0..5 {
+        let result = Command::new(exe)
+            .args(args)
+            .env("MCPGW_UPDATE_BASE_URL", base)
+            .env("MCPGW_STATE_DIR", state)
+            .env_remove("MCPGW_NO_UPDATE_CHECK")
+            .output();
+        match result {
+            Ok(out) => return out,
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
+            }
+            Err(err) => panic!("{}: {err}", exe.display()),
+        }
+    }
+    panic!("{}: still busy after 5 attempts", exe.display())
 }
 
 fn built_binary() -> PathBuf {
