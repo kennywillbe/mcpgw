@@ -159,38 +159,6 @@ async fn a_silent_listener_probes_as_not_http() {
     assert_eq!(reach, GatewayReach::NotHttp);
 }
 
-/// The stub each per-OS milestone replaces. Cfg-gated because exactly one of
-/// the three is compiled into any build, by design — and a platform drops
-/// out of the list once its installer ships, because a real implementation
-/// talks to a real supervisor and this would then register a service on
-/// whatever machine ran it. All three have now shipped — launch agent,
-/// systemd user unit, Windows service — so this asserts on nothing any
-/// supported target still compiles, and `daemon_launchd.rs`,
-/// `daemon_systemd.rs` and `daemon_windows.rs` cover the real ones.
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-#[test]
-fn the_platform_stub_names_its_supervisor_and_the_workaround() {
-    use mcpgw_core::daemon::{ServiceManager as _, platform_service};
-
-    let dir = tempfile::tempdir().unwrap();
-    let service = platform_service();
-    let target = spec("127.0.0.1", 8137, dir.path());
-
-    let messages = [
-        service.install(&target).unwrap_err().to_string(),
-        service.uninstall().unwrap_err().to_string(),
-        service.start(&target).unwrap_err().to_string(),
-        service.stop().unwrap_err().to_string(),
-        service.query().unwrap_err().to_string(),
-    ];
-    for message in &messages {
-        assert!(message.contains("not in this release yet"), "{message}");
-        assert!(message.contains("mcpgw serve"), "{message}");
-    }
-}
-
-/// What replaces the stub test above on Windows.
-///
 /// A live install is never attempted from the suite: it needs administrator
 /// rights, it would leave a registered service behind on a developer's
 /// machine, and on a CI runner — which is elevated — it would succeed.
