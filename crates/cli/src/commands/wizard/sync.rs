@@ -35,12 +35,30 @@ use crate::ui;
 /// stuck is worse than one that reports a slow server.
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// True when there is something to push and nowhere it has been pushed yet.
-/// Both halves matter: with an empty config there is nothing to point a
-/// client at, and once mcpgw's own record shows entries it wrote, keeping
-/// them current is `mcpgw sync`'s job rather than the wizard's.
+/// True when there is something to push and it has not been pushed yet.
+/// With an empty config there is nothing to point a client at, and once
+/// every client holds what the config holds, keeping them current is `mcpgw
+/// sync`'s job rather than the wizard's.
 pub fn pending(cx: &Ctx) -> bool {
-    cx.enabled_servers() > 0 && cx.synced_clients().is_empty()
+    if cx.enabled_servers() == 0 {
+        return false;
+    }
+    if cx.synced_clients().is_empty() {
+        return true;
+    }
+    // A non-empty record used to be the whole answer, and no longer is: the
+    // step before this one *adopts* every client entry it imports, so after
+    // an import mcpgw's record names entries it never wrote. Ask the plan
+    // instead of the record. A first run that imported four servers must
+    // still go on to point the clients at the gateway — telling that user
+    // there was nothing to push would leave the machine half set up, which
+    // is the one thing this step exists to prevent.
+    match plan_all(cx) {
+        Ok(plans) => plans.ready.iter().any(|p| p.plan.has_changes()),
+        // A plan that will not build is not a step with nothing to do:
+        // `run` reaches the same failure and reports it in full.
+        Err(_) => true,
+    }
 }
 
 /// Plans a per-server gateway sync for every client, applies it after one
