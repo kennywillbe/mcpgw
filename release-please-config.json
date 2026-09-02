@@ -1,14 +1,19 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
+  "release-type": "simple",
   "bump-minor-pre-major": true,
   "bump-patch-for-minor-pre-major": false,
   "packages": {
-    "crates/cli": {
+    ".": {
       "component": "mcpgw",
       "include-component-in-tag": false,
       "changelog-path": "/CHANGELOG.md",
       "extra-files": [
+        {
+          "type": "toml",
+          "path": "/crates/cli/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
         {
           "type": "toml",
           "path": "/crates/core/Cargo.toml",
