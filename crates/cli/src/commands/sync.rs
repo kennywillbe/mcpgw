@@ -129,8 +129,9 @@ pub struct PlannedClient {
     pub kind: ClientKind,
     pub path: PathBuf,
     /// Whether the file was already there. One that was not is created, and
-    /// there is nothing to back up.
-    exists: bool,
+    /// there is nothing to back up. Public because `eject` reads it to make
+    /// the opposite decision: it never creates a client config.
+    pub exists: bool,
     doc: ClientDocument,
     pub plan: SyncPlan,
 }
