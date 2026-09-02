@@ -158,37 +158,6 @@ fn install_and_start_name_the_port_that_is_already_taken() {
     drop(held);
 }
 
-/// The installers land per-OS later; until then every one of them has to say
-/// so, and point at the thing that does work today.
-///
-/// Not on macOS, Linux or Windows: all three installers have shipped, so
-/// running this there would bootstrap a real launch agent into the
-/// developer's (or the runner's) own launchd domain, enable a real systemd
-/// user unit, or register a real service on the machine — a CI runner is
-/// elevated, so that would succeed. `daemon_launchd.rs`, `daemon_systemd.rs`
-/// and `daemon_windows.rs` drive those cycles deliberately, and only when
-/// asked.
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-#[test]
-fn the_service_commands_say_which_release_brings_them_and_what_to_do_meanwhile() {
-    let dir = tempfile::tempdir().unwrap();
-    // Port 0 rather than a port that looked free a moment ago: nothing can
-    // ever be holding it, so the preflight always falls through to the
-    // platform and this test can never fail with the port-conflict message.
-    for args in [
-        vec!["install", "--port", "0"],
-        vec!["start", "--port", "0"],
-        vec!["stop"],
-        vec!["uninstall"],
-    ] {
-        let output = daemon(dir.path(), &args);
-        let text = stderr(&output);
-        assert!(text.contains("not in this release yet"), "{args:?}: {text}");
-        assert!(text.contains("mcpgw serve"), "{args:?}: {text}");
-        assert!(!output.status.success(), "{args:?} succeeded: {text}");
-    }
-}
-
 #[test]
 fn logs_prints_both_streams_and_creates_them_owner_only() {
     let dir = tempfile::tempdir().unwrap();

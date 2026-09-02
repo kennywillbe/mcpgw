@@ -2,6 +2,7 @@ pub mod add;
 pub mod connect;
 pub mod daemon;
 pub mod doctor;
+pub mod eject;
 pub mod import;
 pub mod inspect;
 pub mod list;

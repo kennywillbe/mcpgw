@@ -50,6 +50,8 @@ enum Command {
     Import(commands::import::ImportArgs),
     /// Push the canonical server list into client configs
     Sync(commands::sync::SyncArgs),
+    /// Put every client back the way it was before mcpgw
+    Eject(commands::eject::EjectArgs),
     /// Run the gateway: serve canonical servers over one MCP endpoint
     Serve(commands::serve::ServeArgs),
     /// Bridge a stdio-only client to a running gateway over HTTP
@@ -138,6 +140,7 @@ fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
         Command::Disable { name } => commands::toggle::run(&name, false).map(|()| 0),
         Command::Import(args) => commands::import::run(&args).map(|()| 0),
         Command::Sync(args) => commands::sync::run(&args, color).map(|()| 0),
+        Command::Eject(args) => commands::eject::run(&args, color),
         Command::Serve(args) => commands::serve::run(&args).map(|()| 0),
         Command::Connect(args) => commands::connect::run(&args).map(|()| 0),
         Command::Daemon(args) => commands::daemon::run(&args),
