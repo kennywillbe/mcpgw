@@ -268,6 +268,275 @@ fn assert_no_service(home: &Path) {
     }
 }
 
+/// A client file under the sandbox home.
+fn write_client(home: &Path, rel: &str, json: &str) {
+    let path = home.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, json).unwrap();
+}
+
+/// An address nothing will ever answer HTTP on, so the daemon step reports
+/// "not running" for a reason the test owns rather than finding whatever
+/// gateway the runner happens to have up. Port 0 and a fixed port are both
+/// wrong here: one is not a real address, the other is a race (#54, #83).
+///
+/// The listener is returned rather than dropped, and holding it is what
+/// keeps these import tests from installing a login service: the daemon
+/// step's preflight sees the port taken and offers nothing.
+fn dead_gateway() -> (std::net::TcpListener, String) {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", held.local_addr().unwrap());
+    (held, url)
+}
+
+/// Runs the wizard against `home`, feeding it `input` and returning stdout.
+async fn wizard(home: &Path, url: &str, extra: &[&str], input: &str) -> String {
+    let mut child = command(home)
+        .arg("init")
+        .args(extra)
+        .args(["--gateway-url", url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Written up front and the pipe closed: every question this wizard asks
+    // is answered by the same script, and an open stdin with nothing coming
+    // is how these tests hang instead of failing.
+    //
+    // The noes on the end are load-bearing rather than padding: an exhausted
+    // stdin takes the *recommended* answer, and the recommended answer to
+    // the step after this one installs a login service on the machine
+    // running the tests.
+    if !input.is_empty() {
+        use tokio::io::AsyncWriteExt as _;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(format!("{input}{}", "n\n".repeat(8)).as_bytes())
+            .await
+            .unwrap();
+        stdin.shutdown().await.unwrap();
+    }
+    let output = finish(child, "`mcpgw init`").await;
+    assert_eq!(output.status.code(), Some(0));
+    assert_no_service(home);
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// One server configured in two clients is one server in the config, and the
+/// wizard says so before writing rather than leaving the merge to be noticed
+/// in `mcpgw list` afterwards.
+#[tokio::test]
+async fn import_dedupes_a_server_two_clients_share_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"]},
+            "notes": {"command": "notes-mcp"}
+        }}"#,
+    );
+    write_client(
+        dir.path(),
+        ".claude.json",
+        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &["--yes"], "").await;
+
+    assert!(
+        stdout.contains("the same server configured in more than one place"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("github — from"), "{stdout}");
+    assert!(stdout.contains("Claude Code"), "{stdout}");
+    assert!(stdout.contains("Cursor"), "{stdout}");
+    assert!(
+        stdout.contains("The rest come across as they are: notes."),
+        "{stdout}"
+    );
+
+    // `--yes` never read a line, and still wrote both servers and adopted
+    // all three client entries.
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("[servers.github]"), "{config}");
+    assert!(config.contains("[servers.notes]"), "{config}");
+    let state = std::fs::read_to_string(dir.path().join("state").join("managed.json")).unwrap();
+    assert!(state.contains("claude-code"), "{state}");
+    assert!(state.contains("cursor"), "{state}");
+}
+
+/// Two clients using one name for two different servers is the case where
+/// the plan quietly invents a name, so both survivors are shown with the
+/// client they came from and what each one actually runs — key names only,
+/// never the token that sits in a header or an env var.
+#[tokio::test]
+async fn import_shows_both_sides_of_a_name_two_clients_disagree_on() {
+    let dir = tempfile::tempdir().unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "db": {"command": "db-mcp", "args": ["--local"], "env": {"DB_TOKEN": "hunter2"}}
+        }}"#,
+    );
+    write_client(
+        dir.path(),
+        ".claude.json",
+        r#"{"mcpServers": {"db": {"type": "http", "url": "https://db.example.com/mcp",
+            "headers": {"Authorization": "Bearer hunter2"}}}}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &["--yes"], "").await;
+
+    assert!(
+        stdout.contains("but configure it differently, so both are kept"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("db-mcp --local"), "{stdout}");
+    assert!(stdout.contains("https://db.example.com/mcp"), "{stdout}");
+    assert!(stdout.contains("db-2"), "{stdout}");
+    // The names of an env var and a header are context; their values are
+    // credentials, and this transcript ends up in bug reports.
+    assert!(stdout.contains("(env: DB_TOKEN)"), "{stdout}");
+    assert!(stdout.contains("(headers: Authorization)"), "{stdout}");
+    assert!(!stdout.contains("hunter2"), "{stdout}");
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("[servers.db]"), "{config}");
+    assert!(config.contains("[servers.db-2]"), "{config}");
+}
+
+/// The escape hatch: one line of names instead of yes, and those servers are
+/// left where they are — not written, and not adopted either, so nothing
+/// claims to manage a client entry the user kept for themselves.
+#[tokio::test]
+async fn import_leaves_out_the_names_you_type() {
+    let dir = tempfile::tempdir().unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"]},
+            "notes": {"command": "notes-mcp"},
+            "linear": {"type": "http", "url": "https://mcp.linear.app/mcp"}
+        }}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    // `y` for the survey, then the two names to skip.
+    let stdout = wizard(dir.path(), &url, &[], "y\ngithub, linear\n").await;
+
+    assert!(
+        stdout.contains("or type names to leave out, comma-separated"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Imported 1 server."), "{stdout}");
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("[servers.notes]"), "{config}");
+    assert!(!config.contains("[servers.github]"), "{config}");
+    assert!(!config.contains("[servers.linear]"), "{config}");
+    let state = std::fs::read_to_string(dir.path().join("state").join("managed.json")).unwrap();
+    assert!(state.contains("notes"), "{state}");
+    assert!(!state.contains("github"), "{state}");
+}
+
+/// A name that is not in the plan is a typo, not an instruction: the wizard
+/// says which names it has and asks again rather than importing everything.
+#[tokio::test]
+async fn a_name_that_is_not_in_the_plan_is_asked_again() {
+    let dir = tempfile::tempdir().unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &[], "y\ngithbu\ngithub\n").await;
+
+    assert!(stdout.contains("I don't have a server called"), "{stdout}");
+    assert!(stdout.contains("the names are: github"), "{stdout}");
+    assert!(stdout.contains("Imported 0 servers."), "{stdout}");
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(!config.contains("[servers.github]"), "{config}");
+}
+
+/// The seam between this step and the one that pushes: importing a client's
+/// servers adopts that client's entries, and adoption must not be mistaken
+/// for "already synced". A first run that imports has to go on to point the
+/// clients at the gateway, or it leaves the machine half set up.
+#[tokio::test]
+async fn what_the_import_step_adopts_is_still_pushed_by_the_sync_step() {
+    let dir = tempfile::tempdir().unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {"notes": {"command": "notes-mcp"}}}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &["--yes"], "").await;
+
+    assert!(stdout.contains("Imported 1 server."), "{stdout}");
+    assert!(!stdout.contains("nothing to push"), "{stdout}");
+    assert!(
+        stdout.contains("Pointing your clients at the gateway"),
+        "{stdout}"
+    );
+
+    // The entry the wizard adopted a moment ago now points at the gateway,
+    // which is the whole promise of a first run.
+    let entries: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.path().join(".cursor/mcp.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        entries["mcpServers"]["notes"]["url"],
+        url.replace("/mcp", "/s/notes")
+    );
+}
+
+/// Re-running over a config that already holds a *different* server under
+/// one of the names keeps what is already there. The wizard never overwrites
+/// the canonical config — that decision belongs to `mcpgw import`.
+#[tokio::test]
+async fn import_never_overwrites_what_the_config_already_says() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"]},
+            "notes": {"command": "notes-mcp"}
+        }}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &["--yes"], "").await;
+
+    assert!(
+        stdout.contains("differ from what your config already says"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("github left alone"), "{stdout}");
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("mine"), "{config}");
+    assert!(!config.contains("server-github"), "{config}");
+    assert!(config.contains("[servers.notes]"), "{config}");
+}
+
 /// Reads the served address out of the gateway's own banner and keeps
 /// draining its stdout, so a later banner line cannot hit a closed pipe.
 async fn gateway_url(child: &mut tokio::process::Child) -> String {
@@ -309,10 +578,24 @@ fn claude_desktop_config(home: &Path) -> std::path::PathBuf {
 /// has a hand-made one, and Claude Desktop, which cannot and gets the stdio
 /// bridge. Claude Desktop is installed but unconfigured, so the wizard has to
 /// create its file as well as write into one.
+///
+/// The config gains a *disabled* `notes` so these tests are about the sync
+/// step and nothing else. A hand-made entry the canonical config has never
+/// heard of is something the import step now adopts, one step earlier — the
+/// entry would arrive here as mcpgw's own and there would be no foreign
+/// entry left to leave untouched. Disabled means known, so import has
+/// nothing to do, and not published, so sync has no reason to write it.
 fn install_two_clients(home: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let cursor = home.join(".cursor/mcp.json");
     std::fs::create_dir_all(cursor.parent().unwrap()).unwrap();
     std::fs::write(&cursor, CURSOR_WITH_A_HAND_MADE_ENTRY).unwrap();
+
+    let config = home.join("config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[servers.notes]\nenabled = false\ntype = \"stdio\"\ncommand = \"notes-mcp\"\n",
+    );
+    std::fs::write(&config, text).unwrap();
 
     let claude = claude_desktop_config(home);
     std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
@@ -487,12 +770,13 @@ async fn a_second_run_has_nothing_left_to_push() {
     std::fs::write(dir.path().join("config.toml"), config()).unwrap();
     install_two_clients(dir.path());
 
-    let mut gateway = command(dir.path())
-        .args(["serve", "--port", "0", "--no-capture"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let url = gateway_url(&mut gateway).await;
+    // A held port rather than a running gateway, for two reasons: the daemon
+    // step keeps something to say on the second run, which is what makes the
+    // wizard walk its steps and print this step's dim line rather than the
+    // status card — and a port somebody else holds is a port no login
+    // service can be installed on, so `--yes` installs nothing.
+    let blocked = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", blocked.local_addr().unwrap());
 
     for run in 1..=2 {
         let child = command(dir.path())
@@ -509,12 +793,12 @@ async fn a_second_run_has_nothing_left_to_push() {
         if run == 1 {
             assert!(stdout.contains("+ fx1"), "{stdout}");
         } else {
-            // The hand-made Cursor entry keeps the import step pending, so
+            // The gateway nobody is running keeps the daemon step pending, so
             // the wizard still walks — and the sync step is the one with
             // nothing to say.
             assert!(stdout.contains("nothing to push"), "{stdout}");
             assert!(!stdout.contains("Point them at the gateway?"), "{stdout}");
         }
+        assert_no_service(dir.path());
     }
-    gateway.kill().await.unwrap();
 }

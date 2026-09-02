@@ -147,3 +147,96 @@ fn sse_note_travels_with_the_candidate() {
     assert_eq!(plan.new[0].notes.len(), 1);
     assert!(plan.new[0].notes[0].contains("sse"));
 }
+
+/// Case in the scheme and host and one trailing slash are the same endpoint
+/// spelled two ways, and two clients routinely spell it both ways. Merging
+/// them is the difference between one server in the config and two.
+#[test]
+fn http_urls_that_differ_only_in_case_or_a_trailing_slash_dedup() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"ctx7": {"type": "http", "url": "HTTPS://MCP.Context7.com/mcp/"}}}"#,
+    );
+    let vscode = read(
+        ClientKind::VsCode,
+        r#"{"servers": {"context7": {"type": "http", "url": "https://mcp.context7.com/mcp"}}}"#,
+    );
+    let plan = plan_import(
+        &[("cursor".into(), cursor), ("vscode".into(), vscode)],
+        &BTreeMap::new(),
+    );
+
+    assert_eq!(plan.new.len(), 1);
+    assert_eq!(plan.new[0].origins.len(), 2);
+}
+
+/// A host is case-insensitive; a path, a query and a port are not. Nothing
+/// past the authority is normalized, because everything past it can change
+/// which server answers.
+#[test]
+fn urls_that_differ_past_the_host_stay_separate() {
+    for (a, b) in [
+        ("https://h/mcp", "https://h/MCP"),
+        ("https://h/mcp", "https://h/mcp/v2"),
+        ("https://h/mcp?x=1", "https://h/mcp?x=2"),
+        ("https://h/mcp", "https://h:8443/mcp"),
+        ("https://h/mcp", "http://h/mcp"),
+        ("https://h/mcp//", "https://h/mcp"),
+    ] {
+        let cursor = read(
+            ClientKind::Cursor,
+            &format!(r#"{{"mcpServers": {{"one": {{"type": "http", "url": "{a}"}}}}}}"#),
+        );
+        let vscode = read(
+            ClientKind::VsCode,
+            &format!(r#"{{"servers": {{"two": {{"type": "http", "url": "{b}"}}}}}}"#),
+        );
+        let plan = plan_import(
+            &[("cursor".into(), cursor), ("vscode".into(), vscode)],
+            &BTreeMap::new(),
+        );
+        assert_eq!(plan.new.len(), 2, "{a} and {b} were merged");
+    }
+}
+
+/// The same headers under two spellings of one URL still merge; different
+/// headers are a different server however the URL is spelled, because the
+/// surviving copy's definition is the one that runs.
+#[test]
+fn header_differences_survive_url_canonicalization() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"a": {"type": "http", "url": "https://H/mcp/",
+            "headers": {"X-Key": "one"}}}}"#,
+    );
+    let vscode = read(
+        ClientKind::VsCode,
+        r#"{"servers": {"b": {"type": "http", "url": "https://h/mcp",
+            "headers": {"X-Key": "two"}}}}"#,
+    );
+    let plan = plan_import(
+        &[("cursor".into(), cursor), ("vscode".into(), vscode)],
+        &BTreeMap::new(),
+    );
+    assert_eq!(plan.new.len(), 2);
+}
+
+/// Stdio is compared byte for byte, argument order included: two commands
+/// with the same arguments in a different order can behave differently, and
+/// a merge picks one of them for the user without saying so.
+#[test]
+fn stdio_is_untouched_by_url_canonicalization() {
+    let cursor = read(
+        ClientKind::Cursor,
+        r#"{"mcpServers": {"one": {"command": "NPX", "args": ["--a", "--b"]}}}"#,
+    );
+    let vscode = read(
+        ClientKind::VsCode,
+        r#"{"servers": {"two": {"type": "stdio", "command": "npx", "args": ["--b", "--a"]}}}"#,
+    );
+    let plan = plan_import(
+        &[("cursor".into(), cursor), ("vscode".into(), vscode)],
+        &BTreeMap::new(),
+    );
+    assert_eq!(plan.new.len(), 2);
+}

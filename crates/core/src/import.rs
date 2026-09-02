@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::clients::ClientRead;
-use crate::config::{Server, validate_name};
+use crate::config::{Server, Transport, validate_name};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportCandidate {
@@ -55,7 +55,7 @@ pub fn plan_import(
             // entry, several adopted origins.
             if let Some(existing) = candidates
                 .iter_mut()
-                .find(|c| c.server.transport == server.transport)
+                .find(|c| same_transport(&c.server.transport, &server.transport))
             {
                 existing
                     .origins
@@ -116,13 +116,59 @@ pub fn plan_import(
     for candidate in candidates {
         match canonical.get(&candidate.name) {
             None => plan.new.push(candidate),
-            Some(existing) if existing.transport == candidate.server.transport => {
+            Some(existing) if same_transport(&existing.transport, &candidate.server.transport) => {
                 plan.already.push(candidate);
             }
             Some(_) => plan.conflicts.push(candidate),
         }
     }
     plan
+}
+
+/// Whether two transports address the same server.
+///
+/// Byte equality everywhere except an HTTP URL, which is compared as a URL:
+/// scheme and host are case-insensitive per RFC 3986, and one trailing slash
+/// on the path names the same endpoint. That much is safe to merge, and not
+/// merging it means the same remote server imported twice under two names.
+///
+/// Nothing beyond that is normalized, deliberately. Argument order, path
+/// case, query order and a default port spelled out are all things two
+/// clients can differ on *and mean differently*, and a dedupe is a silent
+/// behaviour change: the surviving copy's definition is the one that runs.
+fn same_transport(a: &Transport, b: &Transport) -> bool {
+    match (a, b) {
+        (
+            Transport::Http {
+                url: a_url,
+                headers: a_headers,
+            },
+            Transport::Http {
+                url: b_url,
+                headers: b_headers,
+            },
+        ) => a_headers == b_headers && canonical_url(a_url) == canonical_url(b_url),
+        _ => a == b,
+    }
+}
+
+/// Lowercases scheme and host and drops a single trailing slash from the
+/// path. Anything that is not `scheme://…` is left exactly as it came in —
+/// this is a comparison key, not a validator, so an unparseable URL should
+/// only ever equal itself.
+fn canonical_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    // Userinfo keeps its case: a password is not a hostname.
+    let authority = match authority.split_once('@') {
+        Some((userinfo, host)) => format!("{userinfo}@{}", host.to_ascii_lowercase()),
+        None => authority.to_ascii_lowercase(),
+    };
+    let (path, query) = tail.split_at(tail.find(['?', '#']).unwrap_or(tail.len()));
+    let path = path.strip_suffix('/').unwrap_or(path);
+    format!("{}://{authority}{path}{query}", scheme.to_ascii_lowercase())
 }
 
 /// Maps an arbitrary client name into `[a-z0-9-_]`: lowercases, replaces
