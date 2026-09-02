@@ -459,6 +459,62 @@ fn import_dedupes_a_server_the_user_has_on_both_cline_surfaces() {
     }
 }
 
+/// Zoo Code's own path, a sibling of Cline's inside VS Code's globalStorage.
+fn zoo_extension_rel() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Library/Application Support/Code/User/globalStorage/zoocodeorganization.zoo-code/settings/mcp_settings.json"
+    } else if cfg!(windows) {
+        "AppData/Code/User/globalStorage/zoocodeorganization.zoo-code/settings/mcp_settings.json"
+    } else {
+        ".config/Code/User/globalStorage/zoocodeorganization.zoo-code/settings/mcp_settings.json"
+    }
+}
+
+#[test]
+fn import_from_zoo_adopts_entries_carrying_the_roo_extras() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        zoo_extension_rel(),
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"],
+                       "cwd": "/srv", "timeout": 60,
+                       "watchPaths": ["/srv/dist/index.js"],
+                       "alwaysAllow": ["search_repositories"],
+                       "disabledTools": ["delete_repository"]},
+            "browser": {"command": "browser-mcp", "disabled": true},
+            "linear": {"url": "https://mcp.linear.app/mcp", "type": "streamable-http"},
+            "inherited": {"url": "https://inherited.example/mcp", "type": "streamableHttp"}
+        }}"#,
+    );
+    let out = sb.ok(&["import", "--from", "zoo"]);
+    for name in ["+ github", "+ browser", "+ linear", "+ inherited"] {
+        assert!(out.contains(name), "{out}");
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    // The camelCase spelling Zoo Code inherited from Cline is the same
+    // transport, so an entry carried over from an older install imports too.
+    assert_eq!(
+        json["servers"]["inherited"]["url"],
+        "https://inherited.example/mcp"
+    );
+    // `disabled: true` is the inverse of the canonical flag.
+    assert_eq!(json["servers"]["browser"]["enabled"], false);
+    // None of Zoo Code's own bookkeeping has a canonical counterpart.
+    let canonical = std::fs::read_to_string(sb.home.join("config.toml")).unwrap();
+    for extra in ["alwaysAllow", "disabledTools", "watchPaths"] {
+        assert!(!canonical.contains(extra), "{canonical}");
+    }
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "zoo"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
 /// Amp's settings file under the sandbox environment; XDG on macOS and
 /// Linux, the app-data dir only on Windows.
 fn amp_settings_rel() -> &'static str {

@@ -51,4 +51,8 @@ expression: matrix
         "amp",
         "Json / amp.mcpServers / Amp",
     ),
+    (
+        "zoo",
+        "Json / mcpServers / ZooCode",
+    ),
 ]

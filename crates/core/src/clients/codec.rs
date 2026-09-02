@@ -127,6 +127,12 @@ pub enum EntrySchema {
     /// `type` at all, so a remote entry is a bare `url` and the transport is
     /// whichever target field is present.
     Amp,
+    /// Zoo Code's shape: Cline's fields, read by exactly Cline's rules, with
+    /// the remote `type` spelled `streamable-http`. The two cannot share one
+    /// variant because Zoo Code validates the entry against a `z.enum` that
+    /// lists the hyphenated spelling alone — Cline's `streamableHttp` is a
+    /// schema error there, not a tolerated alias.
+    ZooCode,
 }
 
 impl EntrySchema {
@@ -148,7 +154,9 @@ impl EntrySchema {
             Self::Codex => parse_codex(obj),
             Self::Opencode => parse_opencode(obj),
             Self::Windsurf => parse_windsurf(obj),
-            Self::Cline => parse_cline(obj),
+            // Zoo Code inherited Cline's read rules through Roo Code,
+            // untyped remote entry included, so it reads by them too.
+            Self::Cline | Self::ZooCode => parse_cline(obj),
             // Zed adds `source` to the shared fields and nothing else, and
             // that one is read as absent: an entry an extension installed
             // carries a source of its own, and refusing to read it would
@@ -216,6 +224,15 @@ impl EntrySchema {
                         // left untyped would read back as the legacy SSE
                         // transport, which is a different protocol.
                         obj.insert("type".to_owned(), "streamableHttp".into());
+                        obj.insert("url".to_owned(), url.as_str().into());
+                        "headers"
+                    }
+                    Self::ZooCode => {
+                        // Zoo Code's own spelling of the same transport
+                        // Cline calls `streamableHttp`. Its schema accepts
+                        // this one alone, and an untyped entry would read
+                        // back as legacy SSE.
+                        obj.insert("type".to_owned(), "streamable-http".into());
                         obj.insert("url".to_owned(), url.as_str().into());
                         "headers"
                     }
@@ -336,7 +353,8 @@ fn parse_windsurf(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
     Ok((server, note))
 }
 
-/// Cline's entry shape: the `mcpServers` rules — `disabled` included — with
+/// Cline's entry shape, shared with the Zoo Code fork: the `mcpServers`
+/// rules — `disabled` included — with
 /// one transport difference, so it is read by deferring to them and then
 /// correcting that one case.
 ///
@@ -348,7 +366,9 @@ fn parse_windsurf(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
 ///
 /// `autoApprove` is a list of tool names Cline runs without asking. It has no
 /// canonical counterpart, so it is read as absent — an entry mcpgw does not
-/// manage keeps it verbatim because sync never rewrites it.
+/// manage keeps it verbatim because sync never rewrites it. Zoo Code's own
+/// extras (`alwaysAllow`, `disabledTools`, `watchPaths`, `cwd`, `timeout`)
+/// are ignored on read for the same reason and survive for the same one.
 fn parse_cline(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
     let (server, note) = parse_mcp_servers(obj)?;
     if !obj.contains_key("type") && matches!(server.transport, Transport::Http { .. }) {

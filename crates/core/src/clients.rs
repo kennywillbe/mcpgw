@@ -1,6 +1,6 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
 //! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI,
-//! opencode, Windsurf, Zed, Cline, the Cline CLI and Amp).
+//! opencode, Windsurf, Zed, Cline, the Cline CLI, Amp and Zoo Code).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -41,6 +41,11 @@ pub enum ClientKind {
     /// won the candidate race and hide the other.
     ClineCli,
     Amp,
+    /// Zoo Code's VS Code extension, the community successor to Roo Code
+    /// (archived May 2026) and so a second-generation fork of Cline's
+    /// config lineage: same `mcpServers` map, same `disabled` switch, its
+    /// own storage dir and its own remote-type spelling.
+    ZooCode,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -69,7 +74,7 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
@@ -82,6 +87,7 @@ impl ClientKind {
         Self::Cline,
         Self::ClineCli,
         Self::Amp,
+        Self::ZooCode,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -100,6 +106,7 @@ impl ClientKind {
             Self::Cline => "cline",
             Self::ClineCli => "cline-cli",
             Self::Amp => "amp",
+            Self::ZooCode => "zoo",
         }
     }
 
@@ -125,6 +132,7 @@ impl ClientKind {
             Self::Cline => "Cline",
             Self::ClineCli => "Cline CLI",
             Self::Amp => "Amp",
+            Self::ZooCode => "Zoo Code",
         }
     }
 
@@ -146,8 +154,9 @@ impl ClientKind {
     /// rules but spells the remote URL `serverUrl`, Zed keeps its
     /// servers under `context_servers` inside its whole-editor settings,
     /// both Cline surfaces are `mcpServers` with a `disabled` flag and a
-    /// camelCase remote `type`, and Amp namespaces its map under a single
-    /// dotted key.
+    /// camelCase remote `type`, Amp namespaces its map under a single
+    /// dotted key, and Zoo Code is Cline's shape with the remote `type`
+    /// hyphenated.
     #[must_use]
     pub fn codec(self) -> Codec {
         match self {
@@ -199,6 +208,11 @@ impl ClientKind {
                 format: Format::Json,
                 root: RootPath::new(&["amp.mcpServers"]),
                 entries: EntrySchema::Amp,
+            },
+            Self::ZooCode => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["mcpServers"]),
+                entries: EntrySchema::ZooCode,
             },
             _ => Codec {
                 format: Format::Json,
@@ -263,6 +277,7 @@ impl ClientKind {
             // file it actually loads.
             Self::ClineCli => home_dir(&get).map(|dir| dir.join(".cline/data/settings")),
             Self::Amp => xdg_or_windows_app_data_dir(&get, "amp", "amp"),
+            Self::ZooCode => zoo_extension_dir(&get).map(|dir| dir.join("settings")),
         }) else {
             return Vec::new();
         };
@@ -278,6 +293,7 @@ impl ClientKind {
             Self::Opencode => &["opencode.json", "opencode.jsonc"],
             Self::Windsurf => &["mcp_config.json"],
             Self::Cline | Self::ClineCli => &["cline_mcp_settings.json"],
+            Self::ZooCode => &["mcp_settings.json"],
         };
         names.iter().map(|name| dir.join(name)).collect()
     }
@@ -303,6 +319,10 @@ impl ClientKind {
             Self::ClineCli => home_dir(&get)?.join(".cline"),
             // Amp's own dir, which its CLI and its editor extensions share.
             Self::Amp => xdg_or_windows_app_data_dir(&get, "amp", "amp")?,
+            // Same reasoning as Cline: the extension's storage dir exists
+            // from its first run, so it tells "Zoo Code installed" apart
+            // from "VS Code installed".
+            Self::ZooCode => zoo_extension_dir(&get)?,
         };
         Some(path)
     }
@@ -487,6 +507,19 @@ fn xdg_or_windows_app_data_dir(
 // it shipped under before the rename, which the marketplace still uses.
 fn cline_extension_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     Some(app_data_dir(get)?.join("Code/User/globalStorage/saoudrizwan.claude-dev"))
+}
+
+// Zoo Code stores everything under VS Code's globalStorage the way Cline
+// does, keyed by its marketplace id `ZooCodeOrganization.zoo-code` — folded
+// to lower case, because that is how VS Code names a globalStorage directory.
+//
+// Roo Code, the archived product Zoo Code forked, kept the same layout under
+// its own sibling id (`RooVeterinaryInc.roo-cline`). mcpgw does not detect it:
+// the product is dead, and offering to sync a client nobody can install would
+// be noise. A future read-only legacy import is a second dir here, not a
+// change to this one.
+fn zoo_extension_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(app_data_dir(get)?.join("Code/User/globalStorage/zoocodeorganization.zoo-code"))
 }
 
 // The XDG config dir on *every* platform, which is what a client following

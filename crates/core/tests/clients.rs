@@ -381,6 +381,79 @@ fn the_cline_cli_reads_the_extension_format() {
 }
 
 #[test]
+fn zoo_reads_the_roo_extras_and_both_remote_type_spellings() {
+    let read = read_fixture(ClientKind::ZooCode, "zoo_mcp_settings.json");
+
+    // Zoo Code's Roo-era extras — `cwd`, `timeout`, `watchPaths`,
+    // `alwaysAllow`, `disabledTools` — have no canonical counterpart, so an
+    // entry carrying all of them still reads as the plain stdio server it is
+    // rather than being rejected.
+    assert_eq!(
+        read.servers["github"].transport,
+        mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: vec![
+                "-y".to_owned(),
+                "@modelcontextprotocol/server-github".to_owned()
+            ],
+            env: [("GITHUB_TOKEN".to_owned(), "ghp_example".to_owned())]
+                .into_iter()
+                .collect(),
+        }
+    );
+    // `disabled` is the inverse of the canonical flag.
+    assert!(read.servers["github"].enabled);
+    assert!(!read.servers["browser"].enabled);
+
+    // Zoo Code's own hyphenated spelling and the camelCase one it inherited
+    // from Cline are the same transport, and both read cleanly: a file
+    // carried over from a Cline or Roo install must not lose its servers.
+    for (name, url) in [
+        ("linear", "https://mcp.linear.app/mcp"),
+        ("inherited", "https://inherited.example/mcp"),
+    ] {
+        assert!(matches!(
+            &read.servers[name].transport,
+            mcpgw_core::Transport::Http { url: got, .. } if got == url
+        ));
+        assert!(
+            !read
+                .problems
+                .iter()
+                .any(|p| p.server.as_deref() == Some(name)),
+            "{name} should read without a note"
+        );
+    }
+
+    // An untyped remote entry is SSE in the Roo lineage, so it gets the same
+    // note the explicitly typed one does.
+    for name in ["legacy", "untyped"] {
+        let note = read
+            .problems
+            .iter()
+            .find(|p| p.server.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no note for {name}"));
+        assert_eq!(note.message, "legacy `sse` transport read as http");
+    }
+
+    // An entry that is only an alwaysAllow list is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    assert_eq!(read.servers.len(), 6);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+/// Zoo Code is a fork of a fork, so its read rules are Cline's exactly — the
+/// spelling difference lives in what mcpgw writes, not in what it accepts.
+#[test]
+fn zoo_reads_a_cline_file_the_way_cline_does() {
+    assert_eq!(
+        read_fixture(ClientKind::ZooCode, "cline_mcp_settings.json"),
+        read_fixture(ClientKind::Cline, "cline_mcp_settings.json")
+    );
+}
+
+#[test]
 fn amp_reads_the_namespaced_key_and_not_a_nested_one() {
     let read = read_fixture(ClientKind::Amp, "amp_settings.json");
 
@@ -626,6 +699,56 @@ fn the_two_cline_surfaces_detect_independently() {
         ClientKind::Cline.detect_with(&env),
         Detection::Configured(_)
     ));
+}
+
+/// Zoo Code lives in its own globalStorage dir beside Cline's, so the three
+/// detection states come from that dir and the file inside it — and having
+/// Cline installed must not make Zoo Code look installed.
+#[test]
+fn zoo_detects_from_its_own_extension_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let appdata = home.join("AppData");
+    let env = move |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "HOME" | "USERPROFILE" => Some(home.clone().into()),
+            "APPDATA" => Some(appdata.clone().into()),
+            _ => None,
+        }
+    };
+
+    assert_eq!(
+        ClientKind::ZooCode.detect_with(&env),
+        Detection::NotInstalled
+    );
+
+    // Cline's dir is a sibling, not Zoo Code's: installing one says nothing
+    // about the other.
+    std::fs::create_dir_all(ClientKind::Cline.install_trace_with(&env).unwrap()).unwrap();
+    assert_eq!(
+        ClientKind::ZooCode.detect_with(&env),
+        Detection::NotInstalled
+    );
+
+    let trace = ClientKind::ZooCode.install_trace_with(&env).unwrap();
+    assert!(trace.ends_with("Code/User/globalStorage/zoocodeorganization.zoo-code"));
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::ZooCode.detect_with(&env), Detection::Installed);
+
+    let config = ClientKind::ZooCode.config_path_with(&env).unwrap();
+    assert!(
+        config.ends_with(
+            "Code/User/globalStorage/zoocodeorganization.zoo-code/settings/mcp_settings.json"
+        ),
+        "{}",
+        config.display()
+    );
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
+    assert_eq!(
+        ClientKind::ZooCode.detect_with(&env),
+        Detection::Configured(config)
+    );
 }
 
 /// Amp's own dir holds its settings file, so "installed" and "configured"
