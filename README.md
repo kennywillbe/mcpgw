@@ -7,7 +7,7 @@
 
 **[Documentation →](https://kennywillbe.github.io/mcpgw/)**
 
-![demo](docs/demo.gif)
+![demo](https://raw.githubusercontent.com/kennywillbe/mcpgw/main/docs/demo.gif)
 
 <!-- The GIF above is generated with vhs from docs/demo.tape: `vhs docs/demo.tape`. -->
 
@@ -155,7 +155,7 @@ Post-launch, ordered by what feedback says first:
 ## Contributing
 
 Conventional commits, green CI, PRs against `main` — details in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/kennywillbe/mcpgw/blob/main/CONTRIBUTING.md).
 
 ## License
 
