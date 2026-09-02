@@ -15,14 +15,65 @@ The per-OS installers are landing one at a time in this release wave:
 | ------------------------------- | ------------------------------------------ |
 | `mcpgw daemon status`           | works now                                  |
 | `mcpgw daemon logs [--follow]`  | works now                                  |
-| `mcpgw daemon install`          | per-OS installer arriving in this wave     |
+| `mcpgw daemon install`          | macOS now; Linux and Windows in this wave  |
 | `mcpgw daemon uninstall`        | ditto                                      |
 | `mcpgw daemon start` / `stop`   | ditto                                      |
 
 Until your platform's installer ships, `install`, `start`, `stop` and
 `uninstall` tell you so and point you at `mcpgw serve`. `status` and `logs`
-already work, and `status` reports on a foreground `mcpgw serve` exactly as
-it will on a supervised one.
+already work everywhere, and `status` reports on a foreground `mcpgw serve`
+exactly as it will on a supervised one.
+
+## macOS: the launch agent
+
+```sh
+mcpgw daemon install            # or --port 9000 --bind ::1
+```
+
+```text
+installed the mcpgw gateway service at ~/Library/LaunchAgents/io.mcpgw.gateway.plist
+  macOS will show a "Background Items Added" notification and list mcpgw under
+  System Settings › General › Login Items & Extensions — leave it enabled, or the
+  gateway will not come back at your next login
+  it serves ~/.config/mcpgw/config.toml and runs with the PATH you installed from,
+  so re-run `mcpgw daemon install` if either moves
+  its output goes to the daemon logs — `mcpgw daemon logs --follow` reads both streams
+it will answer on http://127.0.0.1:8137/mcp
+```
+
+The notification is the part worth reading twice. macOS announces every new
+login item, and the entry it adds is switchable — turn mcpgw off there and
+the gateway stops coming back at login, with nothing in mcpgw to say why.
+
+What gets installed is a plain launch agent: a plist in
+`~/Library/LaunchAgents`, loaded into your login session with `launchctl
+bootstrap`. It is readable, and it is the whole story — `cat` it if you ever
+wonder what the daemon is running.
+
+Two things in it are decisions rather than defaults:
+
+- **`KeepAlive` is a dictionary, `SuccessfulExit = false`.** A gateway that
+  crashes comes straight back; a gateway you stopped stays stopped. The bare
+  `KeepAlive = true` most generators emit cannot tell those apart, and
+  restarts the one you just asked it to stop.
+- **`PATH` is captured at install time.** A launch agent otherwise starts with
+  `/usr/bin:/bin:/usr/sbin:/sbin`, and almost every stdio MCP server is an
+  `npx`, `uvx` or `bunx` living somewhere else — so the gateway would come up
+  with every stdio server failing to spawn. The cost is that the `PATH` is
+  frozen: change it, or move your config, and re-run `install`.
+
+The rest of the commands do what they say:
+
+```sh
+mcpgw daemon stop        # unloads the job; the plist stays, so status says "stopped"
+mcpgw daemon start       # loads it again, on the port it was installed with
+mcpgw daemon uninstall   # unloads it and deletes the plist
+```
+
+`stop` unloads the job rather than signalling it, because a signalled gateway
+is a gateway that did not exit successfully — which is exactly what
+`KeepAlive` restarts on. `start` runs the plist as it stands, so changing the
+port means running `install` again rather than `start --port`.
 
 ## Status
 
@@ -32,7 +83,7 @@ mcpgw daemon status
 
 ```text
 gateway   running — http://127.0.0.1:8137/mcp answers (HTTP 405)
-service   not installed — the macOS launch agent is not in this release yet …
+service   not installed under launchd
 logs      ~/.local/share/mcpgw/logs/daemon.out.log (not written yet)
           ~/.local/share/mcpgw/logs/daemon.err.log (not written yet)
 

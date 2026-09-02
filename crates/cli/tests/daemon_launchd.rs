@@ -1,0 +1,212 @@
+//! The real macOS install → run → stop → start → uninstall cycle.
+//!
+//! This bootstraps a launch agent into the launchd domain of whoever runs it,
+//! so it is opt-in: set `MCPGW_DAEMON_LIVE=1`. Without it the test reports
+//! what it skipped and passes, which is what CI gets — a runner is a login
+//! session too, and leaving agents behind in one is how a green build becomes
+//! a haunted machine.
+//!
+//! Everything else is kept off the real machine: `HOME` points at a temp
+//! directory, so the plist is written and removed there rather than in
+//! `~/Library/LaunchAgents`. The one thing that cannot be isolated is the
+//! label — `io.mcpgw.gateway` is global to the domain, so running this while
+//! you have your own mcpgw daemon installed will stop it.
+
+#![cfg(target_os = "macos")]
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+mod util;
+use util::fixture_binary;
+
+const LIVE_ENV: &str = "MCPGW_DAEMON_LIVE";
+
+/// How long the gateway gets to come up under launchd. Generous: the agent is
+/// a cold process start, and a flaky "not yet" here would read as a broken
+/// installer.
+const UP_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn daemon(home: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
+        .arg("daemon")
+        .args(args)
+        .env("MCPGW_NO_UPDATE_CHECK", "1")
+        .env("MCPGW_CONFIG", home.join("config.toml"))
+        .env("MCPGW_STATE_DIR", home.join("state"))
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap()
+}
+
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Boots the label out of the domain and deletes the plist whatever happened,
+/// so a failed assertion cannot leave a supervised gateway running.
+struct LeaveNothingBehind {
+    home: PathBuf,
+}
+
+impl Drop for LeaveNothingBehind {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("/bin/launchctl")
+            .args(["bootout", &service_target()])
+            .output();
+        let _ = std::fs::remove_file(plist_path(&self.home));
+    }
+}
+
+fn uid() -> String {
+    let output = std::process::Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+fn service_target() -> String {
+    format!("gui/{}/{}", uid(), mcpgw_core::daemon::launchd::LABEL)
+}
+
+fn plist_path(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{}.plist", mcpgw_core::daemon::launchd::LABEL))
+}
+
+/// Whether launchd currently holds the job.
+fn loaded() -> bool {
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", &service_target()])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// A port that was free a moment ago, and deliberately not 8137: a developer
+/// running this very likely has a foreground gateway on the default port.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Polls `daemon status` until the gateway answers, returning its output.
+fn wait_until_up(home: &Path, url: &str) -> std::process::Output {
+    let deadline = Instant::now() + UP_TIMEOUT;
+    loop {
+        let output = daemon(home, &["status", "--url", url]);
+        if output.status.code() == Some(0) || Instant::now() > deadline {
+            return output;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[test]
+fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
+    if std::env::var(LIVE_ENV).as_deref() != Ok("1") {
+        eprintln!("skipped: set {LIVE_ENV}=1 to bootstrap a real launch agent");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let _cleanup = LeaveNothingBehind {
+        home: home.to_owned(),
+    };
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "version = 1\n\n[servers.fx1]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\n",
+            fixture_binary().display()
+        ),
+    )
+    .unwrap();
+
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let plist = plist_path(home);
+
+    // Install: the plist lands, launchd takes the job, and the user is told
+    // about the notification macOS is about to show them.
+    let installed = daemon(home, &["install", "--port", &port.to_string()]);
+    let text = stdout(&installed);
+    assert!(
+        installed.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(text.contains(&plist.display().to_string()), "{text}");
+    assert!(text.contains("Background Items Added"), "{text}");
+    assert!(text.contains(&url), "{text}");
+    assert!(plist.exists(), "{}", plist.display());
+    assert!(loaded(), "launchd did not take the job");
+
+    // Running: the gateway answers on the port it was installed for, and
+    // `status` says the service and the gateway are the same thing.
+    let up = wait_until_up(home, &url);
+    let text = stdout(&up);
+    assert_eq!(up.status.code(), Some(0), "{text}");
+    assert!(text.contains("gateway   running"), "{text}");
+    assert!(text.contains("answers (HTTP"), "{text}");
+    assert!(text.contains("installed under launchd, running"), "{text}");
+    assert!(!text.contains("foreground"), "{text}");
+
+    // Stop: the decided semantics. `KeepAlive` restarts a crash, so the proof
+    // that stop is not a crash is that the gateway is still down a moment
+    // later rather than back up.
+    let stopped = daemon(home, &["stop"]);
+    assert!(
+        stopped.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!loaded(), "launchd restarted the gateway after a stop");
+    let down = daemon(home, &["status", "--url", &url]);
+    let text = stdout(&down);
+    assert_eq!(down.status.code(), Some(1), "{text}");
+    assert!(text.contains("gateway   not running"), "{text}");
+    // Stopped, not uninstalled: the plist is still on disk and `status` says
+    // so, because "it will be back at login" is a different state from gone.
+    assert!(plist.exists(), "{}", plist.display());
+    assert!(text.contains("installed under launchd, stopped"), "{text}");
+
+    // Start: back from the plist that was never removed.
+    let started = daemon(home, &["start", "--port", &port.to_string()]);
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let up = wait_until_up(home, &url);
+    assert_eq!(up.status.code(), Some(0), "{}", stdout(&up));
+
+    // Uninstall: out of the domain, off the disk, off the port.
+    let removed = daemon(home, &["uninstall"]);
+    assert!(
+        removed.status.success(),
+        "uninstall failed: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!plist.exists(), "{} survived", plist.display());
+    assert!(!loaded(), "the job is still in the launchd domain");
+
+    let gone = daemon(home, &["status", "--url", &url]);
+    let text = stdout(&gone);
+    assert_eq!(gone.status.code(), Some(1), "{text}");
+    assert!(text.contains("service   not installed"), "{text}");
+
+    // The real LaunchAgents directory was never a party to any of this.
+    if let Some(real_home) = std::env::var_os("HOME") {
+        let real = plist_path(Path::new(&real_home));
+        assert!(!real.exists(), "{} was written", real.display());
+    }
+
+    // Uninstalling twice is the same end state, not an error.
+    assert!(daemon(home, &["uninstall"]).status.success());
+}

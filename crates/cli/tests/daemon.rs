@@ -160,6 +160,11 @@ fn install_and_start_name_the_port_that_is_already_taken() {
 
 /// The installers land per-OS later; until then every one of them has to say
 /// so, and point at the thing that does work today.
+///
+/// Not on macOS: its installer has shipped, so running this there would
+/// bootstrap a real launch agent into the developer's (or the runner's) own
+/// launchd domain. `daemon_launchd.rs` drives that cycle deliberately.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn the_service_commands_say_which_release_brings_them_and_what_to_do_meanwhile() {
     let dir = tempfile::tempdir().unwrap();
