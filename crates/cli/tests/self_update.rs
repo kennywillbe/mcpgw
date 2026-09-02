@@ -14,6 +14,9 @@ use assert_cmd::Command;
 
 /// The triple this test binary — and therefore the mcpgw under test — was
 /// built for, from the same build script the command reads it from.
+// Only the unix-gated end-to-end tests name the triple; Windows builds the
+// file without them and -D warnings rejects the dead const.
+#[cfg(unix)]
 const TARGET: &str = env!("MCPGW_TARGET");
 
 #[cfg(unix)]
