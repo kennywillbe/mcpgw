@@ -576,6 +576,60 @@ fn dry_run_writes_nothing() {
 }
 
 #[test]
+fn yes_skips_the_conflict_and_keeps_canonical() {
+    let sb = Sandbox::new();
+    sb.ok(&["add", "github", "--", "npx", "canonical-version"]);
+    sb.write_client(
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["client-version"]},
+            "linear": {"command": "linear-mcp"}
+        }}"#,
+    );
+
+    let out = sb.ok(&["import", "--from", "cursor", "--yes"]);
+    assert!(
+        out.contains("! github differs from the canonical entry (skipped — --yes keeps canonical)"),
+        "{out}"
+    );
+    // The rest of the run must still land: --yes resolves the conflict, it
+    // does not abandon the import.
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(
+        out.contains("imported 1, already present 0, skipped 1"),
+        "{out}"
+    );
+
+    let list = sb.ok(&["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(json["servers"]["github"]["args"][0], "canonical-version");
+    assert_eq!(json["servers"]["linear"]["command"], "linear-mcp");
+}
+
+#[test]
+fn yes_without_conflicts_matches_a_plain_import() {
+    let plain = Sandbox::new();
+    let yes = Sandbox::new();
+    for sb in [&plain, &yes] {
+        sb.write_client(
+            ".cursor/mcp.json",
+            r#"{"mcpServers": {
+                "github": {"command": "npx", "args": ["server-github"]},
+                "My Notes": {"command": "notes-mcp"}
+            }}"#,
+        );
+    }
+
+    let plain_out = plain.ok(&["import", "--from", "cursor"]);
+    let yes_out = yes.ok(&["import", "--from", "cursor", "--yes"]);
+    assert_eq!(plain_out, yes_out);
+    assert_eq!(
+        std::fs::read_to_string(plain.home.join("config.toml")).unwrap(),
+        std::fs::read_to_string(yes.home.join("config.toml")).unwrap()
+    );
+}
+
+#[test]
 fn unknown_from_id_errors() {
     let sb = Sandbox::new();
     let out = sb.mcpgw(&["import", "--from", "emacs"]);

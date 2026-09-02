@@ -18,7 +18,14 @@ same server configured in three clients is imported once.
 ```sh
 mcpgw import --dry-run          # look before you leap
 mcpgw import --from cursor      # only one client (repeatable)
+mcpgw import --yes              # never prompt; keep canonical on conflict
 ```
+
+A client entry that differs from a canonical entry you already wrote is a
+conflict, and `import` asks what to do with it. `--yes` answers "keep the
+canonical entry" without asking, so scripts and agents can run `import`
+knowing it will neither block nor overwrite anything you wrote by hand. The
+skipped entries are still listed in the output.
 
 Client ids are `claude-desktop`, `claude-code`, `cursor`, `vscode`, `gemini`,
 `codex`, `opencode`, `windsurf`, `zed`, `cline`, `cline-cli`, `amp`, `zoo` —
