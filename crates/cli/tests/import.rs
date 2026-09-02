@@ -386,6 +386,125 @@ fn import_from_zed_reads_every_source_out_of_the_editor_settings() {
     assert!(!sync.contains("! "), "{sync}");
 }
 
+/// The extension's own path, which is inside VS Code's globalStorage.
+fn cline_extension_rel() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
+    } else if cfg!(windows) {
+        "AppData/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
+    } else {
+        ".config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
+    }
+}
+
+#[test]
+fn import_from_cline_adopts_disabled_and_auto_approved_entries() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        cline_extension_rel(),
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"],
+                       "autoApprove": ["search_repositories"]},
+            "browser": {"command": "browser-mcp", "disabled": true},
+            "linear": {"url": "https://mcp.linear.app/mcp", "type": "streamableHttp"}
+        }}"#,
+    );
+    let out = sb.ok(&["import", "--from", "cline"]);
+    for name in ["+ github", "+ browser", "+ linear"] {
+        assert!(out.contains(name), "{out}");
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    // `disabled: true` is the inverse of the canonical flag.
+    assert_eq!(json["servers"]["browser"]["enabled"], false);
+    // `autoApprove` is Cline's own and has no canonical counterpart.
+    let canonical = std::fs::read_to_string(sb.home.join("config.toml")).unwrap();
+    assert!(!canonical.contains("autoApprove"), "{canonical}");
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "cline"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
+/// Cline's extension and its CLI read different files that nothing keeps in
+/// step, which is why they are two clients — and why importing from a machine
+/// with both has to land one canonical server carrying both origins rather
+/// than two copies of it.
+#[test]
+fn import_dedupes_a_server_the_user_has_on_both_cline_surfaces() {
+    let sb = Sandbox::new();
+    let entry = r#"{"mcpServers": {
+        "github": {"command": "npx", "args": ["server-github"]}
+    }}"#;
+    sb.write_client(cline_extension_rel(), entry);
+    sb.write_client(".cline/data/settings/cline_mcp_settings.json", entry);
+
+    let out = sb.ok(&["import"]);
+    assert!(
+        out.contains("+ github (from cline, cline-cli)")
+            || out.contains("+ github (from cline-cli, cline)"),
+        "{out}"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(json["servers"].as_object().unwrap().len(), 1);
+    // One import adopts the entry on both surfaces, so neither conflicts.
+    for id in ["cline", "cline-cli"] {
+        let sync = sb.ok(&["sync", "--client", id]);
+        assert!(!sync.contains("! "), "{id}: {sync}");
+    }
+}
+
+/// Amp's settings file under the sandbox environment; XDG on macOS and
+/// Linux, the app-data dir only on Windows.
+fn amp_settings_rel() -> &'static str {
+    if cfg!(windows) {
+        "AppData/amp/settings.json"
+    } else {
+        ".config/amp/settings.json"
+    }
+}
+
+#[test]
+fn import_from_amp_reads_the_namespaced_key_only() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        amp_settings_rel(),
+        r#"{
+            "amp.notifications.enabled": true,
+            "amp.mcpServers": {
+                "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]},
+                "browser": {"command": "browser-mcp", "disabled": true},
+                "linear": {"url": "https://mcp.linear.app/sse"}
+            },
+            "amp": {"mcpServers": {"decoy": {"command": "never-read-me"}}}
+        }"#,
+    );
+    let out = sb.ok(&["import", "--from", "amp"]);
+    for name in ["+ playwright", "+ browser", "+ linear"] {
+        assert!(out.contains(name), "{out}");
+    }
+    // The dot belongs to the key, so the nested object is another property.
+    assert!(!out.contains("decoy"), "{out}");
+
+    let json: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    assert_eq!(json["servers"].as_object().unwrap().len(), 3);
+    assert_eq!(
+        json["servers"]["linear"]["url"],
+        "https://mcp.linear.app/sse"
+    );
+    // `disabled: true` is the inverse of the canonical flag.
+    assert_eq!(json["servers"]["browser"]["enabled"], false);
+
+    // Adoption means the next sync owns the entries rather than conflicting.
+    let sync = sb.ok(&["sync", "--client", "amp"]);
+    assert!(!sync.contains("! "), "{sync}");
+}
+
 #[test]
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();

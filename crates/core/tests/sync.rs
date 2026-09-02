@@ -185,14 +185,42 @@ fn entry_shapes_per_client() {
     assert_eq!(zed_http["url"], "https://mcp.linear.app/mcp");
     assert!(zed_http.get("type").is_none());
 
+    // Cline is the shared stdio shape; a remote entry needs its camelCase
+    // `type`, because an untyped one means the legacy SSE transport there.
+    let cline_stdio = client_entry(ClientKind::Cline, &canonical["github"]);
+    let cline_http = client_entry(ClientKind::Cline, &canonical["linear"]);
+    assert_eq!(cline_stdio, cursor_stdio);
+    assert_eq!(cline_http["type"], "streamableHttp");
+    assert_eq!(cline_http["url"], "https://mcp.linear.app/mcp");
+    // `disabled` and `autoApprove` are Cline's own; mcpgw writes neither.
+    assert!(cline_http.get("disabled").is_none());
+    assert!(cline_stdio.get("autoApprove").is_none());
+    // Both surfaces write the same bytes.
+    assert_eq!(
+        client_entry(ClientKind::ClineCli, &canonical["linear"]),
+        cline_http
+    );
+
+    // Amp is the shared stdio shape, and a bare `url` for remote: it has no
+    // `type` field, so writing one would be a field its schema does not have.
+    let amp_stdio = client_entry(ClientKind::Amp, &canonical["github"]);
+    let amp_http = client_entry(ClientKind::Amp, &canonical["linear"]);
+    assert_eq!(amp_stdio, cursor_stdio);
+    assert_eq!(amp_http["url"], "https://mcp.linear.app/mcp");
+    assert!(amp_http.get("type").is_none());
+    // `source` is Zed's, not Amp's, however alike the two shapes look.
+    assert!(amp_http.get("source").is_none());
+    assert!(amp_stdio.get("disabled").is_none());
+
     insta::assert_snapshot!(serde_json::to_string_pretty(&vs_stdio).unwrap());
 }
 
 /// The clients whose entry shape is rewritten rather than passed through:
 /// opencode splits and rejoins the `command` array, Windsurf renames the
-/// remote URL, Zed adds a `source` its reader has to ignore. Emitting and
-/// re-reading has to give back the server that went in — for every client,
-/// but for these three it is load bearing rather than incidental.
+/// remote URL, Zed adds a `source` its reader has to ignore, Cline spells the
+/// remote type its own way, Amp drops the `type` the shared shape carries.
+/// Emitting and re-reading has to give back the server that went in — for
+/// every client, but for these it is load bearing rather than incidental.
 #[test]
 fn emitting_and_re_reading_an_entry_returns_the_same_server() {
     let mut servers: Vec<mcpgw_core::Server> = canonical().into_values().collect();
@@ -225,7 +253,14 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
         },
     });
 
-    for kind in [ClientKind::Opencode, ClientKind::Windsurf, ClientKind::Zed] {
+    for kind in [
+        ClientKind::Opencode,
+        ClientKind::Windsurf,
+        ClientKind::Zed,
+        ClientKind::Cline,
+        ClientKind::ClineCli,
+        ClientKind::Amp,
+    ] {
         let entries = kind.codec().entries;
         for server in &servers {
             let emitted = entries.emit(server);
@@ -305,6 +340,25 @@ fn gateway_entry_shapes_per_client() {
     assert_eq!(zed["url"], url);
     assert_eq!(zed["source"], "custom");
     assert!(zed.get("command").is_none());
+
+    // Cline reads an untyped remote entry as SSE, so even the gateway has
+    // to carry the type that says otherwise.
+    let cline = client_entry(
+        ClientKind::Cline,
+        &gateway_server(ClientKind::Cline, url, "mcpgw"),
+    );
+    assert_eq!(cline["url"], url);
+    assert_eq!(cline["type"], "streamableHttp");
+    assert!(cline.get("command").is_none());
+
+    // Amp reads a remote entry from the URL alone, so the gateway is one.
+    let amp = client_entry(
+        ClientKind::Amp,
+        &gateway_server(ClientKind::Amp, url, "mcpgw"),
+    );
+    assert_eq!(amp["url"], url);
+    assert!(amp.get("type").is_none());
+    assert!(amp.get("command").is_none());
 
     for kind in ClientKind::ALL {
         assert_eq!(

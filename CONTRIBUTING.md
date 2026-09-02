@@ -87,3 +87,12 @@ Dependabot opens one grouped PR a week per ecosystem — `cargo-deps` for crates
 `actions-deps` for workflow actions — under a `deps:` prefix, which
 release-please files under **Dependencies** in the changelog. A `deps:` commit
 with nothing else alongside it bumps the patch version.
+
+## Style
+
+- Comments explain *why*, not what. No commented-out code, no changelog
+  comments, no bare `TODO` without an issue link.
+- Errors: `thiserror` in `mcpgw-core`, `anyhow` in the CLI crate.
+- No `unwrap()`/`expect()` outside tests unless the invariant is proven in a
+  comment right there.
+- Secrets never reach logs, errors, or test fixtures.

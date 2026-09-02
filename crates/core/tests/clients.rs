@@ -309,6 +309,123 @@ fn zed_reads_context_servers_whatever_their_source() {
 }
 
 #[test]
+fn cline_reads_disabled_entries_and_both_remote_spellings() {
+    let read = read_fixture(ClientKind::Cline, "cline_mcp_settings.json");
+
+    // `autoApprove` is Cline's own bookkeeping: read as absent, and left on
+    // the entry because sync never rewrites one it does not manage.
+    assert_eq!(
+        read.servers["github"].transport,
+        mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: vec![
+                "-y".to_owned(),
+                "@modelcontextprotocol/server-github".to_owned()
+            ],
+            env: [("GITHUB_TOKEN".to_owned(), "ghp_example".to_owned())]
+                .into_iter()
+                .collect(),
+        }
+    );
+    // `disabled` is the inverse of the canonical flag.
+    assert!(read.servers["github"].enabled);
+    assert!(!read.servers["browser"].enabled);
+
+    // Cline's own spelling of streamable HTTP reads as http with nothing
+    // lost, so it must not be reported as an unknown transport.
+    assert_eq!(
+        read.servers["linear"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [("Authorization".to_owned(), "Bearer token".to_owned())]
+                .into_iter()
+                .collect(),
+        }
+    );
+    assert!(
+        !read
+            .problems
+            .iter()
+            .any(|p| p.server.as_deref() == Some("linear"))
+    );
+
+    // An untyped remote entry is SSE in Cline, so it gets the same note the
+    // explicitly typed one does.
+    for name in ["legacy", "untyped"] {
+        let note = read
+            .problems
+            .iter()
+            .find(|p| p.server.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no note for {name}"));
+        assert_eq!(note.message, "legacy `sse` transport read as http");
+    }
+
+    // An entry that is only an autoApprove list is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    assert_eq!(read.servers.len(), 5);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+/// The two Cline surfaces read the same bytes; only where they read them from
+/// differs, which is why they share one entry schema.
+#[test]
+fn the_cline_cli_reads_the_extension_format() {
+    assert_eq!(
+        ClientKind::ClineCli.codec().entries,
+        ClientKind::Cline.codec().entries
+    );
+    let extension = read_fixture(ClientKind::Cline, "cline_mcp_settings.json");
+    let cli = read_fixture(ClientKind::ClineCli, "cline_mcp_settings.json");
+    assert_eq!(extension, cli);
+}
+
+#[test]
+fn amp_reads_the_namespaced_key_and_not_a_nested_one() {
+    let read = read_fixture(ClientKind::Amp, "amp_settings.json");
+
+    assert_eq!(
+        read.servers["playwright"].transport,
+        mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: vec![
+                "-y".to_owned(),
+                "@playwright/mcp@latest".to_owned(),
+                "--headless".to_owned()
+            ],
+            env: std::collections::BTreeMap::new(),
+        }
+    );
+    // `disabled` is the inverse of the canonical flag.
+    assert!(read.servers["playwright"].enabled);
+    assert!(!read.servers["browser"].enabled);
+
+    // A remote entry is a bare `url` — Amp has no `type` to say so — and its
+    // `${VAR}` interpolation is kept verbatim rather than expanded here.
+    assert_eq!(
+        read.servers["sourcegraph"].transport,
+        mcpgw_core::Transport::Http {
+            url: "${SRC_ENDPOINT}/.api/mcp/v1".to_owned(),
+            headers: [(
+                "Authorization".to_owned(),
+                "token ${SRC_ACCESS_TOKEN}".to_owned()
+            )]
+            .into_iter()
+            .collect(),
+        }
+    );
+
+    // The dot belongs to the key: a genuinely nested `amp` object is a
+    // different property and must stay invisible.
+    assert!(!read.servers.contains_key("decoy"));
+    // An entry that is only an off switch is a problem, not a failure.
+    assert!(!read.servers.contains_key("husk"));
+    assert_eq!(read.servers.len(), 4);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+#[test]
 fn broken_entries_become_problems_not_failures() {
     let read = read_fixture(ClientKind::ClaudeDesktop, "messy.json");
     // Exactly one entry survives; every other becomes a reported problem.
@@ -449,6 +566,100 @@ fn detect_reports_three_states() {
     std::fs::write(&config, "// mine\n{ \"vim_mode\": true }\n").unwrap();
     assert_eq!(
         ClientKind::Zed.detect_with(&env),
+        Detection::Configured(config)
+    );
+}
+
+/// Cline's extension and its CLI are separate installs that read different
+/// files and never sync, so each has to detect on its own — and a machine
+/// with both has to report both.
+#[test]
+fn the_two_cline_surfaces_detect_independently() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let appdata = home.join("AppData");
+    let env = move |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "HOME" | "USERPROFILE" => Some(home.clone().into()),
+            "APPDATA" => Some(appdata.clone().into()),
+            _ => None,
+        }
+    };
+
+    for kind in [ClientKind::Cline, ClientKind::ClineCli] {
+        assert_eq!(kind.detect_with(&env), Detection::NotInstalled);
+    }
+
+    // The extension surface: its globalStorage dir, inside VS Code's own.
+    let trace = ClientKind::Cline.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Cline.detect_with(&env), Detection::Installed);
+    assert_eq!(
+        ClientKind::ClineCli.detect_with(&env),
+        Detection::NotInstalled
+    );
+    let config = ClientKind::Cline.config_path_with(&env).unwrap();
+    assert!(config.ends_with(
+        "Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json"
+    ));
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
+    assert_eq!(
+        ClientKind::Cline.detect_with(&env),
+        Detection::Configured(config)
+    );
+
+    let trace = ClientKind::ClineCli.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::ClineCli.detect_with(&env), Detection::Installed);
+    let config = ClientKind::ClineCli.config_path_with(&env).unwrap();
+    assert!(config.ends_with(".cline/data/settings/cline_mcp_settings.json"));
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, r#"{"mcpServers": {}}"#).unwrap();
+    // A machine with both installed reports both, which is the whole point
+    // of modelling them as two clients.
+    assert_eq!(
+        ClientKind::ClineCli.detect_with(&env),
+        Detection::Configured(config)
+    );
+    assert!(matches!(
+        ClientKind::Cline.detect_with(&env),
+        Detection::Configured(_)
+    ));
+}
+
+/// Amp's own dir holds its settings file, so "installed" and "configured"
+/// are told apart by the file — and the dir is XDG on macOS too, not the
+/// app-data dir the GUI clients use.
+#[test]
+fn amp_detects_from_its_config_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let appdata = home.join("AppData");
+    let env = move |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "HOME" | "USERPROFILE" => Some(home.clone().into()),
+            "APPDATA" => Some(appdata.clone().into()),
+            _ => None,
+        }
+    };
+
+    assert_eq!(ClientKind::Amp.detect_with(&env), Detection::NotInstalled);
+
+    let trace = ClientKind::Amp.install_trace_with(&env).unwrap();
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(ClientKind::Amp.detect_with(&env), Detection::Installed);
+
+    let config = ClientKind::Amp.config_path_with(&env).unwrap();
+    let expected = if cfg!(windows) {
+        "AppData/amp/settings.json"
+    } else {
+        ".config/amp/settings.json"
+    };
+    assert!(config.ends_with(expected), "{}", config.display());
+    std::fs::write(&config, r#"{"amp.mcpServers": {}}"#).unwrap();
+    assert_eq!(
+        ClientKind::Amp.detect_with(&env),
         Detection::Configured(config)
     );
 }

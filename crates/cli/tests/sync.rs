@@ -62,17 +62,22 @@ impl Sandbox {
         serde_json::from_str(&text).unwrap()
     }
 
-    /// Mirrors `ClientKind::config_path` for Claude Desktop under the sandbox
-    /// environment, per platform app-data convention.
-    fn claude_desktop_path(&self) -> PathBuf {
-        let app_data = if cfg!(target_os = "macos") {
+    /// The platform-native app-data dir under the sandbox environment, which
+    /// is where the GUI clients keep their config.
+    fn app_data(&self) -> PathBuf {
+        if cfg!(target_os = "macos") {
             self.home.join("Library/Application Support")
         } else if cfg!(windows) {
             self.home.join("AppData")
         } else {
             self.home.join(".config")
-        };
-        app_data.join("Claude/claude_desktop_config.json")
+        }
+    }
+
+    /// Mirrors `ClientKind::config_path` for Claude Desktop under the sandbox
+    /// environment.
+    fn claude_desktop_path(&self) -> PathBuf {
+        self.app_data().join("Claude/claude_desktop_config.json")
     }
 
     fn install_claude_desktop(&self) {
@@ -186,6 +191,59 @@ impl Sandbox {
             .unwrap()
     }
 
+    /// Amp follows the XDG layout on macOS as well as Linux, and only uses
+    /// the app-data dir on Windows.
+    fn amp_dir(&self) -> PathBuf {
+        if cfg!(windows) {
+            self.home.join("AppData/amp")
+        } else {
+            self.home.join(".config/amp")
+        }
+    }
+
+    /// `None` installs the directory alone (Amp present, unconfigured).
+    fn install_amp(&self, settings: Option<&str>) {
+        std::fs::create_dir_all(self.amp_dir()).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(self.amp_dir().join("settings.json"), text).unwrap();
+        }
+    }
+
+    fn amp_text(&self) -> String {
+        std::fs::read_to_string(self.amp_dir().join("settings.json")).unwrap()
+    }
+
+    fn amp_json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.amp_text()).unwrap()
+    }
+
+    /// Cline's two surfaces read different files that nothing keeps in
+    /// step, so each gets its own directory here.
+    fn cline_dir(&self, kind: mcpgw_core::ClientKind) -> PathBuf {
+        match kind {
+            mcpgw_core::ClientKind::Cline => self
+                .app_data()
+                .join("Code/User/globalStorage/saoudrizwan.claude-dev/settings"),
+            _ => self.home.join(".cline/data/settings"),
+        }
+    }
+
+    /// `None` installs the directory alone (Cline present, unconfigured).
+    fn install_cline(&self, kind: mcpgw_core::ClientKind, settings: Option<&str>) {
+        std::fs::create_dir_all(self.cline_dir(kind)).unwrap();
+        if let Some(text) = settings {
+            std::fs::write(self.cline_dir(kind).join("cline_mcp_settings.json"), text).unwrap();
+        }
+    }
+
+    fn cline_text(&self, kind: mcpgw_core::ClientKind) -> String {
+        std::fs::read_to_string(self.cline_dir(kind).join("cline_mcp_settings.json")).unwrap()
+    }
+
+    fn cline_json(&self, kind: mcpgw_core::ClientKind) -> serde_json::Value {
+        serde_json::from_str(&self.cline_text(kind)).unwrap()
+    }
+
     fn windsurf_json(&self) -> serde_json::Value {
         let text =
             std::fs::read_to_string(self.home.join(".codeium/windsurf/mcp_config.json")).unwrap();
@@ -268,6 +326,39 @@ const ZED_SETTINGS: &str = r#"// My Zed settings — do not reformat.
   }
 }
 "#;
+
+/// A Cline file with an entry mcpgw does not own: switched off in place, and
+/// carrying the `autoApprove` list Cline maintains itself. A sync has to
+/// leave both exactly as it found them.
+const CLINE_SETTINGS: &str = r#"{
+  "mcpServers": {
+    "notes": {
+      "command": "notes-mcp",
+      "disabled": true,
+      "autoApprove": ["list_notes", "read_note"]
+    }
+  }
+}"#;
+
+/// An Amp settings file with everything a sync has to leave alone: settings
+/// that are not MCP at all, an entry mcpgw does not own, and — the one that
+/// only Amp can get wrong — a genuinely nested `amp` object, which is a
+/// different property from the `amp.mcpServers` key beside it.
+const AMP_SETTINGS: &str = r#"{
+  "amp.notifications.enabled": true,
+  "amp.mcpServers": {
+    "notes": {
+      "command": "notes-mcp",
+      "disabled": true
+    }
+  },
+  "amp": {
+    "mcpServers": {
+      "decoy": { "command": "never-read-me" }
+    }
+  },
+  "amp.tools.disable": ["edit_file"]
+}"#;
 
 /// The bridge command is either the bare name (mcpgw on PATH) or the path of
 /// the binary under test.
@@ -891,6 +982,159 @@ fn zed_gateway_entry_is_a_custom_url() {
     let entry = sb.zed_json()["context_servers"]["mcpgw"].clone();
     assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
     assert_eq!(entry["source"], "custom");
+    assert!(entry.get("command").is_none());
+}
+
+#[test]
+fn cline_sync_types_remote_entries_and_leaves_foreign_ones_intact() {
+    for kind in [
+        mcpgw_core::ClientKind::Cline,
+        mcpgw_core::ClientKind::ClineCli,
+    ] {
+        let sb = Sandbox::new();
+        sb.install_cline(kind, Some(CLINE_SETTINGS));
+        sb.ok(&[
+            "add",
+            "github",
+            "--env",
+            "TOKEN=t",
+            "--",
+            "npx",
+            "server-github",
+        ]);
+        sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+        let out = sb.ok(&["sync", "--client", kind.id()]);
+        assert!(out.contains("+ github"), "{out}");
+        assert!(out.contains("+ linear"), "{out}");
+        assert!(out.contains("? notes"), "{out}");
+
+        let json = sb.cline_json(kind);
+        // The entry mcpgw does not own keeps its off switch and the
+        // auto-approved tool list Cline maintains for it.
+        assert_eq!(json["mcpServers"]["notes"]["disabled"], true);
+        assert_eq!(
+            json["mcpServers"]["notes"]["autoApprove"],
+            serde_json::json!(["list_notes", "read_note"])
+        );
+
+        assert_eq!(json["mcpServers"]["github"]["command"], "npx");
+        assert_eq!(json["mcpServers"]["github"]["env"]["TOKEN"], "t");
+        // Without the type Cline would treat the URL as an SSE endpoint.
+        assert_eq!(json["mcpServers"]["linear"]["type"], "streamableHttp");
+        assert_eq!(
+            json["mcpServers"]["linear"]["url"],
+            "https://mcp.linear.app/mcp"
+        );
+
+        let text = sb.cline_text(kind);
+        let again = sb.ok(&["sync", "--client", kind.id()]);
+        assert!(again.contains("no changes"), "{again}");
+        assert_eq!(sb.cline_text(kind), text);
+    }
+}
+
+#[test]
+fn cline_gateway_entry_carries_the_streamable_type() {
+    let sb = Sandbox::new();
+    sb.install_cline(mcpgw_core::ClientKind::Cline, None);
+    let out = sb.ok(&["sync", "--client", "cline", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.cline_json(mcpgw_core::ClientKind::Cline)["mcpServers"]["mcpgw"].clone();
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
+    assert_eq!(entry["type"], "streamableHttp");
+    assert!(entry.get("command").is_none());
+}
+
+/// Syncing one surface must not touch the other: they are separate installs,
+/// and a user who has both expects both to end up with the server.
+#[test]
+fn the_two_cline_surfaces_are_synced_independently() {
+    let sb = Sandbox::new();
+    sb.install_cline(mcpgw_core::ClientKind::Cline, None);
+    sb.install_cline(mcpgw_core::ClientKind::ClineCli, None);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    sb.ok(&["sync", "--client", "cline"]);
+    assert!(
+        !sb.cline_dir(mcpgw_core::ClientKind::ClineCli)
+            .join("cline_mcp_settings.json")
+            .exists()
+    );
+
+    sb.ok(&["sync", "--client", "cline-cli"]);
+    for kind in [
+        mcpgw_core::ClientKind::Cline,
+        mcpgw_core::ClientKind::ClineCli,
+    ] {
+        assert_eq!(
+            sb.cline_json(kind)["mcpServers"]["linear"]["url"],
+            "https://mcp.linear.app/mcp"
+        );
+    }
+}
+
+#[test]
+fn amp_sync_writes_the_namespaced_key_and_leaves_the_nested_one_alone() {
+    let sb = Sandbox::new();
+    sb.install_amp(Some(AMP_SETTINGS));
+    sb.ok(&[
+        "add",
+        "github",
+        "--env",
+        "TOKEN=t",
+        "--",
+        "npx",
+        "server-github",
+    ]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+
+    let out = sb.ok(&["sync", "--client", "amp"]);
+    assert!(out.contains("+ github"), "{out}");
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("? notes"), "{out}");
+
+    let json = sb.amp_json();
+    // Settings that have nothing to do with MCP are untouched, dotted
+    // siblings of the server map included.
+    assert_eq!(json["amp.notifications.enabled"], true);
+    assert_eq!(json["amp.tools.disable"], serde_json::json!(["edit_file"]));
+    // So is the entry mcpgw does not own, its off switch included.
+    assert_eq!(json["amp.mcpServers"]["notes"]["disabled"], true);
+    // The nested object is a different property and stays a bystander: it is
+    // neither read as the server map nor written into.
+    assert_eq!(
+        json["amp"]["mcpServers"]["decoy"]["command"],
+        "never-read-me"
+    );
+    assert!(json["amp"]["mcpServers"].get("github").is_none());
+
+    assert_eq!(json["amp.mcpServers"]["github"]["command"], "npx");
+    assert_eq!(json["amp.mcpServers"]["github"]["env"]["TOKEN"], "t");
+    // Amp infers the transport from the URL; it has no `type` field.
+    assert_eq!(
+        json["amp.mcpServers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp"
+    );
+    assert!(json["amp.mcpServers"]["linear"].get("type").is_none());
+
+    let text = sb.amp_text();
+    let again = sb.ok(&["sync", "--client", "amp"]);
+    assert!(again.contains("no changes"), "{again}");
+    assert_eq!(sb.amp_text(), text);
+}
+
+#[test]
+fn amp_gateway_entry_is_a_bare_url() {
+    let sb = Sandbox::new();
+    sb.install_amp(None);
+    let out = sb.ok(&["sync", "--client", "amp", "--gateway"]);
+    assert!(out.contains("+ mcpgw"), "{out}");
+
+    let entry = sb.amp_json()["amp.mcpServers"]["mcpgw"].clone();
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/mcp");
+    assert!(entry.get("type").is_none());
     assert!(entry.get("command").is_none());
 }
 

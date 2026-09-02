@@ -1,6 +1,6 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
 //! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI,
-//! opencode, Windsurf, Zed).
+//! opencode, Windsurf, Zed, Cline, the Cline CLI and Amp).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -31,6 +31,16 @@ pub enum ClientKind {
     Opencode,
     Windsurf,
     Zed,
+    /// Cline's VS Code extension, which keeps its servers in the
+    /// extension's own globalStorage directory.
+    Cline,
+    /// Cline's standalone CLI. A separate kind rather than a second path
+    /// candidate on [`ClientKind::Cline`] because the two installs are
+    /// genuinely independent: neither reads the other's file and nothing
+    /// syncs them (cline/cline#11671). One kind would report whichever file
+    /// won the candidate race and hide the other.
+    ClineCli,
+    Amp,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -59,7 +69,7 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
@@ -69,6 +79,9 @@ impl ClientKind {
         Self::Opencode,
         Self::Windsurf,
         Self::Zed,
+        Self::Cline,
+        Self::ClineCli,
+        Self::Amp,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -84,6 +97,9 @@ impl ClientKind {
             Self::Opencode => "opencode",
             Self::Windsurf => "windsurf",
             Self::Zed => "zed",
+            Self::Cline => "cline",
+            Self::ClineCli => "cline-cli",
+            Self::Amp => "amp",
         }
     }
 
@@ -106,6 +122,9 @@ impl ClientKind {
             Self::Opencode => "opencode",
             Self::Windsurf => "Windsurf",
             Self::Zed => "Zed",
+            Self::Cline => "Cline",
+            Self::ClineCli => "Cline CLI",
+            Self::Amp => "Amp",
         }
     }
 
@@ -124,8 +143,11 @@ impl ClientKind {
     /// name but spells entries its own way, Codex CLI is TOML end to end —
     /// a `[mcp_servers]` table of `snake_case` entries — opencode is
     /// JSONC under a plain `mcp` key, Windsurf keeps the `mcpServers`
-    /// rules but spells the remote URL `serverUrl`, and Zed keeps its
-    /// servers under `context_servers` inside its whole-editor settings.
+    /// rules but spells the remote URL `serverUrl`, Zed keeps its
+    /// servers under `context_servers` inside its whole-editor settings,
+    /// both Cline surfaces are `mcpServers` with a `disabled` flag and a
+    /// camelCase remote `type`, and Amp namespaces its map under a single
+    /// dotted key.
     #[must_use]
     pub fn codec(self) -> Codec {
         match self {
@@ -162,6 +184,21 @@ impl ClientKind {
                 format: Format::Jsonc,
                 root: RootPath::new(&["context_servers"]),
                 entries: EntrySchema::Zed,
+            },
+            // Both Cline surfaces write the same file format under the same
+            // name; only the directory differs.
+            Self::Cline | Self::ClineCli => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["mcpServers"]),
+                entries: EntrySchema::Cline,
+            },
+            // The dot is part of Amp's key: its settings file holds one
+            // `"amp.mcpServers"` property, not an `amp` object with a
+            // `mcpServers` inside it. One literal segment says exactly that.
+            Self::Amp => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["amp.mcpServers"]),
+                entries: EntrySchema::Amp,
             },
             _ => Codec {
                 format: Format::Json,
@@ -219,7 +256,13 @@ impl ClientKind {
             // re-checking: it is still `.codeium` today, and a future one
             // becomes another entry in the candidate list above.
             Self::Windsurf => home_dir(&get).map(|dir| dir.join(".codeium/windsurf")),
-            Self::Zed => zed_config_dir(&get),
+            Self::Zed => xdg_or_windows_app_data_dir(&get, "zed", "Zed"),
+            Self::Cline => cline_extension_dir(&get).map(|dir| dir.join("settings")),
+            // Cline's own docs say `~/.cline/mcp.json`; the CLI does not
+            // read that path and never has (cline/cline#11671). This is the
+            // file it actually loads.
+            Self::ClineCli => home_dir(&get).map(|dir| dir.join(".cline/data/settings")),
+            Self::Amp => xdg_or_windows_app_data_dir(&get, "amp", "amp"),
         }) else {
             return Vec::new();
         };
@@ -227,13 +270,14 @@ impl ClientKind {
             Self::ClaudeDesktop => &["claude_desktop_config.json"],
             Self::ClaudeCode => &[".claude.json"],
             Self::Cursor | Self::VsCode => &["mcp.json"],
-            // Neither of these is an MCP file: each is the whole of its
+            // None of these is an MCP file: each is the whole of its
             // tool's settings, so everything outside the server map is
             // foreign state a write has to leave exactly as it found it.
-            Self::Gemini | Self::Zed => &["settings.json"],
+            Self::Gemini | Self::Zed | Self::Amp => &["settings.json"],
             Self::Codex => &["config.toml"],
             Self::Opencode => &["opencode.json", "opencode.jsonc"],
             Self::Windsurf => &["mcp_config.json"],
+            Self::Cline | Self::ClineCli => &["cline_mcp_settings.json"],
         };
         names.iter().map(|name| dir.join(name)).collect()
     }
@@ -252,7 +296,13 @@ impl ClientKind {
             Self::Codex => home_dir(&get)?.join(".codex"),
             Self::Opencode => xdg_config_dir(&get)?.join("opencode"),
             Self::Windsurf => home_dir(&get)?.join(".codeium/windsurf"),
-            Self::Zed => zed_config_dir(&get)?,
+            Self::Zed => xdg_or_windows_app_data_dir(&get, "zed", "Zed")?,
+            // The extension's storage dir exists from its first run, which
+            // is what tells "Cline installed" apart from "VS Code installed".
+            Self::Cline => cline_extension_dir(&get)?,
+            Self::ClineCli => home_dir(&get)?.join(".cline"),
+            // Amp's own dir, which its CLI and its editor extensions share.
+            Self::Amp => xdg_or_windows_app_data_dir(&get, "amp", "amp")?,
         };
         Some(path)
     }
@@ -412,18 +462,31 @@ fn app_data_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     }
 }
 
-// Zed is XDG on macOS as well as Linux — its settings are in ~/.config/zed
-// on both, *not* in ~/Library/Application Support like the GUI clients that
-// go through `app_data_dir`. Windows is the one platform where it uses the
-// native app-data dir.
-fn zed_config_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+// Zed and Amp are XDG on macOS as well as Linux — their settings are in
+// ~/.config/zed and ~/.config/amp on both, *not* in ~/Library/Application
+// Support like the GUI clients that go through `app_data_dir`. Windows is the
+// one platform where they use the native app-data dir, and Zed capitalizes
+// its directory there (`%APPDATA%\Zed`), so the caller passes both spellings
+// rather than one to be case-mangled.
+fn xdg_or_windows_app_data_dir(
+    get: impl Fn(&str) -> Option<OsString>,
+    xdg_name: &str,
+    windows_name: &str,
+) -> Option<PathBuf> {
     if cfg!(windows) {
         get("APPDATA")
             .filter(|v| !v.is_empty())
-            .map(|appdata| PathBuf::from(appdata).join("Zed"))
+            .map(|appdata| PathBuf::from(appdata).join(windows_name))
     } else {
-        Some(xdg_config_dir(get)?.join("zed"))
+        Some(xdg_config_dir(get)?.join(xdg_name))
     }
+}
+
+// Cline's VS Code extension stores everything under VS Code's own
+// globalStorage, keyed by the extension id — `saoudrizwan.claude-dev`, the id
+// it shipped under before the rename, which the marketplace still uses.
+fn cline_extension_dir(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(app_data_dir(get)?.join("Code/User/globalStorage/saoudrizwan.claude-dev"))
 }
 
 // The XDG config dir on *every* platform, which is what a client following
