@@ -75,7 +75,7 @@ Instead of every client talking to every server, they can all talk to mcpgw:
 
 ```sh
 mcpgw serve            # all enabled servers, each also on its own endpoint
-mcpgw sync --gateway   # point every client at it, one entry per server
+mcpgw sync             # point every client at it, one entry per server
 ```
 
 Every server keeps its name and its own entry in the client — only the
@@ -86,8 +86,8 @@ no process per session. If an upstream dies it's restarted with backoff, and if
 it keeps failing you get a loud error instead of a silently shorter tool list.
 
 Clients that only speak stdio (Claude Desktop) get `mcpgw connect`, a stdio↔HTTP
-bridge to the running gateway. `sync --gateway` picks the right shape per
-client for you.
+bridge to the running gateway. `sync` picks the right shape per client for
+you.
 
 Not a one-way door: `mcpgw eject` writes your original server definitions back
 into every client, drops the gateway entry, removes the daemon, and prints what

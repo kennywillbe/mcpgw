@@ -41,9 +41,8 @@ pub fn endpoint_path(name: &str) -> String {
 pub const AGGREGATE_LABEL: &str = "mcp";
 
 /// Where `mcpgw serve` listens with its own defaults. It lives here rather
-/// than beside the CLI's bridge because the entries `sync --gateway` writes
-/// and the checks `doctor` runs over those entries have to agree on one
-/// spelling.
+/// than beside the CLI's bridge because the entries `sync` writes and the
+/// checks `doctor` runs over those entries have to agree on one spelling.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8137/mcp";
 
 /// How `name`'s endpoint names itself in capture records: the path without

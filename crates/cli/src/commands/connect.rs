@@ -33,8 +33,8 @@ pub struct ConnectArgs {
 /// The gateway URL to bridge to. `--url` alone is taken verbatim: it is the
 /// escape hatch for a gateway on another port or path. Alongside `--server` it
 /// says where the *gateway* is and the server's endpoint is resolved on it —
-/// which is the shape `sync --gateway` writes into stdio-only clients, so the
-/// name in the file stays the server's rather than a hard-coded path.
+/// which is the shape `sync` writes into stdio-only clients, so the name in
+/// the file stays the server's rather than a hard-coded path.
 fn target_url(args: &ConnectArgs) -> anyhow::Result<String> {
     match (&args.url, &args.server) {
         (Some(url), Some(name)) => Ok(mcpgw_core::endpoints::per_server_url(url, name)?),

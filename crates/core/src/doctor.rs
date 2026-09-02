@@ -220,8 +220,8 @@ impl GatewayPlan {
 /// server — a spawned command is nobody's gateway.
 ///
 /// The bridge half must keep agreeing with how `mcpgw connect` resolves the
-/// same flags; the entries it reads are the ones `sync --gateway` writes for
-/// clients that cannot hold an http entry, and those are the majority.
+/// same flags; the entries it reads are the ones `sync` writes for clients
+/// that cannot hold an http entry, and those are the majority.
 #[must_use]
 pub fn gateway_entry_url(server: &Server) -> Option<String> {
     match &server.transport {

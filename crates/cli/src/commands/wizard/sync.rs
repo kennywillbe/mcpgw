@@ -1,8 +1,8 @@
 //! Wizard step 4: point every client at the gateway, then check the path
 //! actually works.
 //!
-//! The step is one plan and one question. `mcpgw sync --gateway` already
-//! asks nothing and writes every client; the wizard's job is to show what
+//! The step is one plan and one question. `mcpgw sync` already asks nothing
+//! and writes every client; the wizard's job is to show what
 //! that would do first, in the language of "your Cursor entry keeps its name
 //! and changes where it points", and to take a single yes for the whole set.
 //! Thirteen prompts would be an interrogation rather than show-and-confirm.
@@ -90,7 +90,7 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
         if !cx.confirm("\nPoint them at the gateway?")? {
             println!();
             ui::already_done(
-                "Left alone. `mcpgw sync --gateway` does this whenever you're ready.",
+                "Left alone. `mcpgw sync` does this whenever you're ready.",
                 cx.color,
             );
             return Ok(Outcome::Handled);
@@ -116,8 +116,8 @@ struct Plans {
     skipped: Vec<(&'static str, String)>,
 }
 
-/// Plans the same per-server gateway sync `mcpgw sync --gateway` would, for
-/// every client that is installed.
+/// Plans the same per-server gateway sync `mcpgw sync` would, for every
+/// client that is installed.
 ///
 /// Clients that are not installed are left out entirely rather than listed as
 /// skipped: the survey step already said how many there are, and repeating

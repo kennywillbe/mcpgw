@@ -1,10 +1,9 @@
 //! End-to-end tests for `mcpgw eject`, driven through the real binary.
 //!
-//! The headline assertion in most of them is a byte comparison against a
-//! *second* sandbox that only ever synced directly: eject claims to put a
-//! client back the way it was, and the only honest check of that is that the
-//! file it leaves behind is indistinguishable from one mcpgw never pointed
-//! at a gateway.
+//! The headline assertion in most of them is a byte comparison against the
+//! file a pre-gateway mcpgw wrote: eject claims to put a client back the way
+//! it was, and the only honest check of that is that the file it leaves
+//! behind is indistinguishable from one mcpgw never pointed at a gateway.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -122,27 +121,62 @@ impl Sandbox {
     }
 }
 
-/// A sandbox that only ever synced directly, for the file eject has to
-/// reproduce. Its temp dir differs from the one under test, which is fine:
-/// nothing in a client entry names a path.
-fn direct_reference(install: fn(&Sandbox)) -> Sandbox {
-    let sb = Sandbox::new();
-    install(&sb);
-    sb.add_servers();
-    sb.ok(&["sync"]);
-    sb
+/// The Cursor file eject has to reproduce, byte for byte: the two servers of
+/// `add_servers` written as the client's own, beside a foreign entry.
+///
+/// A literal, and captured from the last mcpgw that could write it: sync no
+/// longer has a direct mode to generate a reference sandbox with. Pinning the
+/// bytes is the point — this is the file a user gets back.
+const CURSOR_DIRECT: &str = r#"{
+  "mcpServers": {
+    "mine": {
+      "command": "deno"
+    },
+    "github": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "server-github"
+      ],
+      "env": {
+        "TOKEN": "t"
+      }
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp"
+    }
+  }
 }
+"#;
+
+/// The same for Claude Desktop, which starts empty and has no foreign entry.
+const CLAUDE_DESKTOP_DIRECT: &str = r#"{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "server-github"
+      ],
+      "env": {
+        "TOKEN": "t"
+      }
+    },
+    "linear": {
+      "type": "http",
+      "url": "https://mcp.linear.app/mcp"
+    }
+  }
+}
+"#;
 
 #[test]
 fn eject_restores_the_original_transports_byte_for_byte() {
-    let reference = direct_reference(|sb| {
-        sb.install_cursor(Some(r#"{"mcpServers": {"mine": {"command": "deno"}}}"#));
-    });
-
     let sb = Sandbox::new();
     sb.install_cursor(Some(r#"{"mcpServers": {"mine": {"command": "deno"}}}"#));
     sb.add_servers();
-    sb.ok(&["sync", "--gateway"]);
+    sb.ok(&["sync"]);
     assert!(sb.cursor_json()["mcpServers"]["github"]["url"].is_string());
 
     let out = sb.ok(&["eject", "--yes"]);
@@ -154,7 +188,7 @@ fn eject_restores_the_original_transports_byte_for_byte() {
     assert!(out.contains("? mine (not mine — left untouched)"), "{out}");
     assert!(out.contains("mcpgw is out of the path"), "{out}");
 
-    assert_eq!(sb.cursor_text(), reference.cursor_text());
+    assert_eq!(sb.cursor_text(), CURSOR_DIRECT);
     assert_eq!(sb.cursor_json()["mcpServers"]["mine"]["command"], "deno");
 }
 
@@ -163,7 +197,7 @@ fn eject_drops_the_aggregate_entry_and_puts_the_servers_back() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.add_servers();
-    sb.ok(&["sync", "--gateway", "--aggregate"]);
+    sb.ok(&["sync", "--aggregate"]);
     assert!(sb.cursor_json()["mcpServers"]["mcpgw"]["url"].is_string());
 
     let out = sb.ok(&["eject", "--yes"]);
@@ -181,14 +215,14 @@ fn eject_drops_the_aggregate_entry_and_puts_the_servers_back() {
 }
 
 /// The state file has to end the run describing what is actually in the
-/// client, or the next plain `sync` would either re-add the gateway entry or
-/// refuse to touch the restored ones as foreign.
+/// client, or a user who changes their mind is stuck: the restored entries
+/// would read as foreign and sync would refuse to touch them ever again.
 #[test]
-fn a_later_sync_finds_nothing_left_to_do() {
+fn a_later_sync_takes_the_restored_entries_back_over() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.add_servers();
-    sb.ok(&["sync", "--gateway", "--aggregate"]);
+    sb.ok(&["sync", "--aggregate"]);
     sb.ok(&["eject", "--yes"]);
 
     assert_eq!(
@@ -196,8 +230,16 @@ fn a_later_sync_finds_nothing_left_to_do() {
         serde_json::json!(["github", "linear"])
     );
     let out = sb.ok(&["sync"]);
-    assert!(out.contains("no changes"), "{out}");
-    assert!(!out.contains("mcpgw"), "{out}");
+    // Updates under the same names: nothing refused as somebody else's, and
+    // nothing left over from the aggregate entry eject removed.
+    assert!(out.contains("~ github"), "{out}");
+    assert!(out.contains("~ linear"), "{out}");
+    assert!(!out.contains("! "), "{out}");
+    assert!(!out.contains("+ mcpgw"), "{out}");
+    assert_eq!(
+        sb.cursor_json()["mcpServers"]["github"]["url"],
+        "http://127.0.0.1:8137/s/github"
+    );
 }
 
 /// Eject writes through the same machinery as sync, so it takes the same
@@ -207,7 +249,7 @@ fn rollback_after_eject_brings_the_gateway_entries_back() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.add_servers();
-    sb.ok(&["sync", "--gateway"]);
+    sb.ok(&["sync"]);
     let flipped = sb.cursor_text();
     sb.ok(&["eject", "--yes"]);
     assert_ne!(sb.cursor_text(), flipped);
@@ -223,15 +265,13 @@ fn rollback_after_eject_brings_the_gateway_entries_back() {
 /// fix for.
 #[test]
 fn a_stdio_only_client_gets_its_original_definitions_back_unchanged() {
-    let reference = direct_reference(Sandbox::install_claude_desktop);
-
     let sb = Sandbox::new();
     sb.install_claude_desktop();
     sb.add_servers();
-    sb.ok(&["sync", "--gateway", "--aggregate"]);
+    sb.ok(&["sync", "--aggregate"]);
     sb.ok(&["eject", "--yes"]);
 
-    assert_eq!(sb.claude_desktop_text(), reference.claude_desktop_text());
+    assert_eq!(sb.claude_desktop_text(), CLAUDE_DESKTOP_DIRECT);
 }
 
 #[test]
@@ -287,7 +327,7 @@ fn eject_refuses_to_write_without_a_confirmation() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.add_servers();
-    sb.ok(&["sync", "--gateway"]);
+    sb.ok(&["sync"]);
     let before = sb.cursor_text();
 
     let out = sb.mcpgw(&["eject"]);
@@ -306,7 +346,7 @@ fn the_closing_screen_names_everything_eject_does_not_delete() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.add_servers();
-    sb.ok(&["sync", "--gateway"]);
+    sb.ok(&["sync"]);
 
     let out = sb.ok(&["eject", "--yes"]);
     assert!(out.contains(&sb.config.display().to_string()), "{out}");

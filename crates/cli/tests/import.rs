@@ -89,10 +89,20 @@ fn import_then_sync_produces_no_conflicts() {
     );
     sb.ok(&["import", "--from", "cursor"]);
 
-    // Adoption must make sync own the entry: no `!` conflict, no changes.
+    // Adoption must make sync own the entry: it is re-pointed at the gateway
+    // under its own name rather than refused as somebody else's.
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(!out.contains("! github"), "{out}");
-    assert!(out.contains("no changes"), "{out}");
+    assert!(out.contains("~ github"), "{out}");
+    let text = std::fs::read_to_string(sb.home.join(".cursor/mcp.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        json["mcpServers"]["github"]["url"],
+        "http://127.0.0.1:8137/s/github"
+    );
+
+    let again = sb.ok(&["sync", "--client", "cursor"]);
+    assert!(again.contains("no changes"), "{again}");
 }
 
 #[test]
@@ -111,7 +121,10 @@ fn renamed_import_is_renamed_in_client_by_next_sync() {
     let text = std::fs::read_to_string(sb.home.join(".cursor/mcp.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert!(json["mcpServers"].get("My Notes").is_none());
-    assert_eq!(json["mcpServers"]["my-notes"]["command"], "notes-mcp");
+    assert_eq!(
+        json["mcpServers"]["my-notes"]["url"],
+        "http://127.0.0.1:8137/s/my-notes"
+    );
 }
 
 #[test]

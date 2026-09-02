@@ -148,7 +148,7 @@ down.
 ## Pointing clients at it
 
 ```sh
-mcpgw sync --gateway
+mcpgw sync
 ```
 
 Every enabled server keeps its entry and its name; only the transport changes,
@@ -166,15 +166,15 @@ The shape is per client: `httpUrl` for Gemini, `serverUrl` for Windsurf,
 those endpoints.
 
 ```sh
-mcpgw sync --gateway --gateway-url http://127.0.0.1:9000/mcp
-mcpgw sync --gateway --dry-run
+mcpgw sync --gateway-url http://127.0.0.1:9000/mcp
+mcpgw sync --dry-run
 mcpgw sync --rollback              # back to whatever was there before
 ```
 
 ### One entry for the whole gateway
 
 ```sh
-mcpgw sync --gateway --aggregate
+mcpgw sync --aggregate
 ```
 
 Replaces the per-server entries with a single `mcpgw` entry pointing at `/mcp`,
@@ -226,7 +226,7 @@ tools:
 ```
 
 `--gateway-url` points the check at a gateway on another port, matching
-`sync --gateway --gateway-url`.
+`sync --gateway-url`.
 
 ## stdio-only clients
 
@@ -242,9 +242,8 @@ mcpgw connect --server github --url http://127.0.0.1:9000/mcp
 ```
 
 `--url` alone is the gateway, verbatim. With `--server` it says where the
-gateway is and the server's endpoint is resolved on it — which is what
-`sync --gateway` writes for a stdio-only client.
+gateway is and the server's endpoint is resolved on it — which is what `sync`
+writes for a stdio-only client.
 
-`sync --gateway` writes this for you; you rarely type it. If the gateway isn't
-running, the client sees a plain message saying so and telling you to start it
+`sync` writes this for you; you rarely type it. If the gateway isn't running, the client sees a plain message saying so and telling you to start it
 — not a transport error.
