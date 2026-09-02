@@ -420,34 +420,28 @@ impl ServerHandler for Gateway {
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let session = Self::session_of(&context);
         match &self.mode {
+            // One request, one answer, handed back exactly as the upstream
+            // wrote it. The pipe used to collect every page with
+            // `list_all_tools` and rebuild the result around the tools it
+            // found, which threw away everything else the upstream had put
+            // there — the SEP-2549 caching fields (`ttlMs`, `cacheScope`)
+            // among them, which a strict client rejects the answer for — and
+            // left the client with no cursor to page with either.
             Mode::Pipe(upstream) => {
-                let started = Instant::now();
-                let tools = self
-                    .within_deadline(upstream, async {
-                        let service = self.upstream_service(upstream).await?;
-                        service
-                            .list_all_tools()
-                            .await
-                            .map_err(|err| ErrorData::internal_error(err.to_string(), None))
-                    })
-                    .await;
-                let elapsed = started.elapsed();
-                self.record(session.as_deref(), |session| {
-                    let record = CaptureRecord::new(session, upstream, Kind::List, elapsed);
-                    match &tools {
-                        Ok(tools) => record.with_response(format!("{} tool(s)", tools.len())),
-                        Err(err) => record.with_error(&err.message),
-                    }
-                });
-                Ok(ListToolsResult {
-                    tools: tools?,
-                    ..ListToolsResult::default()
-                })
+                self.forward(
+                    session.as_deref(),
+                    upstream,
+                    Kind::List,
+                    None,
+                    |service| async move { service.list_tools(request).await },
+                    |result| format!("{} tool(s)", result.tools.len()),
+                )
+                .await
             }
             Mode::Aggregate(upstreams) => {
                 Ok(self.aggregate_tools(session.as_deref(), upstreams).await)

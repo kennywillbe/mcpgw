@@ -9,7 +9,14 @@
 //! Modes (first CLI argument): `healthy` (default), `slow` (never answers),
 //! `garbage` (non-JSON output), `exit` (dies immediately), `die-on-tools`
 //! (handshakes fine, then dies on the first tools/list — exercises
-//! died-after-ready reconnection).
+//! died-after-ready reconnection), `paged` (serves its tools over two
+//! cursored pages — exercises a pipe forwarding pagination rather than
+//! collapsing it).
+//!
+//! `healthy` decorates its answers with the caching fields a 2026-07-28
+//! server sends (`ttlMs`, `cacheScope`) and with `_meta`, because a pipe
+//! that hands back anything less than what the upstream wrote is what
+//! made a strict client reject the gateway's tools/list.
 
 use std::io::{BufRead as _, Write as _};
 
@@ -32,7 +39,7 @@ fn main() {
             park();
         }
         "slow" => park(),
-        mode => serve(mode == "die-on-tools"),
+        mode => serve(mode),
     }
 }
 
@@ -40,7 +47,8 @@ fn park() {
     std::thread::sleep(std::time::Duration::from_secs(3600));
 }
 
-fn serve(die_on_tools: bool) {
+fn serve(mode: &str) {
+    let die_on_tools = mode == "die-on-tools";
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -58,7 +66,7 @@ fn serve(die_on_tools: bool) {
         if method == "tools/list" && die_on_tools {
             std::process::exit(0);
         }
-        match reply(method, &msg) {
+        match reply(mode, method, &msg) {
             Some(Ok(result)) => respond(&mut stdout, &id, &result),
             Some(Err(message)) => fail(&mut stdout, &id, &message),
             // Methods this fixture does not implement get no answer at all,
@@ -71,7 +79,11 @@ fn serve(die_on_tools: bool) {
 /// The scripted answer to one request: `None` for a method this fixture does
 /// not implement, `Err` for a refusal the gateway is expected to carry
 /// through as an error rather than as an empty result.
-fn reply(method: &str, msg: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
+fn reply(
+    mode: &str,
+    method: &str,
+    msg: &serde_json::Value,
+) -> Option<Result<serde_json::Value, String>> {
     let params = &msg["params"];
     let result = match method {
         "initialize" => {
@@ -93,7 +105,7 @@ fn reply(method: &str, msg: &serde_json::Value) -> Option<Result<serde_json::Val
             })
         }
         "ping" => serde_json::json!({}),
-        "tools/list" | "tools/call" => tools(method, params),
+        "tools/list" | "tools/call" => tools(mode, method, params),
         "resources/list" | "resources/templates/list" | "resources/read" => {
             return Some(resources(method, params));
         }
@@ -104,15 +116,39 @@ fn reply(method: &str, msg: &serde_json::Value) -> Option<Result<serde_json::Val
     Some(Ok(result))
 }
 
-fn tools(method: &str, params: &serde_json::Value) -> serde_json::Value {
+/// The cursor the `paged` mode hands out for its second page. Deliberately
+/// opaque: a pipe may only carry it, never interpret it.
+const PAGE_TWO: &str = "fixture-cursor-page-2";
+
+/// One tool entry, carrying a field no MCP model has ever heard of so the
+/// suite can pin down how far a pipe's transparency actually reaches.
+fn tool(name: &str, description: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "description": description,
+        "inputSchema": { "type": "object" },
+        "x-fixture-tool": "alien"
+    })
+}
+
+fn tools(mode: &str, method: &str, params: &serde_json::Value) -> serde_json::Value {
     if method == "tools/list" {
+        if mode == "paged" {
+            return paged_tools(params);
+        }
         return serde_json::json!({
             "tools": [
-                { "name": "echo", "description": "echoes input",
-                  "inputSchema": { "type": "object" } },
-                { "name": "reverse", "description": "reverses input",
-                  "inputSchema": { "type": "object" } }
-            ]
+                tool("echo", "echoes input"),
+                tool("reverse", "reverses input")
+            ],
+            // What a 2026-07-28 server says about caching this answer
+            // (SEP-2549). A client that asks for that protocol version
+            // treats them as required, so a pipe that drops them turns a
+            // perfectly good server into an invalid one.
+            "ttlMs": 4242,
+            "cacheScope": "public",
+            "_meta": { "io.mcpgw.test/list": "verbatim" },
+            "x-fixture-alien": { "deep": ["a", 1] }
         });
     }
     let message = params["arguments"]["message"].as_str().unwrap_or("");
@@ -121,7 +157,32 @@ fn tools(method: &str, params: &serde_json::Value) -> serde_json::Value {
         "reverse" => message.chars().rev().collect(),
         other => format!("unknown tool {other}"),
     };
-    serde_json::json!({ "content": [{ "type": "text", "text": text }] })
+    serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "_meta": { "io.mcpgw.test/call": "verbatim" },
+        "x-fixture-alien": "call"
+    })
+}
+
+/// tools/list over two pages. Only the exact cursor from the first page
+/// yields the second, so a pipe that invented its own pagination — or that
+/// dropped the cursor the client sent — answers the wrong page here.
+fn paged_tools(params: &serde_json::Value) -> serde_json::Value {
+    match params["cursor"].as_str() {
+        None => serde_json::json!({
+            "tools": [tool("echo", "echoes input")],
+            "nextCursor": PAGE_TWO
+        }),
+        Some(PAGE_TWO) => serde_json::json!({
+            "tools": [tool("reverse", "reverses input")]
+        }),
+        // Reported rather than answered: a wrong cursor means the pipe
+        // mangled it, and the test should see which one arrived.
+        Some(other) => serde_json::json!({
+            "tools": [],
+            "_meta": { "io.mcpgw.test/unexpectedCursor": other }
+        }),
+    }
 }
 
 fn resources(method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {

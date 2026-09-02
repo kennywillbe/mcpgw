@@ -390,11 +390,24 @@ async fn raw_post(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
 /// The same, aimed at an arbitrary path and keeping the whole response so a
 /// test can read the body as well as the status line.
 async fn raw_post_to(addr: std::net::SocketAddr, path: &str, origin: Option<&str>) -> String {
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    raw_post_body(addr, path, origin, None, body).await
+}
+
+/// One raw POST with a caller-supplied body and optional session header,
+/// returning headers and body together — the whole point being that nothing
+/// on this path parses the answer into a typed model on the way past.
+async fn raw_post_body(
+    addr: std::net::SocketAddr,
+    path: &str,
+    origin: Option<&str>,
+    session: Option<&str>,
+    body: &str,
+) -> String {
     use std::fmt::Write as _;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let mut request = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
          Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\
@@ -403,6 +416,9 @@ async fn raw_post_to(addr: std::net::SocketAddr, path: &str, origin: Option<&str
     );
     if let Some(origin) = origin {
         let _ = write!(request, "Origin: {origin}\r\n");
+    }
+    if let Some(session) = session {
+        let _ = write!(request, "Mcp-Session-Id: {session}\r\n");
     }
     request.push_str("\r\n");
     request.push_str(body);
@@ -874,5 +890,192 @@ async fn the_origin_guard_covers_the_per_server_endpoints_too() {
     // A non-browser client (no Origin) is untouched by the guard.
     let response = raw_post_to(addr, "/s/fx1", None).await;
     assert!(!response.contains("403"), "{response}");
+    manager.shutdown().await;
+}
+
+/// A downstream MCP session driven as raw JSON-RPC.
+///
+/// Every other test here talks through an rmcp client, which decodes what it
+/// receives into rmcp's models — exactly the step that was laundering the
+/// upstream's answers, and therefore the one thing that must not stand
+/// between the assertion and the wire. These tests read the JSON the gateway
+/// actually wrote.
+struct RawSession {
+    addr: std::net::SocketAddr,
+    path: String,
+    id: u32,
+    session: Option<String>,
+}
+
+impl RawSession {
+    /// Opens a session on `path`: initialize, then the notification that
+    /// completes the handshake.
+    async fn open(addr: std::net::SocketAddr, path: &str) -> Self {
+        let mut raw = Self {
+            addr,
+            path: path.to_owned(),
+            id: 0,
+            session: None,
+        };
+        let response = raw
+            .post(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2026-07-28","capabilities":{},
+                    "clientInfo":{"name":"raw","version":"0"}}}"#,
+            )
+            .await;
+        raw.session = response
+            .lines()
+            .find_map(|line| {
+                let value = line.strip_prefix("mcp-session-id: ")?;
+                Some(value.trim().to_owned())
+            })
+            .or_else(|| panic!("no session id in: {response}"));
+        raw.post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await;
+        raw
+    }
+
+    async fn post(&self, body: &str) -> String {
+        raw_post_body(self.addr, &self.path, None, self.session.as_deref(), body).await
+    }
+
+    /// Sends one request and returns its `result` object verbatim.
+    async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        self.id += 1;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": self.id, "method": method, "params": params
+        });
+        let response = self.post(&body.to_string()).await;
+        // The transport answers over SSE, so the JSON-RPC message is the
+        // payload of the one `data:` event that carries a result.
+        let message = response
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+            .find(|value| value.get("id").is_some())
+            .unwrap_or_else(|| panic!("no JSON-RPC answer in: {response}"));
+        assert!(message.get("error").is_none(), "{method} failed: {message}");
+        message["result"].clone()
+    }
+}
+
+fn names_in(result: &serde_json::Value) -> Vec<&str> {
+    result["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect()
+}
+
+/// The bug behind issue #62: a pipe used to rebuild the result around the
+/// tools it found, so everything else the upstream had written — the
+/// SEP-2549 caching fields a strict client validates, the `_meta` the spec
+/// reserves for extensions — arrived as `undefined` and the client refused
+/// the answer.
+#[tokio::test]
+async fn a_pipe_hands_back_the_upstreams_own_tools_list_fields() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    let result = fx.request("tools/list", serde_json::json!({})).await;
+
+    assert_eq!(names_in(&result), ["echo", "reverse"]);
+    assert_eq!(result["ttlMs"], 4242, "{result}");
+    assert_eq!(result["cacheScope"], "public", "{result}");
+    assert_eq!(
+        result["_meta"]["io.mcpgw.test/list"], "verbatim",
+        "{result}"
+    );
+    manager.shutdown().await;
+}
+
+/// The same for a tool call: the answer a pipe returns is the upstream's,
+/// not one rebuilt out of the parts a pipe happens to care about.
+#[tokio::test]
+async fn a_pipe_hands_back_the_upstreams_own_call_result_fields() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    let result = fx
+        .request(
+            "tools/call",
+            serde_json::json!({ "name": "reverse", "arguments": { "message": "mcpgw" } }),
+        )
+        .await;
+
+    assert_eq!(result["content"][0]["text"], "wgpcm", "{result}");
+    assert_eq!(
+        result["_meta"]["io.mcpgw.test/call"], "verbatim",
+        "{result}"
+    );
+    manager.shutdown().await;
+}
+
+/// Pagination is the upstream's to run: the pipe carries the cursor out and
+/// the next cursor back, and never collapses the pages into one answer of
+/// its own. Collapsing is what hid the upstream's own result fields, and it
+/// also left a client with no way to ask for page two.
+#[tokio::test]
+async fn a_pipe_forwards_pagination_cursors_verbatim() {
+    let (addr, manager) = serve_both(&[("fx", "paged")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    let first = fx.request("tools/list", serde_json::json!({})).await;
+    assert_eq!(names_in(&first), ["echo"], "{first}");
+    let cursor = first["nextCursor"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no cursor to page with: {first}"))
+        .to_owned();
+
+    let second = fx
+        .request("tools/list", serde_json::json!({ "cursor": cursor }))
+        .await;
+    // The fixture answers page two only for its own cursor, and says so when
+    // a different one arrives.
+    assert_eq!(names_in(&second), ["reverse"], "{second}");
+    assert!(second.get("nextCursor").is_none(), "{second}");
+    manager.shutdown().await;
+}
+
+/// The aggregate is allowed to be lossy, and pinning that keeps the two
+/// modes honest: it exists to merge N servers under `server__tool` names, so
+/// it collapses pagination and answers with a result of its own making.
+#[tokio::test]
+async fn the_aggregate_keeps_its_collapsed_prefixed_answer() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut aggregate = RawSession::open(addr, "/mcp").await;
+
+    let result = aggregate.request("tools/list", serde_json::json!({})).await;
+
+    assert_eq!(names_in(&result), ["fx__echo", "fx__reverse"], "{result}");
+    assert!(result.get("ttlMs").is_none(), "{result}");
+    assert!(result.get("cacheScope").is_none(), "{result}");
+    manager.shutdown().await;
+}
+
+/// How far transparency reaches, pinned as a fact rather than assumed.
+///
+/// Both hops go through rmcp's models — the upstream's answer is decoded
+/// into `ServerResult` (an untagged enum whose `ListToolsResult` variant
+/// matches first and keeps only the fields it declares) before the pipe ever
+/// sees it, and rmcp offers no raw relay to sidestep that. So everything the
+/// MCP schema defines survives, `_meta` included, which is the extension
+/// point the spec actually reserves; a field of a server's own invention
+/// does not. If rmcp ever grows a verbatim path this test is the one that
+/// notices, by failing.
+#[tokio::test]
+async fn fields_outside_the_mcp_schema_do_not_survive_the_hop() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    let result = fx.request("tools/list", serde_json::json!({})).await;
+
+    assert!(result.get("x-fixture-alien").is_none(), "{result}");
+    assert!(
+        result["tools"][0].get("x-fixture-tool").is_none(),
+        "{result}"
+    );
     manager.shutdown().await;
 }

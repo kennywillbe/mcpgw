@@ -63,7 +63,10 @@ mcpgw serve --per-server
 
 A per-server endpoint is a plain pipe, so it forwards everything an MCP server
 can offer — tools, resources, resource templates, prompts and argument
-completion — with names, URIs and errors untouched.
+completion — with names, URIs and errors untouched. Answers are handed back as
+the server wrote them: caching metadata, `_meta`, and pagination cursors all
+survive the hop, and a client pages through a long `tools/list` against the
+server's own cursors instead of being handed one list the gateway assembled.
 
 `/mcp` serves tools only, and that is deliberate. Tools can be namespaced
 (`github__create_issue`); resource URIs and prompt names cannot. Two servers
