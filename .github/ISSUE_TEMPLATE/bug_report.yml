@@ -22,7 +22,7 @@ body:
       description: The exact commands, in order.
       placeholder: |
         1. mcpgw add github -- npx -y @modelcontextprotocol/server-github
-        2. mcpgw sync --gateway
+        2. mcpgw sync
         3. Claude Desktop's config now has …
     validations:
       required: true

@@ -1737,34 +1737,26 @@ fn the_client_flags_list_every_shipped_id() {
     }
 }
 
-/// `--gateway` is what every script and README out there spells, so it is
-/// still accepted — it just has nothing left to select. It says so once and
-/// changes nothing about the run.
+/// `--gateway` selected a mode, then spent a release accepted and ignored.
+/// Nothing selects a mode any more, so the flag is gone with them: a script
+/// that still spells it gets told, rather than syncing under a name mcpgw no
+/// longer understands.
 #[test]
-fn the_gateway_flag_is_an_accepted_no_op() {
+fn the_gateway_flag_is_gone() {
     let sb = Sandbox::new();
-    // A file that was already there, so the sync below leaves a backup for
-    // the rollback at the end of the test to find.
-    sb.install_cursor(Some(r#"{"mcpServers": {}}"#));
+    sb.install_cursor(None);
     sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["sync", "--client", "cursor"]);
-    let without = sb.cursor_json();
 
-    let out = sb.ok(&["sync", "--client", "cursor", "--gateway"]);
-    assert!(
-        out.contains("note: --gateway is the only mode now; the flag does nothing"),
-        "{out}"
-    );
-    assert!(out.contains("no changes"), "{out}");
-    assert_eq!(sb.cursor_json(), without);
+    let refused = sb.mcpgw(&["sync", "--client", "cursor", "--gateway"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(stderr.contains("--gateway"), "{stderr}");
+    // The error came before any writing.
+    assert!(!sb.home.join(".cursor/mcp.json").exists());
 
-    // Not a mode, so it does not conflict with one either.
-    let rollback = sb.ok(&["sync", "--client", "cursor", "--gateway", "--rollback"]);
-    assert!(rollback.contains("restored"), "{rollback}");
-
-    // Hidden: `--help` no longer offers a choice that is not there — and
-    // there is no other one left to offer either.
+    // `--gateway-url` is a different flag and still a flag.
     let help = sb.ok(&["sync", "--help"]);
+    assert!(help.contains("--gateway-url"), "{help}");
     assert!(!help.contains("--gateway "), "{help}");
     assert!(!help.contains("aggregate"), "{help}");
 }

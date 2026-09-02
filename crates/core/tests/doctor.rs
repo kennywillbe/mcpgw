@@ -149,7 +149,7 @@ fn only_entries_aimed_at_this_gateway_are_collected() {
 #[test]
 fn the_stdio_bridge_resolves_the_url_connect_would_dial() {
     let mut plan = GatewayPlan::new(BASE);
-    // What `sync --gateway` writes for a client with no http entries.
+    // What `sync` writes for a client with no http entries.
     assert!(plan.collect(
         "Claude Desktop",
         "github",
