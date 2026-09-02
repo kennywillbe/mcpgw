@@ -30,12 +30,15 @@ pub struct ConnectArgs {
     pub server: Option<String>,
 }
 
-/// The gateway URL to bridge to. An explicit `--url` is taken verbatim: it is
-/// the escape hatch for a gateway on another port or path, and `--server`
-/// second-guessing it would take that away.
+/// The gateway URL to bridge to. `--url` alone is taken verbatim: it is the
+/// escape hatch for a gateway on another port or path. Alongside `--server` it
+/// says where the *gateway* is and the server's endpoint is resolved on it —
+/// which is the shape `sync --gateway` writes into stdio-only clients, so the
+/// name in the file stays the server's rather than a hard-coded path.
 fn target_url(args: &ConnectArgs) -> anyhow::Result<String> {
     match (&args.url, &args.server) {
-        (Some(url), _) => Ok(url.clone()),
+        (Some(url), Some(name)) => Ok(mcpgw_core::endpoints::per_server_url(url, name)?),
+        (Some(url), None) => Ok(url.clone()),
         (None, Some(name)) => Ok(mcpgw_core::endpoints::per_server_url(DEFAULT_URL, name)?),
         (None, None) => Ok(DEFAULT_URL.to_owned()),
     }
@@ -90,12 +93,13 @@ mod tests {
             target_url(&args(None, Some("github"))).unwrap(),
             "http://127.0.0.1:8137/s/github"
         );
-        // An explicit URL is never rewritten, even alongside --server.
+        // An explicit URL alone is never rewritten; with --server it is the
+        // gateway the endpoint is resolved on.
         let explicit = "http://127.0.0.1:9000/mcp";
         assert_eq!(target_url(&args(Some(explicit), None)).unwrap(), explicit);
         assert_eq!(
             target_url(&args(Some(explicit), Some("github"))).unwrap(),
-            explicit
+            "http://127.0.0.1:9000/s/github"
         );
     }
 }
