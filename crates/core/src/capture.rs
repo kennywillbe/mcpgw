@@ -81,7 +81,19 @@ pub struct CaptureRecord {
     /// RFC 3339 keeps the record dependency-free and lets `watch` compute
     /// ages by subtraction instead of parsing.
     pub ts: u64,
+    /// Which downstream client the request came from — the fingerprint of the
+    /// transport session when there is one, otherwise the gateway process's
+    /// own id. See [`CaptureWriter::session`] for what each means.
     pub session: String,
+    /// Which face of the gateway took the request: `s/<server>` for a
+    /// per-server endpoint, `mcp` for the aggregate. Absent on lines written
+    /// before this field existed and on the stdio face, which has no path.
+    ///
+    /// Additive and optional on purpose: every JSONL line already on disk has
+    /// to keep parsing, and a `jq` filter written against the old shape has to
+    /// keep working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub server: String,
     /// What the request named: the tool, the prompt, the resource URI or the
     /// argument being completed. Absent for the list families, which name
@@ -107,6 +119,7 @@ impl CaptureRecord {
         Self {
             ts: now_millis(),
             session: session.to_owned(),
+            endpoint: None,
             server: server.to_owned(),
             tool: None,
             kind,
@@ -116,6 +129,14 @@ impl CaptureRecord {
             args: None,
             response: None,
         }
+    }
+
+    /// Attributes the record to the gateway face that took the request, e.g.
+    /// `s/github` or `mcp`.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
     }
 
     #[must_use]
@@ -241,9 +262,15 @@ impl CaptureWriter {
         &self.dir
     }
 
-    /// Identifies this gateway process in every record it writes. Splitting
-    /// it per downstream client is a later refinement; the gateway does not
-    /// thread session identity through its handlers yet.
+    /// Identifies this gateway process. Records fall back to it when the
+    /// downstream transport offers no session of its own — a stdio face, or
+    /// an HTTP client on MCP 2026-07-28, which removed protocol sessions
+    /// (SEP-2567). Traffic attributed to it is "this gateway run", not "this
+    /// client": a long-lived daemon serving several harnesses cannot tell
+    /// them apart through this id.
+    ///
+    /// When the transport does hand out a session id, records carry
+    /// [`session_fingerprint`] of it instead.
     #[must_use]
     pub fn session(&self) -> &str {
         &self.session
@@ -306,4 +333,28 @@ fn new_session_id() -> String {
     let low = u64::try_from(nanos & u128::from(u64::MAX)).unwrap_or_default();
     let mixed = (low.rotate_left(17) ^ (u64::from(std::process::id()) << 24)) & 0xffff_ffff;
     format!("{mixed:08x}")
+}
+
+/// A stable short id for a downstream transport session, in the same 8-hex
+/// shape as [`new_session_id`] so a reader never has to care which kind of id
+/// a line carries.
+///
+/// The raw id is *not* stored. A Streamable HTTP session id is a bearer
+/// credential — whoever presents it speaks as that session — and the traffic
+/// log is a file people `cat`, paste into issues and grep in front of others.
+/// A digest keeps the one property attribution needs (equal ids mean the same
+/// session, different ids mean different clients) while putting nothing
+/// replayable on disk. It is not a secret-grade hash and is not meant to be:
+/// the input is a v4 UUID, so there is no dictionary to walk back through it.
+#[must_use]
+pub fn session_fingerprint(session_id: &str) -> String {
+    // FNV-1a, 64-bit: a few lines, no dependency, and well-distributed over
+    // short ASCII inputs, which is all a display id needs.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in session_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // Folded to 32 bits so the id is the same width as the per-process one.
+    format!("{:08x}", (hash ^ (hash >> 32)) & 0xffff_ffff)
 }
