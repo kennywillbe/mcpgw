@@ -29,6 +29,9 @@ tower-service.workspace = true
 [dev-dependencies]
 insta.workspace = true
 tempfile.workspace = true
+# tests/tls.rs alone, and only to prove the TLS backend rmcp's `reqwest`
+# feature turns on is really compiled in — see the workspace manifest.
+reqwest.workspace = true
 
 [lints]
 workspace = true
