@@ -37,4 +37,8 @@ jobs:
             exit 1
           }
           Write-Host "clean: the service control manager has no mcpgw"
+          # The absence of the service is what success looks like here, but
+          # sc.exe reported it by *failing* (1060), and the pwsh shell ends
+          # every step with `exit $LASTEXITCODE`. Say so explicitly.
+          exit 0
         shell: pwsh
