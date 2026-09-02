@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use mcpgw_core::daemon::{
-    DaemonError, DaemonSpec, GatewayReach, LogPaths, PROBE_TIMEOUT, ServiceManager as _,
-    platform_service, preflight, prepare_logs, probe_gateway,
+    DaemonError, DaemonSpec, GatewayReach, LogPaths, PROBE_TIMEOUT, preflight, prepare_logs,
+    probe_gateway,
 };
 
 fn spec(bind: &str, port: u16, state_dir: &std::path::Path) -> DaemonSpec {
@@ -160,9 +160,13 @@ async fn a_silent_listener_probes_as_not_http() {
 }
 
 /// The stub each per-OS milestone replaces. Cfg-gated because exactly one of
-/// the three is compiled into any build, by design.
+/// the three is compiled into any build, by design — and macOS is out of the
+/// list because its launch agent has shipped; `daemon_launchd.rs` covers it.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn the_platform_stub_names_its_supervisor_and_the_workaround() {
+    use mcpgw_core::daemon::{ServiceManager as _, platform_service};
+
     let dir = tempfile::tempdir().unwrap();
     let service = platform_service();
     let target = spec("127.0.0.1", 8137, dir.path());
@@ -179,15 +183,6 @@ fn the_platform_stub_names_its_supervisor_and_the_workaround() {
         assert!(message.contains("mcpgw serve"), "{message}");
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        assert_eq!(service.name(), "launchd");
-        assert!(
-            messages[0].contains("macOS launch agent"),
-            "{}",
-            messages[0]
-        );
-    }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         assert_eq!(service.name(), "systemd --user");
