@@ -35,7 +35,9 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 
     let selected = select(args, &config, &config_path)?;
 
-    if !is_loopback(&args.bind) {
+    // The same classification `mcpgw daemon` refuses to install past, so a
+    // bind that only warns here can never quietly become one that passes there.
+    if !mcpgw_core::daemon::is_loopback(&args.bind) {
         eprintln!(
             "warning: binding to {} without any authentication — anyone who can reach \
              this address can call your MCP servers; keep it behind a trusted network \
@@ -182,11 +184,4 @@ fn select(
         }
     }
     Ok(args.server.clone())
-}
-
-fn is_loopback(bind: &str) -> bool {
-    bind == "localhost"
-        || bind
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }

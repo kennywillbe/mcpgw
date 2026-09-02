@@ -60,9 +60,11 @@ pub fn run(args: &ConnectArgs) -> anyhow::Result<()> {
     )])));
     // The one failure mode worth naming here is "the daemon isn't up", and
     // the client only ever shows the MCP error text — so the fix goes in it.
-    let gateway = Gateway::new(Arc::clone(&manager), UPSTREAM.to_owned()).with_unavailable_hint(
-        format!("gateway is not running at {url} — start it with `mcpgw serve`"),
-    );
+    let gateway =
+        Gateway::new(Arc::clone(&manager), UPSTREAM.to_owned()).with_unavailable_hint(format!(
+            "gateway is not running at {url} — start it with `mcpgw daemon start` \
+             (or `mcpgw serve` in a terminal)"
+        ));
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
