@@ -59,6 +59,22 @@ impl Sandbox {
         path
     }
 
+    /// Stamps mcpgw's own state with the entries a client is claimed to hold.
+    ///
+    /// The upgrade-path tests need a client a *previous* mcpgw synced, and
+    /// what that mcpgw wrote is a shape this binary can no longer produce. An
+    /// entry nothing claims reads as foreign and sync leaves it alone, so the
+    /// claim is what makes such a fixture a migration rather than a stranger.
+    fn claim(&self, client: &str, names: &[&str]) {
+        std::fs::create_dir_all(&self.state).unwrap();
+        let state = serde_json::json!({ "clients": { client: names } });
+        std::fs::write(
+            self.state.join("managed.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn cursor_json(&self) -> serde_json::Value {
         let text = std::fs::read_to_string(self.home.join(".cursor/mcp.json")).unwrap();
         serde_json::from_str(&text).unwrap()
@@ -450,7 +466,7 @@ const AMP_SETTINGS: &str = r#"{
 /// Spelled here and nowhere else, so the mode the suite exercises is one line
 /// rather than fifty — and so making it the only mode is a deletion.
 fn sync<'a>(rest: &[&'a str]) -> Vec<&'a str> {
-    let mut args: Vec<&'a str> = vec!["sync", "--gateway"];
+    let mut args: Vec<&'a str> = vec!["sync"];
     args.extend_from_slice(rest);
     args
 }
@@ -547,11 +563,15 @@ fn disabling_a_server_removes_it_on_next_sync() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
     sb.ok(&sync(&["--client", "cursor"]));
-    sb.ok(&["disable", "github"]);
+    sb.ok(&["disable", "linear"]);
     let out = sb.ok(&sync(&["--client", "cursor"]));
-    assert!(out.contains("- github"), "{out}");
-    assert!(sb.cursor_json()["mcpServers"].get("github").is_none());
+    assert!(out.contains("- linear"), "{out}");
+    let entries = sb.cursor_json()["mcpServers"].clone();
+    assert!(entries.get("linear").is_none());
+    // The servers that stayed enabled are left exactly where they were.
+    assert_eq!(entries["github"]["url"], "http://127.0.0.1:8137/s/github");
 }
 
 #[test]
@@ -666,7 +686,7 @@ fn aggregate_gateway_mode_replaces_the_per_server_entries() {
     sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
     sb.ok(&sync(&["--client", "cursor"]));
 
-    let out = sb.ok(&["sync", "--client", "cursor", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "cursor", "--aggregate"]);
     assert!(out.contains("gateway mode"), "{out}");
     assert!(out.contains("+ mcpgw"), "{out}");
     assert!(out.contains("- github"), "{out}");
@@ -685,7 +705,7 @@ fn aggregate_gateway_mode_replaces_the_per_server_entries() {
     assert_eq!(entries["mcpgw"]["url"], "http://127.0.0.1:8137/mcp");
     assert!(entries["mcpgw"].get("command").is_none());
 
-    let again = sb.ok(&["sync", "--client", "cursor", "--gateway", "--aggregate"]);
+    let again = sb.ok(&["sync", "--client", "cursor", "--aggregate"]);
     assert!(again.contains("no changes"), "{again}");
 }
 
@@ -700,7 +720,6 @@ fn claude_desktop_gets_the_stdio_bridge() {
         "claude-desktop",
         "--client",
         "cursor",
-        "--gateway",
         "--aggregate",
     ]);
 
@@ -726,7 +745,6 @@ fn gateway_url_override_reaches_both_shapes() {
     sb.install_claude_desktop();
     sb.ok(&[
         "sync",
-        "--gateway",
         "--aggregate",
         "--gateway-url",
         "http://127.0.0.1:9000/mcp",
@@ -742,18 +760,29 @@ fn gateway_url_override_reaches_both_shapes() {
     );
 }
 
-/// The headline of per-server gateway mode: the entry names do not move, so
-/// flipping a directly synced client over is a set of updates — no removes,
-/// no adds, and nothing for the user to re-approve under a new name.
-///
-// direct-mode-specific: removed by F1
+/// A Cursor config as a pre-gateway mcpgw left it: the servers spawned by the
+/// client itself, under the canonical names. A literal rather than the output
+/// of a sync, because no mcpgw that writes this shape exists any more — which
+/// is what makes it worth pinning.
+const CURSOR_DIRECT: &str = r#"{
+  "mcpServers": {
+    "mine": { "command": "deno" },
+    "github": { "command": "npx", "args": ["server-github"] },
+    "linear": { "type": "http", "url": "https://mcp.linear.app/mcp" }
+  }
+}"#;
+
+/// The upgrade path, and the headline of gateway mode: the entry names do not
+/// move, so a client an older mcpgw synced directly comes over as a set of
+/// updates — no removes, no adds, and nothing for the user to re-approve
+/// under a new name.
 #[test]
-fn per_server_gateway_mode_updates_the_same_entries() {
+fn a_directly_synced_client_comes_over_as_plain_updates() {
     let sb = Sandbox::new();
-    sb.install_cursor(Some(r#"{"mcpServers": {"mine": {"command": "deno"}}}"#));
+    sb.install_cursor(Some(CURSOR_DIRECT));
+    sb.claim("cursor", &["github", "linear"]);
     sb.ok(&["add", "github", "--", "npx", "server-github"]);
     sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
-    sb.ok(&["sync", "--client", "cursor"]);
 
     let out = sb.ok(&sync(&["--client", "cursor"]));
     assert!(out.contains("gateway mode"), "{out}");
@@ -778,12 +807,6 @@ fn per_server_gateway_mode_updates_the_same_entries() {
 
     let again = sb.ok(&sync(&["--client", "cursor"]));
     assert!(again.contains("no changes"), "{again}");
-
-    // And back: direct mode restores the servers' own transports, still under
-    // the same names.
-    let out = sb.ok(&["sync", "--client", "cursor"]);
-    assert!(out.contains("~ github"), "{out}");
-    assert_eq!(sb.cursor_json()["mcpServers"]["github"]["command"], "npx");
 }
 
 /// A config synced with the old single-entry shape and then synced again with
@@ -794,7 +817,7 @@ fn per_server_gateway_mode_migrates_off_the_aggregate_entry() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["sync", "--client", "cursor", "--gateway", "--aggregate"]);
+    sb.ok(&["sync", "--client", "cursor", "--aggregate"]);
     assert_eq!(
         sb.cursor_json()["mcpServers"]["mcpgw"]["url"],
         "http://127.0.0.1:8137/mcp"
@@ -808,7 +831,7 @@ fn per_server_gateway_mode_migrates_off_the_aggregate_entry() {
     assert_eq!(entries["github"]["url"], "http://127.0.0.1:8137/s/github");
 
     // The way back is the same move in reverse, and just as complete.
-    let out = sb.ok(&["sync", "--client", "cursor", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "cursor", "--aggregate"]);
     assert!(out.contains("- github"), "{out}");
     assert!(out.contains("+ mcpgw"), "{out}");
 }
@@ -901,76 +924,52 @@ fn per_server_gateway_mode_unexcludes_in_gemini() {
     assert_eq!(json["mcp"]["excluded"], serde_json::json!(["theirs"]));
 }
 
-/// A hand-written entry that happens to be named like a canonical server is
-/// still the user's, gateway mode or not.
+/// The other half of the upgrade path: rollback restores whatever the client
+/// held before the run that replaced it, and for the first gateway sync of an
+/// older install that is the direct entries. A user who wants their old setup
+/// back has one command, not a mode.
 #[test]
-fn per_server_gateway_mode_never_overwrites_a_foreign_entry() {
+fn rollback_restores_the_direct_entries_the_first_gateway_sync_replaced() {
     let sb = Sandbox::new();
-    sb.install_cursor(Some(r#"{"mcpServers": {"github": {"command": "deno"}}}"#));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-
-    let out = sb.ok(&sync(&["--client", "cursor"]));
-    assert!(out.contains("! github"), "{out}");
-    assert_eq!(sb.cursor_json()["mcpServers"]["github"]["command"], "deno");
-}
-
-#[test]
-fn per_server_gateway_mode_drops_a_disabled_server() {
-    let sb = Sandbox::new();
-    sb.install_cursor(None);
+    sb.install_cursor(Some(CURSOR_DIRECT));
+    sb.claim("cursor", &["github", "linear"]);
     sb.ok(&["add", "github", "--", "npx", "server-github"]);
     sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
     sb.ok(&sync(&["--client", "cursor"]));
-    sb.ok(&["disable", "linear"]);
-
-    let out = sb.ok(&sync(&["--client", "cursor"]));
-    assert!(out.contains("- linear"), "{out}");
-    let entries = sb.cursor_json()["mcpServers"].clone();
-    assert!(entries.get("linear").is_none());
-    assert_eq!(entries["github"]["url"], "http://127.0.0.1:8137/s/github");
-}
-
-// direct-mode-specific: removed by F1
-#[test]
-fn per_server_gateway_rollback_restores_the_direct_entries() {
-    let sb = Sandbox::new();
-    sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["sync", "--client", "cursor"]);
-    sb.ok(&sync(&["--client", "cursor"]));
-    assert!(sb.cursor_json()["mcpServers"]["github"]["url"].is_string());
+    assert_eq!(
+        sb.cursor_json()["mcpServers"]["github"]["url"],
+        "http://127.0.0.1:8137/s/github"
+    );
 
     sb.ok(&["sync", "--client", "cursor", "--rollback"]);
-    let entry = sb.cursor_json()["mcpServers"]["github"].clone();
-    assert_eq!(entry["command"], "npx");
-    assert!(entry.get("url").is_none());
+    let entries = sb.cursor_json()["mcpServers"].clone();
+    assert_eq!(entries["github"]["command"], "npx");
+    assert!(entries["github"].get("url").is_none());
+    assert_eq!(entries["linear"]["url"], "https://mcp.linear.app/mcp");
 }
 
+/// A base URL that cannot take an endpoint path is wrong for every client, so
+/// it fails the run outright — before the first client file is read, in either
+/// mode, leaving nothing half-written behind.
 #[test]
-fn per_server_gateway_dry_run_writes_nothing() {
+fn a_bad_gateway_url_fails_before_anything_is_written() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    let out = sb.ok(&sync(&["--client", "cursor", "--dry-run"]));
-    assert!(out.contains("+ github"), "{out}");
-    assert!(!sb.home.join(".cursor/mcp.json").exists());
-}
 
-#[test]
-fn per_server_gateway_needs_a_url_it_can_build_endpoints_on() {
-    let sb = Sandbox::new();
-    sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    let out = sb.mcpgw(&sync(&["--gateway-url", "nonsense"]));
-    assert!(!out.status.success());
-    assert!(!sb.home.join(".cursor/mcp.json").exists());
-}
-
-#[test]
-fn aggregate_needs_gateway_mode() {
-    let sb = Sandbox::new();
-    let out = sb.mcpgw(&["sync", "--aggregate"]);
-    assert!(!out.status.success());
+    for mode in [vec![], vec!["--aggregate"]] {
+        let mut args = sync(&["--gateway-url", "nonsense"]);
+        args.extend(mode);
+        let out = sb.mcpgw(&args);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--gateway-url nonsense"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!sb.home.join(".cursor/mcp.json").exists());
+        assert!(!sb.state.join("managed.json").exists());
+    }
 }
 
 #[test]
@@ -1021,7 +1020,7 @@ fn gemini_sync_preserves_the_rest_of_the_settings_file() {
 fn gemini_gateway_entry_uses_http_url() {
     let sb = Sandbox::new();
     sb.install_gemini(None);
-    let out = sb.ok(&["sync", "--client", "gemini", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "gemini", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.gemini_json()["mcpServers"]["mcpgw"].clone();
@@ -1090,7 +1089,7 @@ fn codex_sync_preserves_comments_siblings_and_foreign_entries() {
 fn codex_gateway_entry_is_a_plain_url() {
     let sb = Sandbox::new();
     sb.install_codex(None);
-    let out = sb.ok(&["sync", "--client", "codex", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "codex", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.codex_toml()["mcp_servers"]["mcpgw"].clone();
@@ -1194,7 +1193,7 @@ fn opencode_writes_the_extension_the_machine_already_uses() {
 fn opencode_gateway_entry_is_a_remote_type() {
     let sb = Sandbox::new();
     sb.install_opencode(None);
-    let out = sb.ok(&["sync", "--client", "opencode", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "opencode", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.opencode_json("opencode.json")["mcp"]["mcpgw"].clone();
@@ -1252,7 +1251,7 @@ fn windsurf_sync_writes_server_url_and_leaves_foreign_entries_alone() {
 fn windsurf_gateway_entry_uses_server_url() {
     let sb = Sandbox::new();
     sb.install_windsurf(None);
-    let out = sb.ok(&["sync", "--client", "windsurf", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "windsurf", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.windsurf_json()["mcpServers"]["mcpgw"].clone();
@@ -1326,7 +1325,7 @@ fn zed_sync_marks_entries_custom_and_leaves_the_rest_of_the_settings_alone() {
 fn zed_gateway_entry_is_a_custom_url() {
     let sb = Sandbox::new();
     sb.install_zed(None);
-    let out = sb.ok(&["sync", "--client", "zed", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "zed", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.zed_json()["context_servers"]["mcpgw"].clone();
@@ -1393,7 +1392,7 @@ fn cline_sync_types_remote_entries_and_leaves_foreign_ones_intact() {
 fn cline_gateway_entry_carries_the_streamable_type() {
     let sb = Sandbox::new();
     sb.install_cline(mcpgw_core::ClientKind::Cline, None);
-    let out = sb.ok(&["sync", "--client", "cline", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "cline", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.cline_json(mcpgw_core::ClientKind::Cline)["mcpServers"]["mcpgw"].clone();
@@ -1494,7 +1493,7 @@ fn zoo_sync_types_remote_entries_and_keeps_the_roo_extras() {
 fn zoo_gateway_entry_carries_the_hyphenated_streamable_type() {
     let sb = Sandbox::new();
     sb.install_zoo(None);
-    let out = sb.ok(&["sync", "--client", "zoo", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "zoo", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.zoo_json()["mcpServers"]["mcpgw"].clone();
@@ -1760,7 +1759,7 @@ fn an_inline_codex_server_map_keeps_its_foreign_entries() {
 fn amp_gateway_entry_is_a_bare_url() {
     let sb = Sandbox::new();
     sb.install_amp(None);
-    let out = sb.ok(&["sync", "--client", "amp", "--gateway", "--aggregate"]);
+    let out = sb.ok(&["sync", "--client", "amp", "--aggregate"]);
     assert!(out.contains("+ mcpgw"), "{out}");
 
     let entry = sb.amp_json()["amp.mcpServers"]["mcpgw"].clone();
@@ -1791,25 +1790,42 @@ fn the_client_flags_list_every_shipped_id() {
     }
 }
 
+/// `--gateway` is what every script and README out there spells, so it is
+/// still accepted — it just has nothing left to select. It says so once and
+/// changes nothing about the run.
 #[test]
-fn gateway_and_rollback_conflict() {
+fn the_gateway_flag_is_an_accepted_no_op() {
     let sb = Sandbox::new();
-    let out = sb.mcpgw(&["sync", "--gateway", "--rollback"]);
-    assert!(!out.status.success());
+    // A file that was already there, so the sync below leaves a backup for
+    // the rollback at the end of the test to find.
+    sb.install_cursor(Some(r#"{"mcpServers": {}}"#));
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&sync(&["--client", "cursor"]));
+    let without = sb.cursor_json();
+
+    let out = sb.ok(&["sync", "--client", "cursor", "--gateway"]);
+    assert!(
+        out.contains("note: --gateway is the only mode now; the flag does nothing"),
+        "{out}"
+    );
+    assert!(out.contains("no changes"), "{out}");
+    assert_eq!(sb.cursor_json(), without);
+
+    // Not a mode, so it does not conflict with one either.
+    let rollback = sb.ok(&["sync", "--client", "cursor", "--gateway", "--rollback"]);
+    assert!(rollback.contains("restored"), "{rollback}");
+
+    // Hidden: `--help` no longer offers a choice that is not there.
+    let help = sb.ok(&["sync", "--help"]);
+    assert!(!help.contains("--gateway "), "{help}");
+    assert!(help.contains("--aggregate"), "{help}");
 }
 
 #[test]
 fn gateway_dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    let out = sb.ok(&[
-        "sync",
-        "--client",
-        "cursor",
-        "--gateway",
-        "--aggregate",
-        "--dry-run",
-    ]);
+    let out = sb.ok(&["sync", "--client", "cursor", "--aggregate", "--dry-run"]);
     assert!(out.contains("+ mcpgw"), "{out}");
     assert!(!sb.home.join(".cursor/mcp.json").exists());
 }

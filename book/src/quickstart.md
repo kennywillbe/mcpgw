@@ -135,8 +135,8 @@ entries actually point at — the path a client takes, which a direct probe says
 nothing about. Probes run in parallel with a per-server timeout
 (`--timeout SECS`, default 10).
 
-The second section appears once `sync --gateway` has written entries pointing
-at a gateway; see [Gateway](./gateway.md#checking-the-path-clients-take).
+The second section appears once `sync` has written entries pointing at a
+gateway; see [Gateway](./gateway.md#checking-the-path-clients-take).
 
 For one server in detail, without a gateway:
 

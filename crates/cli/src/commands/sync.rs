@@ -34,14 +34,15 @@ pub struct SyncArgs {
     /// Restore each selected client's config from its most recent backup
     #[arg(long, conflicts_with = "dry_run")]
     pub rollback: bool,
-    /// Point every entry at the gateway instead of at the server directly
-    #[arg(long, conflicts_with = "rollback")]
+    /// Accepted and ignored: syncing through the gateway is the only mode.
+    /// Kept for one release so scripts and docs that spell it keep working.
+    #[arg(long, hide = true)]
     pub gateway: bool,
-    /// With `--gateway`: write one `mcpgw` entry for the whole gateway instead
-    /// of one entry per server
-    #[arg(long, requires = "gateway", conflicts_with = "rollback")]
+    /// Write one `mcpgw` entry for the whole gateway instead of one entry per
+    /// server
+    #[arg(long, conflicts_with = "rollback")]
     pub aggregate: bool,
-    /// URL of the gateway written by `--gateway`
+    /// URL of the gateway the entries point at
     #[arg(long, default_value = super::connect::DEFAULT_URL, value_name = "URL")]
     pub gateway_url: String,
 }
@@ -51,15 +52,24 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
 
+    if args.gateway {
+        println!(
+            "{}",
+            crate::ui::dim(
+                "note: --gateway is the only mode now; the flag does nothing and will be removed",
+                color
+            )
+        );
+    }
+
     if args.rollback {
         return rollback(&targets, &state_dir);
     }
 
-    // Aggregate gateway mode writes one synthetic entry per client, so the
-    // canonical servers are irrelevant there — an unreadable config must not
-    // block it. Per-server mode mirrors those servers by name and needs them,
-    // as direct mode does.
-    let canonical = if args.gateway && args.aggregate {
+    // Aggregate mode writes one synthetic entry per client, so the canonical
+    // servers are irrelevant there — an unreadable config must not block it.
+    // Per-server mode mirrors those servers by name and needs them.
+    let canonical = if args.aggregate {
         BTreeMap::new()
     } else {
         let config_path = super::canonical_config_path()?;
@@ -90,9 +100,8 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             }
         };
         let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
-        let gateway_desired = gateway_entries(kind, args, &canonical, bridge.as_deref())?;
-        let desired = gateway_desired.as_ref().unwrap_or(&canonical);
-        let mut planned = match plan_client(kind, desired, &managed)? {
+        let desired = gateway_entries(kind, args, &canonical, &bridge)?;
+        let mut planned = match plan_client(kind, &desired, &managed)? {
             Planned::Ready(planned) => planned,
             Planned::Skipped(reason) => {
                 heading(&reason);
@@ -239,27 +248,22 @@ pub fn apply_client(
     Ok(Applied::Written)
 }
 
-/// Prints what this run is about to do and resolves the stdio bridge command
-/// gateway mode needs — `None` in direct mode, where there is no bridge.
+/// Prints what this run is about to do and resolves the stdio bridge command.
 ///
 /// The bridge is resolved once for the whole run: probing PATH per client
 /// would give the same answer.
-fn announce_mode(args: &SyncArgs) -> anyhow::Result<Option<String>> {
-    if !args.gateway {
-        println!("direct mode — every enabled server gets its own client entry");
-        return Ok(None);
-    }
+fn announce_mode(args: &SyncArgs) -> anyhow::Result<String> {
+    // Checked before a single client is touched, in both modes: a base URL
+    // that cannot take an endpoint path is wrong for all of them, and failing
+    // halfway would leave some clients rewritten and some not.
+    mcpgw_core::endpoints::per_server_url(&args.gateway_url, "probe")
+        .with_context(|| format!("--gateway-url {} is not a URL", args.gateway_url))?;
     if args.aggregate {
         println!(
             "gateway mode — every client gets a single `{GATEWAY_NAME}` entry pointing at {}",
             args.gateway_url
         );
     } else {
-        // Checked before a single client is touched: a base URL that cannot
-        // take an endpoint path is wrong for all of them, and failing halfway
-        // would leave some clients flipped and some not.
-        mcpgw_core::endpoints::per_server_url(&args.gateway_url, "probe")
-            .with_context(|| format!("--gateway-url {} is not a URL", args.gateway_url))?;
         println!(
             "gateway mode — every enabled server keeps its name and points at \
              its own endpoint on the gateway at {} (serve it with `mcpgw \
@@ -267,34 +271,34 @@ fn announce_mode(args: &SyncArgs) -> anyhow::Result<Option<String>> {
             args.gateway_url
         );
     }
-    Ok(Some(bridge_command()))
+    Ok(bridge_command())
 }
 
-/// The desired entry set gateway mode substitutes for the canonical one, or
-/// `None` in direct mode, where the canonical servers are the desired set.
+/// The entries a client should hold: every enabled server, reached through
+/// the gateway.
 ///
-/// Per-server it is the same names as direct mode with a different transport,
-/// so the flip is plain updates. Aggregate it is the single synthetic entry,
-/// so everything an earlier sync managed — per-server entries included —
-/// falls out as removes.
+/// Per-server they carry the canonical names, so a client that mcpgw synced
+/// before keeps its entry names and the rewrite is plain updates. Aggregate
+/// it is the single synthetic entry, so everything an earlier sync managed —
+/// per-server entries included — falls out as removes.
 fn gateway_entries(
     kind: ClientKind,
     args: &SyncArgs,
     canonical: &BTreeMap<String, mcpgw_core::Server>,
-    bridge: Option<&str>,
-) -> anyhow::Result<Option<BTreeMap<String, mcpgw_core::Server>>> {
-    let Some(command) = bridge else {
-        return Ok(None);
-    };
-    let entries = if args.aggregate {
-        BTreeMap::from([(
+    bridge: &str,
+) -> anyhow::Result<BTreeMap<String, mcpgw_core::Server>> {
+    if args.aggregate {
+        return Ok(BTreeMap::from([(
             GATEWAY_NAME.to_owned(),
-            gateway_server(kind, &args.gateway_url, command),
-        )])
-    } else {
-        per_server_gateway_servers(kind, canonical, &args.gateway_url, command)?
-    };
-    Ok(Some(entries))
+            gateway_server(kind, &args.gateway_url, bridge),
+        )]));
+    }
+    Ok(per_server_gateway_servers(
+        kind,
+        canonical,
+        &args.gateway_url,
+        bridge,
+    )?)
 }
 
 /// The file this client's sync reads and writes, and whether it is there

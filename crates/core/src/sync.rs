@@ -240,8 +240,7 @@ pub fn apply_plan(
 pub const GATEWAY_NAME: &str = "mcpgw";
 
 /// The synthetic server that points one client at a running gateway's
-/// aggregate face — the single-entry shape behind `sync --gateway
-/// --aggregate`.
+/// aggregate face — the single-entry shape behind `sync --aggregate`.
 ///
 /// It is a plain [`Server`] so gateway mode reaches the client file through
 /// [`client_entry`] like every other entry — the two shapes cannot drift.
