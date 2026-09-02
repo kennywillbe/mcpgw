@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mcpgw_core::capture::{CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER};
-use mcpgw_core::gateway::{Gateway, resolve, serve_http};
+use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
+use mcpgw_core::gateway::{Gateway, resolve, serve_http, serve_http_with};
 use mcpgw_core::upstream::UpstreamManager;
 use mcpgw_core::{Server, Transport};
 use rmcp_client_http::ServiceExt as _;
@@ -374,13 +375,24 @@ async fn capture_is_off_unless_asked_for() {
 /// without adding an HTTP client to the dev-dependencies, and returns the
 /// status line of the response.
 async fn raw_post(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
+    raw_post_to(addr, "/mcp", origin)
+        .await
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The same, aimed at an arbitrary path and keeping the whole response so a
+/// test can read the body as well as the status line.
+async fn raw_post_to(addr: std::net::SocketAddr, path: &str, origin: Option<&str>) -> String {
     use std::fmt::Write as _;
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
     let mut request = format!(
-        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
          Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\
          Connection: close\r\n",
         body.len()
@@ -395,11 +407,7 @@ async fn raw_post(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
-    String::from_utf8_lossy(&response)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_owned()
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 #[tokio::test]
@@ -420,5 +428,144 @@ async fn a_hostile_origin_is_refused_before_it_reaches_the_gateway() {
         let status = raw_post(addr, origin).await;
         assert!(!status.contains("403"), "{origin:?} -> {status}");
     }
+    manager.shutdown().await;
+}
+
+/// Serves `gateway` at `/mcp` and one pipe endpoint per upstream at
+/// `/s/<name>`, all over the one shared manager, and returns the address.
+async fn serve_both(
+    upstreams: &[(&str, &str)],
+    capture: Option<&Arc<CaptureWriter>>,
+) -> (std::net::SocketAddr, Arc<UpstreamManager>) {
+    let manager = manager(upstreams);
+    let names: Vec<String> = upstreams.iter().map(|(n, _)| (*n).to_owned()).collect();
+    let with_capture = |gateway: Gateway| match capture {
+        Some(writer) => gateway.with_capture(Arc::clone(writer)),
+        None => gateway,
+    };
+    let pipes: Vec<(String, Gateway)> = names
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                with_capture(Gateway::new(Arc::clone(&manager), name.clone())),
+            )
+        })
+        .collect();
+    let endpoints = Endpoints::new(EndpointTable::new(pipes));
+    let aggregate = with_capture(Gateway::aggregate(Arc::clone(&manager), names));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_http_with(
+        aggregate,
+        Some(endpoints),
+        listener,
+        std::future::pending(),
+    ));
+    (addr, manager)
+}
+
+/// A client on an arbitrary path of the gateway.
+async fn client_at(addr: std::net::SocketAddr, path: &str) -> Client {
+    let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}{path}"));
+    ().serve(transport).await.unwrap()
+}
+
+fn tool_names(tools: &[rmcp_client_http::model::Tool]) -> Vec<&str> {
+    tools.iter().map(|t| t.name.as_ref()).collect()
+}
+
+/// The point of the endpoint table: three simultaneous views of the same
+/// upstreams — one aggregate and one per server — sharing a single
+/// `UpstreamManager`, so no view costs an extra process.
+#[tokio::test]
+async fn per_server_endpoints_serve_their_own_tools_next_to_the_aggregate() {
+    let (addr, manager) = serve_both(&[("fx1", "healthy"), ("fx2", "healthy")], None).await;
+
+    let aggregate = client_at(addr, "/mcp").await;
+    let fx1 = client_at(addr, &endpoint_path("fx1")).await;
+    let fx2 = client_at(addr, &endpoint_path("fx2")).await;
+
+    let (agg_tools, fx1_tools, fx2_tools) = tokio::join!(
+        aggregate.list_all_tools(),
+        fx1.list_all_tools(),
+        fx2.list_all_tools(),
+    );
+    // The aggregate keeps prefixing; each endpoint hands out bare names.
+    assert_eq!(
+        tool_names(&agg_tools.unwrap()),
+        ["fx1__echo", "fx1__reverse", "fx2__echo", "fx2__reverse"]
+    );
+    assert_eq!(tool_names(&fx1_tools.unwrap()), ["echo", "reverse"]);
+    assert_eq!(tool_names(&fx2_tools.unwrap()), ["echo", "reverse"]);
+
+    // And the unprefixed call lands on the server whose endpoint took it.
+    let (one, two) = tokio::join!(
+        fx1.call_tool(call("echo", "from fx1")),
+        fx2.call_tool(call("reverse", "abcd")),
+    );
+    assert!(format!("{:?}", one.unwrap()).contains("from fx1"));
+    assert!(format!("{:?}", two.unwrap()).contains("dcba"));
+
+    for client in [aggregate, fx1, fx2] {
+        client.cancel().await.unwrap();
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_endpoint_is_a_404_that_names_the_real_ones() {
+    let (addr, manager) = serve_both(&[("fx1", "healthy"), ("fx2", "healthy")], None).await;
+
+    let response = raw_post_to(addr, "/s/nope", None).await;
+    assert!(response.contains("404"), "{response}");
+    assert!(response.contains("nope"), "{response}");
+    assert!(
+        response.contains("/s/fx1") && response.contains("/s/fx2"),
+        "the 404 should list what is actually served: {response}"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn per_server_traffic_is_captured_under_the_right_server() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) =
+        serve_both(&[("fx1", "healthy"), ("fx2", "healthy")], Some(&writer)).await;
+
+    let fx2 = client_at(addr, &endpoint_path("fx2")).await;
+    fx2.call_tool(call("echo", "hi")).await.unwrap();
+    fx2.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    let shape: Vec<(Kind, &str, Option<&str>, bool)> = records
+        .iter()
+        .map(|r| (r.kind, r.server.as_str(), r.tool.as_deref(), r.ok))
+        .collect();
+    // The endpoint, not the tool name, is what attributes the call — the
+    // name arriving here is bare.
+    assert_eq!(
+        shape,
+        [(Kind::Call, "fx2", Some("echo"), true)],
+        "{records:#?}"
+    );
+}
+
+#[tokio::test]
+async fn the_origin_guard_covers_the_per_server_endpoints_too() {
+    let (addr, manager) = serve_both(&[("fx1", "healthy")], None).await;
+
+    let response = raw_post_to(addr, "/s/fx1", Some("https://evil.example")).await;
+    assert!(response.contains("403"), "{response}");
+    // Even an endpoint that does not exist is refused before it is looked up.
+    let response = raw_post_to(addr, "/s/nope", Some("https://evil.example")).await;
+    assert!(response.contains("403"), "{response}");
+
+    // A non-browser client (no Origin) is untouched by the guard.
+    let response = raw_post_to(addr, "/s/fx1", None).await;
+    assert!(!response.contains("403"), "{response}");
     manager.shutdown().await;
 }

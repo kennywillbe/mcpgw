@@ -381,6 +381,23 @@ pub async fn serve_http(
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_http_with(gateway, None, listener, shutdown).await
+}
+
+/// Serves the gateway at `/mcp` and, when `endpoints` is given, one
+/// per-server face under `/s/<name>` for each of them. Both share the
+/// listener, the origin guard and — because every gateway is built over the
+/// same [`UpstreamManager`] — the upstream connections.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the HTTP server fails.
+pub async fn serve_http_with(
+    gateway: Gateway,
+    endpoints: Option<crate::endpoints::Endpoints>,
+    listener: tokio::net::TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -391,9 +408,12 @@ pub async fn serve_http(
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(axum::middleware::from_fn(guard_origin));
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+    if let Some(endpoints) = endpoints {
+        router = router.merge(crate::endpoints::router(endpoints));
+    }
+    // Layered over the merged router, so the guard covers every face.
+    let router = router.layer(axum::middleware::from_fn(guard_origin));
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await

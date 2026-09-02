@@ -3,6 +3,7 @@ pub mod capture;
 pub mod clients;
 pub mod config;
 pub mod doctor;
+pub mod endpoints;
 pub mod error;
 pub mod gateway;
 pub mod import;

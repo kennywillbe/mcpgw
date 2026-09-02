@@ -54,6 +54,14 @@ rmcp = { version = "3", features = [
 ] }
 rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "transport-streamable-http-client-reqwest"] }
 axum = "0.8"
+# The per-server endpoint table is read on every request and replaced whole
+# when the config reloads. `ArcSwap` is the read-mostly shape for exactly
+# that: the load on the hot path is lock-free, so a reload can never make a
+# request queue behind a writer — which an `RwLock` around the same map would.
+arc-swap = "1.9"
+# axum gives us a router but not tower's `Service` trait, and dispatching to a
+# pre-built rmcp service means driving one by hand.
+tower-service = "0.3"
 http = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",

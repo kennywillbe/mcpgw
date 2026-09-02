@@ -14,17 +14,40 @@ const UPSTREAM: &str = "gateway";
 
 #[derive(clap::Args)]
 pub struct ConnectArgs {
-    /// URL of the running gateway
-    #[arg(long, default_value = DEFAULT_URL, value_name = "URL")]
-    pub url: String,
+    /// URL of the running gateway. Optional rather than defaulted so
+    /// `--server` can tell "the user picked this URL" from "nobody did".
+    // The default is spelled out in the help text by hand for the same reason
+    // — clap only prints one for an argument that actually has one.
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "URL of the running gateway [default: http://127.0.0.1:8137/mcp]"
+    )]
+    pub url: Option<String>,
+    /// Bridge to one server's own endpoint instead of the aggregate, so its
+    /// tools arrive unprefixed (needs `mcpgw serve --per-server`)
+    #[arg(long, value_name = "NAME")]
+    pub server: Option<String>,
+}
+
+/// The gateway URL to bridge to. An explicit `--url` is taken verbatim: it is
+/// the escape hatch for a gateway on another port or path, and `--server`
+/// second-guessing it would take that away.
+fn target_url(args: &ConnectArgs) -> anyhow::Result<String> {
+    match (&args.url, &args.server) {
+        (Some(url), _) => Ok(url.clone()),
+        (None, Some(name)) => Ok(mcpgw_core::endpoints::per_server_url(DEFAULT_URL, name)?),
+        (None, None) => Ok(DEFAULT_URL.to_owned()),
+    }
 }
 
 pub fn run(args: &ConnectArgs) -> anyhow::Result<()> {
+    let url = target_url(args)?;
     let server = Server {
         enabled: true,
         tags: Vec::new(),
         transport: Transport::Http {
-            url: args.url.clone(),
+            url: url.clone(),
             headers: BTreeMap::new(),
         },
     };
@@ -34,19 +57,45 @@ pub fn run(args: &ConnectArgs) -> anyhow::Result<()> {
     )])));
     // The one failure mode worth naming here is "the daemon isn't up", and
     // the client only ever shows the MCP error text — so the fix goes in it.
-    let gateway =
-        Gateway::new(Arc::clone(&manager), UPSTREAM.to_owned()).with_unavailable_hint(format!(
-            "gateway is not running at {} — start it with `mcpgw serve`",
-            args.url
-        ));
+    let gateway = Gateway::new(Arc::clone(&manager), UPSTREAM.to_owned()).with_unavailable_hint(
+        format!("gateway is not running at {url} — start it with `mcpgw serve`"),
+    );
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
         // stdout is the MCP transport from here on; diagnostics go to stderr.
-        eprintln!("mcpgw connect: bridging stdio to {}", args.url);
+        eprintln!("mcpgw connect: bridging stdio to {url}");
         let reason = serve_stdio(gateway).await?;
         eprintln!("mcpgw connect: closed ({reason:?})");
         manager.shutdown().await;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectArgs, DEFAULT_URL, target_url};
+
+    fn args(url: Option<&str>, server: Option<&str>) -> ConnectArgs {
+        ConnectArgs {
+            url: url.map(ToOwned::to_owned),
+            server: server.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn server_names_the_per_server_endpoint_and_url_still_wins() {
+        assert_eq!(target_url(&args(None, None)).unwrap(), DEFAULT_URL);
+        assert_eq!(
+            target_url(&args(None, Some("github"))).unwrap(),
+            "http://127.0.0.1:8137/s/github"
+        );
+        // An explicit URL is never rewritten, even alongside --server.
+        let explicit = "http://127.0.0.1:9000/mcp";
+        assert_eq!(target_url(&args(Some(explicit), None)).unwrap(), explicit);
+        assert_eq!(
+            target_url(&args(Some(explicit), Some("github"))).unwrap(),
+            explicit
+        );
+    }
 }
