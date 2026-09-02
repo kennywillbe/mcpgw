@@ -6,7 +6,7 @@ use mcpgw_core::upstream::UpstreamManager;
 use mcpgw_core::{Server, Transport};
 
 /// Where `mcpgw serve` listens with its own defaults.
-pub const DEFAULT_URL: &str = "http://127.0.0.1:8137/mcp";
+pub use mcpgw_core::endpoints::DEFAULT_URL;
 
 /// Name of the single synthetic upstream. It never reaches tool names — the
 /// bridge is a pure pipe — but it does appear in upstream error messages.

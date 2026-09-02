@@ -60,12 +60,16 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
-        /// Also reach every server and run a live MCP handshake
+        /// Also reach every server directly, and every gateway endpoint the
+        /// managed client entries point at, with a live MCP handshake
         #[arg(long)]
         probe: bool,
         /// Per-server probe timeout in seconds
         #[arg(long, default_value_t = 10, requires = "probe", value_name = "SECS")]
         timeout: u64,
+        /// Gateway the managed client entries are expected to reach
+        #[arg(long, default_value = commands::connect::DEFAULT_URL, value_name = "URL")]
+        gateway_url: String,
     },
     /// Replace this binary with the latest release
     SelfUpdate(commands::self_update::SelfUpdateArgs),
@@ -110,10 +114,12 @@ fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
             json,
             probe,
             timeout,
+            gateway_url,
         } => commands::doctor::run(
             json,
             color,
             probe.then(|| std::time::Duration::from_secs(timeout)),
+            &gateway_url,
         ),
         Command::SelfUpdate(args) => commands::self_update::run(&args),
     }
