@@ -18,6 +18,9 @@ pub struct ImportArgs {
     /// Show what would be imported without writing anything
     #[arg(long)]
     pub dry_run: bool,
+    /// Skip the conflict prompt and keep the canonical entry
+    #[arg(long)]
+    pub yes: bool,
 }
 
 pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
@@ -64,19 +67,26 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     // the guarantee the plan-under-lock fix bought (plan and write describe
     // the same file) survives, and a name that changed underneath us falls
     // back to being skipped.
-    let (mut store, plan, overwrite) =
-        if plan.conflicts.is_empty() || !std::io::stdin().is_terminal() {
-            // Nothing to ask, so nothing to release: the plan already under
-            // the lock is the one that gets applied.
-            (store, plan, BTreeSet::new())
-        } else {
-            let questions: Vec<String> = plan.conflicts.iter().map(|c| c.name.clone()).collect();
-            drop(store);
-            let overwrite = ask(&questions)?;
-            let store = ConfigStore::edit_or_create(&config_path)?;
-            let plan = plan_import(&sources, &store.config().servers);
-            (store, plan, overwrite)
-        };
+    //
+    // `--yes` states the answer up front — keep canonical — so the prompt is
+    // never reached and the lock never has to be released for it. It says by
+    // intent what the IsTerminal check can only guess: a script that pipes
+    // input to import is indistinguishable from an interactive run, so the
+    // fallback alone leaves scripted callers unable to promise they will not
+    // block.
+    let non_interactive = args.yes || !std::io::stdin().is_terminal();
+    let (mut store, plan, overwrite) = if plan.conflicts.is_empty() || non_interactive {
+        // Nothing to ask, so nothing to release: the plan already under
+        // the lock is the one that gets applied.
+        (store, plan, BTreeSet::new())
+    } else {
+        let questions: Vec<String> = plan.conflicts.iter().map(|c| c.name.clone()).collect();
+        drop(store);
+        let overwrite = ask(&questions)?;
+        let store = ConfigStore::edit_or_create(&config_path)?;
+        let plan = plan_import(&sources, &store.config().servers);
+        (store, plan, overwrite)
+    };
 
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
@@ -108,8 +118,13 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
             println!("~ {} overwritten{}", candidate.name, describe(candidate));
         } else {
             skipped += 1;
+            let why = if args.yes {
+                "--yes keeps canonical"
+            } else {
+                "run interactively to decide"
+            };
             println!(
-                "! {} differs from the canonical entry (skipped — run interactively to decide)",
+                "! {} differs from the canonical entry (skipped — {why})",
                 candidate.name
             );
         }
