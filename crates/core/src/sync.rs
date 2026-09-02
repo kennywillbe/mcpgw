@@ -235,10 +235,13 @@ pub fn apply_plan(
     codec::edit_json(kind.codec().root, root, &plan.removes, &plan.upserts())
 }
 
-/// The entry name mcpgw owns in every client when syncing in gateway mode.
+/// The entry name mcpgw owns in every client when syncing in aggregate
+/// gateway mode. Per-server gateway entries are named as their server.
 pub const GATEWAY_NAME: &str = "mcpgw";
 
-/// The synthetic server that points one client at a running gateway.
+/// The synthetic server that points one client at a running gateway's
+/// aggregate face — the single-entry shape behind `sync --gateway
+/// --aggregate`.
 ///
 /// It is a plain [`Server`] so gateway mode reaches the client file through
 /// [`client_entry`] like every other entry — the two shapes cannot drift.
@@ -263,6 +266,87 @@ pub fn gateway_server(kind: ClientKind, url: &str, bridge_command: &str) -> Serv
         tags: Vec::new(),
         transport,
     }
+}
+
+/// The synthetic server that points one client at *one* server's own gateway
+/// endpoint (`<base>/s/<name>`).
+///
+/// The entry is named as the server it stands for, which is the whole point:
+/// a client synced directly and then synced in gateway mode sees the same
+/// names change transport, so the flip is a set of updates rather than a set
+/// of conflicts against entries mcpgw already manages. It also means the
+/// client's own fields on those entries — [`preserved_fields`], Cline's
+/// `disabled` and `autoApprove` and their kin — carry over the flip: the user
+/// switched *that server* off *in that client*, and reaching it through the
+/// gateway does not undo that decision. Only the transport changes.
+///
+/// [`preserved_fields`]: codec::EntrySchema::preserved_fields
+///
+/// `enabled` and `tags` are carried over rather than forced on: this is the
+/// same canonical server, reached differently, and [`plan_sync`] stays the one
+/// place that decides a disabled server is not mirrored.
+///
+/// # Errors
+///
+/// Returns the parse error when `base_url` is not an absolute URL.
+pub fn per_server_gateway_server(
+    kind: ClientKind,
+    name: &str,
+    server: &Server,
+    base_url: &str,
+    bridge_command: &str,
+) -> Result<Server, url::ParseError> {
+    let transport = if kind.supports_http_entries() {
+        Transport::Http {
+            url: crate::endpoints::per_server_url(base_url, name)?,
+            headers: BTreeMap::new(),
+        }
+    } else {
+        Transport::Stdio {
+            command: bridge_command.to_owned(),
+            // The gateway's base URL plus the server's name, not the endpoint
+            // path spelled out: the bridge derives the path, so a client file
+            // written today keeps working if the path shape ever moves.
+            args: vec![
+                "connect".to_owned(),
+                "--server".to_owned(),
+                name.to_owned(),
+                "--url".to_owned(),
+                base_url.to_owned(),
+            ],
+            env: BTreeMap::new(),
+        }
+    };
+    Ok(Server {
+        enabled: server.enabled,
+        tags: server.tags.clone(),
+        transport,
+    })
+}
+
+/// The whole desired set for one client in per-server gateway mode: every
+/// canonical server, by its own name, pointing at its own endpoint.
+///
+/// Disabled servers are kept in the map — as disabled — so [`plan_sync`]
+/// applies exactly the rule it applies in direct mode: not mirrored, and
+/// removed if it managed them before.
+///
+/// # Errors
+///
+/// Returns the parse error when `base_url` is not an absolute URL.
+pub fn per_server_gateway_servers(
+    kind: ClientKind,
+    canonical: &BTreeMap<String, Server>,
+    base_url: &str,
+    bridge_command: &str,
+) -> Result<BTreeMap<String, Server>, url::ParseError> {
+    canonical
+        .iter()
+        .map(|(name, server)| {
+            let entry = per_server_gateway_server(kind, name, server, base_url, bridge_command)?;
+            Ok((name.clone(), entry))
+        })
+        .collect()
 }
 
 /// The client-shaped value for one canonical server, as its codec spells it.
