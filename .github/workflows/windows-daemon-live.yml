@@ -1,0 +1,40 @@
+name: Windows daemon (live)
+
+# Never automatic. crates/cli/tests/daemon_windows.rs registers a real service
+# in the runner's service control manager — harmless on a throwaway VM, but it
+# is the kind of thing that should be somebody's decision rather than a side
+# effect of pushing. A GitHub windows-latest runner is elevated, so the only
+# thing standing between this workflow and a real install → run → stop → start
+# → uninstall cycle is MCPGW_DAEMON_LIVE, which is set below and nowhere else.
+on: workflow_dispatch
+
+jobs:
+  live:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The test drives a gateway that fronts the scripted fixture server, and
+      # util::fixture_binary() looks for that binary next to the test
+      # executable rather than building it — a plain `cargo test -p mcpgw`
+      # would fail on a missing mcpgw-test-server, so build the workspace.
+      - run: cargo build --locked --workspace
+      - run: cargo test --locked -p mcpgw --test daemon_windows -- --nocapture
+        env:
+          MCPGW_DAEMON_LIVE: "1"
+      # The test cleans up after itself even when an assertion fails, but a
+      # crashed or cancelled run cannot. Fail loudly here rather than let a
+      # stray service disappear quietly with the runner: a leak means the
+      # uninstall path is broken, which is exactly what this workflow exists
+      # to find out. `sc` is a PowerShell alias for Set-Content, hence sc.exe.
+      - name: No mcpgw service left registered
+        if: always()
+        run: |
+          sc.exe query mcpgw
+          if ($LASTEXITCODE -eq 0) {
+            Write-Error "an mcpgw service is still registered after the run"
+            exit 1
+          }
+          Write-Host "clean: the service control manager has no mcpgw"
+        shell: pwsh
