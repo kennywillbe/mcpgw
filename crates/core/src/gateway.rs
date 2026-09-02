@@ -41,7 +41,35 @@ enum Mode {
     /// Single upstream, names passed through verbatim.
     Pipe(String),
     /// N upstreams, every tool exposed as `server__tool`.
-    Aggregate(Vec<String>),
+    Aggregate(ServerList),
+}
+
+/// The set of servers an aggregate gateway fronts, shared and atomically
+/// replaceable.
+///
+/// Shared rather than owned because the `/mcp` service is built once, from a
+/// factory that clones one `Gateway` per session: a reload that rebuilt the
+/// list by value would only reach sessions opened afterwards. Cloning this
+/// handle shares the cell, so a swap is visible to every session at its next
+/// request — and to none of them mid-request, since each read is one load.
+#[derive(Clone)]
+pub struct ServerList(Arc<arc_swap::ArcSwap<Vec<String>>>);
+
+impl ServerList {
+    #[must_use]
+    pub fn new(names: Vec<String>) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(names)))
+    }
+
+    /// Publishes `names` in place of the current list.
+    pub fn store(&self, names: Vec<String>) {
+        self.0.store(Arc::new(names));
+    }
+
+    #[must_use]
+    pub fn load(&self) -> Arc<Vec<String>> {
+        self.0.load_full()
+    }
 }
 
 #[derive(Clone)]
@@ -74,6 +102,13 @@ impl Gateway {
     /// added later.
     #[must_use]
     pub fn aggregate(manager: Arc<UpstreamManager>, upstreams: Vec<String>) -> Self {
+        Self::aggregate_shared(manager, ServerList::new(upstreams))
+    }
+
+    /// Aggregates whatever `upstreams` holds at each request, so a config
+    /// reload can change the set under a running `/mcp` service.
+    #[must_use]
+    pub fn aggregate_shared(manager: Arc<UpstreamManager>, upstreams: ServerList) -> Self {
         Self {
             manager,
             mode: Mode::Aggregate(upstreams),
@@ -574,9 +609,9 @@ impl ServerHandler for Gateway {
                 )
                 .await
             }
-            Mode::Aggregate(upstreams) => {
-                Ok(self.aggregate_tools(session.as_deref(), upstreams).await)
-            }
+            Mode::Aggregate(upstreams) => Ok(self
+                .aggregate_tools(session.as_deref(), &upstreams.load())
+                .await),
         };
         Ok(bridged(&context, result?))
     }
@@ -590,7 +625,10 @@ impl ServerHandler for Gateway {
         let upstream = match &self.mode {
             Mode::Pipe(upstream) => upstream.clone(),
             Mode::Aggregate(upstreams) => {
-                let Some((server, tool)) = resolve(&request.name, upstreams) else {
+                // One load for the whole request: the name is resolved
+                // against exactly the list the error message would name.
+                let upstreams = upstreams.load();
+                let Some((server, tool)) = resolve(&request.name, &upstreams) else {
                     return Err(ErrorData::invalid_params(
                         format!(
                             "tool {:?} does not name a known server (expected \

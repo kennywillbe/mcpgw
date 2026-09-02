@@ -115,6 +115,33 @@ afternoon.
 stdio and HTTP upstreams run through the same lifecycle; from a client's side
 they're indistinguishable.
 
+## Config reload
+
+A running gateway follows the config file. `mcpgw add`, `remove`, `enable` and
+`disable` take effect within a couple of seconds — no restart, and nothing
+disconnected:
+
+```sh
+mcpgw add github -- npx -y @modelcontextprotocol/server-github
+# a moment later, without touching the gateway:
+curl http://127.0.0.1:8137/s/github
+```
+
+An added server gets its endpoint and joins `/mcp`; a removed or disabled one
+loses both and its process is stopped. A server the edit didn't mention is left
+completely alone — same connection, same child process — so adding one server
+never interrupts the others. Only a change to a server's own transport (its
+command, args, env or URL) restarts that server.
+
+Nothing is torn down under a request in flight: a `tools/call` that was already
+running when the config changed still gets its answer from the process it
+started on.
+
+On Unix, `kill -HUP` the gateway to reload immediately rather than waiting for
+the next check. A config file that doesn't parse changes nothing — the gateway
+says so and keeps serving what it already had, so a typo can't take your servers
+down.
+
 ## Pointing clients at it
 
 ```sh
