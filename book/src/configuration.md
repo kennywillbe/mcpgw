@@ -132,9 +132,9 @@ project configs — not managed by sync yet
   ⚠ /work/api/.mcp.json holds 1 direct MCP entry mcpgw does not manage — …
 ```
 
-`--json` carries the same thing as a `projects` array. `mcpgw import` cannot
-read these files yet, so adopting one means copying the entry into the
-canonical config by hand for now — see [Roadmap](./roadmap.md).
+`--json` carries the same thing as a `projects` array. `mcpgw import` does not
+read these files, so adopting one means copying the entry into the canonical
+config by hand.
 
 Only the repo root and your working directory are looked at, and never above
 the repo root.

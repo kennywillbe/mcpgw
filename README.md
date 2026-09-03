@@ -195,26 +195,10 @@ version of what that does and does not protect. The short one:
   you actually want them.
 - Captured arguments and responses are **truncated at 2 KB, not redacted** — if
   a secret is passed as a tool argument, it lands in that file. Use
-  `mcpgw serve --no-capture` if that's not acceptable yet.
+  `mcpgw serve --no-capture` if that's not acceptable.
 - `mcpgw watch --json` masks the captured `args` and `response` values, so
   piping the stream somewhere doesn't spread what's in the file; pass
   `--show-secrets` to see them. The human `watch` view never printed them.
-- Redaction, tool allowlists and an OAuth broker are on the roadmap below, not
-  shipped.
-
-## Roadmap
-
-Ordered by what feedback asks for first:
-
-- tool allowlist, deny-by-default
-- tool-definition drift detection (a server quietly changing what a tool does)
-- log redaction
-- rate limiting
-- OAuth 2.1 with DCR and PKCE — for remote servers, and with it authentication
-  on the gateway itself
-- a full TUI for `watch`
-- `mcpgw connect` starting a managed gateway on its own, when no daemon is
-  installed
 
 ## Contributing
 

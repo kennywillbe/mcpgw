@@ -110,10 +110,9 @@ The mitigations today are that the file is `0600` under your own state
 directory, that `mcpgw serve --no-capture` disables capture entirely, and that
 `watch` does not put those bodies back on your terminal: the one-line view
 never showed them, and `--json` replaces each with `"***"` unless you ask for
-`--show-secrets`. That bounds the spread, not the file itself. Redaction at
-capture time is on the [roadmap](./roadmap.md); until it ships, this is the
-honest description, and the [Trust model](./trust-model.md) puts it beside
-everything else worth knowing before every call goes through one process.
+`--show-secrets`. That bounds the spread, not the file itself, and the
+[Trust model](./trust-model.md) puts it beside everything else worth knowing
+before every call goes through one process.
 
 ## One server, no gateway
 

@@ -35,8 +35,7 @@ its own servers. Now one process holds the whole set: every token in your
 canonical config is loaded by `mcpgw serve`, and any client that reaches the
 gateway can use any of them. The credentials did not become more exposed —
 they were already on the disk — but they became reachable through one place
-rather than thirteen. A tool allowlist is the answer to that and is on the
-[roadmap](./roadmap.md); it is not shipped.
+rather than thirteen.
 
 **One log.** Every call now passes a single capture point, and by default it
 is written down. That is the feature — it is why `mcpgw watch` can show you
@@ -56,9 +55,9 @@ mcpgw serve --no-capture      # no traffic log at all
 The file lives under your state directory at mode `0600`, and `mcpgw watch`
 masks `args` and `response` in `--json` output unless you pass
 `--show-secrets` (the human view never printed them). That bounds how far the
-bodies spread; it does not change what is in the file. Redaction at capture
-time is on the roadmap. Until it ships, `--no-capture` is the switch, and
-[Watching traffic](./traffic.md) is the longer version of this paragraph.
+bodies spread; it does not change what is in the file. `--no-capture` is the
+switch, and [Watching traffic](./traffic.md) is the longer version of this
+paragraph.
 
 ## Binding anywhere else
 
@@ -117,10 +116,6 @@ A remote MCP server that requires OAuth is authenticated the way it always
 was: with a token you put in the config as a header. mcpgw forwards it. It
 does not broker the flow, hold a refresh token, or renew anything on your
 behalf.
-
-An OAuth 2.1 broker (DCR and PKCE) is on the roadmap, and with it
-authentication on the gateway itself. Neither is shipped. If you read
-something that suggests otherwise, this page is the one that is current.
 
 ## The short version
 

@@ -42,7 +42,7 @@ mcpgw serve --no-capture                      # don't write the traffic log
 ### Binding
 
 `--bind` defaults to `127.0.0.1`. Anything else prints a warning, because
-**there is no authentication yet** — whoever can reach the address can call
+**there is no authentication** — whoever can reach the address can call
 your MCP servers:
 
 ```sh

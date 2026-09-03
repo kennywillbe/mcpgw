@@ -9,4 +9,3 @@
 - [Trust model](./trust-model.md)
 - [Configuration reference](./configuration.md)
 - [Backing out](./eject.md)
-- [Roadmap](./roadmap.md)

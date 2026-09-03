@@ -7,8 +7,7 @@ body:
       value: |
         mcpgw is deliberately narrow: one config, every client, and a gateway
         that watches the traffic. Requests that turn it into a full API
-        management platform are unlikely to be accepted — see the Roadmap
-        section of the README for what's already planned.
+        management platform are unlikely to be accepted.
   - type: textarea
     id: problem
     attributes:
