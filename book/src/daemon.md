@@ -326,9 +326,9 @@ than an error: the gateway may be answering perfectly well on the old binary,
 and the only thing actually broken is that upgrading it changes nothing.
 
 The same three also say when the gateway that is *answering* is a different
-version than the mcpgw you are typing — a service keeps running the build it
-was started with, so `brew upgrade` leaves yesterday's gateway on the port
-until something restarts it:
+version than the mcpgw you are typing. A service that watches its binary
+closes that gap itself within seconds; one installed before it did leaves
+yesterday's gateway on the port until something restarts it:
 
 ```text
 service   runs mcpgw 0.4.0; you are running 0.4.1 — run `mcpgw daemon install` to restart it on this build

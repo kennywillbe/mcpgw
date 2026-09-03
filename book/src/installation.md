@@ -82,6 +82,19 @@ It never writes to stdout, so `--json` output stays parseable, and it stays
 quiet when the network doesn't answer. `MCPGW_NO_UPDATE_CHECK=1` turns it off
 entirely.
 
+However you upgrade, an installed service follows. The new binary lands at
+the path the service was installed with, the running gateway notices it
+within a few seconds and ends, and launchd, systemd or the Windows service
+manager starts the new one — see
+[After an upgrade](./daemon.md#after-an-upgrade). There is nothing to stop
+first.
+
+Two cases it doesn't cover. Changing *how* mcpgw is installed — `cargo
+install` to Homebrew, or back — puts the new binary at a different path, and
+the service keeps running the old copy until `mcpgw daemon install`
+re-registers it. And a service installed before 0.4.1 doesn't watch its
+binary at all; run `mcpgw daemon install` once and it will.
+
 ## Check it
 
 ```sh
