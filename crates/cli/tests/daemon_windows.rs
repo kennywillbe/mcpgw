@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 mod util;
-use util::fixture_binary;
+use util::{daemon, fixture_config, install_on_a_free_port, stderr, stdout};
 
 const LIVE_ENV: &str = "MCPGW_DAEMON_LIVE";
 
@@ -27,27 +27,10 @@ const LIVE_ENV: &str = "MCPGW_DAEMON_LIVE";
 /// this is a cold process start of a process that starts another process.
 const UP_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn daemon(home: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
-        .arg("daemon")
-        .args(args)
-        .env("MCPGW_NO_UPDATE_CHECK", "1")
-        .env("MCPGW_CONFIG", home.join("config.toml"))
-        .env("MCPGW_STATE_DIR", home.join("state"))
-        .env("USERPROFILE", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .output()
-        .unwrap()
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
+/// How long the gateway gets to go away after a stop. Shorter than coming
+/// up, because nothing has to start: the service manager only has to notice
+/// the request and let the child die.
+const DOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Removes the registration whatever happened, so a failed assertion cannot
 /// leave a service running on the machine that ran the test.
@@ -74,19 +57,28 @@ fn registered() -> bool {
         .success()
 }
 
-/// A port that was free a moment ago, and deliberately not 8137: whoever
-/// runs this very likely has a foreground gateway on the default port.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 /// Polls `daemon status` until the gateway answers, returning its output.
 fn wait_until_up(home: &Path, url: &str) -> std::process::Output {
     let deadline = Instant::now() + UP_TIMEOUT;
     loop {
         let output = daemon(home, &["status", "--url", url]);
         if output.status.code() == Some(0) || Instant::now() > deadline {
+            return output;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Polls `daemon status` until the gateway stops answering, returning its
+/// output — the mirror of [`wait_until_up`], and the condition the
+/// assertions after a stop are about. A service manager that mistook the
+/// requested stop for a failure keeps the gateway answering, so that case
+/// runs out the deadline and fails on the output it returns.
+fn wait_until_down(home: &Path, url: &str) -> std::process::Output {
+    let deadline = Instant::now() + DOWN_TIMEOUT;
+    loop {
+        let output = daemon(home, &["status", "--url", url]);
+        if output.status.code() != Some(0) || Instant::now() > deadline {
             return output;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -103,22 +95,14 @@ fn the_service_installs_runs_stops_and_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     let _cleanup = LeaveNothingBehind;
-    std::fs::write(
-        home.join("config.toml"),
-        format!(
-            "version = 1\n\n[servers.fx1]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\n",
-            fixture_binary().display()
-        ),
-    )
-    .unwrap();
-
-    let port = free_port();
-    let url = format!("http://127.0.0.1:{port}/mcp");
+    std::fs::write(home.join("config.toml"), fixture_config(&["fx1"])).unwrap();
 
     // Install. Elevated already, so no prompt is involved and nothing here
     // waits on a dialog — that branch is covered by the unit tests, which is
     // the only place it can be covered without a person at the keyboard.
-    let installed = daemon(home, &["install", "--port", &port.to_string()]);
+    let (port, installed) =
+        install_on_a_free_port(|port| daemon(home, &["install", "--port", &port.to_string()]));
+    let url = format!("http://127.0.0.1:{port}/mcp");
     let text = stdout(&installed);
     assert!(
         installed.status.success(),
@@ -173,8 +157,7 @@ fn the_service_installs_runs_stops_and_leaves_nothing_behind() {
         "stop failed: {}",
         stderr(&stopped)
     );
-    std::thread::sleep(Duration::from_secs(5));
-    let down = daemon(home, &["status", "--url", &url]);
+    let down = wait_until_down(home, &url);
     let text = stdout(&down);
     assert_eq!(down.status.code(), Some(1), "{text}");
     assert!(text.contains("gateway   not running"), "{text}");

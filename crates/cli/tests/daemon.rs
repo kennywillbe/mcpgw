@@ -7,82 +7,22 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 mod util;
-use util::fixture_binary;
+use util::{daemon, fixture_config, free_port, stderr, stdout};
 
-/// The daemon command with a home, config and state dir of its own, so no
-/// test can see (or write to) the real ones.
-fn daemon(home: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
-        .arg("daemon")
-        .args(args)
-        .env("MCPGW_NO_UPDATE_CHECK", "1")
-        .env("MCPGW_CONFIG", home.join("config.toml"))
-        .env("MCPGW_STATE_DIR", home.join("state"))
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .output()
-        .unwrap()
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-/// Spawns a real foreground gateway on an ephemeral port, returning it with
-/// the URL read off its banner — the port is never guessed, so two tests
-/// running at once cannot collide.
+/// A gateway serving one healthy fixture server, with the URL of its
+/// aggregate endpoint read off the banner.
 async fn serve(home: &Path) -> (tokio::process::Child, String) {
-    let config_path = home.join("config.toml");
-    std::fs::write(
-        &config_path,
-        format!(
-            "version = 1\n\n[servers.fx1]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\n",
-            fixture_binary().display()
-        ),
-    )
-    .unwrap();
-
-    let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
-        .arg("serve")
-        .args(["--port", "0", "--no-capture"])
-        .env("MCPGW_NO_UPDATE_CHECK", "1")
-        .env("MCPGW_CONFIG", &config_path)
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let banner = lines.next_line().await.unwrap().unwrap();
-    let addr = banner
-        .split("http://")
-        .nth(1)
-        .and_then(|rest| rest.split("/mcp").next())
-        .unwrap_or_else(|| panic!("no address in banner: {banner}"))
-        .to_owned();
-    // Kept drained: a gateway whose `println!` hits a closed pipe dies of
-    // EPIPE mid-test (see the same guard in tests/serve.rs).
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    std::fs::write(home.join("config.toml"), fixture_config(&["fx1"])).unwrap();
+    let (child, addr, _endpoints) = util::serve(home, &[]).await;
     (child, format!("http://{addr}/mcp"))
 }
 
 #[test]
 fn status_reports_a_gateway_that_is_not_there_and_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
-    // A port that was free a moment ago; nothing here depends on it staying
-    // free beyond "not a gateway of ours".
-    let port = {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    // Nothing here depends on the port staying free beyond "not a gateway
+    // of ours".
+    let port = free_port();
     let url = format!("http://127.0.0.1:{port}/mcp");
     let output = daemon(dir.path(), &["status", "--url", &url]);
 
@@ -280,14 +220,8 @@ async fn logs_follow_prints_lines_appended_after_it_started() {
     daemon(dir.path(), &["logs"]);
     std::fs::write(logs.join("daemon.out.log"), "already there\n").unwrap();
 
-    let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
+    let mut child = tokio::process::Command::from(util::mcpgw(dir.path()))
         .args(["daemon", "logs", "--follow"])
-        .env("MCPGW_NO_UPDATE_CHECK", "1")
-        .env("MCPGW_CONFIG", dir.path().join("config.toml"))
-        .env("MCPGW_STATE_DIR", dir.path().join("state"))
-        .env("HOME", dir.path())
-        .env("USERPROFILE", dir.path())
-        .env_remove("XDG_DATA_HOME")
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
