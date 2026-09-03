@@ -98,11 +98,27 @@ fn main() -> anyhow::Result<ExitCode> {
         command,
         Command::Serve(_) | Command::Connect(_) | Command::SelfUpdate(_)
     );
+    // The two commands a user runs *because* something is wrong. Suppressing
+    // the notice on their failing exit is how the person whose gateway will
+    // not answer — often because it is an old gateway — is the one person
+    // never told a newer mcpgw exists. They get the cached line only: a
+    // failed command is the wrong moment to spend a network round trip.
+    let notice_when_failed = matches!(
+        command,
+        Command::Doctor { .. }
+            | Command::Daemon(commands::daemon::DaemonArgs {
+                command: commands::daemon::DaemonCommand::Status { .. },
+            })
+    );
     let code = dispatch(command, color)?;
     // Only after a command that worked, and only once its own output is
     // out: a notice is a footnote, never the last word on a failure.
-    if notice && code == 0 {
-        update::notice::print_if_due(env!("CARGO_PKG_VERSION"));
+    if notice {
+        if code == 0 {
+            update::notice::print_if_due(env!("CARGO_PKG_VERSION"));
+        } else if notice_when_failed {
+            update::notice::print_cached(env!("CARGO_PKG_VERSION"));
+        }
     }
     Ok(ExitCode::from(code))
 }
