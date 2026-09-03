@@ -66,6 +66,16 @@ fn is_active() -> bool {
     String::from_utf8_lossy(&systemctl(&["is-active", UNIT]).stdout).trim() == "active"
 }
 
+/// The pid systemd has for the unit's own process, or 0 when it has none.
+/// The one thing that says a reinstall really replaced what was running: the
+/// unit file can name a new binary while the old process keeps serving.
+fn main_pid() -> u32 {
+    String::from_utf8_lossy(&systemctl(&["show", "-p", "MainPID", "--value", UNIT]).stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
 /// Polls `daemon status` until the gateway answers, returning its output.
 fn wait_until_up(state: &Path, url: &str) -> std::process::Output {
     let deadline = Instant::now() + UP_TIMEOUT;
@@ -173,6 +183,8 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
     let up = wait_until_up(state, &url);
     assert_eq!(up.status.code(), Some(0), "{}", stdout(&up));
 
+    reinstall_over_the_running_service(state, &unit, port, &url);
+
     // Uninstall: out of the manager, off the disk, off the port.
     let removed = daemon(state, &["uninstall"]);
     assert!(
@@ -192,4 +204,48 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
 
     // Uninstalling twice is the same end state, not an error.
     assert!(daemon(state, &["uninstall"]).status.success());
+}
+
+/// The #116 step, in a function of its own so the cycle above stays readable:
+/// a service that is running is reinstalled over rather than refused, and the
+/// gateway is back afterwards.
+fn reinstall_over_the_running_service(state: &Path, unit: &Path, port: u16, url: &str) {
+    let before = main_pid();
+    assert_ne!(before, 0, "nothing was running to reinstall over");
+
+    let again = daemon(state, &["install", "--port", &port.to_string()]);
+    let text = stdout(&again);
+    let errors = String::from_utf8_lossy(&again.stderr).into_owned();
+    assert!(again.status.success(), "reinstall failed: {errors}");
+    assert!(!errors.contains("already listens"), "{errors}");
+    assert!(
+        text.contains("stopping the running service to reinstall it"),
+        "{text}"
+    );
+    assert!(unit.exists(), "{}", unit.display());
+    assert!(is_active(), "the reinstalled unit is not active");
+
+    // A gateway that answers is not enough: it would answer just as happily
+    // out of the process the reinstall was supposed to replace.
+    let deadline = Instant::now() + UP_TIMEOUT;
+    let after = loop {
+        let pid = main_pid();
+        if (pid != 0 && pid != before) || Instant::now() > deadline {
+            break pid;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_ne!(after, 0, "the reinstalled unit has no main process");
+    assert_ne!(
+        after, before,
+        "the reinstall left the process from the old unit serving"
+    );
+
+    let up = wait_until_up(state, url);
+    let text = stdout(&up);
+    assert_eq!(up.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("installed under systemd --user, running"),
+        "{text}"
+    );
 }

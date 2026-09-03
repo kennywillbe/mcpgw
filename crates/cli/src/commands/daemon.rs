@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use mcpgw_core::daemon::{
-    DaemonError, DaemonSpec, GatewayReach, LogPaths, PROBE_TIMEOUT, ServiceManager as _,
-    ServiceStatus,
+    DaemonError, DaemonSpec, GatewayReach, LogPaths, PROBE_TIMEOUT, PortPolicy,
+    ServiceManager as _, ServiceStatus,
 };
 
 /// How often `logs --follow` looks for appended bytes. The same interval
@@ -155,9 +155,17 @@ pub fn run(args: &DaemonArgs) -> anyhow::Result<u8> {
 
 fn install(address: &AddressArgs) -> anyhow::Result<()> {
     let spec = spec(address, None)?;
-    mcpgw_core::daemon::preflight(&spec)?;
-    warn_about_protected_paths(&spec);
     let service = mcpgw_core::daemon::platform_service();
+    // Asked before the port check so that reinstalling over our own service
+    // — the whole of what changing how mcpgw is installed amounts to — is
+    // not refused as if a stranger held the port. A supervisor that cannot
+    // be queried at all decides nothing, and the refusal stands.
+    let policy = port_policy(service.query().ok().as_ref(), &spec)?;
+    mcpgw_core::daemon::preflight(&spec, policy)?;
+    if policy == PortPolicy::OwnServiceReinstall {
+        println!("{}", reinstall_notice(&spec.state_dir));
+    }
+    warn_about_protected_paths(&spec);
     let installed = service.install(&spec)?;
     // Recorded only once the supervisor has accepted the job, and never
     // fatally: the service exists either way, and the only thing a missing
@@ -230,7 +238,7 @@ fn start(address: &AddressArgs) -> anyhow::Result<()> {
     // An address the user did not name comes from the record, so a service
     // installed on 18137 comes back on 18137.
     let spec = spec(address, installed.as_ref())?;
-    mcpgw_core::daemon::preflight(&spec)?;
+    mcpgw_core::daemon::preflight(&spec, PortPolicy::MustBeFree)?;
     let service = mcpgw_core::daemon::platform_service();
     service.start(&spec)?;
     println!("started the mcpgw gateway service on {}", spec.url());
@@ -282,6 +290,45 @@ fn spec(address: &AddressArgs, installed: Option<&DaemonSpec>) -> anyhow::Result
             .unwrap_or(DEFAULT_PORT),
         logs,
     })
+}
+
+/// [`mcpgw_core::daemon::port_policy`] on a runtime built for it and torn
+/// down again — everything in `mcpgw daemon` outside `status` is
+/// synchronous, and one loopback probe does not justify colouring it.
+///
+/// Shared with the wizard's daemon step so both installers get the same
+/// answer to "is that our own service holding the port".
+///
+/// # Errors
+///
+/// Fails only when no runtime can be built to run the probe on.
+pub(crate) fn port_policy(
+    queried: Option<&ServiceStatus>,
+    spec: &DaemonSpec,
+) -> anyhow::Result<PortPolicy> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok(runtime.block_on(mcpgw_core::daemon::port_policy(queried, spec)))
+}
+
+/// The line printed before a reinstall replaces the service that is running.
+///
+/// No confirmation goes with it: the user asked for an install, and the only
+/// thing being taken away is a service of ours that this command is about to
+/// put back. The old binary is named because switching between a `cargo
+/// install` and a Homebrew mcpgw is what brings people here, and seeing the
+/// path they are leaving is how they know the reinstall was the point.
+pub(crate) fn reinstall_notice(state_dir: &Path) -> String {
+    match mcpgw_core::daemon::load_spec(state_dir) {
+        Some(recorded) => format!(
+            "stopping the running service to reinstall it (was: {})",
+            recorded.exe.display()
+        ),
+        // Nothing recorded: an install from before 0.3.1, which knew what it
+        // ran but never wrote it down.
+        None => "stopping the running service to reinstall it".to_owned(),
+    }
 }
 
 /// Warns when anything the service will execute sits in a folder macOS keeps
@@ -660,6 +707,39 @@ mod tests {
 
         // Where a real install puts it, and where nothing has to be said.
         assert!(protected_path_warnings(&spec(home.join(".cargo/bin/mcpgw")), home).is_empty());
+    }
+
+    /// Printed instead of a refusal when the port is held by the service
+    /// this install replaces. The old binary is the whole point of the line:
+    /// it is what tells someone who has just moved from `cargo install` to
+    /// Homebrew that the reinstall did what they came for.
+    #[test]
+    fn the_reinstall_notice_names_the_binary_the_service_was_installed_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        // Nothing recorded: pre-0.3.1, and there is no path to name.
+        assert_eq!(
+            reinstall_notice(&state),
+            "stopping the running service to reinstall it"
+        );
+
+        let exe = dir.path().join(".cargo/bin/mcpgw");
+        mcpgw_core::daemon::save_spec(&DaemonSpec {
+            exe: exe.clone(),
+            config_path: dir.path().join("config.toml"),
+            state_dir: state.clone(),
+            bind: "127.0.0.1".to_owned(),
+            port: 8137,
+            logs: LogPaths::under_state_dir(&state),
+        })
+        .unwrap();
+        assert_eq!(
+            reinstall_notice(&state),
+            format!(
+                "stopping the running service to reinstall it (was: {})",
+                exe.display()
+            )
+        );
     }
 
     #[test]

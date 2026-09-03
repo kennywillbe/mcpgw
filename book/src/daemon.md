@@ -101,8 +101,9 @@ your environment and reads config out of your home directory, so nothing
 about it wants root. Everything is `systemctl --user`, which means
 `systemctl --user status mcpgw.service` and `journalctl --user -u mcpgw` work
 on it exactly as you would expect. Install writes the unit, reloads the user
-manager and `enable --now`s it, so the gateway is up before the command
-returns and comes back at your next login.
+manager, enables it and restarts it, so the gateway is up before the command
+returns and comes back at your next login — and a reinstall over a running
+unit really does hand the port to the binary the new unit names.
 
 The unit is short and worth reading:
 
@@ -254,6 +255,30 @@ mean mcpgw asking for and storing your password, which it will not do. So:
 
 If that trade is wrong for you, `mcpgw serve` in a terminal is the same
 gateway with none of it.
+
+## After mcpgw itself moves
+
+The service definition names the binary it was installed from by absolute
+path, so changing how mcpgw is installed — `cargo install` to Homebrew, or
+back, or a manual download to either — leaves the service pointing at the old
+copy. Run `mcpgw daemon install` again and it is re-registered against the
+binary you are running now:
+
+```sh
+mcpgw daemon install
+```
+
+```text
+stopping the running service to reinstall it (was: ~/.cargo/bin/mcpgw)
+installed the mcpgw gateway service at ~/Library/LaunchAgents/io.mcpgw.gateway.plist
+```
+
+It reinstalls over the running service rather than refusing the port it is
+still holding, so there is no `mcpgw daemon stop` to remember first. The
+refusal is still there for anything that is *not* the installed service: a
+foreground `mcpgw serve` on the same port, or some other program, is left
+alone and named instead. The same command is how a moved config file or a
+changed `PATH` gets picked up.
 
 ## Status
 

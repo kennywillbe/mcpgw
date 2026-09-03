@@ -118,7 +118,7 @@ impl ServiceManager for Systemd {
     }
 }
 
-/// Writes the unit, reloads the user manager and enables it now.
+/// Writes the unit, reloads the user manager, enables it and starts it.
 ///
 /// # Errors
 ///
@@ -148,11 +148,13 @@ pub fn install_with(
     // its own cache of the unit directory, and a unit written this second is
     // not in it yet.
     check(run(exec, "systemctl", &["--user", "daemon-reload"])?)?;
-    check(run(
-        exec,
-        "systemctl",
-        &["--user", "enable", "--now", UNIT],
-    )?)?;
+    check(run(exec, "systemctl", &["--user", "enable", UNIT])?)?;
+    // `restart` rather than `enable --now`'s `start`, which does nothing to a
+    // unit that is already active: reinstalling over a running service is how
+    // it is pointed at an mcpgw that has moved, and a unit left running would
+    // keep executing the binary named by the definition this one replaced.
+    // Starting a stopped unit is what `restart` does anyway.
+    check(run(exec, "systemctl", &["--user", "restart", UNIT])?)?;
 
     Ok(Installed {
         unit_path: unit_path.to_owned(),

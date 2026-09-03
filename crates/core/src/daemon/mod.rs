@@ -276,6 +276,42 @@ pub fn is_loopback(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Who may be holding the address a service is about to be installed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PortPolicy {
+    /// Anything on the address is a conflict. What `start` asks for, and
+    /// what an install asks for until [`port_policy`] says otherwise.
+    #[default]
+    MustBeFree,
+    /// The listener is mcpgw's own installed service, and this install is
+    /// about to re-register it. A supervisor replacing its own job is not a
+    /// port conflict, and treating it as one is what turned "point the
+    /// service at a different mcpgw binary" into `stop` then `install`.
+    OwnServiceReinstall,
+}
+
+/// Whether a busy address is mcpgw's own running service rather than a
+/// conflict.
+///
+/// The one place that decision is made, for the same reason the port check
+/// itself lives here: `mcpgw daemon install` and the wizard's daemon step
+/// both ask it, and two spellings of it would be two different answers to
+/// "may I reinstall over myself".
+///
+/// Both halves are required. The supervisor alone cannot say whether the
+/// port is ours — it knows a job is running, not what that job bound — and a
+/// gateway answering alone cannot say the port is ours either, since a
+/// foreground `mcpgw serve` answers exactly the same way and would be killed
+/// out from under its owner by a service installed on top of it.
+pub async fn port_policy(queried: Option<&ServiceStatus>, spec: &DaemonSpec) -> PortPolicy {
+    let supervised = queried.is_some_and(|status| status.installed && status.running);
+    if supervised && probe_gateway(&spec.url(), PROBE_TIMEOUT).await.is_up() {
+        PortPolicy::OwnServiceReinstall
+    } else {
+        PortPolicy::MustBeFree
+    }
+}
+
 /// The checks that must pass before any platform is asked to install or
 /// start a service.
 ///
@@ -283,17 +319,22 @@ pub fn is_loopback(host: &str) -> bool {
 /// three supervisors enforce is not a security property, and the port
 /// message is the same sentence on every OS.
 ///
+/// The bind check is unconditional; `policy` only decides whether a busy
+/// port is a refusal, and it comes from [`port_policy`] rather than from a
+/// caller's own reading of the situation.
+///
 /// # Errors
 ///
 /// [`DaemonError::NonLoopbackBind`] for a bind address other people could
-/// reach, [`DaemonError::PortInUse`] when the port is already taken.
-pub fn preflight(spec: &DaemonSpec) -> Result<(), DaemonError> {
+/// reach, [`DaemonError::PortInUse`] when the port is already taken by
+/// something this install is not replacing.
+pub fn preflight(spec: &DaemonSpec, policy: PortPolicy) -> Result<(), DaemonError> {
     if !is_loopback(&spec.bind) {
         return Err(DaemonError::NonLoopbackBind {
             bind: spec.bind.clone(),
         });
     }
-    if port_in_use(&spec.bind, spec.port) {
+    if policy == PortPolicy::MustBeFree && port_in_use(&spec.bind, spec.port) {
         return Err(DaemonError::PortInUse {
             authority: spec.authority(),
         });
