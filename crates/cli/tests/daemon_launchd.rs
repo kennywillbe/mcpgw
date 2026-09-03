@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod util;
-use util::{daemon, fixture_config, install_on_a_free_port, stdout};
+use util::{daemon, fixture_binary, fixture_config, install_on_a_free_port, stdout};
 
 const LIVE_ENV: &str = "MCPGW_DAEMON_LIVE";
 
@@ -59,6 +59,44 @@ fn plist_path(home: &Path) -> PathBuf {
         .join(format!("{}.plist", mcpgw_core::daemon::launchd::LABEL))
 }
 
+/// The plist of the machine's own mcpgw service, if this session has a `HOME`
+/// at all.
+fn real_plist() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| plist_path(Path::new(&home)))
+}
+
+/// Refuses the cycle when the binaries it would install sit in a folder macOS
+/// keeps behind TCC.
+///
+/// A launch agent has no TCC grant and no window to ask for one, so a gateway
+/// launched from `~/Desktop` hangs in dyld before `main` (#105). What the
+/// cycle then reports is the first "gateway running" check timing out after
+/// twenty seconds with "nothing is listening" — true, and about the wrong
+/// thing. This runs before anything is installed so the failure a developer
+/// reads is the remedy instead.
+fn refuse_to_run_from_a_tcc_protected_dir() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    // Both, because the gateway the agent starts is the mcpgw binary and the
+    // servers it then spawns are the fixture; either one under TCC hangs.
+    for exe in [assert_cmd::cargo::cargo_bin("mcpgw"), fixture_binary()] {
+        if let Some(dir) = mcpgw_core::daemon::tcc_protected_dir(&exe, &home) {
+            panic!(
+                "{} is under ~/{dir}, which macOS keeps behind TCC: a launch \
+                 agent gets no grant there, so the gateway would hang in dyld \
+                 before main and this cycle would fail twenty seconds later \
+                 claiming nothing is listening. Build outside it and rerun, \
+                 e.g. CARGO_TARGET_DIR=~/.cache/mcpgw-target {}=1 cargo test \
+                 -p mcpgw --test daemon_launchd",
+                exe.display(),
+                LIVE_ENV,
+            );
+        }
+    }
+}
+
 /// Whether launchd currently holds the job.
 fn loaded() -> bool {
     std::process::Command::new("/bin/launchctl")
@@ -87,6 +125,13 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
         eprintln!("skipped: set {LIVE_ENV}=1 to bootstrap a real launch agent");
         return;
     }
+
+    refuse_to_run_from_a_tcc_protected_dir();
+
+    // Snapshotted before anything is installed: the developer running this may
+    // have mcpgw installed as a real service, and the end of the cycle has to
+    // be able to tell "left alone" from "absent".
+    let real_before = real_plist().map(|path| std::fs::read(&path).ok());
 
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
@@ -192,14 +237,32 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
     assert_eq!(gone.status.code(), Some(1), "{text}");
     assert!(text.contains("service   not installed"), "{text}");
 
-    // The real LaunchAgents directory was never a party to any of this.
-    if let Some(real_home) = std::env::var_os("HOME") {
-        let real = plist_path(Path::new(&real_home));
-        assert!(!real.exists(), "{} was written", real.display());
+    // The real LaunchAgents directory was never a party to any of this: the
+    // plist there is byte for byte what it was before, whether that is a
+    // service the developer installed themselves or no file at all. Asserting
+    // it is absent would fail on every machine that has mcpgw installed.
+    if let (Some(path), Some(before)) = (real_plist(), real_before) {
+        let after = std::fs::read(&path).ok();
+        assert!(
+            after == before,
+            "{} changed: it was {} and is now {}",
+            path.display(),
+            describe(before.as_deref()),
+            describe(after.as_deref()),
+        );
     }
 
     // Uninstalling twice is the same end state, not an error.
     assert!(daemon(home, &["uninstall"]).status.success());
+}
+
+/// A plist snapshot in words, for the one assertion that compares two of them
+/// and must not print either as a wall of bytes.
+fn describe(bytes: Option<&[u8]>) -> String {
+    match bytes {
+        None => "absent".to_owned(),
+        Some(bytes) => format!("{} bytes", bytes.len()),
+    }
 }
 
 /// The #116 step, in a function of its own so the cycle above stays readable:
