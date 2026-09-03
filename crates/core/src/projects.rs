@@ -51,11 +51,16 @@ pub enum Standing {
 
 impl ProjectConfig {
     /// The scope this file's bookkeeping lives under.
+    ///
+    /// The path is normalised here rather than left as discovered, so that a
+    /// scope compares equal to the one [`ManagedState::project_scopes`]
+    /// rebuilds out of a state key, and so that the `@path` an origin key
+    /// carries reads back to the same file it was written from.
     #[must_use]
     pub fn scope(&self) -> Scope {
         Scope::Project {
             kind: self.kind,
-            path: self.path.clone(),
+            path: crate::paths::normalize(&self.path),
         }
     }
 
@@ -204,12 +209,11 @@ pub fn discover_cwd() -> Vec<ProjectConfig> {
         .unwrap_or_default()
 }
 
-/// Whether two paths name one file. Resolved rather than compared as text:
-/// a temp dir reached through `/var` and through `/private/var` is one
-/// directory, and on that machine every home path is spelled both ways.
+/// Whether two paths name one file. Compared through the same normalisation
+/// the state keys use, so "is this the client's per-user file?" is answered
+/// the way "have I written to this file?" is.
 fn same_file(a: &Path, b: &Path) -> bool {
-    let resolve = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    a == b || resolve(a) == resolve(b)
+    a == b || crate::paths::normalize(a) == crate::paths::normalize(b)
 }
 
 /// A file that will not parse becomes one file-level problem rather than an

@@ -180,14 +180,26 @@ impl Scope {
         match self {
             Self::Home(kind) => kind.id().to_owned(),
             Self::Project { kind, path } => {
-                format!("{}-{:016x}", kind.id(), path_hash(path))
+                // Over the same normalised key the record lives under, so a
+                // file addressed two ways keeps one backup stack rather than
+                // two `sync --rollback` would restore out of turn.
+                format!("{}-{:016x}", kind.id(), path_hash(&Self::file_key(path)))
             }
         }
     }
 
     /// The key this scope's [`FileRecord`] lives under.
+    ///
+    /// Normalised, never the path as carried: the same file arrives under
+    /// the spelling the process's working directory has, the spelling a
+    /// user typed, and on Windows the verbatim `\\?\C:\...` one
+    /// `canonicalize` returns. Two spellings would be two records, and the
+    /// entries `sync --project` wrote through one would read back unmanaged
+    /// through the other. A key a 0.5 dev build wrote under some other
+    /// spelling is not read back, which is the whole of the compatibility
+    /// story: no released version has ever written this map.
     fn file_key(path: &Path) -> String {
-        path.to_string_lossy().into_owned()
+        crate::paths::normalize(path).to_string_lossy().into_owned()
     }
 
     /// The id an import source carries so that adopting its entries writes
@@ -298,12 +310,12 @@ impl Scope {
     }
 }
 
-/// FNV-1a over the path's bytes: short, stable across runs and platforms,
+/// FNV-1a over the key's bytes: short, stable across runs and platforms,
 /// and never used for anything but naming a directory — two paths colliding
 /// would share a backup stack, not lose a file.
-fn path_hash(path: &Path) -> u64 {
+fn path_hash(key: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in path.to_string_lossy().as_bytes() {
+    for byte in key.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
