@@ -2,6 +2,14 @@
 //! keeps this decoupled from the gateway — there is no socket to connect to,
 //! watching works on a gateway started before it, and the same loop replays
 //! history it finds in today's file before following new lines.
+//!
+//! `--tui` draws the same records as three panes instead of a line stream.
+//! It reads through the same [`Follow`], so there is one piece of tailing
+//! logic in the tool and the two views cannot disagree about what arrived,
+//! what a rollover is, or how often to look.
+
+mod state;
+mod tui;
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
@@ -41,6 +49,10 @@ pub struct WatchArgs {
     /// Stream the JSONL lines instead of the rendered stream
     #[arg(long)]
     pub json: bool,
+    /// Open the full-screen terminal UI instead of the line stream: a live
+    /// per-server table, a scrolling call log and a detail pane
+    #[arg(long, conflicts_with = "json")]
+    pub tui: bool,
     /// Print captured arguments and responses instead of masking them. Only
     /// changes anything for lines a gateway captured with
     /// `--capture-bodies full`
@@ -52,23 +64,20 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
     let state_dir = mcpgw_core::paths::state_dir()
         .context("cannot determine a home directory to resolve the state directory")?;
     let dir = state_dir.join(mcpgw_core::capture::TRAFFIC_DIR);
+    if args.tui {
+        return tui::run(args, dir);
+    }
     if !args.json {
         println!("watching {} (Ctrl-C to stop)", dir.display());
     }
 
     let filters = Filters::new(args);
-    let mut tail = Tail::new(daily_path(&dir, now_millis()));
+    let mut follow = Follow::new(dir);
     // Said at most once per run: a stream full of redacted lines would
     // otherwise repeat it for every one of them.
     let mut said_nothing_to_reveal = false;
     loop {
-        // Re-resolved every round: at midnight the gateway starts a new file
-        // and the tail follows it without needing to be restarted.
-        let path = daily_path(&dir, now_millis());
-        if path != tail.path {
-            tail = Tail::new(path);
-        }
-        for line in poll_or_report(&mut tail) {
+        for line in poll_or_report(&mut follow) {
             let Ok(record) = serde_json::from_str::<CaptureRecord>(&line) else {
                 // A line the current build cannot parse (older or newer
                 // format) is skipped rather than ending the stream.
@@ -99,13 +108,43 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
 /// propagated: a watch is meant to be left running all day, and a single
 /// EACCES or a stat caught mid-rotation must not end it. The next poll is
 /// 500ms away, so retrying costs nothing and only Ctrl-C stops the stream.
-fn poll_or_report(tail: &mut Tail) -> Vec<String> {
-    match tail.poll() {
+fn poll_or_report(follow: &mut Follow) -> Vec<String> {
+    match follow.poll() {
         Ok(lines) => lines,
         Err(err) => {
             eprintln!("watch: {err:#} — retrying");
             Vec::new()
         }
+    }
+}
+
+/// Follows the traffic directory: today's file, and tomorrow's when the day
+/// turns over.
+///
+/// The one place either view of `watch` reads from. A second tailing loop for
+/// the TUI is exactly the kind of duplicate that ends with the two views
+/// disagreeing about what a rollover is — and about whether a line arrived at
+/// all, since two readers of the same file each keep their own offset.
+struct Follow {
+    dir: PathBuf,
+    tail: Tail,
+}
+
+impl Follow {
+    fn new(dir: PathBuf) -> Self {
+        let tail = Tail::new(daily_path(&dir, now_millis()));
+        Self { dir, tail }
+    }
+
+    /// Complete lines appended since the last poll, following the file the
+    /// gateway is writing to *now*: at midnight it starts a new one and the
+    /// tail moves across without needing to be restarted.
+    fn poll(&mut self) -> anyhow::Result<Vec<String>> {
+        let path = daily_path(&self.dir, now_millis());
+        if path != self.tail.path {
+            self.tail = Tail::new(path);
+        }
+        self.tail.poll()
     }
 }
 
@@ -428,6 +467,7 @@ mod tests {
             endpoint: Some("/s/github".to_owned()),
             session: None,
             json: false,
+            tui: false,
             show_secrets: false,
         };
         assert!(Filters::new(&args).matches(&call().with_endpoint("s/github")));
@@ -542,15 +582,46 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A directory where a file is expected fails to read on every
         // platform, which is the shape of any transient I/O error here.
-        let blocked = dir.path().join("2026-01-01.jsonl");
+        let blocked = daily_path(dir.path(), now_millis());
         std::fs::create_dir(&blocked).unwrap();
-        let mut tail = Tail::new(blocked.clone());
-        assert!(poll_or_report(&mut tail).is_empty());
+        let mut follow = Follow::new(dir.path().to_path_buf());
+        assert!(poll_or_report(&mut follow).is_empty());
 
-        // The same tail recovers once the path is readable again.
+        // The same follow recovers once the path is readable again.
         std::fs::remove_dir(&blocked).unwrap();
         std::fs::write(&blocked, "one\n").unwrap();
-        assert_eq!(poll_or_report(&mut tail), ["one"]);
+        assert_eq!(poll_or_report(&mut follow), ["one"]);
+    }
+
+    #[test]
+    fn a_follow_reads_the_file_for_today() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = daily_path(dir.path(), now_millis());
+        std::fs::write(&today, "one\n").unwrap();
+        let mut follow = Follow::new(dir.path().to_path_buf());
+        assert_eq!(follow.poll().unwrap(), ["one"]);
+        assert!(follow.poll().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_rollover_moves_the_follow_to_the_new_day() {
+        let dir = tempfile::tempdir().unwrap();
+        // A follow left over from yesterday: the offset it holds belongs to a
+        // file nobody is writing to any more.
+        let yesterday = daily_path(dir.path(), now_millis() - 86_400_000);
+        std::fs::write(&yesterday, "old\n").unwrap();
+        let mut follow = Follow {
+            dir: dir.path().to_path_buf(),
+            tail: Tail::new(yesterday),
+        };
+
+        let today = daily_path(dir.path(), now_millis());
+        std::fs::write(&today, "new\n").unwrap();
+        assert_eq!(follow.poll().unwrap(), ["new"]);
+        assert_eq!(follow.tail.path, today);
+        // …and the new day is followed from its own offset, not yesterday's.
+        std::fs::write(&today, "new\nnewer\n").unwrap();
+        assert_eq!(follow.poll().unwrap(), ["newer"]);
     }
 
     #[test]

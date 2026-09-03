@@ -24,6 +24,8 @@ self-replace.workspace = true
 sha2.workspace = true
 flate2.workspace = true
 tar.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 zip.workspace = true
