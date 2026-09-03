@@ -64,27 +64,10 @@ async fn status_names_a_running_foreground_gateway_with_no_service_installed() {
     child.kill().await.unwrap();
 }
 
-/// Writes the record `daemon install` leaves behind, without installing a
-/// service: a live install would register a launch agent on whatever machine
-/// ran the suite, and the behaviour under test is entirely about what
-/// `status` and `start` read back out of it.
+/// The record `daemon install` leaves behind, naming a binary these tests do
+/// not care about. See [`util::record_installed_spec`].
 fn record_installed_spec(home: &Path, bind: &str, port: u16) {
-    let state = home.join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let path = |name: &str| state.join(name).display().to_string();
-    std::fs::write(
-        state.join("daemon.json"),
-        format!(
-            r#"{{"exe":"/usr/local/bin/mcpgw","config_path":{:?},"state_dir":{:?},
-                 "bind":"{bind}","port":{port},
-                 "logs":{{"stdout":{:?},"stderr":{:?}}}}}"#,
-            home.join("config.toml").display().to_string(),
-            state.display().to_string(),
-            path("logs/daemon.out.log"),
-            path("logs/daemon.err.log"),
-        ),
-    )
-    .unwrap();
+    util::record_installed_spec(home, Path::new("/usr/local/bin/mcpgw"), bind, port);
 }
 
 /// The bug in #104: a service installed on `--port 18137` was reported as a
@@ -114,6 +97,54 @@ async fn status_probes_the_address_the_service_was_installed_with() {
     assert_eq!(output.status.code(), Some(0), "{text}");
 
     child.kill().await.unwrap();
+}
+
+/// The state a `cargo uninstall` followed by a Homebrew install leaves
+/// behind: the service definition names a binary that is no longer on disk,
+/// and until now nothing said so.
+#[test]
+fn status_names_a_service_installed_from_a_binary_that_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("cargo").join("bin").join("mcpgw");
+    util::record_installed_spec(dir.path(), &gone, "127.0.0.1", free_port());
+
+    let output = daemon(dir.path(), &["status"]);
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!("service   installed from {}", gone.display())),
+        "{text}"
+    );
+    assert!(text.contains("which is gone"), "{text}");
+    assert!(
+        text.contains("run `mcpgw daemon install` to point it at"),
+        "{text}"
+    );
+    // The report is a report: it says nothing about whether a gateway
+    // answered, and the exit code still only tracks that.
+    assert_eq!(output.status.code(), Some(1), "{text}");
+}
+
+/// Two mcpgw binaries on one machine — the service running one while every
+/// upgrade lands on the other. The fixture server stands in for the second
+/// binary: what matters is that it exists and is not the mcpgw being run.
+#[test]
+fn status_names_a_service_running_a_different_binary_than_you_are() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = util::fixture_binary();
+    util::record_installed_spec(dir.path(), &other, "127.0.0.1", free_port());
+
+    let output = daemon(dir.path(), &["status"]);
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!("service   runs {}", other.display())),
+        "{text}"
+    );
+    assert!(text.contains("you are running"), "{text}");
+    assert!(
+        text.contains("run `mcpgw daemon install` to switch it"),
+        "{text}"
+    );
+    assert_eq!(output.status.code(), Some(1), "{text}");
 }
 
 /// Every install made before 0.3.1, and every machine with no service at

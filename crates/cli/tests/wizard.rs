@@ -149,6 +149,11 @@ async fn an_already_finished_machine_gets_the_status_card() {
         r#"{"clients":{"cursor":["fx1"]}}"#,
     )
     .unwrap();
+    // A service installed from an mcpgw that has since been uninstalled: the
+    // machine really is set up, so the card still says so and only adds the
+    // one line about what the service is pointed at.
+    let gone = dir.path().join("cargo").join("bin").join("mcpgw");
+    util::record_installed_spec(dir.path(), &gone, "127.0.0.1", 18137);
 
     // Port 0 and the banner rather than a number of our own: a fixed port
     // is a race against every other test in the suite (#54, #83).
@@ -177,6 +182,8 @@ async fn an_already_finished_machine_gets_the_status_card() {
     // One per-server endpoint plus the aggregate.
     assert!(stdout.contains("2 endpoints"), "{stdout}");
     assert!(stdout.contains("Cursor"), "{stdout}");
+    assert!(stdout.contains("which is gone"), "{stdout}");
+    assert!(stdout.contains("mcpgw daemon install"), "{stdout}");
     for suggestion in ["mcpgw list", "mcpgw watch", "mcpgw doctor --probe"] {
         assert!(stdout.contains(suggestion), "{stdout}");
     }

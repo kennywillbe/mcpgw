@@ -451,6 +451,17 @@ fn status(url: Option<&str>) -> anyhow::Result<u8> {
 
     println!("gateway   {}", describe_reach(reach, url));
     println!("service   {}", describe_service(service.name(), &queried));
+    // A service still aimed at a binary that moved keeps working, which is
+    // exactly why nobody notices: the supervisor reports a healthy job while
+    // every upgrade lands on the copy it is not running.
+    if let Some(advice) = recorded
+        .as_ref()
+        .and_then(mcpgw_core::daemon_check::service_exe)
+        .as_ref()
+        .and_then(mcpgw_core::daemon_check::ServiceExe::advice)
+    {
+        println!("service   {advice}");
+    }
 
     let logs = LogPaths::under_state_dir(&state_dir);
     println!("logs      {}", describe_log(&logs.stdout));
