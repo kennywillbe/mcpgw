@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod util;
-use util::fixture_binary;
+use util::{daemon, fixture_config, install_on_a_free_port, stdout};
 
 const LIVE_ENV: &str = "MCPGW_DAEMON_LIVE";
 
@@ -26,24 +26,6 @@ const LIVE_ENV: &str = "MCPGW_DAEMON_LIVE";
 /// a cold process start, and a flaky "not yet" here would read as a broken
 /// installer.
 const UP_TIMEOUT: Duration = Duration::from_secs(20);
-
-fn daemon(home: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
-        .arg("daemon")
-        .args(args)
-        .env("MCPGW_NO_UPDATE_CHECK", "1")
-        .env("MCPGW_CONFIG", home.join("config.toml"))
-        .env("MCPGW_STATE_DIR", home.join("state"))
-        .env("HOME", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_DATA_HOME")
-        .output()
-        .unwrap()
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
 
 /// Boots the label out of the domain and deletes the plist whatever happened,
 /// so a failed assertion cannot leave a supervised gateway running.
@@ -87,13 +69,6 @@ fn loaded() -> bool {
         .success()
 }
 
-/// A port that was free a moment ago, and deliberately not 8137: a developer
-/// running this very likely has a foreground gateway on the default port.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 /// Polls `daemon status` until the gateway answers, returning its output.
 fn wait_until_up(home: &Path, url: &str) -> std::process::Output {
     let deadline = Instant::now() + UP_TIMEOUT;
@@ -118,22 +93,15 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
     let _cleanup = LeaveNothingBehind {
         home: home.to_owned(),
     };
-    std::fs::write(
-        home.join("config.toml"),
-        format!(
-            "version = 1\n\n[servers.fx1]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\n",
-            fixture_binary().display()
-        ),
-    )
-    .unwrap();
+    std::fs::write(home.join("config.toml"), fixture_config(&["fx1"])).unwrap();
 
-    let port = free_port();
-    let url = format!("http://127.0.0.1:{port}/mcp");
     let plist = plist_path(home);
 
     // Install: the plist lands, launchd takes the job, and the user is told
     // about the notification macOS is about to show them.
-    let installed = daemon(home, &["install", "--port", &port.to_string()]);
+    let (port, installed) =
+        install_on_a_free_port(|port| daemon(home, &["install", "--port", &port.to_string()]));
+    let url = format!("http://127.0.0.1:{port}/mcp");
     let text = stdout(&installed);
     assert!(
         installed.status.success(),

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod util;
-use util::fixture_binary;
+use util::{fixture_config, install_on_a_free_port, stdout};
 
 use mcpgw_core::daemon::systemd::UNIT;
 
@@ -33,18 +33,7 @@ const UP_TIMEOUT: Duration = Duration::from_secs(20);
 /// `HOME` is deliberately left alone — see the module docs — so only the
 /// config and state directory are redirected into the temp directory.
 fn daemon(state: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
-        .arg("daemon")
-        .args(args)
-        .env("MCPGW_NO_UPDATE_CHECK", "1")
-        .env("MCPGW_CONFIG", state.join("config.toml"))
-        .env("MCPGW_STATE_DIR", state.join("state"))
-        .output()
-        .unwrap()
-}
-
-fn stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    util::daemon_keeping_the_real_home(state, args)
 }
 
 fn systemctl(args: &[&str]) -> std::process::Output {
@@ -77,13 +66,6 @@ fn is_active() -> bool {
     String::from_utf8_lossy(&systemctl(&["is-active", UNIT]).stdout).trim() == "active"
 }
 
-/// A port that was free a moment ago, and deliberately not 8137: a developer
-/// running this very likely has a foreground gateway on the default port.
-fn free_port() -> u16 {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    listener.local_addr().unwrap().port()
-}
-
 /// Polls `daemon status` until the gateway answers, returning its output.
 fn wait_until_up(state: &Path, url: &str) -> std::process::Output {
     let deadline = Instant::now() + UP_TIMEOUT;
@@ -106,22 +88,15 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path();
     let _cleanup = LeaveNothingBehind;
-    std::fs::write(
-        state.join("config.toml"),
-        format!(
-            "version = 1\n\n[servers.fx1]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\n",
-            fixture_binary().display()
-        ),
-    )
-    .unwrap();
+    std::fs::write(state.join("config.toml"), fixture_config(&["fx1"])).unwrap();
 
-    let port = free_port();
-    let url = format!("http://127.0.0.1:{port}/mcp");
     let unit = unit_path().expect("no HOME to resolve the unit path from");
 
     // Install: the unit lands where systemctl reads it, and the user is told
     // whether it will survive their logout.
-    let installed = daemon(state, &["install", "--port", &port.to_string()]);
+    let (port, installed) =
+        install_on_a_free_port(|port| daemon(state, &["install", "--port", &port.to_string()]));
+    let url = format!("http://127.0.0.1:{port}/mcp");
     let text = stdout(&installed);
     assert!(
         installed.status.success(),
