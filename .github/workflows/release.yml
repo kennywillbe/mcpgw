@@ -4,7 +4,7 @@ name: Release
 # PR merges, though a hand-pushed tag works too. This builds one archive per
 # target, hashes it, and attaches everything to the GitHub Release, creating
 # that release only if release-please has not already. Deliberately
-# hand-rolled instead of generated: four targets and a `gh` invocation are
+# hand-rolled instead of generated: five targets and a `gh` invocation are
 # easier to read than a generator's output.
 
 on:
@@ -28,6 +28,15 @@ jobs:
             os: macos-latest
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # Built on a native arm64 runner rather than cross-compiled: the
+          # TLS stack pulls in C build scripts (aws-lc-sys, ring) that want a
+          # working cross toolchain and sysroot, and `cross`/`zigbuild` would
+          # add a container or a second linker to keep working for a target
+          # GitHub hands us a real machine for. arm64 standard runners are
+          # free on public repositories:
+          # https://github.blog/changelog/2025-08-07-arm64-hosted-runners-for-public-repositories-are-now-generally-available/
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:

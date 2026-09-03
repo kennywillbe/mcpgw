@@ -30,6 +30,10 @@ class Mcpgw < Formula
       url "https://github.com/kennywillbe/mcpgw/releases/download/v#{version}/mcpgw-#{version}-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "0000000000000000000000000000000000000000000000000000000000000000"
     end
+    on_arm do
+      url "https://github.com/kennywillbe/mcpgw/releases/download/v#{version}/mcpgw-#{version}-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    end
   end
 
   def install

@@ -34,6 +34,7 @@ targets=(
   aarch64-apple-darwin
   x86_64-apple-darwin
   x86_64-unknown-linux-gnu
+  aarch64-unknown-linux-gnu
 )
 
 # digest <target> — the sha256 of mcpgw-<version>-<target>.tar.gz.

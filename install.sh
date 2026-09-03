@@ -26,7 +26,6 @@ case "$(uname -m)" in
 esac
 
 target="$arch-$os"
-[ "$target" = "aarch64-unknown-linux-gnu" ] && fail "no linux arm64 build yet; use \`cargo install mcpgw\`"
 
 if [ "$VERSION" = latest ]; then
     base="https://github.com/$REPO/releases/latest/download"

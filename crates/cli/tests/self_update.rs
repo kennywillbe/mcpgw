@@ -27,10 +27,11 @@ mod util;
 const TARGET: &str = env!("MCPGW_TARGET");
 
 #[cfg(unix)]
-const SHIPPED_TARGETS: [&str; 4] = [
+const SHIPPED_TARGETS: [&str; 5] = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
 ];
 
