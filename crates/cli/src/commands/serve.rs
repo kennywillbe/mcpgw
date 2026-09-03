@@ -6,6 +6,7 @@ use mcpgw_core::capture::CaptureWriter;
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{Gateway, ServerList, serve_http_with};
 use mcpgw_core::reload::{POLL_INTERVAL, Reloader};
+use mcpgw_core::runtime::GatewayRecord;
 use mcpgw_core::upstream::UpstreamManager;
 
 #[derive(clap::Args)]
@@ -102,6 +103,10 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             .await
             .with_context(|| format!("cannot bind {}:{}", args.bind, args.port))?;
         let addr = listener.local_addr()?;
+        // Published only once the listener is bound, so `--port 0` records
+        // the port the kernel actually handed out rather than the zero it
+        // asked for.
+        let state_dir = publish_record(&args.bind, addr.port());
         let shape = if pipe {
             format!("piping {:?}", serving.join(", "))
         } else {
@@ -145,11 +150,57 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         // the watcher must not outlive the gateway it reloads.
         stop.notify_one();
         let _ = watcher.await;
+        // Withdrawn before the error is propagated: this gateway is gone
+        // either way, and a record left behind by a bind that died under us
+        // is exactly the stale one readers should not have to reason about.
+        if let Some(dir) = &state_dir {
+            mcpgw_core::runtime::remove_record(dir, addr.port());
+        }
         served?;
         // Ctrl-C fell through the graceful shutdown: kill the children too.
         manager.shutdown().await;
         Ok(())
     })
+}
+
+/// Publishes what this gateway is, returning the state directory it went
+/// into so the shutdown path can withdraw it again.
+///
+/// A state directory that cannot be written costs a later `status` its
+/// version comparison; it is not worth costing the user their gateway, so
+/// the failure is said once and serving continues.
+fn publish_record(bind: &str, port: u16) -> Option<std::path::PathBuf> {
+    let dir = mcpgw_core::paths::state_dir()?;
+    if let Err(err) = mcpgw_core::runtime::write_record(&dir, &runtime_record(bind, port)) {
+        eprintln!(
+            "warning: could not record what this gateway is running: {:#}",
+            anyhow::Error::from(err)
+        );
+    }
+    Some(dir)
+}
+
+/// What this process publishes about itself while it is serving.
+fn runtime_record(bind: &str, port: u16) -> GatewayRecord {
+    // Canonicalized so that "is the binary on disk still the one running?"
+    // compares two real paths rather than a symlink against its target. The
+    // raw path is kept when it cannot be: on unix the running image may
+    // already have been replaced or unlinked, and a path that no longer
+    // resolves is still better evidence than none.
+    let exe = std::env::current_exe().unwrap_or_default();
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    GatewayRecord {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        pid: std::process::id(),
+        exe,
+        bind: bind.to_owned(),
+        port,
+        // A clock behind the epoch is not worth a failure path; the field is
+        // only ever used to say how long the gateway has been up.
+        started_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs()),
+    }
 }
 
 /// The servers to serve at startup, refusing the mistakes worth refusing.

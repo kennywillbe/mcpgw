@@ -72,6 +72,15 @@ pub enum Error {
         #[source]
         source: Box<serde_json::Error>,
     },
+
+    // Separate from `StateParse` because the advice differs: this file is
+    // rewritten by the next gateway start, so deleting it costs nothing.
+    #[error("invalid gateway record {path} (delete it; the gateway rewrites it at startup)")]
+    RecordParse {
+        path: PathBuf,
+        #[source]
+        source: Box<serde_json::Error>,
+    },
 }
 
 fn known(available: &[String]) -> String {
