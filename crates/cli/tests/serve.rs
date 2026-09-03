@@ -220,38 +220,6 @@ async fn a_clean_shutdown_withdraws_the_record() {
     );
 }
 
-/// A copy of the binary under test, outside the target directory.
-///
-/// The two tests below replace the file they run, and the file cargo built
-/// is the one every other test in the run is about to execute. Unix only,
-/// for the same reason those two are.
-#[cfg(unix)]
-fn binary_copy(dir: &Path) -> std::path::PathBuf {
-    let copy = dir.join(format!("mcpgw{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(assert_cmd::cargo::cargo_bin("mcpgw"), &copy).unwrap();
-    copy
-}
-
-/// Publishes a new binary at `path` the way every real upgrade does: the
-/// bytes go to a sibling file and that file is renamed over the target.
-///
-/// Not a write in place, for two reasons. Linux refuses one against an image
-/// that is executing (`ETXTBSY`), which is exactly the situation the tests
-/// below set up; and a rename is what cargo, Homebrew and `self_replace` all
-/// do, so the signal under test is the real one — a new inode at the same
-/// path, whole from the first tick that sees it.
-fn replace_binary(path: &Path) {
-    let mut bytes = std::fs::read(path).unwrap();
-    bytes.extend_from_slice(b"an upgrade");
-    let published = path.with_extension("new");
-    std::fs::write(&published, bytes).unwrap();
-    // Carried over so the replacement is a plausible binary rather than a
-    // 0644 file wearing its name.
-    let mode = std::fs::metadata(path).unwrap().permissions();
-    std::fs::set_permissions(&published, mode).unwrap();
-    std::fs::rename(&published, path).unwrap();
-}
-
 /// Waits for `needle` to show up on the gateway's stderr.
 ///
 /// The line the exe watcher prints when it starts is the only signal that it
@@ -298,7 +266,7 @@ async fn wait_for_exit(
 #[tokio::test]
 async fn a_supervised_gateway_stands_aside_when_its_binary_is_replaced() {
     let dir = tempfile::tempdir().unwrap();
-    let copy = binary_copy(dir.path());
+    let copy = util::binary_copy(dir.path());
     let state = dir.path().join("state");
     write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
     let (mut child, addr, _, errors) =
@@ -307,7 +275,7 @@ async fn a_supervised_gateway_stands_aside_when_its_binary_is_replaced() {
     wait_for_record(&state, port).await;
     wait_for_stderr(&errors, "watching").await;
 
-    replace_binary(&copy);
+    util::replace_binary(&copy);
 
     assert_eq!(
         wait_for_exit(&mut child, &errors).await,
@@ -337,11 +305,11 @@ async fn a_supervised_gateway_stands_aside_when_its_binary_is_replaced() {
 #[tokio::test]
 async fn a_gateway_without_the_flag_serves_straight_through_a_replacement() {
     let dir = tempfile::tempdir().unwrap();
-    let copy = binary_copy(dir.path());
+    let copy = util::binary_copy(dir.path());
     write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
     let (mut child, addr, _, _errors) = util::serve_binary(&copy, dir.path(), &[]).await;
 
-    replace_binary(&copy);
+    util::replace_binary(&copy);
     // The one fixed wait in this file, because the assertion is that nothing
     // happens: there is no event to poll for, and a gateway that was going
     // to react to the new binary would have done it within three polls.
@@ -391,7 +359,7 @@ async fn a_supervised_gateway_watches_the_binary_its_service_was_installed_with(
     .await;
     wait_for_stderr(&errors, &installed.display().to_string()).await;
 
-    replace_binary(&installed);
+    util::replace_binary(&installed);
 
     assert_eq!(
         wait_for_exit(&mut child, &errors).await,

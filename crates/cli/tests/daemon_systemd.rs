@@ -30,10 +30,21 @@ const LIVE_ENV: &str = "MCPGW_DAEMON_LIVE";
 /// installer.
 const UP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the gateway gets to come back out of a binary that replaced the
+/// one it was started from. Much longer than a start: the watcher needs two
+/// polls to be sure the new file stopped moving, the outgoing gateway then
+/// drains for up to five seconds, and only after `RestartSec=2` does systemd
+/// run the replacement.
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// `HOME` is deliberately left alone — see the module docs — so only the
 /// config and state directory are redirected into the temp directory.
-fn daemon(state: &Path, args: &[&str]) -> std::process::Output {
-    util::daemon_keeping_the_real_home(state, args)
+///
+/// The mcpgw run is a copy rather than the binary cargo built, because the
+/// upgrade step replaces the file the unit was installed from — and that
+/// must not be the file the rest of the run is about to execute.
+fn daemon(mcpgw: &Path, state: &Path, args: &[&str]) -> std::process::Output {
+    util::run_daemon(util::mcpgw_binary_keeping_the_real_home(mcpgw, state), args)
 }
 
 fn systemctl(args: &[&str]) -> std::process::Output {
@@ -77,10 +88,10 @@ fn main_pid() -> u32 {
 }
 
 /// Polls `daemon status` until the gateway answers, returning its output.
-fn wait_until_up(state: &Path, url: &str) -> std::process::Output {
+fn wait_until_up(mcpgw: &Path, state: &Path, url: &str) -> std::process::Output {
     let deadline = Instant::now() + UP_TIMEOUT;
     loop {
-        let output = daemon(state, &["status", "--url", url]);
+        let output = daemon(mcpgw, state, &["status", "--url", url]);
         if output.status.code() == Some(0) || Instant::now() > deadline {
             return output;
         }
@@ -97,6 +108,9 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
 
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path();
+    // The unit is installed from this copy and not from the binary cargo
+    // built, so the upgrade step below has something it may replace.
+    let mcpgw = &util::binary_copy(&state.join("bin"));
     let _cleanup = LeaveNothingBehind;
     std::fs::write(state.join("config.toml"), fixture_config(&["fx1"])).unwrap();
 
@@ -104,8 +118,9 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
 
     // Install: the unit lands where systemctl reads it, and the user is told
     // whether it will survive their logout.
-    let (port, installed) =
-        install_on_a_free_port(|port| daemon(state, &["install", "--port", &port.to_string()]));
+    let (port, installed) = install_on_a_free_port(|port| {
+        daemon(mcpgw, state, &["install", "--port", &port.to_string()])
+    });
     let url = format!("http://127.0.0.1:{port}/mcp");
     let text = stdout(&installed);
     assert!(
@@ -133,7 +148,7 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
 
     // Running: the gateway answers on the port it was installed for, and
     // `status` says the service and the gateway are the same thing.
-    let up = wait_until_up(state, &url);
+    let up = wait_until_up(mcpgw, state, &url);
     let text = stdout(&up);
     assert_eq!(up.status.code(), Some(0), "{text}");
     assert!(text.contains("gateway   running"), "{text}");
@@ -141,7 +156,7 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
 
     // The bug this cycle exists to catch: a bare `status`, with no --url,
     // has to probe the port the service was installed with.
-    let bare = daemon(state, &["status"]);
+    let bare = daemon(mcpgw, state, &["status"]);
     let text = stdout(&bare);
     assert_eq!(bare.status.code(), Some(0), "{text}");
     assert!(text.contains(&url), "{text}");
@@ -153,7 +168,7 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
 
     // Stop: `Restart=on-failure` restarts a crash, so the proof that stop is
     // not a crash is that the gateway is still down a moment later.
-    let stopped = daemon(state, &["stop"]);
+    let stopped = daemon(mcpgw, state, &["stop"]);
     assert!(
         stopped.status.success(),
         "stop failed: {}",
@@ -161,7 +176,7 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
     );
     std::thread::sleep(Duration::from_secs(3));
     assert!(!is_active(), "systemd restarted the gateway after a stop");
-    let down = daemon(state, &["status", "--url", &url]);
+    let down = daemon(mcpgw, state, &["status", "--url", &url]);
     let text = stdout(&down);
     assert_eq!(down.status.code(), Some(1), "{text}");
     assert!(text.contains("gateway   not running"), "{text}");
@@ -174,19 +189,21 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
     );
 
     // Start: back from the unit that was never removed.
-    let started = daemon(state, &["start", "--port", &port.to_string()]);
+    let started = daemon(mcpgw, state, &["start", "--port", &port.to_string()]);
     assert!(
         started.status.success(),
         "start failed: {}",
         String::from_utf8_lossy(&started.stderr)
     );
-    let up = wait_until_up(state, &url);
+    let up = wait_until_up(mcpgw, state, &url);
     assert_eq!(up.status.code(), Some(0), "{}", stdout(&up));
 
-    reinstall_over_the_running_service(state, &unit, port, &url);
+    reinstall_over_the_running_service(mcpgw, state, &unit, port, &url);
+
+    the_unit_runs_the_binary_that_replaced_the_installed_one(mcpgw, state, port, &url);
 
     // Uninstall: out of the manager, off the disk, off the port.
-    let removed = daemon(state, &["uninstall"]);
+    let removed = daemon(mcpgw, state, &["uninstall"]);
     assert!(
         removed.status.success(),
         "uninstall failed: {}",
@@ -197,29 +214,49 @@ fn the_user_unit_installs_runs_stops_and_leaves_nothing_behind() {
     // The record describes a service that no longer exists.
     assert!(!recorded.exists(), "{} survived", recorded.display());
 
-    let gone = daemon(state, &["status", "--url", &url]);
+    let gone = daemon(mcpgw, state, &["status", "--url", &url]);
     let text = stdout(&gone);
     assert_eq!(gone.status.code(), Some(1), "{text}");
     assert!(text.contains("service   not installed"), "{text}");
 
     // Uninstalling twice is the same end state, not an error.
-    assert!(daemon(state, &["uninstall"]).status.success());
+    assert!(daemon(mcpgw, state, &["uninstall"]).status.success());
 }
 
 /// The #116 step, in a function of its own so the cycle above stays readable:
 /// a service that is running is reinstalled over rather than refused, and the
 /// gateway is back afterwards.
-fn reinstall_over_the_running_service(state: &Path, unit: &Path, port: u16, url: &str) {
+fn reinstall_over_the_running_service(
+    mcpgw: &Path,
+    state: &Path,
+    unit: &Path,
+    port: u16,
+    url: &str,
+) {
+    // The notice names the binary being left behind, which is the copy this
+    // cycle installed from — the one assertion that says the redirection
+    // took, rather than the unit quietly running what cargo built.
+    let recorded = mcpgw_core::daemon::load_spec(&state.join("state"))
+        .expect("install has to record the binary it installed")
+        .exe;
+    assert_eq!(
+        std::fs::canonicalize(&recorded).unwrap(),
+        std::fs::canonicalize(mcpgw).unwrap()
+    );
+
     let before = main_pid();
     assert_ne!(before, 0, "nothing was running to reinstall over");
 
-    let again = daemon(state, &["install", "--port", &port.to_string()]);
+    let again = daemon(mcpgw, state, &["install", "--port", &port.to_string()]);
     let text = stdout(&again);
     let errors = String::from_utf8_lossy(&again.stderr).into_owned();
     assert!(again.status.success(), "reinstall failed: {errors}");
     assert!(!errors.contains("already listens"), "{errors}");
     assert!(
-        text.contains("stopping the running service to reinstall it"),
+        text.contains(&format!(
+            "stopping the running service to reinstall it (was: {})",
+            recorded.display()
+        )),
         "{text}"
     );
     assert!(unit.exists(), "{}", unit.display());
@@ -241,11 +278,64 @@ fn reinstall_over_the_running_service(state: &Path, unit: &Path, port: u16, url:
         "the reinstall left the process from the old unit serving"
     );
 
-    let up = wait_until_up(state, url);
+    let up = wait_until_up(mcpgw, state, url);
     let text = stdout(&up);
     assert_eq!(up.status.code(), Some(0), "{text}");
     assert!(
         text.contains("installed under systemd --user, running"),
+        "{text}"
+    );
+}
+
+/// The #130 step: the binary the unit was installed from is replaced, and the
+/// gateway ends itself with a status `Restart=on-failure` acts on — so what
+/// comes back is a process running the *new* file, from the same path.
+fn the_unit_runs_the_binary_that_replaced_the_installed_one(
+    mcpgw: &Path,
+    state: &Path,
+    port: u16,
+    url: &str,
+) {
+    let records = state.join("state");
+    let before = mcpgw_core::runtime::read_record(&records, port)
+        .unwrap()
+        .expect("a running gateway has to have published a record");
+    assert!(
+        before.last_upgrade_restart.is_none(),
+        "nothing has been replaced yet: {before:?}"
+    );
+
+    util::replace_binary(mcpgw);
+    // Checked here rather than left to the timeout: a replacement that will
+    // not execute is a unit that never comes back, which would otherwise read
+    // as a watcher that never noticed.
+    let ran = util::output_retrying_while_busy(std::process::Command::new(mcpgw).arg("--version"));
+    assert!(
+        ran.status.success(),
+        "the replaced binary does not run: {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    let after = util::wait_for_an_upgrade_restart(&records, port, before.pid, UPGRADE_TIMEOUT);
+    // For the file that is there now, and not for some other change: a
+    // restart is only evidence of an upgrade if it is an upgrade into this.
+    let restart = after.last_upgrade_restart.unwrap();
+    assert_eq!(restart.stamp.len, std::fs::metadata(mcpgw).unwrap().len());
+
+    let up = wait_until_up(mcpgw, state, url);
+    let text = stdout(&up);
+    assert_eq!(up.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("installed under systemd --user, running"),
+        "{text}"
+    );
+
+    // The gateway said why it was going, on the stderr the unit appends to
+    // the log file `daemon logs` prints.
+    let logs = daemon(mcpgw, state, &["logs", "--lines", "500"]);
+    let text = stdout(&logs);
+    assert!(
+        text.contains("changed; restarting so the service runs it"),
         "{text}"
     );
 }
