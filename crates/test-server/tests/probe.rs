@@ -153,3 +153,15 @@ async fn fixture_gateway() -> (std::net::SocketAddr, Arc<UpstreamManager>) {
     tokio::spawn(serve_http(gateway, listener, std::future::pending()));
     (addr, manager)
 }
+
+/// A 2026-07-28 server has no `initialize` to answer: the handshake was
+/// replaced by `server/discover` and per-request metadata. Reporting such a
+/// server as unreachable would be doctor calling a healthy server broken, so
+/// the probe tries the newer lifecycle when the older one is refused.
+#[tokio::test]
+async fn a_server_with_no_initialize_is_probed_over_discover() {
+    let success = probe_mode("modern", GENEROUS).await.unwrap();
+    assert_eq!(success.server_name, "mcpgw-test-server-modern");
+    assert_eq!(success.server_version, "9.9.9");
+    assert_eq!(success.tool_count, 2);
+}

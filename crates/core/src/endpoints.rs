@@ -94,6 +94,12 @@ impl EndpointTable {
                 let gateway = gateway.with_endpoint(endpoint_label(&name));
                 let service = StreamableHttpService::new(
                     move || Ok(gateway.clone()),
+                    // One per endpoint, and it stays for the same reason the
+                    // `/mcp` one does: 2026-07-28 dropped sessions (SEP-2567)
+                    // and rmcp routes those requests statelessly regardless,
+                    // so nothing is allocated for a current client — but a
+                    // 2025-11-25 client still opens a session at `initialize`
+                    // and this is what mints and finds it.
                     LocalSessionManager::default().into(),
                     // rmcp's own rebinding guard validates `Host` and, only
                     // when a list is configured, `Origin`. Its default leaves

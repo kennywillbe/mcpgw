@@ -12,7 +12,9 @@
 //! died-after-ready reconnection), `paged` (serves its tools over two
 //! cursored pages — exercises a pipe forwarding pagination rather than
 //! collapsing it), `legacy` (answers the way every server predating
-//! 2026-07-28 does: no `resultType`, no caching fields), `pid` (one tool
+//! 2026-07-28 does: no `resultType`, no caching fields), `modern` (the other
+//! end of the matrix: 2026-07-28 only, no `initialize` at all, and one tool
+//! that needs an MRTR round trip), `pid` (one tool
 //! that names this process, slowly — what config reload is checked with,
 //! since it has to prove both that an untouched server keeps the *same*
 //! child and that a call already in flight still lands on it).
@@ -72,13 +74,22 @@ fn serve(mode: &str) {
         }
         match reply(mode, method, &msg) {
             Some(Ok(result)) => respond(&mut stdout, &id, &result),
-            Some(Err(message)) => fail(&mut stdout, &id, &message),
+            Some(Err(failure)) => fail(&mut stdout, &id, &failure),
             // Methods this fixture does not implement get no answer at all,
             // which is what an unhandled request looks like in the wild.
             None => {}
         }
     }
 }
+
+/// JSON-RPC's "method not found". What a server answers for a method the
+/// revision it speaks does not have — `initialize`, once sessions went.
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// The spec's resource-not-found code up to 2025-11-25. (2026-07-28 renumbers
+/// it to `-32602`, invalid params; the SDK does that translation per peer, so
+/// a fixture on the older revision keeps sending the older code.)
+const RESOURCE_NOT_FOUND: i64 = -32002;
 
 /// The scripted answer to one request: `None` for a method this fixture does
 /// not implement, `Err` for a refusal the gateway is expected to carry
@@ -87,8 +98,11 @@ fn reply(
     mode: &str,
     method: &str,
     msg: &serde_json::Value,
-) -> Option<Result<serde_json::Value, String>> {
+) -> Option<Result<serde_json::Value, Failure>> {
     let params = &msg["params"];
+    if mode == "modern" {
+        return modern(method, params);
+    }
     let result = match method {
         "initialize" => {
             // Echo the client's protocol version back so any rmcp release
@@ -216,7 +230,147 @@ fn paged_tools(params: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-fn resources(method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+/// The opaque state the `ask` tool hands out with its `input_required`
+/// answer. The client must echo it back untouched, and the pipe in between
+/// must not so much as look at it.
+const ASK_STATE: &str = "fixture-request-state-1";
+
+/// A server that speaks 2026-07-28 and nothing else: no `initialize` (the
+/// handshake is gone, SEP-2575), `server/discover` instead, every result
+/// carrying `resultType` and the cacheable ones `ttlMs`/`cacheScope`
+/// (SEP-2322, SEP-2549), and one tool that needs a round trip through the
+/// client before it can answer (MRTR, SEP-2322).
+///
+/// This is the upstream half of the version matrix: a gateway that only knows
+/// how to say `initialize` cannot talk to this server at all.
+fn modern(method: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, Failure>> {
+    let result = match method {
+        // The handshake is not a method in this revision. Answering with an
+        // error rather than silence is what lets a client that tried the old
+        // lifecycle first learn to use the new one — and is what every
+        // 2026-07-28 server does, since the method simply is not there.
+        "initialize" => {
+            return Some(Err(Failure {
+                code: METHOD_NOT_FOUND,
+                message: "initialize was removed in 2026-07-28; use server/discover".to_owned(),
+            }));
+        }
+        "server/discover" => serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            // Deliberately more than this fixture can back up, because what
+            // a pipe in front of it advertises is the interesting part: the
+            // notification-shaped promises (`subscribe`, `listChanged`,
+            // `logging`) stop at the gateway, the tasks extension is a set of
+            // methods it does not forward, and anything else — including an
+            // extension nobody has heard of — is the server's to declare.
+            "capabilities": {
+                "tools": { "listChanged": true },
+                "resources": { "subscribe": true, "listChanged": true },
+                "prompts": {},
+                "completions": {},
+                "logging": {},
+                "extensions": {
+                    "io.modelcontextprotocol/tasks": {},
+                    "com.example/thing": { "deep": true }
+                }
+            },
+            "instructions": "the modern fixture",
+            "ttlMs": 60000,
+            "cacheScope": "public",
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "mcpgw-test-server-modern", "version": "9.9.9"
+                }
+            }
+        }),
+        "tools/list" => serde_json::json!({
+            "tools": [
+                tool("echo", "echoes input"),
+                tool("ask", "asks the client something before it answers")
+            ],
+            "resultType": "complete",
+            "ttlMs": 4242,
+            "cacheScope": "public"
+        }),
+        "tools/call" => modern_call(params),
+        "resources/list" | "resources/templates/list" | "resources/read" => {
+            return Some(resources(method, params).map(|result| cacheable(result, "complete")));
+        }
+        "prompts/list" => cacheable(prompts(method, params), "complete"),
+        "prompts/get" => complete_result(prompts(method, params)),
+        "completion/complete" => complete_result(complete(params)),
+        _ => return None,
+    };
+    Some(Ok(result))
+}
+
+/// `tools/call` on the modern fixture, including the MRTR round trip: `ask`
+/// answers `input_required` the first time and completes on the retry that
+/// carries the client's `inputResponses` and the echoed `requestState`.
+fn modern_call(params: &serde_json::Value) -> serde_json::Value {
+    if params["name"].as_str() == Some("ask") {
+        let Some(responses) = params.get("inputResponses") else {
+            return serde_json::json!({
+                "resultType": "input_required",
+                "requestState": ASK_STATE,
+                "inputRequests": {
+                    "city": {
+                        "method": "elicitation/create",
+                        "params": {
+                            "mode": "form",
+                            "message": "which city?",
+                            "requestedSchema": {
+                                "type": "object",
+                                "properties": { "city": { "type": "string" } },
+                                "required": ["city"]
+                            }
+                        }
+                    }
+                }
+            });
+        };
+        // Both halves are checked, because both have to survive the pipe: the
+        // client's answer, and the state this server minted for this round.
+        let city = responses["city"]["content"]["city"]
+            .as_str()
+            .unwrap_or("nowhere");
+        let state = params["requestState"].as_str().unwrap_or("lost");
+        return complete_result(serde_json::json!({
+            "content": [{ "type": "text", "text": format!("{city} ({state})") }]
+        }));
+    }
+    let message = params["arguments"]["message"].as_str().unwrap_or("");
+    complete_result(serde_json::json!({
+        "content": [{ "type": "text", "text": message }]
+    }))
+}
+
+/// Stamps the `resultType` every 2026-07-28 result carries.
+fn complete_result(mut result: serde_json::Value) -> serde_json::Value {
+    result["resultType"] = "complete".into();
+    result
+}
+
+/// The same, plus the caching fields the revision requires on list and read
+/// results. `public` and a real window, so a test can tell the upstream's own
+/// policy from the "already stale, do not share" one a pipe falls back to.
+fn cacheable(mut result: serde_json::Value, result_type: &str) -> serde_json::Value {
+    result["resultType"] = result_type.into();
+    result["ttlMs"] = 4242.into();
+    result["cacheScope"] = "public".into();
+    result
+}
+
+/// A JSON-RPC error a mode chose to answer with: the code matters, because a
+/// client tells "this server has no such method" apart from "this server
+/// refused" by reading it.
+struct Failure {
+    code: i64,
+    message: String,
+}
+
+fn resources(method: &str, params: &serde_json::Value) -> Result<serde_json::Value, Failure> {
     match method {
         "resources/list" => Ok(serde_json::json!({
             "resources": [
@@ -232,7 +386,10 @@ fn resources(method: &str, params: &serde_json::Value) -> Result<serde_json::Val
         _ => {
             let uri = params["uri"].as_str().unwrap_or("");
             if uri != RESOURCE_URI {
-                return Err(format!("no such resource {uri}"));
+                return Err(Failure {
+                    code: RESOURCE_NOT_FOUND,
+                    message: format!("no such resource {uri}"),
+                });
             }
             Ok(serde_json::json!({
                 "contents": [
@@ -283,11 +440,11 @@ fn respond(out: &mut impl std::io::Write, id: &serde_json::Value, result: &serde
     out.flush().unwrap();
 }
 
-/// A JSON-RPC error reply. `-32002` is the spec's "resource not found".
-fn fail(out: &mut impl std::io::Write, id: &serde_json::Value, message: &str) {
+/// A JSON-RPC error reply.
+fn fail(out: &mut impl std::io::Write, id: &serde_json::Value, failure: &Failure) {
     let msg = serde_json::json!({
         "jsonrpc": "2.0", "id": id,
-        "error": { "code": -32002, "message": message }
+        "error": { "code": failure.code, "message": failure.message }
     });
     writeln!(out, "{msg}").unwrap();
     out.flush().unwrap();

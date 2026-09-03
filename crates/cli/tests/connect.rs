@@ -85,6 +85,38 @@ async fn bridges_a_stdio_client_to_the_http_gateway() {
     manager.shutdown().await;
 }
 
+/// A client on the current revision never sends `initialize`: it opens with
+/// `server/discover` and carries its protocol version in every request's
+/// `_meta` (SEP-2575). The bridge has to serve that client as readily as the
+/// handshake one, because it is the lifecycle a current client uses.
+#[tokio::test]
+async fn a_stdio_client_on_the_current_revision_is_bridged_too() {
+    use rmcp::ClientServiceExt as _;
+
+    let (url, manager) = fixture_gateway().await;
+    let mut command = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"));
+    command.args(["connect", "--url", &url]);
+    let (transport, _stderr) = TokioChildProcess::builder(command)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = ()
+        .serve_with_lifecycle(
+            transport,
+            rmcp::ClientLifecycleMode::Discover {
+                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .unwrap();
+
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tool_names(&tools), ["echo", "reverse"]);
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_down_gateway_is_reported_with_the_fix() {
     // Port 1 is never a gateway; the bridge is lazy, so the handshake with

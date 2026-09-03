@@ -71,11 +71,14 @@ mcpgw watch --json | jq -r 'select(.ok == false) | "\(.server) \(.error)"'
   `initialize`, so two harnesses talking to one gateway get different ids and
   a client that reconnects gets a new one. It is a fingerprint, not the
   session id itself: the raw id is a credential and does not belong in a log
-  file. Where the transport has no session — a stdio client, or an HTTP client
-  on MCP 2026-07-28, which
-  [removed sessions](https://modelcontextprotocol.io/specification/2026-07-28/)
-  — it falls back to an id for the gateway *process*, which cannot tell two
-  clients apart. Same field, and the ids never collide; just a coarser answer.
+  file. Where there is no session — a client on MCP 2026-07-28, which
+  [removed them](https://modelcontextprotocol.io/specification/2026-07-28/) —
+  it is a fingerprint of the name and version the client gives on each request
+  instead. That separates clients by software rather than by connection: two
+  windows of the same editor share a row, where two different harnesses do
+  not. Failing both, it falls back to an id for the gateway *process*, which
+  cannot tell any two clients apart. Same field either way, and the ids never
+  collide; just a coarser answer.
 - `endpoint` — which face of the gateway took the request: `mcp` for the
   gateway's own endpoint, `s/<server>` for a per-server one. Absent on stdio
   traffic
