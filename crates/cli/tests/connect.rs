@@ -2,7 +2,9 @@
 //! client spawns the real binary, which pipes to a gateway served in-process.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mcpgw_core::gateway::{Gateway, serve_http};
@@ -10,9 +12,11 @@ use mcpgw_core::upstream::UpstreamManager;
 use mcpgw_core::{Server, Transport};
 use rmcp::ServiceExt as _;
 use rmcp::transport::TokioChildProcess;
+use rmcp::transport::async_rw::AsyncRwTransport;
+use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 mod util;
-use util::fixture_binary;
+use util::{fixture_binary, fixture_config, free_port, mcpgw};
 
 /// Serves a gateway piping the healthy fixture on an ephemeral port and
 /// returns its `/mcp` URL plus the manager (for shutdown).
@@ -104,4 +108,207 @@ fn url_defaults_to_the_serve_port() {
         .unwrap();
     let help = String::from_utf8(out.stdout).unwrap();
     assert!(help.contains("8137"), "{help}");
+}
+
+/// A sandbox home with one fixture server per name already configured, which
+/// is everything the bridge needs to be able to serve a gateway of its own.
+fn home_serving(names: &[&str]) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), fixture_config(names)).unwrap();
+    home
+}
+
+/// The bridge as a stdio-only client runs it, in `home`'s sandbox, with its
+/// stderr collected as it arrives.
+///
+/// The child is spawned here rather than by rmcp's own child transport
+/// because the test has to own it: that transport kills the process when it
+/// is dropped, and what half of this file is about is what the bridge does
+/// when its stdin closes instead.
+async fn spawn_bridge(
+    home: &Path,
+    args: &[&str],
+) -> (Client, tokio::process::Child, Arc<Mutex<String>>) {
+    let mut command = tokio::process::Command::from(mcpgw(home));
+    let mut child = util::spawn_retrying_while_busy(
+        command
+            .arg("connect")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    let stdout = child.stdout.take().unwrap();
+    let stdin = child.stdin.take().unwrap();
+
+    let errors = Arc::new(Mutex::new(String::new()));
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    tokio::spawn({
+        let errors = Arc::clone(&errors);
+        async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut errors = errors.lock().unwrap();
+                errors.push_str(&line);
+                errors.push('\n');
+            }
+        }
+    });
+
+    let client = ().serve(AsyncRwTransport::new_client(stdout, stdin)).await.unwrap();
+    (client, child, errors)
+}
+
+/// Closes the bridge's stdin the way a client that quits does, and returns
+/// the exit status of the process that was behind it.
+async fn ends(client: Client, mut child: tokio::process::Child) -> std::process::ExitStatus {
+    // Cancelling ends the service task that owns the transport, which drops
+    // the child's stdin — the same EOF Claude Desktop leaves behind.
+    client.cancel().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), child.wait())
+        .await
+        .expect("the bridge did not exit after its stdin closed")
+        .unwrap()
+}
+
+fn tool_names(tools: &[rmcp::model::Tool]) -> Vec<&str> {
+    tools.iter().map(|t| t.name.as_ref()).collect()
+}
+
+fn said(errors: &Arc<Mutex<String>>) -> String {
+    errors.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn a_bridge_with_nothing_to_bridge_to_serves_a_gateway_for_the_session() {
+    let home = home_serving(&["fx1"]);
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let (client, child, errors) =
+        spawn_bridge(home.path(), &["--url", &url, "--server", "fx1"]).await;
+
+    // The bridge answers, which it could only do over a gateway it started.
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tool_names(&tools), ["echo", "reverse"]);
+    let said = said(&errors);
+    // The URL named is the endpoint the bridge was pointed at, which with
+    // `--server` is the server's own face on that gateway.
+    assert!(
+        said.contains(&format!("no gateway at http://127.0.0.1:{port}/s/fx1")),
+        "{said}"
+    );
+    assert!(said.contains("serving one for this session"), "{said}");
+    assert!(said.contains("mcpgw daemon install"), "{said}");
+
+    // Published like any other gateway's, and withdrawn on the way out —
+    // which a bridge that was killed rather than closed would not do.
+    let state = home.path().join("state");
+    assert!(
+        mcpgw_core::runtime::read_record(&state, port)
+            .unwrap()
+            .is_some()
+    );
+
+    let status = ends(client, child).await;
+    assert!(status.success(), "{status}");
+    assert_eq!(
+        mcpgw_core::runtime::read_record(&state, port).unwrap(),
+        None
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "the gateway the bridge started outlived it on port {port}"
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_that_is_already_up_is_bridged_to_and_nothing_is_started() {
+    let home = home_serving(&["fx1"]);
+    let (mut gateway, addr, _endpoints) = util::serve(home.path(), &[]).await;
+    let url = format!("http://{addr}/mcp");
+
+    let (client, child, errors) =
+        spawn_bridge(home.path(), &["--url", &url, "--server", "fx1"]).await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tool_names(&tools), ["echo", "reverse"]);
+    let said = said(&errors);
+    assert!(!said.contains("serving one for this session"), "{said}");
+
+    ends(client, child).await;
+    gateway.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_service_installed_on_the_port_is_never_raced_by_the_bridge() {
+    let home = home_serving(&["fx1"]);
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    // Installed, and nothing behind it: the state a stopped service leaves.
+    util::record_installed_spec(
+        home.path(),
+        &std::env::current_exe().unwrap(),
+        "127.0.0.1",
+        port,
+    );
+
+    let (client, child, errors) =
+        spawn_bridge(home.path(), &["--url", &url, "--server", "fx1"]).await;
+    let message = client.list_all_tools().await.unwrap_err().to_string();
+    assert!(
+        message.contains("the installed service is not running"),
+        "{message}"
+    );
+    assert!(message.contains("mcpgw daemon start"), "{message}");
+
+    let said = said(&errors);
+    assert!(!said.contains("serving one for this session"), "{said}");
+    assert!(
+        said.contains("the installed service is not running"),
+        "{said}"
+    );
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+        "the bridge started a gateway on the service's port {port}"
+    );
+
+    ends(client, child).await;
+}
+
+#[tokio::test]
+async fn two_bridges_starting_at_once_end_up_on_one_gateway() {
+    let home = home_serving(&["fx1", "fx2"]);
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    // The shape Claude Desktop produces: two entries, both launched when the
+    // app starts, both pointed at their own server's endpoint on one gateway.
+    let one_args = ["--url", url.as_str(), "--server", "fx1"];
+    let two_args = ["--url", url.as_str(), "--server", "fx2"];
+    let (first, second) = tokio::join!(
+        spawn_bridge(home.path(), &one_args),
+        spawn_bridge(home.path(), &two_args),
+    );
+    let (one, one_child, one_said) = first;
+    let (two, two_child, two_said) = second;
+
+    assert_eq!(
+        tool_names(&one.list_all_tools().await.unwrap()),
+        ["echo", "reverse"]
+    );
+    assert_eq!(
+        tool_names(&two.list_all_tools().await.unwrap()),
+        ["echo", "reverse"]
+    );
+
+    // One of them bound the port and the other found it taken and waited.
+    let started =
+        |errors: &Arc<Mutex<String>>| said(errors).contains("serving one for this session");
+    assert!(
+        started(&one_said) ^ started(&two_said),
+        "one: {}\ntwo: {}",
+        said(&one_said),
+        said(&two_said)
+    );
+
+    ends(one, one_child).await;
+    ends(two, two_child).await;
 }

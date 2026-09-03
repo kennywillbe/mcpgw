@@ -37,7 +37,8 @@ const HEADING: &str = "Next: keep the gateway running.";
 /// What the step offers instead of a service, on every path that ends without
 /// one — a declined install, an unsupported platform, a failed install.
 const FALLBACK: &str = "Run `mcpgw serve` in a terminal and leave it open; everything else in this setup works \
-     exactly the same.";
+     exactly the same. A stdio-only client needs no terminal at all: `mcpgw connect` serves a \
+     gateway for itself while that client is open.";
 
 /// True unless a gateway is already answering. Deliberately not "is a
 /// service installed": a foreground `mcpgw serve` in another terminal is a

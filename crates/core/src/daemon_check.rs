@@ -236,6 +236,20 @@ pub fn url_port(url: &str) -> Option<u16> {
     url::Url::parse(url).ok()?.port_or_known_default()
 }
 
+/// The host a reader probed, off the URL it probed, with an IPv6 literal's
+/// brackets removed.
+///
+/// Sits next to [`url_port`] because it answers the other half of the same
+/// question — a reader holding a URL and needing the address behind it, to
+/// ask [`crate::daemon::is_loopback`] about or to bind. Bracketless because
+/// both of those want it that way, and a caller that needs the URL spelling
+/// back already has the URL.
+#[must_use]
+pub fn url_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    Some(parsed.host_str()?.trim_matches(['[', ']']).to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,5 +459,19 @@ mod tests {
         // The default the scheme implies, for a URL that left it out.
         assert_eq!(url_port("http://localhost/mcp"), Some(80));
         assert_eq!(url_port("not a url"), None);
+    }
+
+    #[test]
+    fn the_host_comes_off_the_same_url_without_its_brackets() {
+        assert_eq!(
+            url_host("http://127.0.0.1:8137/mcp").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(url_host("http://[::1]:8137/mcp").as_deref(), Some("::1"));
+        assert_eq!(
+            url_host("http://localhost/mcp").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(url_host("not a url"), None);
     }
 }

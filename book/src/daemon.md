@@ -12,6 +12,15 @@ nicety: a gateway nobody started is a client with no servers. The setup wizard
 offers to install it for that reason, and `mcpgw daemon install` is the same
 step on its own.
 
+The one client that gets by without it is a stdio-only one, because `mcpgw
+connect` serves a gateway of its own when it finds nothing listening on
+loopback — for that client, for as long as it stays open. That is a fallback
+and it costs you what a service buys: the gateway restarts every time the
+client does, its stdio servers are started and stopped along with it, and a
+second client gets no gateway at all unless its bridge happens to be running.
+Where a service *is* installed, `connect` never starts a rival for its port —
+it says the service is not running and leaves `mcpgw daemon start` to you.
+
 Every command works on all three platforms, each through that platform's own
 supervisor: a launch agent on macOS, a systemd user unit on Linux, a service
 on Windows. The three sections below are what is different about each; the
