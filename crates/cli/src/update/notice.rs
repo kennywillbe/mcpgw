@@ -32,13 +32,22 @@ const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// coming back two seconds late — once a day, offline.
 const TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Prints the notice if one is due. Never fails, never blocks longer than
-/// [`TIMEOUT`], never writes to stdout.
-pub fn print_if_due(current: &str) {
-    if let Some(latest) = look_up()
-        && super::is_newer(&latest, current)
-    {
-        eprintln!("mcpgw {latest} is available (you have {current}) — run `mcpgw self-update`");
+/// Prints the notice if one is due, returning whether it printed. Never
+/// fails, never blocks longer than [`TIMEOUT`], never writes to stdout.
+///
+/// The answer matters to the caller because a check that was not due says
+/// nothing at all, and since a supervised gateway spends the daily check of
+/// its own accord that is now the ordinary outcome rather than the rare one.
+pub fn print_if_due(current: &str) -> bool {
+    let Some(state_dir) = mcpgw_core::paths::state_dir() else {
+        return false;
+    };
+    match check_and_stamp(&state_dir) {
+        Some(latest) if super::is_newer(&latest, current) => {
+            announce(&latest, current);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -53,8 +62,13 @@ pub fn print_cached(current: &str) {
     if let Some(latest) = cached()
         && super::is_newer(&latest, current)
     {
-        eprintln!("mcpgw {latest} is available (you have {current}) — run `mcpgw self-update`");
+        announce(&latest, current);
     }
+}
+
+/// The one line, wherever it is said from.
+fn announce(latest: &str, current: &str) {
+    eprintln!("mcpgw {latest} is available (you have {current}) — run `mcpgw self-update`");
 }
 
 /// The version the last successful check saw, if there was one.
@@ -66,14 +80,23 @@ fn cached() -> Option<String> {
     last_seen(&std::fs::read_to_string(stamp).ok()?)
 }
 
-/// Runs the throttled lookup, returning the latest version when a check
-/// actually happened. `None` covers "not due", "switched off" and every
-/// failure alike — the caller has nothing useful to say about any of them.
-fn look_up() -> Option<String> {
+/// Runs the throttled lookup against the release host and records what it
+/// found in `state_dir`, returning the latest version when a check actually
+/// happened. `None` covers "not due", "switched off" and every failure
+/// alike — the caller has nothing useful to say about any of them.
+///
+/// The only thing in mcpgw that asks the release host on a schedule. The
+/// notice above calls it after a command, the supervised gateway calls it
+/// from a background task, and neither owns the stamp: whichever of the two
+/// gets there first spends the day's check for both.
+///
+/// Blocking, and for up to [`TIMEOUT`]. An async caller owes it a
+/// `spawn_blocking`.
+pub fn check_and_stamp(state_dir: &Path) -> Option<String> {
     if std::env::var_os(NO_CHECK_ENV).is_some_and(|value| !value.is_empty()) {
         return None;
     }
-    let stamp = mcpgw_core::paths::state_dir()?.join(STAMP_FILE);
+    let stamp = state_dir.join(STAMP_FILE);
     let now = unix_now()?;
     let previous = std::fs::read_to_string(&stamp).ok();
     if !is_due(previous.as_deref(), now) {

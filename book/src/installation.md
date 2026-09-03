@@ -83,6 +83,23 @@ It never writes to stdout, so `--json` output stays parseable, and it stays
 quiet when the network doesn't answer. `MCPGW_NO_UPDATE_CHECK=1` turns it off
 entirely.
 
+An installed service does the same check on the same schedule, a few minutes
+after it starts and once a day after that, which is what the user who set
+mcpgw up months ago and hasn't typed a command since actually needs. It only
+writes the answer down — a service has nobody to print to — and notes the new
+release once in its own log:
+
+```text
+mcpgw 0.6.0 is available (this gateway is running 0.5.0) — run `mcpgw self-update`
+```
+
+Because it shares the once-a-day stamp with the CLI, the two never both go
+out to GitHub, and `mcpgw daemon status`, `mcpgw doctor` and the wizard then
+report what it found without a request of their own. Nothing is downloaded
+and nothing restarts on its own: the service notices, you decide. A
+foreground `mcpgw serve` doesn't do any of this — it's a command in a
+terminal, and the notice after a command covers it.
+
 However you upgrade, an installed service follows. The new binary lands at
 the path the service was installed with, the running gateway notices it
 within a few seconds and ends, and launchd, systemd or the Windows service
