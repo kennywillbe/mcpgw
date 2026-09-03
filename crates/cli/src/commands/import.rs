@@ -210,14 +210,12 @@ fn write_conflicts(
         // Answers are keyed by name and only honoured where the fresh plan
         // still calls that name a conflict; anything else falls back to the
         // outcome that writes nothing.
-        match answers
-            .get(&candidate.name)
-            .copied()
-            .unwrap_or(ConflictChoice::KeepCanonical)
-        {
+        let answer = answers.get(&candidate.name).copied();
+        match answer.unwrap_or(ConflictChoice::KeepCanonical) {
             ConflictChoice::Overwrite => {
                 store.upsert_server(&candidate.name, &candidate.server, true)?;
                 adopt(state, candidate);
+                resolve_to(state, candidate, &candidate.name);
                 written += 1;
                 println!("~ {} overwritten{}", candidate.name, describe(candidate));
             }
@@ -228,6 +226,10 @@ fn write_conflicts(
                 let second = adopt_as(candidate);
                 store.upsert_server(&second, &candidate.server, false)?;
                 adopt(state, candidate);
+                // The client's entry follows *its* server, not the canonical
+                // one it shares a name with — the user just said those two
+                // are different things.
+                resolve_to(state, candidate, &second);
                 written += 1;
                 println!(
                     "+ {second} kept alongside the canonical {}{}",
@@ -236,6 +238,14 @@ fn write_conflicts(
                 );
             }
             ConflictChoice::KeepCanonical => {
+                // Nothing is adopted, but a person's answer is still recorded:
+                // the wizard reads it to know this conflict has been put to
+                // someone already. `--yes` and a pipe reach the same outcome
+                // without anyone being asked, and must not be remembered as
+                // though they had been.
+                if answer.is_some() {
+                    resolve_to(state, candidate, &candidate.name);
+                }
                 kept += 1;
                 println!(
                     "! {} differs from the canonical entry (skipped — {why_kept})",
@@ -403,6 +413,22 @@ fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
             .entry(client_id.clone())
             .or_default()
             .insert(original.clone());
+    }
+}
+
+/// Records which canonical server each of a conflict's client entries stands
+/// for, so sync and eject follow the client's name to the right server.
+///
+/// Called for every answered conflict, keep-canonical included: an entry
+/// recorded as standing for the name it already carries is how "the user was
+/// asked and said leave it alone" is remembered.
+pub fn resolve_to(state: &mut ManagedState, candidate: &ImportCandidate, canonical: &str) {
+    for (client_id, original) in &candidate.origins {
+        state
+            .resolved
+            .entry(client_id.clone())
+            .or_default()
+            .insert(original.clone(), canonical.to_owned());
     }
 }
 

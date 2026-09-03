@@ -699,6 +699,32 @@ fn a_state_file_written_before_the_migrated_flag_still_loads() {
     let state = ManagedState::load(&path).unwrap();
     assert_eq!(state.clients["cursor"], managed(&["github"]));
     assert!(!state.migrated);
+    // Same for the entry→server mapping: an old file names no mapping, which
+    // reads as every entry standing for the server it is named after.
+    assert!(state.resolved.is_empty());
+}
+
+/// The mapping survives a write and a read, because it is the only record of
+/// which server a client's entry was kept for — losing it points that entry
+/// back at the canonical name it collided with.
+#[test]
+fn the_entry_mapping_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("managed.json");
+
+    let mut state = ManagedState::default();
+    state
+        .clients
+        .insert("cursor".to_owned(), managed(&["github"]));
+    state.resolved.insert(
+        "cursor".to_owned(),
+        [("github".to_owned(), "github-2".to_owned())]
+            .into_iter()
+            .collect(),
+    );
+    state.save(&path).unwrap();
+
+    assert_eq!(ManagedState::load(&path).unwrap(), state);
 }
 
 #[test]

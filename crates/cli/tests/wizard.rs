@@ -1011,3 +1011,70 @@ async fn a_server_this_machine_cannot_start_is_imported_switched_off() {
     assert!(entries["node_repl"].get("url").is_none(), "{entries}");
     assert_eq!(entries["notes"]["url"], url.replace("/mcp", "/s/notes"));
 }
+
+/// The conflict question is asked once. An answer of "keep yours" writes
+/// nothing, so the only thing that can stop the next `mcpgw init` asking
+/// again is the record of having asked.
+#[tokio::test]
+async fn a_conflict_left_alone_is_not_asked_about_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {}, "args": ["healthy"]}}}}}}"#,
+            real_command()
+        ),
+    );
+
+    let (_held, url) = dead_gateway();
+    let first = wizard(dir.path(), &url, &[], "y\n1\n").await;
+    assert!(
+        first.contains("differs from the canonical entry"),
+        "{first}"
+    );
+
+    let second = wizard(dir.path(), &url, &[], "y\n1\n").await;
+    assert!(
+        !second.contains("differs from the canonical entry"),
+        "{second}"
+    );
+}
+
+/// `--yes` reaches keep-canonical by taking the default, not by asking. That
+/// is not an answer, so it must not be remembered as one — the next run at a
+/// real terminal still owes the user the question.
+#[tokio::test]
+async fn yes_keeps_canonical_without_recording_an_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {}, "args": ["healthy"]}}}}}}"#,
+            real_command()
+        ),
+    );
+
+    let (_held, url) = dead_gateway();
+    wizard(dir.path(), &url, &["--yes"], "").await;
+
+    let state: serde_json::Value = json_at(&dir.path().join("state/managed.json"));
+    assert!(state["resolved"].get("cursor").is_none(), "{state}");
+
+    let asked = wizard(dir.path(), &url, &[], "y\n1\n").await;
+    assert!(
+        asked.contains("differs from the canonical entry"),
+        "{asked}"
+    );
+}
