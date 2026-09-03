@@ -110,6 +110,14 @@ answer when the two really are different servers that happen to share a name:
 keeping only yours leaves that client's entry unmanaged, talking to its server
 directly rather than through the gateway.
 
+Keeping both leaves that client's entry pointing at the server it always
+meant. Its `github` is now served as `github-2`, so `sync` points the entry at
+`/s/github-2` and `eject` puts your own definition of it back — you said the
+two were different servers, and the entry that made you say so keeps its own.
+The canonical `github` is not written into that client, because the name is
+spoken for there; `sync` says so on the line under the plan. Every other
+client gets it as usual.
+
 `--yes` answers "keep the canonical entry" without asking, and so does a run
 whose stdin is not a terminal, so scripts and agents can run `import` knowing
 it will neither block nor overwrite anything you wrote by hand. The skipped

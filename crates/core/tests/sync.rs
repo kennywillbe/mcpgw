@@ -4,7 +4,7 @@ use std::path::Path;
 use mcpgw_core::state::ManagedState;
 use mcpgw_core::sync::{
     apply_plan, apply_plan_to, client_entry, per_server_gateway_server, per_server_gateway_servers,
-    plan_client_context, plan_sync,
+    plan_client_context, plan_sync, under_client_names,
 };
 use mcpgw_core::{ClientKind, Config, backup};
 
@@ -775,4 +775,57 @@ fn zed_writes_source_on_stdio_entries_only() {
             "headers": {"Authorization": "Bearer t"},
         })
     );
+}
+
+/// The mapping keep-both leaves behind: the client's own entry name follows
+/// the server that name stood for, not the canonical entry it collided with.
+#[test]
+fn a_resolved_entry_follows_its_own_server() {
+    let canonical = canonical();
+    let resolved: BTreeMap<String, String> = [("github".to_owned(), "github-2".to_owned())]
+        .into_iter()
+        .collect();
+    let mut desired = canonical.clone();
+    desired.insert("github-2".to_owned(), canonical["linear"].clone());
+
+    let names = under_client_names(desired, &resolved);
+
+    // The client's `github` entry is the server it kept, under its own name.
+    assert_eq!(names.desired["github"], canonical["linear"]);
+    // And the canonical `github` is not written here at all: taking that name
+    // is exactly what the user said not to do.
+    assert!(
+        !names.desired.contains_key("github-2"),
+        "{:?}",
+        names.desired
+    );
+    assert_eq!(names.displaced, vec!["github".to_owned()]);
+    // Everything nobody resolved keeps its own name.
+    assert_eq!(names.desired["linear"], canonical["linear"]);
+    assert!(names.desired.contains_key("parked"));
+}
+
+/// An entry resolved to the name it already carries is a recorded answer, not
+/// a rename: it must leave the desired set exactly as it found it.
+#[test]
+fn resolving_an_entry_to_its_own_name_changes_nothing() {
+    let canonical = canonical();
+    let resolved: BTreeMap<String, String> = [("github".to_owned(), "github".to_owned())]
+        .into_iter()
+        .collect();
+
+    let names = under_client_names(canonical.clone(), &resolved);
+
+    assert_eq!(names.desired, canonical);
+    assert!(names.displaced.is_empty());
+}
+
+/// Every state file written before the mapping existed, and every client that
+/// never answered a conflict.
+#[test]
+fn no_mapping_is_the_map_it_was_handed() {
+    let canonical = canonical();
+    let names = under_client_names(canonical.clone(), &BTreeMap::new());
+    assert_eq!(names.desired, canonical);
+    assert!(names.displaced.is_empty());
 }

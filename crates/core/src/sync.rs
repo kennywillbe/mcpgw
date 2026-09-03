@@ -64,6 +64,64 @@ impl SyncPlan {
     }
 }
 
+/// A desired entry set rewritten into one client's own names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientNames {
+    /// The desired set, keyed by the name each server goes under *in this
+    /// client* rather than by its canonical name.
+    pub desired: BTreeMap<String, Server>,
+    /// Canonical servers left out because this client's entry of that name
+    /// stands for a different server. Reported, never written: taking the
+    /// name would repoint an entry at the server the user said was not it,
+    /// which is the whole thing keep-both refused to do.
+    pub displaced: Vec<String>,
+}
+
+/// Rewrites a desired set from canonical names into one client's names.
+///
+/// `resolved` is [`ManagedState::resolved`] for this client: client entry name
+/// → the canonical server it stands for. Every server not named in it keeps
+/// its own name, so a client that never answered a conflict — which is every
+/// client before keep-both existed — gets exactly the map it was handed.
+///
+/// The same rewrite serves sync and eject, which is the point of doing it on
+/// the desired map rather than inside either: eject's desired set is the
+/// canonical servers themselves, so restoring the client's `github` to the
+/// definition it stood for falls out of the same three lines.
+///
+/// [`ManagedState::resolved`]: crate::state::ManagedState::resolved
+#[must_use]
+pub fn under_client_names(
+    desired: BTreeMap<String, Server>,
+    resolved: &BTreeMap<String, String>,
+) -> ClientNames {
+    if resolved.is_empty() {
+        return ClientNames {
+            desired,
+            displaced: Vec::new(),
+        };
+    }
+    let entry_for: BTreeMap<&str, &str> = resolved
+        .iter()
+        .map(|(entry, canonical)| (canonical.as_str(), entry.as_str()))
+        .collect();
+    let mut out = ClientNames {
+        desired: BTreeMap::new(),
+        displaced: Vec::new(),
+    };
+    for (canonical, server) in desired {
+        if let Some(entry) = entry_for.get(canonical.as_str()) {
+            out.desired.insert((*entry).to_owned(), server);
+        } else if resolved.contains_key(&canonical) {
+            // This client's entry of that name stands for something else.
+            out.displaced.push(canonical);
+        } else {
+            out.desired.insert(canonical, server);
+        }
+    }
+    out
+}
+
 /// Computes what `sync` would change for one client.
 ///
 /// `current` is the entry map read out of the client file, `managed` the
