@@ -13,9 +13,8 @@ use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult,
     ErrorData, GetPromptRequestMethod, GetPromptRequestParams, GetPromptResponse, Implementation,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, PromptsCapability, ProtocolVersion, ReadResourceRequestMethod,
-    ReadResourceRequestParams, ReadResourceResponse, ResourcesCapability, ResultType,
-    ServerCapabilities, ServerInfo, Tool, ToolsCapability,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestMethod, ReadResourceRequestParams,
+    ReadResourceResponse, ResultType, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
 
@@ -167,19 +166,35 @@ impl Gateway {
     /// rmcp's Streamable HTTP service injects the HTTP [`http::request::Parts`]
     /// into every request's extensions, which is where the `Mcp-Session-Id`
     /// its session manager minted at `initialize` is legible from a handler.
-    /// That id — not the MCP protocol, which dropped sessions in 2026-07-28
-    /// (SEP-2567) — is the only thing that survives to identify one downstream
-    /// connection, so it is what attribution is built on. It is fingerprinted
+    /// That id is what identifies one downstream connection for as long as a
+    /// client speaks a revision that has sessions at all. It is fingerprinted
     /// rather than stored, because the raw value is a session credential; see
     /// [`session_fingerprint`](crate::capture::session_fingerprint).
     ///
-    /// `None` covers the stdio face and any HTTP client negotiating a version
-    /// with no sessions: those requests are attributed to the gateway process
-    /// instead, which is the pre-N13 behaviour and cannot separate clients.
+    /// A 2026-07-28 client has no session id to fingerprint — sessions are
+    /// gone — but it does say who it is on every request
+    /// (`_meta.io.modelcontextprotocol/clientInfo`, SEP-2575), and that is
+    /// the identity attribution falls back to. It separates clients by
+    /// software rather than by connection, so two instances of the same
+    /// client share a row; that is the most the revision offers, and it beats
+    /// filing every stateless request under the gateway process.
+    ///
+    /// `None` is left for a client that neither holds a session nor names
+    /// itself: those requests are attributed to the gateway process instead,
+    /// which is the pre-N13 behaviour and cannot separate clients.
     fn session_of(context: &RequestContext<RoleServer>) -> Option<String> {
-        let parts = context.extensions.get::<http::request::Parts>()?;
-        let id = parts.headers.get("mcp-session-id")?.to_str().ok()?;
-        Some(crate::capture::session_fingerprint(id))
+        let session = context
+            .extensions
+            .get::<http::request::Parts>()
+            .and_then(|parts| parts.headers.get("mcp-session-id")?.to_str().ok())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                let client = context.client_info()?;
+                // Version included: an upgrade is a different client as far
+                // as "which of these is misbehaving" is concerned.
+                Some(format!("{}/{}", client.name, client.version))
+            })?;
+        Some(crate::capture::session_fingerprint(&session))
     }
 
     /// Writes one record, if capture is on. Deliberately a blocking append
@@ -454,30 +469,55 @@ fn tools_only() -> ServerCapabilities {
     ServerCapabilities::builder().enable_tools().build()
 }
 
-/// The upstream's capabilities, narrowed to the families a pipe actually
-/// forwards.
+/// The upstream's capabilities, minus the ones a pipe cannot honour.
 ///
-/// Copying the upstream's set verbatim would over-claim: `resources.subscribe`
-/// and the `listChanged` flags promise subscriptions and notifications that
-/// stop at the gateway, and a client that took them at their word would sit
-/// waiting for updates that never arrive. What is advertised here is exactly
-/// what [`Gateway`] implements.
+/// Everything else is forwarded as the upstream declared it, including
+/// whatever a later revision adds. The rule used to be the other way round —
+/// an allow-list of the families this file knew about — which quietly dropped
+/// every capability the spec grew afterwards: `extensions` (SEP-1724) went
+/// missing the day it landed, and each future one would have too. A pipe that
+/// forwards the requests has no business hiding the advertisement.
+///
+/// The subtractions, and why each is a promise this gateway would break:
+///
+/// - `listChanged` on tools, resources and prompts, and `resources.subscribe`:
+///   both are notifications travelling upstream-to-downstream, and nothing in
+///   the pipe carries them. A client that believed them would wait for updates
+///   that never come, and stop polling. Lifted when subscription forwarding
+///   lands (`subscriptions/listen`, issue #140).
+/// - `logging`: `logging/setLevel` is not forwarded and `notifications/message`
+///   does not cross the pipe either. Deprecated in 2026-07-28 (SEP-2577), so
+///   this one is not waiting on anything.
+/// - the `io.modelcontextprotocol/tasks` extension (SEP-2663): advertising it
+///   makes the SDK accept `tasks/get`, `tasks/update` and `tasks/cancel` on
+///   this face, which the pipe answers "method not found". A client would be
+///   handed a task handle it could never poll, which is worse than never
+///   being offered one.
 fn forwarded(upstream: &ServerCapabilities) -> ServerCapabilities {
-    let mut capabilities = ServerCapabilities::default();
-    if upstream.tools.is_some() {
-        capabilities.tools = Some(ToolsCapability::default());
+    let mut capabilities = upstream.clone();
+    if let Some(tools) = capabilities.tools.as_mut() {
+        tools.list_changed = None;
     }
-    if upstream.resources.is_some() {
-        capabilities.resources = Some(ResourcesCapability::default());
+    if let Some(prompts) = capabilities.prompts.as_mut() {
+        prompts.list_changed = None;
     }
-    if upstream.prompts.is_some() {
-        capabilities.prompts = Some(PromptsCapability::default());
+    if let Some(resources) = capabilities.resources.as_mut() {
+        resources.list_changed = None;
+        resources.subscribe = None;
     }
-    if upstream.completions.is_some() {
-        capabilities.completions = Some(serde_json::Map::new());
+    capabilities.logging = None;
+    if let Some(extensions) = capabilities.extensions.as_mut() {
+        extensions.remove(TASKS_EXTENSION);
+        if extensions.is_empty() {
+            capabilities.extensions = None;
+        }
     }
     capabilities
 }
+
+/// The tasks extension's key in `capabilities.extensions` (SEP-2663). Spelled
+/// out rather than taken from rmcp, which keeps its copy private.
+const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
 
 /// The revision that made `resultType` required on every result (SEP-2322)
 /// and `ttlMs`/`cacheScope` required on the cacheable ones (SEP-2549).
@@ -672,8 +712,15 @@ impl ServerHandler for Gateway {
         let response = self
             .within_deadline(
                 &upstream,
+                // The `_once` form, for the same reason `read_resource` and
+                // `get_prompt` use it: `call_tool` would drive the MRTR
+                // rounds here, against this process's client handler, which
+                // has no user to ask. An `input_required` answer belongs to
+                // the client downstream — it is the one that can collect the
+                // input and retry with `inputResponses` and `requestState`,
+                // which this pipe forwards as part of the request.
                 self.call_upstream(&upstream, |service| async move {
-                    service.call_tool(request).await.map(CallToolResponse::from)
+                    service.call_tool_once(request).await
                 }),
             )
             .await;
@@ -901,7 +948,18 @@ pub async fn serve_http_with(
     let gateway = gateway.with_endpoint(crate::endpoints::AGGREGATE_LABEL);
     let service = StreamableHttpService::new(
         move || Ok(gateway.clone()),
+        // Kept for the clients that still have sessions. 2026-07-28 removed
+        // them (SEP-2567) and rmcp serves every request on that revision
+        // statelessly whatever this manager says, so it allocates nothing for
+        // a current client; a 2025-11-25 client still opens one at
+        // `initialize` and needs it to exist. Dropping it would break the
+        // older half of the matrix to tidy up the newer half.
         LocalSessionManager::default().into(),
+        // The default also leaves rmcp's SEP-2243 checks on: a POST that
+        // declares 2026-07-28 must carry `Mcp-Method`, and `Mcp-Name` when
+        // the method names a subject, both matching the body. That is
+        // validated before a request reaches this handler, so nothing here
+        // has to re-derive it.
         StreamableHttpServerConfig::default(),
     );
     let mut router = axum::Router::new().nest_service("/mcp", service);

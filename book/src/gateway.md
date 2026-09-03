@@ -97,6 +97,44 @@ gave no freshness hint is reported as `ttlMs: 0`, `cacheScope: private` — "ask
 again, and do not share it": the gateway will not invent a caching policy on a
 server's behalf, and the answer was fetched with your credentials.
 
+## Protocol revisions
+
+The gateway holds two MCP conversations per request — one with your client, one
+with the server — and they do not have to be the same revision. All four
+combinations work:
+
+|  | server on 2025-11-25 or older | server on 2026-07-28 |
+| --- | --- | --- |
+| **client on 2025-11-25 or older** | ✓ | ✓ |
+| **client on 2026-07-28** | ✓ | ✓ |
+
+What each side gets:
+
+- **A client on 2026-07-28** talks to the gateway the way that revision
+  defines: no `initialize`, no session, the protocol version and its own
+  identity in each request's `_meta`, and the `Mcp-Method`/`Mcp-Name` headers
+  on every POST. `server/discover` is answered per endpoint — with the
+  capabilities and the name and version of the server behind that endpoint,
+  not the gateway's. A tool that needs something from the user answers
+  `resultType: "input_required"`, and that answer, the requests inside it and
+  the opaque `requestState` that correlates the retry all cross the gateway
+  untouched: it is your client, not the gateway, that can ask you.
+- **A client on 2025-11-25 or older** still handshakes with `initialize` and
+  still gets a session, and nothing about it changed. Fields belonging to a
+  newer revision are not forced on it.
+- **A server on 2026-07-28** has no `initialize` to answer. The gateway tries
+  the handshake first — nearly every server in the wild is still on it — and
+  falls back to `server/discover` when the server says it has no such method.
+  `mcpgw doctor --probe` and `mcpgw inspect` follow the same rule.
+- **A server on an older revision** is reached exactly as before.
+
+What the gateway advertises for a server is what that server declared, minus
+what a pipe cannot deliver: `listChanged` and `resources.subscribe` (change
+notifications stop at the gateway — until it forwards `subscriptions/listen`,
+promising them would leave a client waiting forever), `logging`, and the tasks
+extension. Everything else is forwarded as-is, including capabilities newer
+than this version of mcpgw.
+
 `/mcp` serves tools only, and that is deliberate. Tools can be namespaced
 (`github__create_issue`); resource URIs and prompt names cannot. Two servers
 can both offer `file:///README.md` — one name, two different documents — and

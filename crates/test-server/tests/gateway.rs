@@ -1018,6 +1018,14 @@ impl RawSession {
 
     /// Sends one request and returns its `result` object verbatim.
     async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let message = self.attempt(method, params).await;
+        assert!(message.get("error").is_none(), "{method} failed: {message}");
+        message["result"].clone()
+    }
+
+    /// The same, handing back the whole JSON-RPC message so a test can assert
+    /// on a failure the gateway is right to produce.
+    async fn attempt(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         self.id += 1;
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": self.id, "method": method, "params": params
@@ -1025,14 +1033,12 @@ impl RawSession {
         let response = self.post(&body.to_string()).await;
         // The transport answers over SSE, so the JSON-RPC message is the
         // payload of the one `data:` event that carries a result.
-        let message = response
+        response
             .lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
             .find(|value| value.get("id").is_some())
-            .unwrap_or_else(|| panic!("no JSON-RPC answer in: {response}"));
-        assert!(message.get("error").is_none(), "{method} failed: {message}");
-        message["result"].clone()
+            .unwrap_or_else(|| panic!("no JSON-RPC answer in: {response}"))
     }
 }
 
@@ -1600,5 +1606,309 @@ async fn an_oauth_upstream_names_the_login_rather_than_relaying_the_challenge() 
     ));
 
     client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// `server/discover` is a MUST on a 2026-07-28 server, and a gateway is one:
+/// a client that has never spoken to this endpoint asks it what it can do,
+/// and the answer has to describe the server behind the pipe.
+#[tokio::test]
+async fn a_pipe_answers_discover_for_the_server_behind_it() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+
+    // Capabilities and identity come from the last successful connect, so
+    // this is what makes there be one — the same rule `initialize` follows.
+    fx.request("tools/list", serde_json::json!({})).await;
+    let result = fx.request("server/discover", serde_json::json!({})).await;
+
+    assert_eq!(result["resultType"], "complete", "{result}");
+    let versions: Vec<&str> = result["supportedVersions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no supportedVersions: {result}"))
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(versions.contains(&"2026-07-28"), "{result}");
+    // The pipe forwards for clients on the older revision too, and says so.
+    assert!(versions.contains(&"2025-11-25"), "{result}");
+    assert!(result["capabilities"]["tools"].is_object(), "{result}");
+    assert!(result["capabilities"]["prompts"].is_object(), "{result}");
+    // The server behind the endpoint, not "mcpgw": one gateway serving N
+    // servers under N endpoints all called mcpgw tells a user nothing.
+    let identity = &result["_meta"]["io.modelcontextprotocol/serverInfo"];
+    assert_eq!(identity["name"], "mcpgw-test-server", "{result}");
+    // Discovery is a cacheable result like any other, and the gateway's own
+    // answer changes with the upstream: nothing here may be cached.
+    assert_eq!(result["ttlMs"], 0, "{result}");
+    assert_eq!(result["cacheScope"], "private", "{result}");
+    manager.shutdown().await;
+}
+
+/// The aggregate answers it too, as itself: it is nobody's proxy in
+/// particular, and it serves tools only.
+#[tokio::test]
+async fn the_aggregate_discovers_as_mcpgw() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut aggregate = InlineSession::new(addr, "/mcp");
+
+    let result = aggregate
+        .request("server/discover", serde_json::json!({}))
+        .await;
+
+    assert_eq!(
+        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "mcpgw",
+        "{result}"
+    );
+    assert!(result["capabilities"]["tools"].is_object(), "{result}");
+    manager.shutdown().await;
+}
+
+/// Capabilities are forwarded allow-new-by-default: everything the upstream
+/// declared reaches the client except the short list the pipe would be lying
+/// about. The old rule was an allow-list of the families this gateway had
+/// heard of, which silently dropped every capability the spec added after it
+/// was written.
+#[tokio::test]
+async fn every_upstream_capability_is_forwarded_except_what_the_pipe_cannot_honour() {
+    let (addr, manager) = serve_both(&[("fx", "modern")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+    fx.request("tools/list", serde_json::json!({})).await;
+
+    let capabilities =
+        fx.request("server/discover", serde_json::json!({})).await["capabilities"].clone();
+
+    // Forwarded, including one this gateway has never heard of.
+    assert!(capabilities["tools"].is_object(), "{capabilities}");
+    assert!(capabilities["resources"].is_object(), "{capabilities}");
+    assert!(capabilities["completions"].is_object(), "{capabilities}");
+    assert_eq!(
+        capabilities["extensions"]["com.example/thing"]["deep"], true,
+        "{capabilities}"
+    );
+    // Dropped: notifications that stop at the gateway, and the methods it
+    // does not forward. A client that believed these would wait forever.
+    assert!(
+        capabilities["resources"].get("subscribe").is_none(),
+        "{capabilities}"
+    );
+    assert!(
+        capabilities["resources"].get("listChanged").is_none(),
+        "{capabilities}"
+    );
+    assert!(
+        capabilities["tools"].get("listChanged").is_none(),
+        "{capabilities}"
+    );
+    assert!(capabilities.get("logging").is_none(), "{capabilities}");
+    assert!(
+        capabilities["extensions"]
+            .get("io.modelcontextprotocol/tasks")
+            .is_none(),
+        "{capabilities}"
+    );
+    manager.shutdown().await;
+}
+
+/// The other half of the version matrix: an upstream that speaks only
+/// 2026-07-28 has no `initialize` to answer, so a gateway that knows one
+/// handshake cannot reach it at all. Every forwarded family has to work
+/// through it, for a client on the current revision.
+#[tokio::test]
+async fn a_modern_client_reaches_a_modern_upstream() {
+    let (addr, manager) = serve_both(&[("fx", "modern")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+
+    let tools = fx.request("tools/list", serde_json::json!({})).await;
+    assert_eq!(names_in(&tools), ["echo", "ask"], "{tools}");
+    // The upstream's own caching policy, not the pipe's fallback.
+    assert_eq!(tools["ttlMs"], 4242, "{tools}");
+    assert_eq!(tools["cacheScope"], "public", "{tools}");
+
+    let call = fx
+        .request(
+            "tools/call",
+            serde_json::json!({ "name": "echo", "arguments": { "message": "hi" } }),
+        )
+        .await;
+    assert_eq!(call["content"][0]["text"], "hi", "{call}");
+    assert_eq!(call["resultType"], "complete", "{call}");
+
+    let resources = fx.request("resources/list", serde_json::json!({})).await;
+    assert_eq!(resources["resources"][0]["name"], "greeting", "{resources}");
+    let prompts = fx.request("prompts/list", serde_json::json!({})).await;
+    assert_eq!(prompts["prompts"][0]["name"], "summarize", "{prompts}");
+    manager.shutdown().await;
+}
+
+/// And the reverse: a client still on the handshake lifecycle, in front of an
+/// upstream that has none. The pipe holds one conversation on each side and
+/// neither client nor server has to know about the other's revision.
+#[tokio::test]
+async fn an_older_client_reaches_a_modern_upstream() {
+    let (addr, manager) = serve_both(&[("fx", "modern")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    let tools = fx.request("tools/list", serde_json::json!({})).await;
+    assert_eq!(names_in(&tools), ["echo", "ask"], "{tools}");
+    // 2025-11-25 has no `resultType`, so the SDK strips what the upstream
+    // sent rather than handing a client a field its revision rejects.
+    assert!(tools.get("resultType").is_none(), "{tools}");
+
+    let call = fx
+        .request(
+            "tools/call",
+            serde_json::json!({ "name": "echo", "arguments": { "message": "hi" } }),
+        )
+        .await;
+    assert_eq!(call["content"][0]["text"], "hi", "{call}");
+
+    let prompts = fx.request("prompts/list", serde_json::json!({})).await;
+    assert_eq!(prompts["prompts"][0]["name"], "summarize", "{prompts}");
+
+    // The one cell of the matrix that cannot work, and must fail loudly
+    // rather than quietly: MRTR arrived with 2026-07-28, so an
+    // `input_required` answer has no shape this client could read. The pipe
+    // does not invent one, and the client is told the request failed instead
+    // of being handed a result it would misread.
+    let refused = fx
+        .attempt("tools/call", serde_json::json!({ "name": "ask" }))
+        .await;
+    assert!(refused.get("error").is_some(), "{refused}");
+    manager.shutdown().await;
+}
+
+/// MRTR (SEP-2322): a tool that needs input answers `input_required`, and the
+/// client retries the same call with what it collected. The pipe is not
+/// allowed to satisfy that round itself — it has no user to ask — so both the
+/// request for input and the state that correlates the retry have to cross it
+/// untouched, in both directions.
+#[tokio::test]
+async fn an_input_required_round_trip_crosses_the_pipe_untouched() {
+    let (addr, manager) = serve_both(&[("fx", "modern")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+
+    let first = fx
+        .request("tools/call", serde_json::json!({ "name": "ask" }))
+        .await;
+    assert_eq!(first["resultType"], "input_required", "{first}");
+    assert_eq!(
+        first["inputRequests"]["city"]["method"], "elicitation/create",
+        "{first}"
+    );
+    assert_eq!(
+        first["inputRequests"]["city"]["params"]["message"], "which city?",
+        "{first}"
+    );
+    let state = first["requestState"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no requestState to echo: {first}"))
+        .to_owned();
+
+    let second = fx
+        .request(
+            "tools/call",
+            serde_json::json!({
+                "name": "ask",
+                "requestState": state,
+                "inputResponses": {
+                    "city": { "action": "accept", "content": { "city": "berlin" } }
+                }
+            }),
+        )
+        .await;
+    assert_eq!(second["resultType"], "complete", "{second}");
+    // The upstream renders both halves back: the client's answer, and its own
+    // state as it came home.
+    assert_eq!(
+        second["content"][0]["text"], "berlin (fixture-request-state-1)",
+        "{second}"
+    );
+    manager.shutdown().await;
+}
+
+/// A 2026-07-28 request allocates no session. The revision removed them
+/// (SEP-2567), and the session manager the endpoints still hold — which a
+/// client on the older revision needs — must not mint one here.
+#[tokio::test]
+async fn a_modern_request_is_answered_without_a_session() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+        "params": { "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "inline", "version": "1" },
+            "io.modelcontextprotocol/clientCapabilities": {}
+        }}
+    })
+    .to_string();
+    let response = raw_post_body(
+        addr,
+        &endpoint_path("fx"),
+        None,
+        &[
+            ("MCP-Protocol-Version", "2026-07-28"),
+            ("Mcp-Method", "tools/list"),
+        ],
+        &body,
+    )
+    .await;
+
+    assert!(response.contains("echo"), "{response}");
+    assert!(
+        !response.to_lowercase().contains("mcp-session-id"),
+        "a sessionless revision was handed a session: {response}"
+    );
+    manager.shutdown().await;
+}
+
+/// SEP-2243 headers are the point of an intermediary: `Mcp-Method` (and
+/// `Mcp-Name` where the method names a subject) let one route without reading
+/// the body, and a mismatch between header and body is a lie the server has
+/// to refuse. The SDK enforces it in front of this gateway; the check is here
+/// because it is part of what mcpgw promises a client, not part of rmcp's
+/// internals.
+#[tokio::test]
+async fn the_standard_headers_are_required_and_checked_against_the_body() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let meta = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { "name": "inline", "version": "1" },
+        "io.modelcontextprotocol/clientCapabilities": {}
+    });
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "echo", "arguments": { "message": "hi" }, "_meta": meta }
+    })
+    .to_string();
+
+    // The subject is named in the body but not in the headers.
+    let missing = raw_post_body(
+        addr,
+        &endpoint_path("fx"),
+        None,
+        &[
+            ("MCP-Protocol-Version", "2026-07-28"),
+            ("Mcp-Method", "tools/call"),
+        ],
+        &body,
+    )
+    .await;
+    assert!(missing.contains("Mcp-Name"), "{missing}");
+
+    // The headers name a different tool than the body does.
+    let mismatched = raw_post_body(
+        addr,
+        &endpoint_path("fx"),
+        None,
+        &[
+            ("MCP-Protocol-Version", "2026-07-28"),
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "reverse"),
+        ],
+        &body,
+    )
+    .await;
+    assert!(mismatched.contains("does not match"), "{mismatched}");
     manager.shutdown().await;
 }

@@ -1,14 +1,14 @@
 //! Live probing for `doctor --probe`: reach the server over its own
-//! transport, run the MCP `initialize` handshake, count its tools.
+//! transport, run whichever MCP handshake it speaks, count its tools.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use rmcp::ServiceExt as _;
 use rmcp::transport::TokioChildProcess;
 use tokio::process::Command;
 
 use crate::config::{Server, Transport};
+use crate::upstream::{DialError, Lifecycle};
 
 /// Appended to the stdio timeout message; the first `npx`/`uvx` run of a
 /// package spends its budget downloading, which looks like a hang.
@@ -125,22 +125,32 @@ async fn connect_stdio(
     args: &[String],
     env: &BTreeMap<String, String>,
 ) -> Result<Service, ProbeError> {
-    let mut cmd = Command::new(command);
-    cmd.args(args);
-    for (key, value) in env {
-        cmd.env(key, value);
+    // Rebuilt per attempt: the first child owns the pipes it was handed, so a
+    // second lifecycle needs a second process.
+    let spawn = || {
+        let mut cmd = Command::new(command);
+        cmd.args(args);
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        // Server logs on stderr are noise here; doctor reports outcomes only.
+        cmd.stderr(std::process::Stdio::null());
+        // A timed-out probe drops its future mid-handshake; without this the
+        // spawned server would outlive us as an orphan.
+        cmd.kill_on_drop(true);
+        TokioChildProcess::new(cmd).map_err(|source| ProbeError::Spawn {
+            command: command.to_owned(),
+            source,
+        })
+    };
+    // The probe runs both lifecycles for the same reason the gateway does:
+    // a 2026-07-28 server has no `initialize` to answer, and reporting it as
+    // unreachable would be doctor lying about a healthy server.
+    match dial(spawn()?, Lifecycle::Legacy).await {
+        Err(err) if err.refused_initialize => dial(spawn()?, Lifecycle::Modern).await,
+        other => other,
     }
-    // Server logs on stderr are noise here; doctor reports outcomes only.
-    cmd.stderr(std::process::Stdio::null());
-    // A timed-out probe drops its future mid-handshake; without this the
-    // spawned server would outlive us as an orphan.
-    cmd.kill_on_drop(true);
-
-    let transport = TokioChildProcess::new(cmd).map_err(|source| ProbeError::Spawn {
-        command: command.to_owned(),
-        source,
-    })?;
-    ().serve(transport).await.map_err(handshake)
+    .map_err(failure)
 }
 
 async fn connect_http(
@@ -149,18 +159,40 @@ async fn connect_http(
 ) -> Result<Service, ProbeError> {
     let config = crate::upstream::http_config(url, headers)
         .map_err(|message| ProbeError::Handshake { message })?;
-    let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
+    let transport = || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
     // Connect errors (refused, TLS, 4xx) arrive as handshake failures —
     // there is no separate "spawn" step for a remote server. The 401 is the
     // exception, and rmcp answers for it rather than the message being
-    // matched: see `upstream::connect_once`.
-    ().serve(transport).await.map_err(|err| {
-        if err.is_authorization_required() {
-            ProbeError::AuthRequired
-        } else {
-            handshake(err)
+    // matched: see `upstream::dial`.
+    match dial(transport(), Lifecycle::Legacy).await {
+        Err(err) if err.refused_initialize => dial(transport(), Lifecycle::Modern).await,
+        other => other,
+    }
+    .map_err(failure)
+}
+
+/// One handshake, with no deadline of its own: [`connected`] already races
+/// the whole probe against the caller's timeout, and a second one inside it
+/// would only decide the same thing twice.
+async fn dial<T, E, A>(transport: T, lifecycle: Lifecycle) -> Result<Service, DialError>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    crate::upstream::dial(transport, lifecycle, None).await
+}
+
+/// What a failed handshake means for the report: a server that will not talk
+/// without a credential is not a broken server, and no retry or timeout bump
+/// is its fix.
+fn failure(err: DialError) -> ProbeError {
+    if err.auth_required {
+        ProbeError::AuthRequired
+    } else {
+        ProbeError::Handshake {
+            message: err.message,
         }
-    })
+    }
 }
 
 fn handshake(err: impl std::fmt::Display) -> ProbeError {

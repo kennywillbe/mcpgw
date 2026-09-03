@@ -682,7 +682,12 @@ impl UpstreamManager {
                 // 500ms → 1s → 2s with the default base.
                 tokio::time::sleep(self.backoff_base * 2u32.pow(attempt - 1)).await;
             }
-            match self.connect_once(name, server).await {
+            // Boxed: this future carries a whole handshake — two of them for
+            // a server that turns out to speak the newer lifecycle — and it
+            // is reached from every downstream request handler, whose frames
+            // would all have to be big enough to hold it. One allocation per
+            // connect attempt buys that back.
+            match Box::pin(self.connect_once(name, server)).await {
                 Ok(service) => return Ok(service),
                 // Retrying a 401 only asks the same question again, more
                 // slowly: the credential this connection lacks cannot appear
@@ -708,55 +713,57 @@ impl UpstreamManager {
             attempts: 1,
             message,
         };
-        let handshake =
-            |result: Result<Result<UpstreamService, _>, tokio::time::error::Elapsed>| {
-                result
-                    .map_err(|_| failed(format!("no handshake within {:?}", self.connect_timeout)))?
-                    .map_err(|err| failed(format!("handshake failed: {err}")))
-            };
-
         match &server.transport {
             Transport::Stdio { command, args, env } => {
-                let mut cmd = Command::new(command);
-                cmd.args(args);
-                for (key, value) in env {
-                    cmd.env(key, value);
+                // Rebuilt per attempt: a handshake that failed leaves a child
+                // holding the pipes, and the second lifecycle needs its own.
+                let spawn = || {
+                    let mut cmd = Command::new(command);
+                    cmd.args(args);
+                    for (key, value) in env {
+                        cmd.env(key, value);
+                    }
+                    cmd.stderr(std::process::Stdio::null());
+                    // Orphan prevention (learned the hard way in the probe milestone).
+                    cmd.kill_on_drop(true);
+                    TokioChildProcess::new(cmd)
+                        .map_err(|err| failed(format!("spawn failed: {err}")))
+                };
+                match dial(spawn()?, Lifecycle::Legacy, Some(self.connect_timeout)).await {
+                    Err(err) if err.refused_initialize => {
+                        dial(spawn()?, Lifecycle::Modern, Some(self.connect_timeout)).await
+                    }
+                    other => other,
                 }
-                cmd.stderr(std::process::Stdio::null());
-                // Orphan prevention (learned the hard way in the probe milestone).
-                cmd.kill_on_drop(true);
-
-                let transport = TokioChildProcess::new(cmd)
-                    .map_err(|err| failed(format!("spawn failed: {err}")))?;
-                handshake(tokio::time::timeout(self.connect_timeout, ().serve(transport)).await)
+                .map_err(|err| failed(err.message))
             }
             Transport::Http { url, headers } => {
                 let config = http_config(url, headers).map_err(failed)?;
                 // Nothing is dialed until the handshake, so an unreachable
                 // host surfaces here as a normal connect failure and feeds
                 // the same backoff ladder as a stdio spawn failure.
-                let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
-                match tokio::time::timeout(self.connect_timeout, ().serve(transport)).await {
-                    Err(_) => Err(failed(format!(
-                        "no handshake within {:?}",
-                        self.connect_timeout
-                    ))),
-                    Ok(Ok(service)) => Ok(service),
-                    // Asked of the error rather than matched on its text:
-                    // rmcp buries the 401 in a `Box<dyn Error>` chain whose
-                    // Display is a bare "Auth required", and this is the
-                    // accessor it exposes for exactly this question. A 403
-                    // (a token that is real but too narrow) is deliberately
-                    // not this state — nothing on this machine minted that
-                    // token, so there is nothing here to widen.
-                    Ok(Err(err)) if err.is_authorization_required() => {
-                        Err(UpstreamError::AuthRequired {
-                            name: name.to_owned(),
-                            resource_metadata: err.auth_challenge().and_then(resource_metadata),
-                        })
+                let transport =
+                    || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
+                match dial(transport(), Lifecycle::Legacy, Some(self.connect_timeout)).await {
+                    // A 401 is not "this server has no `initialize`": it is a
+                    // server that will not answer anything without a
+                    // credential, so asking it again over the other lifecycle
+                    // only spends a second round trip on the same refusal.
+                    Err(err) if err.refused_initialize => {
+                        dial(transport(), Lifecycle::Modern, Some(self.connect_timeout)).await
                     }
-                    Ok(Err(err)) => Err(failed(format!("handshake failed: {err}"))),
+                    other => other,
                 }
+                .map_err(|err| {
+                    if err.auth_required {
+                        UpstreamError::AuthRequired {
+                            name: name.to_owned(),
+                            resource_metadata: err.resource_metadata,
+                        }
+                    } else {
+                        failed(err.message)
+                    }
+                })
             }
         }
     }
@@ -778,6 +785,103 @@ fn resource_metadata(challenge: &str) -> Option<String> {
         None => rest.split(',').next()?.trim(),
     };
     (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Which MCP lifecycle a handshake attempt uses.
+#[derive(Clone, Copy)]
+pub(crate) enum Lifecycle {
+    /// `initialize` plus `notifications/initialized` — every revision up to
+    /// and including 2025-11-25.
+    Legacy,
+    /// `server/discover` plus self-contained per-request `_meta` — 2026-07-28
+    /// (SEP-2575), which has no handshake at all.
+    Modern,
+}
+
+/// A failed handshake, classified into the two things a caller can act on.
+pub(crate) struct DialError {
+    pub(crate) message: String,
+    /// The server answered the handshake with a JSON-RPC error, so it is
+    /// reachable and speaking — a 2026-07-28-only server refusing a method it
+    /// no longer has. A transport error, a timeout or a closed connection
+    /// says nothing of the sort and must not cost a second attempt.
+    pub(crate) refused_initialize: bool,
+    /// The server answered 401. Kept apart from the message because the fix
+    /// is a login on this machine, not a retry, and every layer above has to
+    /// be able to say so without reading error text.
+    pub(crate) auth_required: bool,
+    /// The `resource_metadata` URL from that 401's `WWW-Authenticate`
+    /// challenge, when it sent one.
+    pub(crate) resource_metadata: Option<String>,
+}
+
+/// One handshake against `transport` on `lifecycle`, under `timeout` when
+/// the caller has one. `None` is for a caller that already races the whole
+/// connection against a deadline of its own.
+///
+/// The order the caller uses is legacy first, modern only if the server
+/// answered an error, rather than rmcp's own `Auto` mode, which probes with
+/// `server/discover` and waits ten seconds for a server that simply ignores
+/// methods it does not know. Most upstreams are on the handshake to this day,
+/// and none of them should pay that wait on every connect.
+pub(crate) async fn dial<T, E, A>(
+    transport: T,
+    lifecycle: Lifecycle,
+    timeout: Option<Duration>,
+) -> Result<UpstreamService, DialError>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use rmcp::ClientServiceExt as _;
+
+    let handshake = async {
+        match lifecycle {
+            Lifecycle::Legacy => ().serve(transport).await,
+            Lifecycle::Modern => {
+                ().serve_with_lifecycle(
+                    transport,
+                    rmcp::ClientLifecycleMode::Discover {
+                        preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+                    },
+                )
+                .await
+            }
+        }
+    };
+    let outcome = match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, handshake)
+            .await
+            .map_err(|_| format!("no handshake within {timeout:?}")),
+        None => Ok(handshake.await),
+    };
+    match outcome {
+        Ok(Ok(service)) => Ok(service),
+        Ok(Err(err)) => Err(DialError {
+            refused_initialize: matches!(
+                (lifecycle, &err),
+                (
+                    Lifecycle::Legacy,
+                    rmcp::service::ClientInitializeError::JsonRpcError(_)
+                )
+            ),
+            // Asked of the error rather than matched on its text: rmcp buries
+            // the 401 in a `Box<dyn Error>` chain whose Display is a bare
+            // "Auth required", and this is the accessor it exposes for exactly
+            // this question. A 403 (a token that is real but too narrow) is
+            // deliberately not this state — nothing on this machine minted
+            // that token, so there is nothing here to widen.
+            auth_required: err.is_authorization_required(),
+            resource_metadata: err.auth_challenge().and_then(resource_metadata),
+            message: format!("handshake failed: {err}"),
+        }),
+        Err(message) => Err(DialError {
+            message,
+            refused_initialize: false,
+            auth_required: false,
+            resource_metadata: None,
+        }),
+    }
 }
 
 /// Builds the streamable-http client config for `url`, passing the canonical
