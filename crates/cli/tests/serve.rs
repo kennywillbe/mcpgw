@@ -150,3 +150,72 @@ async fn the_old_per_server_flag_is_still_accepted() {
 
     child.kill().await.unwrap();
 }
+
+/// Port off the banner address, which is where the record's name comes from.
+fn port_of(addr: &str) -> u16 {
+    addr.rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .unwrap_or_else(|| panic!("no port in {addr}"))
+}
+
+/// The record lands around the bind, so the banner is not a guarantee it is
+/// already there — polled to the same deadline the endpoints get.
+async fn wait_for_record(state: &Path, port: u16) -> mcpgw_core::runtime::GatewayRecord {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        if let Some(record) = mcpgw_core::runtime::read_record(state, port).unwrap() {
+            return record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no gateway record for port {port} within {READY_DEADLINE:?}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// An upgrade leaves the running service on the old binary, and nothing on
+/// the wire says so — the gateway has to state its own version, pid and
+/// executable while it is up.
+#[tokio::test]
+async fn a_running_gateway_records_what_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, addr, _) = serve(dir.path(), &[]).await;
+    let port = port_of(&addr);
+
+    let record = wait_for_record(&dir.path().join("state"), port).await;
+
+    assert_eq!(record.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(record.pid, child.id().unwrap());
+    assert_eq!(record.port, port);
+    assert!(record.exe.exists(), "{}", record.exe.display());
+
+    child.kill().await.unwrap();
+}
+
+/// A gateway that shut down cleanly must not leave a record claiming it is
+/// still up. (A crash does, which is why readers probe the port as well.)
+#[cfg(unix)]
+#[tokio::test]
+async fn a_clean_shutdown_withdraws_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (mut child, addr, _) = serve(dir.path(), &[]).await;
+    let port = port_of(&addr);
+    wait_for_record(&state, port).await;
+
+    // SIGINT rather than the `kill` the other tests use: this is the path
+    // Ctrl-C takes, and the only one that gets to clean up after itself.
+    let killed = std::process::Command::new("kill")
+        .args(["-INT", &child.id().unwrap().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success(), "{killed}");
+    child.wait().await.unwrap();
+
+    assert_eq!(
+        mcpgw_core::runtime::read_record(&state, port).unwrap(),
+        None
+    );
+}

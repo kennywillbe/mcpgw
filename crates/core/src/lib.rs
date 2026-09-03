@@ -12,6 +12,7 @@ pub mod paths;
 pub mod private;
 pub mod probe;
 pub mod reload;
+pub mod runtime;
 pub mod state;
 pub mod store;
 pub mod sync;
