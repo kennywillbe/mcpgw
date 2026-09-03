@@ -78,7 +78,15 @@ pub fn mcpgw_binary(exe: &Path, home: &Path) -> Command {
 /// systemctl never sees.
 #[allow(dead_code)]
 pub fn mcpgw_keeping_the_real_home(sandbox: &Path) -> Command {
-    sandboxed(&assert_cmd::cargo::cargo_bin("mcpgw"), sandbox)
+    mcpgw_binary_keeping_the_real_home(&assert_cmd::cargo::cargo_bin("mcpgw"), sandbox)
+}
+
+/// The real home again, around a different `mcpgw` on disk — the systemd
+/// live cycle, which needs both halves at once: the manager's own unit
+/// directory, and a binary it may replace.
+#[allow(dead_code)]
+pub fn mcpgw_binary_keeping_the_real_home(exe: &Path, sandbox: &Path) -> Command {
+    sandboxed(exe, sandbox)
 }
 
 /// The config and state redirection every invocation gets, whichever binary
@@ -96,18 +104,164 @@ fn sandboxed(exe: &Path, sandbox: &Path) -> Command {
 /// `mcpgw daemon`, run to completion in the sandbox `mcpgw` builds.
 #[allow(dead_code)]
 pub fn daemon(home: &Path, args: &[&str]) -> Output {
-    mcpgw(home).arg("daemon").args(args).output().unwrap()
+    run_daemon(mcpgw(home), args)
 }
 
 /// The same, for the one caller that has to keep the real `HOME` — see
 /// [`mcpgw_keeping_the_real_home`].
 #[allow(dead_code)]
 pub fn daemon_keeping_the_real_home(sandbox: &Path, args: &[&str]) -> Output {
-    mcpgw_keeping_the_real_home(sandbox)
-        .arg("daemon")
-        .args(args)
-        .output()
-        .unwrap()
+    run_daemon(mcpgw_keeping_the_real_home(sandbox), args)
+}
+
+/// How long a spawn waits out an executable somebody else is holding open,
+/// and how often it tries again in the meantime.
+const BUSY_DEADLINE: Duration = Duration::from_secs(10);
+const BUSY_POLL: Duration = Duration::from_millis(50);
+
+/// Runs `attempt` until it stops failing with `ETXTBSY`, and returns what it
+/// produced.
+///
+/// Several tests copy the mcpgw binary into a tempdir of their own and
+/// execute the copy. Nothing coordinates them and they share one process: a
+/// sibling test forking while a copy's write handle is still open leaves
+/// that child holding the descriptor, and Linux refuses to execute a file
+/// anyone has open for writing. So a spawn loses a race it took no part in
+/// (#74), against a condition that clears by itself the moment the
+/// descriptor is gone — which is why this waits rather than reports.
+///
+/// Only that one error. Anything else is the failure the test is about, and
+/// is raised on the first try rather than retried for ten seconds.
+#[allow(dead_code)]
+pub fn retrying_while_busy<T>(exe: &Path, mut attempt: impl FnMut() -> std::io::Result<T>) -> T {
+    let deadline = std::time::Instant::now() + BUSY_DEADLINE;
+    loop {
+        match attempt() {
+            Ok(produced) => return produced,
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => assert!(
+                std::time::Instant::now() < deadline,
+                "{} was still busy after {BUSY_DEADLINE:?}",
+                exe.display()
+            ),
+            Err(err) => panic!("{}: {err}", exe.display()),
+        }
+        std::thread::sleep(BUSY_POLL);
+    }
+}
+
+/// `command.output()`, waiting out a busy executable — see
+/// [`retrying_while_busy`].
+#[allow(dead_code)]
+pub fn output_retrying_while_busy(command: &mut Command) -> Output {
+    let exe = PathBuf::from(command.get_program());
+    retrying_while_busy(&exe, || command.output())
+}
+
+/// `command.spawn()`, waiting out a busy executable — see
+/// [`retrying_while_busy`].
+///
+/// The wait between tries blocks the runtime thread rather than yielding to
+/// it. `spawn` is a synchronous call on an async `Command`, the wait is
+/// bounded, and a test whose gateway has not started yet has nothing else
+/// for that thread to be doing.
+#[allow(dead_code)]
+pub fn spawn_retrying_while_busy(command: &mut tokio::process::Command) -> tokio::process::Child {
+    let exe = PathBuf::from(command.as_std().get_program());
+    retrying_while_busy(&exe, || command.spawn())
+}
+
+/// `daemon` against a sandbox the caller built itself.
+///
+/// The live cycles run every command through a copy of mcpgw rather than
+/// through the binary cargo built, and each of them sandboxes differently —
+/// so what they share is this last step and not the `Command` that reaches
+/// it.
+#[allow(dead_code)]
+pub fn run_daemon(mut mcpgw: Command, args: &[&str]) -> Output {
+    output_retrying_while_busy(mcpgw.arg("daemon").args(args))
+}
+
+/// A copy of the mcpgw cargo built, under `dir`, executable and ready to be
+/// installed as a service.
+///
+/// The upgrade tests replace the binary a gateway is running, and the file
+/// cargo built is the one every other test in the run is about to execute —
+/// so they replace a copy of it instead. On macOS the copy also has to sit
+/// outside the folders TCC keeps a launch agent out of, which a temp
+/// directory is.
+#[allow(dead_code)]
+pub fn binary_copy(dir: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let copy = dir.join(format!("mcpgw{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(assert_cmd::cargo::cargo_bin("mcpgw"), &copy).unwrap();
+    copy
+}
+
+/// Publishes a new binary at `path` the way an upgrade does: whole-file, so
+/// the stamp the watcher sees is stable from the first tick that sees it.
+///
+/// Never a write into the file already there. That path is usually a running
+/// image, and writing into one is `ETXTBSY` on Linux and a sharing violation
+/// on Windows — which is why `brew`, `cargo install` and `self_replace` all
+/// publish by renaming a sibling over the path, and why this does too.
+/// Windows will not rename *over* a running image but will rename it aside,
+/// so there the old one is moved out of the way first.
+///
+/// The new bytes are the old ones with a few appended. A Mach-O, an ELF and
+/// a PE are all described by their headers rather than by their length, so
+/// trailing bytes change the stamp without changing what runs — which the
+/// caller is told to confirm, because a binary that no longer executes would
+/// otherwise show up as a service that mysteriously never came back.
+#[allow(dead_code)]
+pub fn replace_binary(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes.extend_from_slice(b"an upgrade");
+    let published = path.with_extension("new");
+    std::fs::write(&published, bytes).unwrap();
+    // Carried over so the replacement is a plausible binary rather than a
+    // 0644 file wearing its name.
+    let mode = std::fs::metadata(path).unwrap().permissions();
+    std::fs::set_permissions(&published, mode).unwrap();
+    if cfg!(windows) {
+        let aside = path.with_extension("old");
+        let _ = std::fs::remove_file(&aside);
+        std::fs::rename(path, &aside).unwrap();
+    }
+    std::fs::rename(&published, path).unwrap();
+}
+
+/// Waits for the gateway on `port` to be a different process that got there
+/// by standing aside for a replaced binary, and returns the record it
+/// published.
+///
+/// Both halves are asserted because either alone is a weaker claim: a new pid
+/// is any restart at all, and a recorded restart is what the *outgoing*
+/// gateway writes on its way out. Only the two together say the supervisor
+/// relaunched the replacement.
+#[allow(dead_code)]
+pub fn wait_for_an_upgrade_restart(
+    state: &Path,
+    port: u16,
+    previous_pid: u32,
+    timeout: Duration,
+) -> mcpgw_core::runtime::GatewayRecord {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last = None;
+    loop {
+        let record = mcpgw_core::runtime::read_record(state, port).unwrap();
+        if let Some(record) = record {
+            if record.pid != previous_pid && record.last_upgrade_restart.is_some() {
+                return record;
+            }
+            last = Some(record);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the gateway on port {port} did not restart onto the replaced binary within \
+             {timeout:?} — the record is now {last:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 #[allow(dead_code)]
@@ -174,13 +328,13 @@ const BANNER_DEADLINE: Duration = Duration::from_secs(60);
 #[allow(dead_code)]
 pub async fn serve(home: &Path, args: &[&str]) -> (tokio::process::Child, String, String) {
     let mut command = tokio::process::Command::from(mcpgw(home));
-    let mut child = command
-        .arg("serve")
-        .args(["--port", "0", "--no-capture"])
-        .args(args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = spawn_retrying_while_busy(
+        command
+            .arg("serve")
+            .args(["--port", "0", "--no-capture"])
+            .args(args)
+            .stdout(Stdio::piped()),
+    );
 
     let (addr, endpoints) = banner(&mut child).await;
     (child, addr, endpoints)
@@ -204,14 +358,14 @@ pub async fn serve_binary(
     std::sync::Arc<std::sync::Mutex<String>>,
 ) {
     let mut command = tokio::process::Command::from(mcpgw_binary(exe, home));
-    let mut child = command
-        .arg("serve")
-        .args(["--port", "0", "--no-capture"])
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = spawn_retrying_while_busy(
+        command
+            .arg("serve")
+            .args(["--port", "0", "--no-capture"])
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
 
     let errors = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
