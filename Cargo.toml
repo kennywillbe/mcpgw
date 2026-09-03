@@ -109,6 +109,23 @@ tar = "0.4"
 # so the zip reader is target-gated in crates/cli/Cargo.toml rather than
 # compiled into every build.
 zip = { version = "8", default-features = false, features = ["deflate"] }
+# `watch --tui` draws a live table, a call log and a detail pane, and
+# redrawing those by hand out of ANSI escapes is how a terminal ends up
+# wedged. ratatui is pure Rust, so the single static binary stays one; the
+# backend split in 0.30 means the default feature set is trimmed to what is
+# actually drawn — no calendar widget, no `macros`, no `underline-color`,
+# just the crossterm backend and the widgets the three panes use.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+# The other half of the same dependency: raw mode, the alternate screen and
+# the key events the TUI loop reads. Named here rather than reached for
+# through ratatui's re-export because the loop drives it directly, and pinned
+# to the 0.29 line ratatui 0.30's backend links against — the graph has to
+# carry one crossterm and not two, or the terminal ratatui restores would not
+# be the one this loop put into raw mode. Left on default features on
+# purpose: ratatui-crossterm already depends on it with defaults, so trimming
+# them here would buy nothing cargo's feature unification does not put back,
+# and would only make the manifest lie about what is compiled.
+crossterm = "0.29"
 insta = "1"
 assert_cmd = "2"
 # Traffic capture redacts before it writes, and `[capture] redact` lets a

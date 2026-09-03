@@ -46,6 +46,53 @@ mcpgw watch --json --show-secrets  # …with args/response unmasked
 mcpgw watch --json | jq -r 'select(.ok == false) | "\(.server) \(.error)"'
 ```
 
+## The terminal UI
+
+```sh
+mcpgw watch --tui
+```
+
+Same records, three panes instead of a stream. It exists because the questions
+that matter with four clients and ten servers are comparative — which server is
+slow, which tool fails and how often, what that one client was doing right
+before it hung — and a line stream can only be scrolled, not compared.
+
+- **Top** — a live table, one row per server and tool: calls, errors, p50 and
+  p95 latency, and how long ago it was last seen. Over a rolling window of the
+  last 1000 records, so the numbers are the shape of the traffic now rather
+  than an all-day average that flattens the spike you opened this to find.
+- **Middle** — the call log, newest at the bottom. Age, outcome, server,
+  target, method, client and duration. It follows the tail until you scroll up,
+  and follows again when you scroll back to the last row.
+- **Bottom** — the detail pane for the selected call, under the same redaction
+  rules as everything else here: a line captured `full` shows `***` for its
+  args and response unless you started with `--show-secrets`, and a line the
+  gateway already redacted is shown as it was written.
+
+| key | what |
+| --- | --- |
+| `q`, `Esc`, `Ctrl-C` | quit |
+| `↑`/`↓`, `k`/`j` | select a call |
+| `Enter` | show or hide the detail pane |
+| `f` | filter by server → tool → status → client, one prompt at a time |
+| `/` | free text filter over server, tool, method, endpoint, session, client and error |
+| `p` | pause and resume — lines that arrive while paused are held, not dropped |
+| `c` | clear |
+| `s` | sort the table by calls, errors or p95 |
+| `?` | the key list, over the panes |
+
+At a prompt, an empty answer takes that filter off again, and `Esc` cancels.
+The `--server`, `--tool`, `--endpoint` and `--session` flags work the same as
+they do for the stream and set where the TUI starts:
+
+```sh
+mcpgw watch --tui --server github
+```
+
+The line stream stays the default. `mcpgw watch` with no flags prints lines
+exactly as it always did, and `--tui` needs a real terminal — off one it says
+so and points at the stream rather than writing escape sequences into a pipe.
+
 ## The record format
 
 ```json
