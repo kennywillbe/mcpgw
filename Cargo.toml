@@ -111,6 +111,18 @@ tar = "0.4"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 insta = "1"
 assert_cmd = "2"
+# Traffic capture redacts before it writes, and `[capture] redact` lets a
+# user add patterns of their own — user-supplied regexes need a real engine,
+# and the built-in credential shapes are the same kind of match. Default
+# features are off: only the ASCII matcher, the literal accelerators the
+# per-request hot path wants, and the two Unicode tables the patterns
+# actually use (`(?i)` case folding and `\s`/`\b`).
+regex = { version = "1", default-features = false, features = [
+    "std",
+    "perf",
+    "unicode-case",
+    "unicode-perl",
+] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, bail};
 use mcpgw_core::Config;
-use mcpgw_core::capture::CaptureWriter;
+use mcpgw_core::capture::{Bodies, CapturePolicy, CaptureWriter, RedactionRules};
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{Gateway, ServerList, serve_http_with};
 use mcpgw_core::reload::{POLL_INTERVAL, Reloader};
@@ -40,6 +40,25 @@ const UPDATE_CHECK_POLL: std::time::Duration = std::time::Duration::from_secs(60
 #[cfg(debug_assertions)]
 const FIRST_UPDATE_CHECK_ENV: &str = "MCPGW_UPDATE_FIRST_CHECK_MS";
 
+/// The `--capture-bodies` values, spelled here rather than derived on
+/// `mcpgw_core::capture::Bodies` so the core crate stays free of clap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CaptureBodies {
+    Off,
+    Redacted,
+    Full,
+}
+
+impl From<CaptureBodies> for Bodies {
+    fn from(bodies: CaptureBodies) -> Self {
+        match bodies {
+            CaptureBodies::Off => Bodies::Off,
+            CaptureBodies::Redacted => Bodies::Redacted,
+            CaptureBodies::Full => Bodies::Full,
+        }
+    }
+}
+
 #[derive(clap::Args)]
 pub struct ServeArgs {
     /// Port to listen on
@@ -59,6 +78,10 @@ pub struct ServeArgs {
     /// Do not write the JSONL traffic log
     #[arg(long)]
     pub no_capture: bool,
+    /// How much of each request to keep in the traffic log: metadata only,
+    /// bodies with credentials replaced, or bodies verbatim
+    #[arg(long, value_enum, default_value = "redacted", value_name = "MODE")]
+    pub capture_bodies: CaptureBodies,
     /// Set by `mcpgw daemon install` in the service definition, never by
     /// hand: it makes the gateway end itself when its own binary is
     /// upgraded, which is only safe under something that will start it
@@ -81,7 +104,12 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         gateway,
         pipe,
         capture_note,
-    } = build(config_path, &args.server, &selected, args.no_capture)?;
+    } = build(
+        config_path,
+        &args.server,
+        &selected,
+        capture_policy(args.no_capture, args.capture_bodies.into(), &config)?,
+    )?;
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -198,9 +226,9 @@ pub(crate) fn build(
     config_path: std::path::PathBuf,
     selection: &[String],
     selected: &[String],
-    no_capture: bool,
+    capture: Option<CapturePolicy>,
 ) -> anyhow::Result<Built> {
-    let (capture, capture_note) = capture_writer(no_capture)?;
+    let (capture, capture_note) = capture_writer(capture)?;
 
     // Started empty and filled by the first `apply` in the caller, so the
     // servers present at boot arrive through exactly the code path a reload
@@ -263,16 +291,45 @@ fn warn_if_reachable(bind: &str) {
     }
 }
 
-/// The traffic log this gateway writes, with the banner line that says where
-/// it goes — or that there is none.
-fn capture_writer(disabled: bool) -> anyhow::Result<(Option<Arc<CaptureWriter>>, String)> {
-    if disabled {
-        return Ok((None, "traffic capture disabled (--no-capture)".to_owned()));
+/// What a gateway captures under, or [`None`] for no traffic log at all.
+///
+/// One construction site for both callers: `serve` reads the mode off its
+/// flag and `connect`'s embedded gateway takes the default, so neither can
+/// end up redacting by a different set of rules than the other.
+///
+/// The rules are read once, here. A `[capture] redact` edit therefore needs a
+/// restart, unlike a server added to the config: the reload path hands the
+/// running gateway a new upstream table, not a new writer, and swapping a
+/// writer underneath a request would be a far bigger change than the one
+/// thing it buys.
+pub(crate) fn capture_policy(
+    no_capture: bool,
+    bodies: Bodies,
+    config: &Config,
+) -> anyhow::Result<Option<CapturePolicy>> {
+    if no_capture {
+        return Ok(None);
     }
+    let rules = RedactionRules::compile(&config.capture.redact)?;
+    Ok(Some(CapturePolicy::new(bodies, rules)))
+}
+
+/// The traffic log this gateway writes, with the banner line that says where
+/// it goes and how much of each request it keeps — or that there is none.
+fn capture_writer(
+    policy: Option<CapturePolicy>,
+) -> anyhow::Result<(Option<Arc<CaptureWriter>>, String)> {
+    let Some(policy) = policy else {
+        return Ok((None, "traffic capture disabled (--no-capture)".to_owned()));
+    };
     let state_dir = mcpgw_core::paths::state_dir()
         .context("cannot determine a home directory to resolve the state directory")?;
-    let writer = CaptureWriter::under_state_dir(&state_dir);
-    let note = format!("capturing traffic to {}", writer.dir().display());
+    let bodies = policy.bodies();
+    let writer = CaptureWriter::under_state_dir(&state_dir).with_policy(policy);
+    let note = format!(
+        "capturing traffic to {} (bodies: {bodies})",
+        writer.dir().display()
+    );
     Ok((Some(Arc::new(writer)), note))
 }
 

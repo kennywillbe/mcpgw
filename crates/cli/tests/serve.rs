@@ -368,3 +368,111 @@ async fn a_supervised_gateway_watches_the_binary_its_service_was_installed_with(
     let said = errors.lock().unwrap().clone();
     assert!(said.contains(&installed.display().to_string()), "{said}");
 }
+
+/// A credential shaped like a real one, passed where a tool argument would
+/// carry it.
+const FAKE_TOKEN: &str = "ghp_0123456789abcdefghij";
+
+/// Calls one tool through the binary's own stdio bridge, once the endpoint is
+/// known to answer.
+async fn call_tool(url: &str, tool: &str, message: &str) {
+    let mut command = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"));
+    // The bridge must not raise a gateway of its own here: the record this
+    // call writes is the thing under test, and a second gateway would write
+    // it somewhere else, under a policy nobody set.
+    command.args(["connect", "--no-auto-start", "--url", url]);
+    let (transport, _stderr) = TokioChildProcess::builder(command)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = ().serve(transport).await.unwrap();
+    let request = rmcp::model::CallToolRequestParams::new(tool.to_owned()).with_arguments(
+        serde_json::json!({ "message": message })
+            .as_object()
+            .cloned()
+            .unwrap(),
+    );
+    client.call_tool(request).await.unwrap();
+    client.cancel().await.unwrap();
+}
+
+/// Everything the gateway captured under `home`, as the bytes on disk.
+fn traffic(home: &Path) -> String {
+    let dir = home.join("state").join("traffic");
+    std::fs::read_dir(&dir)
+        .unwrap_or_else(|err| panic!("no traffic under {}: {err}", dir.display()))
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect()
+}
+
+/// The flag is the surface, so the default it advertises is part of the
+/// promise: capture redacts unless somebody chose otherwise.
+#[test]
+fn capture_bodies_defaults_to_redacted_and_names_its_modes() {
+    let help = util::stdout(
+        &util::mcpgw(Path::new("."))
+            .args(["serve", "--help"])
+            .output()
+            .unwrap(),
+    );
+    assert!(help.contains("--capture-bodies"), "{help}");
+    assert!(help.contains("[default: redacted]"), "{help}");
+    assert!(help.contains("off, redacted, full"), "{help}");
+}
+
+#[test]
+fn an_unknown_capture_bodies_mode_is_refused() {
+    let output = util::mcpgw(Path::new("."))
+        .args(["serve", "--capture-bodies", "verbatim"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let said = util::stderr(&output);
+    assert!(said.contains("verbatim"), "{said}");
+    assert!(said.contains("redacted"), "{said}");
+}
+
+/// The default the flag advertises, end to end through the real binary: a
+/// token handed to a tool is not in the file the gateway wrote.
+#[tokio::test]
+async fn a_captured_tool_argument_is_redacted_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, addr, _) = serve_capturing(dir.path(), &[]).await;
+
+    let url = format!("http://{addr}/s/fx1");
+    tool_names(&url).await;
+    call_tool(&url, "echo", FAKE_TOKEN).await;
+    child.kill().await.unwrap();
+
+    let captured = traffic(dir.path());
+    assert!(!captured.contains(FAKE_TOKEN), "{captured}");
+    assert!(captured.contains("[redacted:ghp_…]"), "{captured}");
+    // Still a log worth keeping: the call is named and timed.
+    assert!(captured.contains(r#""tool":"echo""#), "{captured}");
+}
+
+/// `off` is the mode for people who want the timings and nothing else.
+#[tokio::test]
+async fn capture_bodies_off_records_metadata_and_no_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, addr, _) = serve_capturing(dir.path(), &["--capture-bodies", "off"]).await;
+
+    let url = format!("http://{addr}/s/fx1");
+    tool_names(&url).await;
+    call_tool(&url, "echo", FAKE_TOKEN).await;
+    child.kill().await.unwrap();
+
+    let captured = traffic(dir.path());
+    assert!(!captured.contains(FAKE_TOKEN), "{captured}");
+    assert!(!captured.contains(r#""args""#), "{captured}");
+    assert!(!captured.contains(r#""response""#), "{captured}");
+    assert!(captured.contains(r#""bodies":"off""#), "{captured}");
+    assert!(captured.contains(r#""tool":"echo""#), "{captured}");
+}
+
+/// A gateway that writes a traffic log, which every other test in this file
+/// deliberately does not.
+async fn serve_capturing(home: &Path, args: &[&str]) -> (tokio::process::Child, String, String) {
+    write_config(&home.join("config.toml"), &fixture_config(&["fx1"]));
+    util::serve_with(home, &[], args).await
+}

@@ -51,6 +51,15 @@ pub enum Error {
         available: Vec<String>,
     },
 
+    // The pattern is named because the table can hold several and only the
+    // text the user typed identifies which one the engine refused.
+    #[error("invalid regex {pattern:?} in [capture] redact")]
+    InvalidRedaction {
+        pattern: String,
+        #[source]
+        source: Box<regex::Error>,
+    },
+
     #[error("invalid config in {path}")]
     Edit {
         path: PathBuf,

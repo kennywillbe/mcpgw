@@ -41,7 +41,9 @@ pub struct WatchArgs {
     /// Stream the JSONL lines instead of the rendered stream
     #[arg(long)]
     pub json: bool,
-    /// Print captured arguments and responses instead of masking them
+    /// Print captured arguments and responses instead of masking them. Only
+    /// changes anything for lines a gateway captured with
+    /// `--capture-bodies full`
     #[arg(long)]
     pub show_secrets: bool,
 }
@@ -56,6 +58,9 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
 
     let filters = Filters::new(args);
     let mut tail = Tail::new(daily_path(&dir, now_millis()));
+    // Said at most once per run: a stream full of redacted lines would
+    // otherwise repeat it for every one of them.
+    let mut said_nothing_to_reveal = false;
     loop {
         // Re-resolved every round: at midnight the gateway starts a new file
         // and the tail follows it without needing to be restarted.
@@ -73,14 +78,15 @@ pub fn run(args: &WatchArgs, color: bool) -> anyhow::Result<()> {
                 continue;
             }
             if args.json {
-                // The human stream renders age, outcome, target, latency and
-                // error only, so it has nothing to mask; `--json` is the path
-                // that puts captured bodies on stdout.
-                if args.show_secrets {
-                    println!("{line}");
-                } else {
-                    println!("{}", json_line(&record));
+                if args.show_secrets && !record.bodies.is_full() && !said_nothing_to_reveal {
+                    eprintln!(
+                        "watch: these lines were captured with --capture-bodies {} — \
+                         --show-secrets has nothing left to reveal in them",
+                        record.bodies
+                    );
+                    said_nothing_to_reveal = true;
                 }
+                println!("{}", json_stream_line(&record, &line, args.show_secrets));
             } else {
                 println!("{}", render_line(&record, now_millis(), color));
             }
@@ -156,6 +162,25 @@ fn complete_lines(buffer: &[u8]) -> (Vec<String>, u64) {
         .map(str::to_owned)
         .collect();
     (lines, complete.len() as u64)
+}
+
+/// One line of the `--json` stream: the raw line, or the same record with its
+/// captured bodies masked.
+///
+/// The human stream renders age, outcome, target, latency and error only, so
+/// it has nothing to mask; `--json` is the path that puts captured bodies on
+/// stdout, and the only one that has to decide.
+///
+/// A line the gateway already redacted goes out as it was written. Masking it
+/// a second time would hide the shapes redaction deliberately left legible —
+/// `[redacted:ghp_…]`, the key an argument was under — while revealing
+/// nothing by not doing so.
+fn json_stream_line(record: &CaptureRecord, raw: &str, show_secrets: bool) -> String {
+    if show_secrets || !record.bodies.is_full() {
+        raw.to_owned()
+    } else {
+        json_line(record)
+    }
 }
 
 /// One line of the `--json` stream with the captured bodies masked.
@@ -307,6 +332,8 @@ fn clip(text: &str, chars: usize) -> String {
 mod tests {
     use std::time::Duration;
 
+    use mcpgw_core::capture::Bodies;
+
     use super::*;
 
     const NOW: u64 = 1_767_225_600_000;
@@ -437,6 +464,27 @@ mod tests {
         assert_eq!(json["tool"], "create_issue");
         assert_eq!(json["duration_ms"], 87);
         assert_eq!(json["ok"], true);
+    }
+
+    #[test]
+    fn a_record_redacted_at_capture_time_needs_no_second_mask() {
+        // What the gateway wrote under `--capture-bodies redacted`: the key
+        // is gone, the shape hint is not, and masking would throw that away
+        // for a `***` that says less.
+        let mut record = call().with_args(r#"{"token":"[redacted:ghp_…]"}"#.to_owned());
+        record.bodies = Bodies::Redacted;
+        let raw = serde_json::to_string(&record).unwrap();
+        assert_eq!(json_stream_line(&record, &raw, false), raw);
+        assert_eq!(json_stream_line(&record, &raw, true), raw);
+    }
+
+    #[test]
+    fn a_record_captured_verbatim_is_masked_unless_asked_for() {
+        let record = call().with_args(r#"{"token":"ghp_realsecret"}"#.to_owned());
+        assert!(record.bodies.is_full());
+        let raw = serde_json::to_string(&record).unwrap();
+        assert!(!json_stream_line(&record, &raw, false).contains("ghp_realsecret"));
+        assert_eq!(json_stream_line(&record, &raw, true), raw);
     }
 
     #[test]

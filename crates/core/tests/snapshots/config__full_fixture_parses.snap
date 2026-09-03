@@ -4,6 +4,9 @@ expression: "parse_fixture(\"full.toml\").unwrap()"
 ---
 Config {
     version: 1,
+    capture: Capture {
+        redact: [],
+    },
     servers: {
         "fs": Server {
             enabled: true,

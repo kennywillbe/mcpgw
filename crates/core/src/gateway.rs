@@ -749,7 +749,8 @@ impl ServerHandler for Gateway {
                 ReadResourceResponse::Complete(result) => crate::capture::body(
                     &serde_json::to_value(result).unwrap_or_else(|_| format!("{result:?}").into()),
                 ),
-                other => crate::capture::truncate(&format!("{other:?}")),
+                // Untruncated: the capture writer redacts before it cuts.
+                other => format!("{other:?}"),
             },
         )
         .await
@@ -795,7 +796,8 @@ impl ServerHandler for Gateway {
                 GetPromptResponse::Complete(result) => crate::capture::body(
                     &serde_json::to_value(result).unwrap_or_else(|_| format!("{result:?}").into()),
                 ),
-                other => crate::capture::truncate(&format!("{other:?}")),
+                // Untruncated: the capture writer redacts before it cuts.
+                other => format!("{other:?}"),
             },
         )
         .await
@@ -835,16 +837,18 @@ fn timed_out(upstream: &str, deadline: Duration) -> String {
 
 /// Best-effort JSON rendering of a tool response for the capture log; the
 /// debug form is a readable fallback for anything that will not serialize.
+///
+/// Whole, not truncated: the writer redacts the body before it cuts it, and
+/// cutting here would hand it half a credential (see [`crate::capture`]).
 fn preview(response: &CallToolResponse) -> String {
-    let text = match response {
+    match response {
         CallToolResponse::Complete(result) => {
             serde_json::to_string(result).unwrap_or_else(|_| format!("{result:?}"))
         }
         // Elicitation and task responses carry no result body worth
         // serializing here; their debug form names the shape well enough.
         other => format!("{other:?}"),
-    };
-    crate::capture::truncate(&text)
+    }
 }
 
 /// Serves the gateway over Streamable HTTP at `/mcp` on `listener` until

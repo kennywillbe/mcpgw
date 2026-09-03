@@ -11,7 +11,9 @@ yesterday's traffic.
 ~/.local/share/mcpgw/traffic/2026-09-01.jsonl
 ```
 
-One file per day, mode `0600`. `mcpgw serve --no-capture` turns it off.
+One file per day, mode `0600`. `mcpgw serve --no-capture` turns it off, and
+`--capture-bodies` decides how much of each request goes in — see
+[What is redacted](#what-is-redacted) below.
 
 ## Following it live
 
@@ -57,7 +59,8 @@ mcpgw watch --json | jq -r 'select(.ok == false) | "\(.server) \(.error)"'
   "duration_ms": 87,
   "ok": true,
   "args": "{\"title\":\"…\"}",
-  "response": "{\"content\":[…]}"
+  "response": "{\"content\":[…]}",
+  "bodies": "redacted"
 }
 ```
 
@@ -97,22 +100,84 @@ mcpgw watch --json | jq -r 'select(.ok == false) | "\(.server) \(.error)"'
 - `ok` / `error` — `error` carries the full text; `watch`'s one-line view
   truncates it, `--json` doesn't.
 - `args` / `response` — see below.
+- `bodies` — how much of `args`, `response` and `error` this line was allowed
+  to keep: `off`, `redacted` or `full`. Absent means `full`, which is what
+  every line written before redaction existed is.
 
 Since it's plain JSONL, `tail -f`, `jq` and `grep` all work on it directly.
 
-## Truncation, not redaction
+## What is redacted
 
-Captured arguments and responses are **cut at 2 KB and marked
-`…[truncated]`. They are not redacted.** If a secret is passed as a tool
-argument, it lands in that file.
+Bodies are **redacted first and truncated second**, at capture time, before
+anything reaches the disk. That order is the point: a secret sitting past the
+2 KB cap would otherwise be cut in half and stored anyway.
 
-The mitigations today are that the file is `0600` under your own state
-directory, that `mcpgw serve --no-capture` disables capture entirely, and that
-`watch` does not put those bodies back on your terminal: the one-line view
-never showed them, and `--json` replaces each with `"***"` unless you ask for
-`--show-secrets`. That bounds the spread, not the file itself, and the
-[Trust model](./trust-model.md) puts it beside everything else worth knowing
+```sh
+mcpgw serve                              # --capture-bodies redacted (default)
+mcpgw serve --capture-bodies off         # metadata only: no args, response or error text
+mcpgw serve --capture-bodies full        # everything, verbatim
+mcpgw serve --no-capture                 # no traffic log at all
+```
+
+Under `redacted`, four classes of rule run over `args`, `response` and the
+`error` text:
+
+| Rule | What goes | Example |
+| --- | --- | --- |
+| **Key names** | the whole value under a JSON key that matches, case-insensitively, `authorization`, `cookie`, `set-cookie`, or anything containing `token`, `secret`, `password`, `passwd`, `credential` or `api-key`/`api_key`/`apikey` | `{"api_key": "[redacted]"}` |
+| **Auth schemes** | the credential after `Bearer` or `Basic`, anywhere in a string; the scheme stays | `Authorization: Bearer [redacted]` |
+| **Issuer prefixes** | `sk-`, `ghp_`, `gho_`, `xoxb-`/`xoxa-`/`xoxp-`, `AKIA…`, and JWTs (`eyJ….eyJ….`) | `[redacted:ghp_…]` |
+| **Query values** | the value of a URL parameter whose *name* looks like any of the key names above; the parameter name stays | `?access_token=[redacted]` |
+
+Plus one heuristic, for the credentials that carry no marker at all: a run of
+32 or more `A–Z a–z 0–9 _ -` characters is replaced when **all four** of these
+hold — it mixes at least two of lowercase, uppercase and digits; it has no run
+of eight lowercase letters (which is what an English word looks like); under
+15% of it is `-` or `_` (which is what a URL slug looks like); and its Shannon
+entropy is at least **3.3 bits per character**. Random base64 and hex score
+3.4–4.8; prose and identifiers fall below one of the first three tests before
+entropy is even measured.
+
+Redacted values keep four leading characters — `[redacted:ghp_…]` — so you can
+still tell *which* credential was there without the log holding any of it. The
+bias is deliberately towards redacting: a false positive costs a debugging
+clue, a false negative costs a credential. A UUID or a git sha in a tool
+argument will sometimes be caught; `--capture-bodies full` is the way out.
+
+### Adding your own patterns
+
+Site-specific shapes — an internal ticket id, a customer number — go in the
+config:
+
+```toml
+version = 1
+
+[capture]
+redact = ["ACME-[0-9]{4}", "cus_[A-Za-z0-9]+"]
+```
+
+They're [Rust `regex`](https://docs.rs/regex) patterns, added to the built-in
+rules rather than replacing them, and every match becomes `[redacted]`. A
+pattern the engine cannot compile is a config error naming the pattern, not a
+rule that quietly matches nothing. The table is read once at startup, so an
+edit needs a gateway restart — unlike adding a server, which hot-reloads.
+
+### What redaction is not
+
+It is a filter over shapes, not a guarantee. A secret with no marker, no
+prefix and low entropy — a short passphrase, a four-digit PIN — looks like
+ordinary text and stays. The file is still mode `0600` under your own state
+directory, `--capture-bodies off` still exists for people who only want the
+timings, and `--no-capture` still turns the whole thing off. The
+[Trust model](./trust-model.md) puts this beside everything else worth knowing
 before every call goes through one process.
+
+`mcpgw watch --json` masks `args` and `response` with `"***"` for lines
+captured as `full`, and prints redacted lines as they were written — there is
+nothing left in them to mask, and masking would hide the `[redacted:ghp_…]`
+hints redaction deliberately left legible. `--show-secrets` opts out of the
+masking and says once, on stderr, when it meets a line that had nothing to
+reveal.
 
 ## One server, no gateway
 

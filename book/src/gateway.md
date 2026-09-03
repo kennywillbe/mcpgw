@@ -37,7 +37,11 @@ and reaps the child processes.
 mcpgw serve --port 9000
 mcpgw serve --server github --server linear   # a subset (repeatable)
 mcpgw serve --no-capture                      # don't write the traffic log
+mcpgw serve --capture-bodies off              # timings only, no bodies at all
 ```
+
+Captured bodies are redacted by default; see
+[Watching traffic](./traffic.md).
 
 ### Binding
 

@@ -120,3 +120,34 @@ fn empty_config_is_current_version() {
     assert_eq!(Config::empty().version, SUPPORTED_VERSION);
     assert!(Config::empty().servers.is_empty());
 }
+
+#[test]
+fn the_capture_table_is_optional_and_stays_out_of_a_config_without_it() {
+    let config = Config::parse("version = 1\n", Path::new("c.toml")).unwrap();
+    assert!(config.capture.redact.is_empty());
+    // Nobody's file grows a table they never asked for.
+    assert_eq!(
+        config.to_toml_string().unwrap(),
+        "version = 1\n\n[servers]\n"
+    );
+}
+
+#[test]
+fn redaction_patterns_round_trip_through_the_capture_table() {
+    let text = "version = 1\n\n[capture]\nredact = [\"ACME-[0-9]{4}\"]\n";
+    let config = Config::parse(text, Path::new("c.toml")).unwrap();
+    assert_eq!(config.capture.redact, ["ACME-[0-9]{4}"]);
+    let reparsed = Config::parse(&config.to_toml_string().unwrap(), Path::new("c.toml")).unwrap();
+    assert_eq!(config, reparsed);
+}
+
+#[test]
+fn an_unusable_redaction_pattern_is_a_config_error_that_names_it() {
+    let err = Config::parse(
+        "version = 1\n\n[capture]\nredact = [\"(unclosed\"]\n",
+        Path::new("c.toml"),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidRedaction { .. }), "{err:?}");
+    insta::assert_snapshot!(err.to_string());
+}

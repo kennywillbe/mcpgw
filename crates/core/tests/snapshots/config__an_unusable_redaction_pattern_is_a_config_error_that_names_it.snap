@@ -1,0 +1,5 @@
+---
+source: crates/core/tests/config.rs
+expression: err.to_string()
+---
+invalid regex "(unclosed" in [capture] redact

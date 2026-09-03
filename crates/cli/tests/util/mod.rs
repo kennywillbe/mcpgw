@@ -327,11 +327,24 @@ const BANNER_DEADLINE: Duration = Duration::from_secs(60);
 /// never guessed and two tests running at once cannot collide.
 #[allow(dead_code)]
 pub async fn serve(home: &Path, args: &[&str]) -> (tokio::process::Child, String, String) {
+    serve_with(home, &["--no-capture"], args).await
+}
+
+/// The same, with the capture flags the caller chooses instead of the
+/// `--no-capture` every other test wants. Split out rather than made an
+/// argument of [`serve`] so no test starts writing a traffic log by accident.
+#[allow(dead_code)]
+pub async fn serve_with(
+    home: &Path,
+    capture: &[&str],
+    args: &[&str],
+) -> (tokio::process::Child, String, String) {
     let mut command = tokio::process::Command::from(mcpgw(home));
     let mut child = spawn_retrying_while_busy(
         command
             .arg("serve")
-            .args(["--port", "0", "--no-capture"])
+            .args(["--port", "0"])
+            .args(capture)
             .args(args)
             .stdout(Stdio::piped()),
     );

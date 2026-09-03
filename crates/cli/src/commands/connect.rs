@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use mcpgw_core::capture::Bodies;
 use mcpgw_core::daemon::{GatewayReach, PROBE_TIMEOUT, is_loopback, probe_gateway};
 use mcpgw_core::daemon_check::{url_host, url_port};
 use mcpgw_core::gateway::{Gateway, serve_stdio};
@@ -270,7 +271,14 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
     // `/s/<name>`, exactly as a plain `mcpgw serve` would. Capture is on for
     // the same reason it is there — a session nobody logged is a session
     // `mcpgw watch` cannot explain.
-    let built = super::serve::build(config_path, &[], &selected, false)?;
+    //
+    // Redacted, with no flag to say otherwise. A `--capture-bodies` on the
+    // bridge would do nothing at all in the usual case, where a gateway is
+    // already running and this branch is never reached; somebody who wants
+    // the bodies verbatim wants them from the gateway that serves every
+    // session, which is `mcpgw serve --capture-bodies full`.
+    let capture = super::serve::capture_policy(false, Bodies::Redacted, &config)?;
+    let built = super::serve::build(config_path, &[], &selected, capture)?;
     built.reloader.apply(config).await;
 
     // Published like `serve`'s, so `status`, `doctor` and a second bridge

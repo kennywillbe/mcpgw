@@ -25,6 +25,7 @@ http.workspace = true
 tokio.workspace = true
 arc-swap.workspace = true
 tower-service.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

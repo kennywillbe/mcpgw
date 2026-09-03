@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use mcpgw_core::capture::{
-    CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER, daily_path,
-    session_fingerprint, truncate,
+    Bodies, CapturePolicy, CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, RedactionRules,
+    TRUNCATION_MARKER, daily_path, session_fingerprint, truncate,
 };
 
 fn record() -> CaptureRecord {
@@ -128,7 +128,9 @@ fn daily_files_are_named_by_utc_day() {
 fn writer_appends_jsonl_to_a_dated_file_it_creates() {
     let dir = tempfile::tempdir().unwrap();
     let traffic = dir.path().join("traffic");
-    let writer = CaptureWriter::new(&traffic);
+    // Under `full`, because what this test is about is appending and
+    // rotation: a policy that rewrote the bodies would only obscure that.
+    let writer = CaptureWriter::new(&traffic).with_policy(CapturePolicy::full());
     assert!(!writer.session().is_empty());
 
     let first = record();
@@ -174,4 +176,93 @@ fn traffic_files_are_owner_only() {
     let path = daily_path(writer.dir(), record.ts);
     let mode = std::fs::metadata(&path).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+}
+
+/// A gateway writing under the default policy: the argument that carried a
+/// credential is on disk with the credential gone and everything a reader
+/// filters on still there.
+#[test]
+fn the_default_writer_redacts_before_anything_reaches_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path());
+    let record = CaptureRecord::new(
+        writer.session(),
+        "github",
+        Kind::Call,
+        Duration::from_millis(9),
+    )
+    .with_tool("create_issue")
+    .with_args(r#"{"title":"bug","api_key":"ghp_0123456789abcdefghij"}"#.to_owned())
+    .with_error("GET https://api.example.com/mcp?access_token=s3cr3t3 failed");
+    writer.append(&record).unwrap();
+
+    let text = std::fs::read_to_string(daily_path(writer.dir(), record.ts)).unwrap();
+    assert!(!text.contains("ghp_0123456789abcdefghij"), "{text}");
+    assert!(!text.contains("s3cr3t3"), "{text}");
+    assert!(text.contains("create_issue"), "{text}");
+    assert!(text.contains("bug"), "{text}");
+
+    let stored: CaptureRecord = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(stored.bodies, Bodies::Redacted);
+    assert!(stored.args.as_deref().unwrap().contains("[redacted]"));
+}
+
+/// The whole reason redaction lives in the writer: a secret sitting past the
+/// cap must not survive because the body was cut before anyone looked at it.
+#[test]
+fn a_secret_past_the_cap_is_still_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path());
+    let filler = "x".repeat(MAX_BODY_BYTES);
+    let args = serde_json::json!({"filler": filler, "token": "ghp_0123456789abcdefghij"});
+    let record = CaptureRecord::new(writer.session(), "fx", Kind::Call, Duration::ZERO)
+        .with_args(mcpgw_core::capture::body(&args));
+    writer.append(&record).unwrap();
+
+    let text = std::fs::read_to_string(daily_path(writer.dir(), record.ts)).unwrap();
+    assert!(!text.contains("ghp_0123456789abcdefghij"), "{text}");
+    // And it is still truncated: redaction does not disable the cap.
+    assert!(text.contains(TRUNCATION_MARKER), "{text}");
+}
+
+#[test]
+fn an_off_writer_keeps_the_metadata_and_no_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path())
+        .with_policy(CapturePolicy::new(Bodies::Off, RedactionRules::builtin()));
+    let record = CaptureRecord::new(writer.session(), "fx", Kind::Call, Duration::from_millis(4))
+        .with_tool("echo")
+        .with_args(r#"{"message":"anything at all"}"#.to_owned());
+    writer.append(&record).unwrap();
+
+    let text = std::fs::read_to_string(daily_path(writer.dir(), record.ts)).unwrap();
+    assert!(!text.contains("anything at all"), "{text}");
+    let stored: CaptureRecord = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(stored.bodies, Bodies::Off);
+    assert_eq!(stored.args, None);
+    assert_eq!(stored.tool.as_deref(), Some("echo"));
+    assert_eq!(stored.duration_ms, 4);
+}
+
+#[test]
+fn a_full_writer_is_byte_for_byte_what_it_always_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path()).with_policy(CapturePolicy::full());
+    let record = CaptureRecord::new(writer.session(), "fx", Kind::Call, Duration::ZERO)
+        .with_args(r#"{"token":"ghp_0123456789abcdefghij"}"#.to_owned());
+    writer.append(&record).unwrap();
+
+    let text = std::fs::read_to_string(daily_path(writer.dir(), record.ts)).unwrap();
+    assert!(text.contains("ghp_0123456789abcdefghij"), "{text}");
+    // The mode is the default one for a parsed line, so it stays out of it.
+    assert!(!text.contains("\"bodies\""), "{text}");
+}
+
+/// The field is additive in both directions: a line from an older gateway
+/// reads as `full`, which is exactly what it was.
+#[test]
+fn a_line_without_the_bodies_field_reads_as_full() {
+    let record: CaptureRecord = serde_json::from_str(PRE_N13_LINE).unwrap();
+    assert_eq!(record.bodies, Bodies::Full);
+    assert!(record.bodies.is_full());
 }

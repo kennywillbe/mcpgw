@@ -193,12 +193,16 @@ version of what that does and does not protect. The short one:
   backups of client configs, the managed-state file, traffic logs — is 0600.
 - `mcpgw list --json` masks `env` and header values; pass `--show-secrets` when
   you actually want them.
-- Captured arguments and responses are **truncated at 2 KB, not redacted** — if
-  a secret is passed as a tool argument, it lands in that file. Use
-  `mcpgw serve --no-capture` if that's not acceptable.
-- `mcpgw watch --json` masks the captured `args` and `response` values, so
-  piping the stream somewhere doesn't spread what's in the file; pass
-  `--show-secrets` to see them. The human `watch` view never printed them.
+- Captured arguments, responses and error text are **redacted before they are
+  truncated** — credential-looking keys, `Bearer`/`Basic` values, known issuer
+  prefixes and high-entropy tokens are replaced on the way to disk.
+  `mcpgw serve --capture-bodies off` keeps the timings and no bodies at all,
+  `full` writes them verbatim, and `--no-capture` writes nothing. It is a
+  filter over shapes: a short low-entropy secret still reads as ordinary text.
+- `mcpgw watch --json` masks the captured `args` and `response` values of lines
+  captured verbatim, so piping the stream somewhere doesn't spread what's in
+  the file; pass `--show-secrets` to see them. The human `watch` view never
+  printed them.
 
 ## Contributing
 
