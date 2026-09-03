@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use mcpgw_core::doctor::project_unmanaged;
 use mcpgw_core::doctor::{
     Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
     classify_gateway_failure, classify_problems, gateway_unreachable, unserved_endpoint,
 };
 use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
+use mcpgw_core::projects::{ProjectConfig, Standing};
 use mcpgw_core::state::ManagedState;
 use mcpgw_core::{ClientKind, Config, Detection, Error, Server, Transport};
 use owo_colors::OwoColorize as _;
@@ -67,13 +69,18 @@ pub fn run(
     let managed = managed_state();
 
     let path = super::canonical_config_path()?;
+    // Kept past the match: the project pass below asks of every repo-local
+    // entry whether the canonical config already speaks for it.
+    let mut canonical_servers: BTreeMap<String, Server> = BTreeMap::new();
     let canonical_note = match Config::load(&path) {
         Ok(config) => {
             for (name, server) in &config.servers {
                 findings.extend(check_server(None, name, server, &command_exists));
                 plan.collect("canonical", name, server);
             }
-            format!("{} servers", config.servers.len())
+            let note = format!("{} servers", config.servers.len());
+            canonical_servers = config.servers;
+            note
         }
         Err(Error::NotFound { .. }) => "not created yet (run `mcpgw add`)".to_owned(),
         Err(err) => {
@@ -97,6 +104,11 @@ pub fn run(
     findings.extend(stale_service_exe());
     findings.extend(stale_service_version());
 
+    // Reported from the working directory, not from the machine: a
+    // repo-local file is only in front of the user when they are standing in
+    // that repo, and doctor is run there.
+    let projects = ProjectReport::gather(&canonical_servers);
+
     let (probe_results, gateway_report) = match probe {
         Some(timeout) => {
             // One runtime for both passes: they ask the same machine the same
@@ -114,18 +126,22 @@ pub fn run(
         .as_ref()
         .map_or(&[][..], |report| &report.findings);
     let errors = count(&findings, Severity::Error)
+        + count(&projects.findings, Severity::Error)
         + count(gateway_findings, Severity::Error)
         + probe_results
             .as_ref()
             .map_or(0, |p| p.results.iter().filter(|(_, r)| r.is_err()).count())
         + gateway_report.as_ref().map_or(0, GatewayReport::failures);
-    let warnings = count(&findings, Severity::Warning) + count(gateway_findings, Severity::Warning);
+    let warnings = count(&findings, Severity::Warning)
+        + count(&projects.findings, Severity::Warning)
+        + count(gateway_findings, Severity::Warning);
 
     if json {
         // Gateway findings join the same array: a consumer counting problems
         // should not have to know which pass produced them.
         let all: Vec<Finding> = findings
             .iter()
+            .chain(&projects.findings)
             .chain(gateway_findings)
             .cloned()
             .collect::<Vec<_>>();
@@ -134,6 +150,7 @@ pub fn run(
             &canonical_note,
             &detections,
             &all,
+            &projects,
             probe_results.as_ref(),
             gateway_report.as_ref(),
             errors,
@@ -141,6 +158,7 @@ pub fn run(
         )?;
     } else {
         render(&path, &canonical_note, &detections, &findings, color);
+        render_projects(&projects, color);
         if let Some(probes) = &probe_results {
             render_probes(probes, color);
         }
@@ -272,6 +290,129 @@ fn managed_state() -> ManagedState {
         .unwrap_or_default()
 }
 
+/// One repo-local config file as the report sees it.
+struct ProjectRow {
+    config: ProjectConfig,
+    /// Every server in the file with its standing, computed once so the text
+    /// and the JSON cannot disagree about it.
+    servers: Vec<(String, Standing)>,
+}
+
+/// The repo-local pass: the files found around the working directory, and
+/// the findings they earn.
+///
+/// Its findings are kept apart from the main list rather than appended to
+/// it, because the renderer files a finding under the client section its
+/// `client` names — and these belong under the project section, next to the
+/// file they are about.
+struct ProjectReport {
+    files: Vec<ProjectRow>,
+    findings: Vec<Finding>,
+}
+
+impl ProjectReport {
+    fn gather(canonical: &BTreeMap<String, Server>) -> Self {
+        let mut report = Self {
+            files: Vec::new(),
+            findings: Vec::new(),
+        };
+        for config in mcpgw_core::projects::discover_cwd() {
+            let name = config.kind.display_name();
+            // The path leads every message: a project file and the client's
+            // per-user file are read by the same client, so the client name
+            // alone would not say which of the two is broken.
+            report
+                .findings
+                .extend(
+                    classify_problems(name, &config.read)
+                        .into_iter()
+                        .map(|mut finding| {
+                            finding.message =
+                                format!("{}: {}", config.path.display(), finding.message);
+                            finding
+                        }),
+                );
+            let unmanaged = config.unmanaged(canonical);
+            if unmanaged > 0 {
+                report
+                    .findings
+                    .push(project_unmanaged(name, &config.path, unmanaged));
+            }
+            let servers = config
+                .standings(canonical)
+                .into_iter()
+                .map(|(name, standing)| (name.to_owned(), standing))
+                .collect();
+            report.files.push(ProjectRow { config, servers });
+        }
+        report
+    }
+
+    fn json(&self) -> Vec<serde_json::Value> {
+        self.files
+            .iter()
+            .map(|row| {
+                let servers: Vec<serde_json::Value> = row
+                    .servers
+                    .iter()
+                    .map(|(name, standing)| {
+                        serde_json::json!({
+                            "name": name,
+                            "mirrors_canonical": *standing == Standing::Mirrors,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "path": row.config.path,
+                    "dir": row.config.dir,
+                    "client": row.config.kind.display_name(),
+                    "client_id": row.config.kind.id(),
+                    "servers": servers,
+                    "unmanaged": row
+                        .servers
+                        .iter()
+                        .filter(|(_, standing)| *standing == Standing::Unmanaged)
+                        .count(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// What one repo-local entry means for the user, in the two words the
+/// section exists to say.
+fn standing_text(standing: Standing) -> &'static str {
+    match standing {
+        Standing::Mirrors => "mirrors canonical",
+        Standing::Unmanaged => "not managed: direct entry stays live after sync",
+    }
+}
+
+/// The project section, printed only where there is a file to name — a
+/// machine-wide report has no business claiming a repo the user is not in.
+fn render_projects(report: &ProjectReport, color: bool) {
+    if report.files.is_empty() {
+        return;
+    }
+    println!();
+    heading("project configs — not managed by sync yet", color);
+    for row in &report.files {
+        let count = row.servers.len();
+        let plural = if count == 1 { "server" } else { "servers" };
+        println!(
+            "  {} — {}, {count} {plural}",
+            row.config.path.display(),
+            row.config.kind.display_name()
+        );
+        for (name, standing) in &row.servers {
+            println!("      {name}: {}", standing_text(*standing));
+        }
+    }
+    for finding in &report.findings {
+        print_finding(finding, color);
+    }
+}
+
 // Pure serialization of already-computed pieces; bundling them into a
 // struct would exist only to appease the lint.
 #[allow(clippy::too_many_arguments)]
@@ -280,6 +421,7 @@ fn emit_json(
     canonical_note: &str,
     detections: &[(&'static str, String)],
     findings: &[Finding],
+    projects: &ProjectReport,
     probes: Option<&ProbeReport>,
     gateway: Option<&GatewayReport>,
     errors: usize,
@@ -292,6 +434,9 @@ fn emit_json(
     let mut out = serde_json::json!({
         "config": { "path": path, "state": canonical_note },
         "clients": clients,
+        // Always present, empty included: a consumer should not have to
+        // tell "no project configs" from "an mcpgw that does not look".
+        "projects": projects.json(),
         "findings": findings,
         "errors": errors,
         "warnings": warnings,
@@ -660,22 +805,26 @@ fn print_findings(findings: &[Finding], client: Option<&str>, color: bool) {
     let mut any = false;
     for finding in findings.iter().filter(|f| f.client.as_deref() == client) {
         any = true;
-        let subject = finding
-            .server
-            .as_ref()
-            .map_or(String::new(), |s| format!("server {s:?}: "));
-        let line = format!("{subject}{}", finding.message);
-        match (finding.severity, color) {
-            (Severity::Error, true) => println!("  {} {line}", "✗".red()),
-            (Severity::Error, false) => println!("  ✗ {line}"),
-            (Severity::Warning, true) => println!("  {} {line}", "⚠".yellow()),
-            (Severity::Warning, false) => println!("  ⚠ {line}"),
-        }
+        print_finding(finding, color);
     }
     if !any && client.is_none() {
         // Only the canonical section gets an explicit all-clear; client
         // sections without findings stay quiet to keep the report short.
         println!("  ✓ no problems");
+    }
+}
+
+fn print_finding(finding: &Finding, color: bool) {
+    let subject = finding
+        .server
+        .as_ref()
+        .map_or(String::new(), |s| format!("server {s:?}: "));
+    let line = format!("{subject}{}", finding.message);
+    match (finding.severity, color) {
+        (Severity::Error, true) => println!("  {} {line}", "✗".red()),
+        (Severity::Error, false) => println!("  ✗ {line}"),
+        (Severity::Warning, true) => println!("  {} {line}", "⚠".yellow()),
+        (Severity::Warning, false) => println!("  ⚠ {line}"),
     }
 }
 

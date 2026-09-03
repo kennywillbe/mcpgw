@@ -12,6 +12,7 @@ pub mod import;
 pub mod paths;
 pub mod private;
 pub mod probe;
+pub mod projects;
 pub mod reload;
 pub mod runtime;
 pub mod state;

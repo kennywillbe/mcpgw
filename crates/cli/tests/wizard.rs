@@ -1165,3 +1165,48 @@ async fn yes_keeps_canonical_without_recording_an_answer() {
         "{asked}"
     );
 }
+
+/// The survey names the repo-local config it found, once and dimly. It is
+/// the file a user would otherwise assume the sync step took care of, and
+/// nothing in the wizard touches it.
+#[tokio::test]
+async fn the_survey_names_a_repo_local_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join(".mcp.json"),
+        format!(
+            r#"{{"mcpServers": {{"one": {{"command": {}}}, "two": {{"command": {}}}}}}}"#,
+            real_command(),
+            real_command()
+        ),
+    )
+    .unwrap();
+
+    // A port nothing answers on, for the same reason the walk-through test
+    // uses one: the daemon step must not read a developer's real gateway.
+    let blocked = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", blocked.local_addr().unwrap());
+
+    let child = command(dir.path())
+        .current_dir(&repo)
+        .args(["init", "--yes", "--gateway-url", &url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = finish(child, "`mcpgw init --yes` inside a repo").await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("also found .mcp.json in this repo with 2 servers"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("project files are not managed yet"),
+        "{stdout}"
+    );
+}

@@ -99,6 +99,46 @@ tags = ["work"]
 Values must come before sub-tables within a section — that's TOML, not mcpgw.
 `env` and `headers` are sub-tables, so they go last.
 
+## Project-level client files
+
+Several clients read a second MCP config from inside the repository, next to
+the code and committed with it:
+
+| Client | File | Key |
+| --- | --- | --- |
+| Claude Code | `.mcp.json` | `mcpServers` |
+| Cursor | `.cursor/mcp.json` | `mcpServers` |
+| VS Code | `.vscode/mcp.json` | `servers` |
+| Gemini CLI | `.gemini/settings.json` | `mcpServers` |
+| Codex CLI | `.codex/config.toml` | `[mcp_servers]`, trusted projects only |
+| opencode | `opencode.json` / `opencode.jsonc` | `mcp` |
+| Amp | `.amp/settings.json` | `amp.mcpServers` |
+| Zoo Code | `.roo/mcp.json` | `mcpServers` |
+
+**`mcpgw sync` does not write any of them.** It writes the per-user file only,
+so an entry in a repo-local file keeps talking to its server directly — the
+gateway is not in that path, and neither is `mcpgw disable`.
+
+`mcpgw doctor` reports them, so at least they are not invisible. Run it from
+inside the repo and it adds a **project configs** section listing each file,
+what it holds, and whether each entry mirrors something your canonical config
+already has:
+
+```text
+project configs — not managed by sync yet
+  /work/api/.mcp.json — Claude Code, 2 servers
+      github: mirrors canonical
+      scratch: not managed: direct entry stays live after sync
+  ⚠ /work/api/.mcp.json holds 1 direct MCP entry mcpgw does not manage — …
+```
+
+`--json` carries the same thing as a `projects` array. `mcpgw import` cannot
+read these files yet, so adopting one means copying the entry into the
+canonical config by hand for now — see [Roadmap](./roadmap.md).
+
+Only the repo root and your working directory are looked at, and never above
+the repo root.
+
 ## State directory
 
 ```text
