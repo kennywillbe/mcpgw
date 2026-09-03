@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mcpgw_core::upstream::{UpstreamError, UpstreamManager, UpstreamStatus};
+use mcpgw_core::upstream::{CallError, UpstreamError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
 
 fn stdio_server(mode: &str) -> Server {
@@ -311,5 +311,39 @@ async fn concurrent_demands_coalesce_into_one_instance() {
     });
     let (a, b) = (a.await.unwrap(), b.await.unwrap());
     assert!(Arc::ptr_eq(&a, &b));
+    mgr.shutdown().await;
+}
+
+/// The demotion an http upstream needs must not reach a stdio child, whose
+/// death rmcp reports on its own. That path is unchanged: the slot reads
+/// Idle-with-history and the next demand gets the whole ladder, not the
+/// single latched attempt a `Failed` slot would have been given.
+#[tokio::test]
+async fn a_dead_child_stays_on_the_ladder_instead_of_latching_failed() {
+    let mgr = manager(&[("fx", stdio_server("die-on-tools"))]);
+    let first = mgr.ready("fx").await.unwrap();
+
+    // The fixture dies on this request, so the call fails on a transport
+    // that is on its way down.
+    let err = mgr
+        .call(
+            "fx",
+            |service| async move { service.list_all_tools().await },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CallError::Service(_)),
+        "the upstream was reached, so this is the request failing: {err}"
+    );
+    assert!(
+        !matches!(mgr.status("fx").await, Some(UpstreamStatus::Failed(_))),
+        "a dead child must not latch the slot"
+    );
+
+    // The transport task has to observe the child's death first.
+    wait_for_status(&mgr, "fx", UpstreamStatus::Idle).await;
+    let second = mgr.ready("fx").await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &second), "must be a fresh instance");
     mgr.shutdown().await;
 }

@@ -21,13 +21,29 @@ use crate::config::{Server, Transport};
 pub type UpstreamService = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 // Explicit cancellation and transport death (child exit) are reported by
-// different rmcp signals; either one means the slot is stale. For http
-// upstreams the death signal only fires once the client worker gives up —
-// a server that vanishes between requests stays "alive" here until a call
-// fails, which the slot logic already handles by reconnecting on the next
-// demand.
+// different rmcp signals; either one means the slot is stale. Neither ever
+// fires for a streamable-http upstream whose server vanished: rmcp hands the
+// failed POST to the one request that made it and keeps its worker running,
+// so an http slot can only be found stale by a request failing through it —
+// which is what [`UpstreamManager::call`] is for.
 fn dead(service: &UpstreamService) -> bool {
     service.is_closed() || service.is_transport_closed()
+}
+
+/// Whether `err` means the connection is gone rather than that the server
+/// answered "no".
+///
+/// Only these two are the transport speaking. `McpError` is a JSON-RPC error
+/// the server chose to send — an unknown tool, invalid params — and demoting
+/// on it would tear down a perfectly healthy connection every time a client
+/// mistyped a tool name. A request timeout or a cancellation says nothing
+/// about whether the next request would land either, so both are left alone.
+fn transport_failure(err: &rmcp::service::ServiceError) -> bool {
+    matches!(
+        err,
+        rmcp::service::ServiceError::TransportSend(_)
+            | rmcp::service::ServiceError::TransportClosed
+    )
 }
 
 /// Consecutive connect attempts before latching into `Failed`.
@@ -50,6 +66,18 @@ pub enum UpstreamError {
 
     #[error("upstream {name:?} was shut down while connecting")]
     ShutDown { name: String },
+}
+
+/// What one [`UpstreamManager::call`] can fail at: reaching the upstream at
+/// all, or the request once it was reached. Kept apart because callers say
+/// different things about them — only the first is the gateway being unable
+/// to serve, the second is the server's own answer.
+#[derive(Debug, thiserror::Error)]
+pub enum CallError {
+    #[error(transparent)]
+    Upstream(#[from] UpstreamError),
+    #[error(transparent)]
+    Service(#[from] rmcp::service::ServiceError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +486,74 @@ impl UpstreamManager {
         result
     }
 
+    /// Runs one request against `name`, connecting it first if needed, and
+    /// demotes the slot when the failure is the transport rather than the
+    /// server.
+    ///
+    /// This is the only path a request may take to an upstream. Passive
+    /// liveness alone cannot see an http server that went away — see
+    /// [`dead`] — so the request that fails is the one signal there is, and
+    /// it has to be acted on in exactly one place: the manager owns slot
+    /// state, and a copy of this per request family would be a copy that
+    /// drifts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CallError::Upstream`] when the upstream could not be
+    /// reached at all and [`CallError::Service`] when the request itself
+    /// failed.
+    pub async fn call<T, F>(
+        &self,
+        name: &str,
+        call: impl FnOnce(Arc<UpstreamService>) -> F,
+    ) -> Result<T, CallError>
+    where
+        F: Future<Output = Result<T, rmcp::service::ServiceError>>,
+    {
+        let service = self.ready(name).await?;
+        match call(Arc::clone(&service)).await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                // A service whose own liveness already reports the death —
+                // a stdio child that exited — needs nothing from here: the
+                // slot reads that as Idle-with-history and the next demand
+                // gets the full backoff ladder, which is what a crashed
+                // child has always been given. Demotion is for the failure
+                // rmcp cannot see at all: a transport that still looks alive
+                // because its worker never noticed the far end leave.
+                if transport_failure(&err) && !dead(&service) {
+                    self.demote(name, &service, &err).await;
+                }
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Takes a connection that just failed at the transport out of its slot,
+    /// so the next demand runs the ladder and [`status`](Self::status) stops
+    /// claiming `Ready`.
+    ///
+    /// Released rather than killed, exactly as in [`Upstream::retire`]: other
+    /// requests may still be in flight on this service, and rmcp closes it
+    /// when the last of them drops its handle. The identity check is what
+    /// makes concurrent failures safe — the first one demotes, and a second
+    /// arriving after some other caller already reconnected finds a slot that
+    /// is no longer the one it was talking to and leaves it alone.
+    async fn demote(
+        &self,
+        name: &str,
+        stale: &Arc<UpstreamService>,
+        err: &rmcp::service::ServiceError,
+    ) {
+        let Some(upstream) = self.get(name) else {
+            return;
+        };
+        let mut slot = upstream.slot.lock().await;
+        if matches!(&*slot, Slot::Ready(live) if Arc::ptr_eq(live, stale)) {
+            *slot = Slot::Failed(format!("transport failure: {err}"));
+        }
+    }
+
     /// Makes `servers` the live set, keeping every upstream that did not
     /// change — same entry, same slot, same child process.
     ///
@@ -623,11 +719,23 @@ pub(crate) fn http_config(
             .map_err(|_| format!("invalid value for header {key:?}"))?;
         custom.insert(name, value);
     }
-    Ok(StreamableHttpClientTransportConfig::with_uri(url.to_owned()).custom_headers(custom))
+    Ok(
+        StreamableHttpClientTransportConfig::with_uri(url.to_owned())
+            .custom_headers(custom)
+            // Set rather than inherited: a remote that restarts keeps its port
+            // but forgets our session, and this is what turns the 404 that
+            // follows into a transparent re-handshake instead of a failed
+            // request. It is the fast path in front of the connect ladder, so a
+            // change to the dependency's default must not be able to remove it
+            // quietly.
+            .reinit_on_expired_session(true),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::http_config;
 
     #[test]
@@ -639,6 +747,14 @@ mod tests {
         assert_eq!(&*config.uri, "https://mcp.example.com/mcp");
         let name = http::HeaderName::from_static("authorization");
         assert_eq!(config.custom_headers[&name], "Bearer t0ken");
+    }
+
+    /// The recovery a restarted remote depends on, pinned against a change
+    /// of heart in the transport's defaults.
+    #[test]
+    fn expired_sessions_are_reinitialized() {
+        let config = http_config("https://mcp.example.com/mcp", &BTreeMap::new()).unwrap();
+        assert!(config.reinit_on_expired_session);
     }
 
     #[test]

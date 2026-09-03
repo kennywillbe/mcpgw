@@ -221,16 +221,24 @@ impl Gateway {
         }
     }
 
-    async fn upstream_service(
+    /// Runs one request against `name` through the manager, which is where a
+    /// transport failure retires the connection behind it.
+    async fn call_upstream<T, F>(
         &self,
         name: &str,
-    ) -> Result<Arc<crate::upstream::UpstreamService>, ErrorData> {
+        call: impl FnOnce(Arc<crate::upstream::UpstreamService>) -> F,
+    ) -> Result<T, ErrorData>
+    where
+        F: Future<Output = Result<T, rmcp::service::ServiceError>>,
+    {
         // Upstream failures surface as loud MCP errors — never as a silent
         // empty result.
-        self.manager.ready(name).await.map_err(|err| {
-            let message = match &self.unavailable_hint {
-                Some(hint) => format!("{err} — {hint}"),
-                None => err.to_string(),
+        self.manager.call(name, call).await.map_err(|err| {
+            // The hint is about a gateway that cannot reach its upstream, so
+            // it has no business on an answer the upstream itself gave.
+            let message = match (&err, &self.unavailable_hint) {
+                (crate::upstream::CallError::Upstream(_), Some(hint)) => format!("{err} — {hint}"),
+                _ => err.to_string(),
             };
             ErrorData::internal_error(message, None)
         })
@@ -314,12 +322,7 @@ impl Gateway {
     {
         let started = Instant::now();
         let result = self
-            .within_deadline(upstream, async {
-                let service = self.upstream_service(upstream).await?;
-                call(service)
-                    .await
-                    .map_err(|err| ErrorData::internal_error(err.to_string(), None))
-            })
+            .within_deadline(upstream, self.call_upstream(upstream, call))
             .await;
         let elapsed = started.elapsed();
         self.record(session, |session| {
@@ -354,9 +357,11 @@ impl Gateway {
             tasks.spawn(async move {
                 let started = Instant::now();
                 let work = async {
-                    let service = manager.ready(&name).await.map_err(|err| err.to_string())?;
-                    service
-                        .list_all_tools()
+                    manager
+                        .call(
+                            &name,
+                            |service| async move { service.list_all_tools().await },
+                        )
                         .await
                         .map_err(|err| err.to_string())
                 };
@@ -653,14 +658,12 @@ impl ServerHandler for Gateway {
 
         let started = Instant::now();
         let response = self
-            .within_deadline(&upstream, async {
-                let service = self.upstream_service(&upstream).await?;
-                service
-                    .call_tool(request)
-                    .await
-                    .map(CallToolResponse::from)
-                    .map_err(|err| ErrorData::internal_error(err.to_string(), None))
-            })
+            .within_deadline(
+                &upstream,
+                self.call_upstream(&upstream, |service| async move {
+                    service.call_tool(request).await.map(CallToolResponse::from)
+                }),
+            )
             .await;
         let elapsed = started.elapsed();
 

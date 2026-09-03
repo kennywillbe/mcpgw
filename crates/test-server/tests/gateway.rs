@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mcpgw_core::capture::{CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER};
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{Gateway, resolve, serve_http, serve_http_with};
-use mcpgw_core::upstream::UpstreamManager;
+use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
 use rmcp_client_http::ServiceExt as _;
 use rmcp_client_http::transport::StreamableHttpClientTransport;
@@ -1314,4 +1314,175 @@ async fn the_other_forwarded_families_are_bridged_as_well() {
         .await;
     assert_eq!(completion["resultType"], "complete", "{completion}");
     manager.shutdown().await;
+}
+
+/// One in-process http MCP server: a gateway fronting a `healthy` fixture,
+/// which from the outside is what any remote upstream looks like.
+struct Remote {
+    addr: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    inner: Arc<UpstreamManager>,
+}
+
+impl Remote {
+    /// Port 0 takes any free port; a fixed one is how a restart lands where
+    /// an upstream is already pointing.
+    async fn start(port: u16) -> Self {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // A predecessor releases its listener when its task actually winds
+        // down, which `abort` only schedules — so retrying the bind is the
+        // synchronisation here, rather than a sleep guessed at how long that
+        // takes on a loaded machine.
+        let listener = loop {
+            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => break listener,
+                Err(err) => {
+                    assert!(Instant::now() < deadline, "port {port} never freed: {err}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+        let inner = manager(&[("fx", "healthy")]);
+        let gateway = Gateway::aggregate(Arc::clone(&inner), vec!["fx".to_owned()]);
+        let task = tokio::spawn(serve_http(gateway, listener, std::future::pending()));
+        Self { addr, task, inner }
+    }
+
+    /// Ends the server the way an outage does: the port stops answering, with
+    /// no goodbye to the client holding a session on it.
+    async fn stop(self) {
+        self.task.abort();
+        self.inner.shutdown().await;
+    }
+}
+
+/// A manager with one http upstream named `remote`, pointed at `addr`.
+fn remote_manager(addr: std::net::SocketAddr) -> Arc<UpstreamManager> {
+    let server = Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: Transport::Http {
+            url: format!("http://{addr}/mcp"),
+            headers: BTreeMap::new(),
+        },
+    };
+    Arc::new(
+        UpstreamManager::new([("remote".to_owned(), server)].into_iter().collect())
+            .with_connect_timeout(Duration::from_secs(30))
+            .with_backoff_base(Duration::from_millis(20)),
+    )
+}
+
+async fn list_through(
+    manager: &UpstreamManager,
+) -> Result<Vec<rmcp_client_http::model::Tool>, CallError> {
+    manager
+        .call(
+            "remote",
+            |service| async move { service.list_all_tools().await },
+        )
+        .await
+}
+
+/// The connection an http upstream holds outlives the server behind it: rmcp
+/// hands the failed POST to the request that made it and keeps its worker
+/// running, so nothing in the transport's own liveness ever says the remote
+/// is gone. The slot used to stay `Ready` for the life of the process,
+/// failing every request on a connection that could not come back.
+#[tokio::test]
+async fn a_vanished_http_upstream_stops_reporting_ready() {
+    let remote = Remote::start(0).await;
+    let outer = remote_manager(remote.addr);
+    assert!(!list_through(&outer).await.unwrap().is_empty());
+    assert_eq!(outer.status("remote").await, Some(UpstreamStatus::Ready));
+
+    remote.stop().await;
+
+    let err = list_through(&outer).await.unwrap_err();
+    let status = outer.status("remote").await;
+    let Some(UpstreamStatus::Failed(reason)) = status else {
+        panic!("expected Failed after {err}, got {status:?}");
+    };
+    assert!(
+        reason.contains("transport"),
+        "the reason should name the transport failure: {reason}"
+    );
+    outer.shutdown().await;
+}
+
+/// And the demotion is what buys the recovery: the next demand finds a
+/// `Failed` slot, runs the ladder against the restarted remote and gets a
+/// live connection instead of a second failure.
+#[tokio::test]
+async fn a_restarted_http_upstream_is_reconnected_on_the_next_demand() {
+    let remote = Remote::start(0).await;
+    let addr = remote.addr;
+    let outer = remote_manager(addr);
+    list_through(&outer).await.unwrap();
+    remote.stop().await;
+    assert!(list_through(&outer).await.is_err());
+    // The demotion is what makes the next demand a demand at all: a slot
+    // still reading `Ready` would hand the same dead connection back.
+    assert!(matches!(
+        outer.status("remote").await,
+        Some(UpstreamStatus::Failed(_))
+    ));
+
+    let remote = Remote::start(addr.port()).await;
+    let tools = list_through(&outer).await.unwrap();
+    assert_eq!(tool_names(&tools), ["fx__echo", "fx__reverse"]);
+    assert_eq!(outer.status("remote").await, Some(UpstreamStatus::Ready));
+    outer.shutdown().await;
+    remote.stop().await;
+}
+
+/// The other half of the same rule: a server that answers "no" is a server
+/// that is answering. Tearing the connection down over an unknown tool name
+/// would mean a client typo costing every other session a reconnect.
+#[tokio::test]
+async fn a_json_rpc_error_from_a_live_http_upstream_keeps_the_slot_ready() {
+    let remote = Remote::start(0).await;
+    let outer = remote_manager(remote.addr);
+    list_through(&outer).await.unwrap();
+
+    let err = outer
+        .call("remote", |service| async move {
+            service.call_tool(call("nope", "x")).await
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CallError::Service(_)),
+        "the server answered, so this is not an upstream failure: {err}"
+    );
+    assert_eq!(outer.status("remote").await, Some(UpstreamStatus::Ready));
+
+    // Still usable, which is the whole point.
+    list_through(&outer).await.unwrap();
+    outer.shutdown().await;
+    remote.stop().await;
+}
+
+/// A remote that restarts on its own port between two requests is recovered
+/// by the transport itself: the stale `Mcp-Session-Id` earns a 404 and rmcp
+/// repeats the handshake underneath the call. That is the fast path in front
+/// of the connect ladder, and it must keep working — see the explicit
+/// `reinit_on_expired_session` in `http_config`.
+#[tokio::test]
+async fn a_session_expired_by_a_restart_is_reinitialized_under_the_call() {
+    let remote = Remote::start(0).await;
+    let addr = remote.addr;
+    let outer = remote_manager(addr);
+    list_through(&outer).await.unwrap();
+
+    // No request goes through the outage, so the slot never learns about it.
+    remote.stop().await;
+    let remote = Remote::start(addr.port()).await;
+    assert_eq!(outer.status("remote").await, Some(UpstreamStatus::Ready));
+
+    let tools = list_through(&outer).await.unwrap();
+    assert_eq!(tool_names(&tools), ["fx__echo", "fx__reverse"]);
+    outer.shutdown().await;
+    remote.stop().await;
 }
