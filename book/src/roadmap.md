@@ -46,7 +46,6 @@ Things this page used to promise, so the line is clear:
   turns it off.
 - **A remote server's OAuth is your problem.** mcpgw forwards the header you
   configure; it does not run the flow and does not refresh anything.
-- **No linux-arm64 prebuilt binary yet.** `cargo install mcpgw` works there.
 - **The gateway's own `/mcp` endpoint serves tools only.** Resources and
   prompts reach a client through a per-server endpoint (`/s/<name>`), because
   their names cannot be namespaced across servers the way tool names can. See

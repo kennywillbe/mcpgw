@@ -15,10 +15,11 @@ pub const TARGET: &str = env!("MCPGW_TARGET");
 /// The triples `.github/workflows/release.yml` actually builds. A binary for
 /// anything else came from `cargo install`, so there is no archive to hand
 /// it and self-update has to say so instead of guessing an asset name.
-pub const SHIPPED_TARGETS: [&str; 4] = [
+pub const SHIPPED_TARGETS: [&str; 5] = [
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
 ];
 
@@ -235,6 +236,10 @@ mod tests {
             Some("mcpgw-0.2.0-x86_64-unknown-linux-gnu.tar.gz")
         );
         assert_eq!(
+            asset_name("0.2.0", "aarch64-unknown-linux-gnu").as_deref(),
+            Some("mcpgw-0.2.0-aarch64-unknown-linux-gnu.tar.gz")
+        );
+        assert_eq!(
             asset_name("0.2.0", "x86_64-pc-windows-msvc").as_deref(),
             Some("mcpgw-0.2.0-x86_64-pc-windows-msvc.zip")
         );
@@ -242,8 +247,8 @@ mod tests {
 
     #[test]
     fn targets_without_a_prebuilt_archive_have_no_asset() {
-        assert_eq!(asset_name("0.2.0", "aarch64-unknown-linux-gnu"), None);
         assert_eq!(asset_name("0.2.0", "x86_64-unknown-linux-musl"), None);
+        assert_eq!(asset_name("0.2.0", "aarch64-unknown-linux-musl"), None);
     }
 
     #[test]
