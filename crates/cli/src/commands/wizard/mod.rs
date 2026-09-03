@@ -331,6 +331,12 @@ fn status_card(cx: &Ctx) {
     if let Some(advice) = stale_service_exe() {
         println!("  service   {}", ui::dim(&advice, cx.color));
     }
+    // Dim for the same reason, and read off the gateway the card just
+    // probed rather than the installed service: that is the one the card is
+    // reporting on, and the only port this run has a live answer for.
+    if let Some(advice) = stale_service_version(cx) {
+        println!("  service   {}", ui::dim(&advice, cx.color));
+    }
     let clients = cx.synced_clients();
     println!(
         "  clients   {}",
@@ -358,6 +364,14 @@ fn stale_service_exe() -> Option<String> {
     let state_dir = mcpgw_core::paths::state_dir()?;
     let spec = mcpgw_core::daemon::load_spec(&state_dir)?;
     mcpgw_core::daemon_check::service_exe(&spec)?.advice()
+}
+
+/// The same sentence about a gateway answering on a build other than this
+/// one. Silent unless the gateway answered: a record alone says nothing.
+fn stale_service_version(cx: &Ctx) -> Option<String> {
+    let state_dir = mcpgw_core::paths::state_dir()?;
+    let port = mcpgw_core::daemon_check::url_port(&cx.gateway_url)?;
+    mcpgw_core::daemon_check::service_version(&state_dir, port, cx.reach).advice()
 }
 
 fn describe_gateway(cx: &Ctx, enabled: usize) -> String {

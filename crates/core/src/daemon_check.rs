@@ -8,6 +8,13 @@
 //! lands on the other. Both states are silent: the supervisor reports a
 //! healthy job and the gateway answers.
 //!
+//! The same service is also worth an answer about *which build* it is
+//! serving: launchd and systemd keep executing the binary they were handed
+//! at start, so `brew upgrade` leaves yesterday's gateway answering on 8137
+//! with nothing on the wire admitting it. That half reads the record the
+//! running gateway publishes ([`crate::runtime`]) rather than the service
+//! definition, and is only ever believed together with a live probe.
+//!
 //! Lives outside [`crate::daemon`] because that module is final by contract,
 //! and outside [`crate::doctor`] because this reads the filesystem — doctor's
 //! rules are pure by design and take their environment injected. It is one
@@ -17,8 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::daemon::DaemonSpec;
+use crate::daemon::{DaemonSpec, GatewayReach};
 use crate::doctor::{Finding, Severity};
+use crate::runtime;
 
 /// How the binary the service was installed from relates to the one running
 /// this process.
@@ -118,9 +126,136 @@ pub fn service_exe(spec: &DaemonSpec) -> Option<ServiceExe> {
     Some(check_service_exe(&spec.exe, &running))
 }
 
+/// How the mcpgw the gateway is *running* relates to the one running this
+/// process.
+///
+/// A sibling of [`ServiceExe`] and not a variant of it: which binary a
+/// service is aimed at and which build is answering right now are two facts
+/// that come apart in both directions — a reinstall fixes the first without
+/// restarting anything, and an upgrade in place replaces the file under a
+/// process that keeps serving the old code. Both can be true at once, and a
+/// reader that only prints one of them would be hiding half the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceVersion {
+    /// The gateway that answered is this build. Nothing to report.
+    Same,
+    /// It is answering on a different build than the one you typed.
+    Differs { running: String, current: String },
+    /// Nothing trustworthy to say: no gateway answered, or none published a
+    /// record. Deliberately not an error and deliberately not a guess.
+    Unknown,
+}
+
+impl ServiceVersion {
+    /// The one sentence every command says about a gateway on another
+    /// build, or `None` when there is nothing to say.
+    ///
+    /// Names `mcpgw daemon install` for the same reason [`ServiceExe::advice`]
+    /// does: since 0.4 it reinstalls over its own running service, which is
+    /// the only thing that gets a supervised gateway onto a new binary.
+    #[must_use]
+    pub fn advice(&self) -> Option<String> {
+        match self {
+            ServiceVersion::Same | ServiceVersion::Unknown => None,
+            ServiceVersion::Differs { running, current } => Some(format!(
+                "runs mcpgw {running}; you are running {current} — run \
+                 `mcpgw daemon install` to restart it on this build"
+            )),
+        }
+    }
+
+    /// The same fact as a doctor finding, subject-prefixed like
+    /// [`ServiceExe::finding`] so the two read as one family.
+    ///
+    /// A warning for the same reason: the old build may be serving every
+    /// client perfectly, and what is broken is only that the upgrade did not
+    /// reach it.
+    #[must_use]
+    pub fn finding(&self) -> Option<Finding> {
+        self.advice().map(|advice| Finding {
+            client: None,
+            server: None,
+            severity: Severity::Warning,
+            message: format!("the gateway service {advice}"),
+        })
+    }
+}
+
+/// Compares two version strings as written.
+///
+/// No semver ordering: any difference is worth a line, including a service
+/// that is *newer* than the CLI asking — which is what a stale `cargo
+/// install` binary run against a Homebrew service looks like, and is just as
+/// much a surprise worth naming as the upgrade that did not take.
+#[must_use]
+pub fn check_service_version(running: &str, current: &str) -> ServiceVersion {
+    if running == current {
+        ServiceVersion::Same
+    } else {
+        ServiceVersion::Differs {
+            running: running.to_owned(),
+            current: current.to_owned(),
+        }
+    }
+}
+
+/// What the gateway on `port` is running, according to the record it
+/// published, against this build.
+///
+/// `reach` is the caller's own probe of that port and is not optional: a
+/// record outlives the process that wrote it (a crash, a `kill -9`, a lost
+/// machine), so believing one without a live answer on the port would report
+/// the version of a gateway that stopped running last week. Anything short
+/// of an answer — a port nobody holds, a port held by something that is not
+/// HTTP, no record, or a record nobody can parse — is
+/// [`ServiceVersion::Unknown`]. A corrupt record is not an error here for
+/// the same reason: three read-only commands would each have to decide what
+/// to do about it, and "cannot say" is the honest answer for all of them.
+#[must_use]
+pub fn service_version(state_dir: &Path, port: u16, reach: GatewayReach) -> ServiceVersion {
+    if !reach.is_up() {
+        return ServiceVersion::Unknown;
+    }
+    let Ok(Some(record)) = runtime::read_record(state_dir, port) else {
+        return ServiceVersion::Unknown;
+    };
+    // Compared against core's version rather than the caller's: the CLI
+    // writes the record and both crates are released from this workspace at
+    // one version, so there is one number here and it is this one.
+    check_service_version(&record.version, env!("CARGO_PKG_VERSION"))
+}
+
+/// The port a reader probed, off the URL it probed.
+///
+/// Records are keyed by port and every reader holds a URL instead — the one
+/// from `--url`, from `daemon.json`, or from the wizard's `--gateway-url`.
+/// Parsing it here keeps the three of them from disagreeing about which file
+/// answers for which address.
+#[must_use]
+pub fn url_port(url: &str) -> Option<u16> {
+    url::Url::parse(url).ok()?.port_or_known_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A published record for `port`, with only the version the test cares
+    /// about spelled out.
+    fn write_record(state_dir: &Path, port: u16, version: &str) {
+        crate::runtime::write_record(
+            state_dir,
+            &crate::runtime::GatewayRecord {
+                version: version.to_owned(),
+                pid: 4321,
+                exe: PathBuf::from("/usr/local/bin/mcpgw"),
+                bind: "127.0.0.1".to_owned(),
+                port,
+                started_at: 0,
+            },
+        )
+        .unwrap();
+    }
 
     fn write_binary(path: &Path) {
         std::fs::write(path, b"not really a binary").unwrap();
@@ -216,5 +351,98 @@ mod tests {
         let advice = differs.advice().unwrap();
         assert!(advice.contains("you are running"), "{advice}");
         assert_eq!(differs.finding().unwrap().severity, Severity::Warning);
+    }
+
+    /// A record without a live gateway is a record about a process that is
+    /// gone — the case a crashed 0.4 gateway leaves on every machine.
+    #[test]
+    fn a_version_is_only_read_off_a_port_that_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record(dir.path(), 8137, "0.0.1");
+
+        for reach in [GatewayReach::Down, GatewayReach::NotHttp] {
+            assert_eq!(
+                service_version(dir.path(), 8137, reach),
+                ServiceVersion::Unknown,
+                "{reach:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gateway_that_published_nothing_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            service_version(dir.path(), 8137, GatewayReach::Answering(405)),
+            ServiceVersion::Unknown
+        );
+
+        // Neither is a record nobody can parse: it is a half-written file or
+        // one from a future shape, and either way there is nothing to say.
+        std::fs::write(crate::runtime::record_path(dir.path(), 8137), b"{").unwrap();
+        assert_eq!(
+            service_version(dir.path(), 8137, GatewayReach::Answering(405)),
+            ServiceVersion::Unknown
+        );
+    }
+
+    #[test]
+    fn the_gateway_running_this_build_says_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record(dir.path(), 8137, env!("CARGO_PKG_VERSION"));
+
+        let version = service_version(dir.path(), 8137, GatewayReach::Answering(405));
+        assert_eq!(version, ServiceVersion::Same);
+        assert_eq!(version.advice(), None);
+        assert_eq!(version.finding(), None);
+    }
+
+    /// Both directions: the service left behind by an upgrade, and the old
+    /// `cargo install` binary asking a Homebrew service that is ahead of it.
+    #[test]
+    fn any_difference_is_reported_whichever_side_is_older() {
+        let dir = tempfile::tempdir().unwrap();
+        write_record(dir.path(), 8137, "0.0.1");
+
+        let version = service_version(dir.path(), 8137, GatewayReach::Answering(405));
+        assert_eq!(
+            version,
+            ServiceVersion::Differs {
+                running: "0.0.1".to_owned(),
+                current: env!("CARGO_PKG_VERSION").to_owned(),
+            }
+        );
+
+        assert_eq!(
+            check_service_version("9.9.9", "0.4.0"),
+            ServiceVersion::Differs {
+                running: "9.9.9".to_owned(),
+                current: "0.4.0".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_version_sentence_names_both_builds_and_the_fix() {
+        let advice = check_service_version("0.4.0", "0.4.1").advice().unwrap();
+        assert_eq!(
+            advice,
+            "runs mcpgw 0.4.0; you are running 0.4.1 — run `mcpgw daemon install` to restart it \
+             on this build"
+        );
+        let finding = check_service_version("0.4.0", "0.4.1").finding().unwrap();
+        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(finding.message, format!("the gateway service {advice}"));
+
+        assert_eq!(ServiceVersion::Unknown.advice(), None);
+        assert_eq!(ServiceVersion::Unknown.finding(), None);
+    }
+
+    #[test]
+    fn the_port_a_reader_probed_comes_off_its_url() {
+        assert_eq!(url_port("http://127.0.0.1:8137/mcp"), Some(8137));
+        // The default the scheme implies, for a URL that left it out.
+        assert_eq!(url_port("http://localhost/mcp"), Some(80));
+        assert_eq!(url_port("not a url"), None);
     }
 }
