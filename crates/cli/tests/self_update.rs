@@ -17,6 +17,8 @@ use std::process::Output;
 
 use assert_cmd::Command;
 
+mod util;
+
 /// The triple this test binary — and therefore the mcpgw under test — was
 /// built for, from the same build script the command reads it from.
 // Only the unix-gated end-to-end tests name the triple; Windows builds the
@@ -143,27 +145,19 @@ fn release_archive(version: &str, binary: &[u8]) -> Vec<u8> {
 /// Runs the mcpgw at `exe` with the release host and state directory pinned
 /// into the sandbox.
 ///
-/// Several tests copy the binary into their tempdir and exec the copy. A
-/// sibling test forking while that copy's write handle is still open leaves
-/// the kernel holding the file as busy, so the spawn can lose the race with
-/// ETXTBSY; it clears on its own once the descriptor is gone.
+/// Several tests copy the binary into their tempdir and exec the copy, so
+/// the spawn can lose the ETXTBSY race a sibling test's fork sets up —
+/// waited out by [`util::retrying_while_busy`], which is where the whole
+/// suite's account of that race now lives.
 fn run(exe: &Path, base: &str, state: &Path, args: &[&str]) -> Output {
-    for attempt in 0..5 {
-        let result = Command::new(exe)
+    util::retrying_while_busy(exe, || {
+        Command::new(exe)
             .args(args)
             .env("MCPGW_UPDATE_BASE_URL", base)
             .env("MCPGW_STATE_DIR", state)
             .env_remove("MCPGW_NO_UPDATE_CHECK")
-            .output();
-        match result {
-            Ok(out) => return out,
-            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                std::thread::sleep(std::time::Duration::from_millis(50 * (attempt + 1)));
-            }
-            Err(err) => panic!("{}: {err}", exe.display()),
-        }
-    }
-    panic!("{}: still busy after 5 attempts", exe.display())
+            .output()
+    })
 }
 
 fn built_binary() -> PathBuf {
@@ -367,7 +361,7 @@ fn a_verified_archive_replaces_the_running_binary() {
     // The replaced file is an executable that runs, and it is the one that
     // came down the wire — an assertion the old payload could not make,
     // being a copy of the binary that was already sitting there.
-    let version = Command::new(&exe).arg("--version").output().unwrap();
+    let version = util::retrying_while_busy(&exe, || Command::new(&exe).arg("--version").output());
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
