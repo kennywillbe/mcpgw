@@ -55,6 +55,7 @@ fn canonical() -> BTreeMap<String, Server> {
             tags: Vec::new(),
             transport: Transport::Http {
                 url: SHARED_URL.to_owned(),
+                headers_command: Vec::new(),
                 headers: BTreeMap::new(),
             },
         },
@@ -105,6 +106,7 @@ fn a_matching_name_with_a_different_target_is_unmanaged() {
     let mut canonical = canonical();
     canonical.get_mut("linear").unwrap().transport = Transport::Http {
         url: "https://mcp.example.com/mcp".to_owned(),
+        headers_command: Vec::new(),
         headers: BTreeMap::new(),
     };
 

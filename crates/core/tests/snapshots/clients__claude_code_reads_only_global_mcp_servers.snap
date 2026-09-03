@@ -9,9 +9,22 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://mcp.context7.com/mcp",
+                headers_command: [],
                 headers: {
                     "CONTEXT7_API_KEY": "REDACTED",
                 },
+            },
+        },
+        "corp": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.corp.example/mcp",
+                headers_command: [
+                    "corp-auth",
+                    "print-mcp-headers",
+                ],
+                headers: {},
             },
         },
         "sqlite": Server {

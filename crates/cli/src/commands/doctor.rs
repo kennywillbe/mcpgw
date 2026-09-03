@@ -26,7 +26,7 @@ const REACH_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum TargetKey {
     Stdio(String, Vec<String>, BTreeMap<String, String>),
-    Http(String, BTreeMap<String, String>),
+    Http(String, Vec<String>, BTreeMap<String, String>),
 }
 
 /// One endpoint to dial, the sources that named it, and the name a fix would
@@ -41,6 +41,11 @@ struct ProbeTarget {
     /// canonical name — which is what any advice naming a command has to
     /// use, since that is the name the command would take.
     name: String,
+    /// The `headers_command` line, for an entry whose headers are minted
+    /// rather than written down. The row says so: a reader comparing this
+    /// report against the config file otherwise finds an entry with no
+    /// credential in it and no explanation of how it authenticated.
+    helper: Option<String>,
 }
 
 #[derive(Default)]
@@ -57,11 +62,25 @@ impl ProbePlan {
             Transport::Stdio { command, args, env } => {
                 TargetKey::Stdio(command.clone(), args.clone(), env.clone())
             }
-            Transport::Http { url, headers } => TargetKey::Http(url.clone(), headers.clone()),
+            // The command is part of the key: two entries at one URL that
+            // mint their credentials differently are two things to dial.
+            Transport::Http {
+                url,
+                headers_command,
+                headers,
+            } => TargetKey::Http(url.clone(), headers_command.clone(), headers.clone()),
         };
         self.targets
             .entry(key)
             .or_insert_with(|| ProbeTarget {
+                helper: match &server.transport {
+                    Transport::Http {
+                        headers_command, ..
+                    } if !headers_command.is_empty() => {
+                        Some(mcpgw_core::headers::display(headers_command))
+                    }
+                    Transport::Http { .. } | Transport::Stdio { .. } => None,
+                },
                 server: server.clone(),
                 labels: Vec::new(),
                 name: name.to_owned(),
@@ -478,21 +497,30 @@ fn emit_json(
         let entries: Vec<serde_json::Value> = probes
             .results
             .iter()
-            .map(|(label, outcome)| match outcome {
-                Ok(success) => serde_json::json!({
-                    "servers": label, "ok": true,
-                    "server_name": success.server_name,
-                    "server_version": success.server_version,
-                    "tools": success.tool_count,
-                }),
-                Err(ProbeError::AuthRequired) => serde_json::json!({
-                    "servers": label, "ok": false,
-                    "code": mcpgw_core::doctor::NEEDS_OAUTH,
-                    "error": probes.oauth_message(label),
-                }),
-                Err(err) => serde_json::json!({
-                    "servers": label, "ok": false, "error": err.to_string(),
-                }),
+            .map(|(label, outcome)| {
+                let mut row = match outcome {
+                    Ok(success) => serde_json::json!({
+                        "servers": label, "ok": true,
+                        "server_name": success.server_name,
+                        "server_version": success.server_version,
+                        "tools": success.tool_count,
+                    }),
+                    Err(ProbeError::AuthRequired) => serde_json::json!({
+                        "servers": label, "ok": false,
+                        "code": mcpgw_core::doctor::NEEDS_OAUTH,
+                        "error": probes.oauth_message(label),
+                    }),
+                    Err(err) => serde_json::json!({
+                        "servers": label, "ok": false, "error": err.to_string(),
+                    }),
+                };
+                // On every row for the same reason the rendered ones carry
+                // it: how a target authenticates is a property of the target,
+                // not of how the probe went.
+                if let Some(command) = probes.helpers.get(label) {
+                    row["headers_from_command"] = serde_json::json!(command);
+                }
+                row
             })
             .collect();
         out["probes"] = serde_json::json!({ "results": entries });
@@ -553,6 +581,9 @@ struct ProbeReport {
     results: Vec<ProbeRow>,
     /// Row label → the name a command about that row would name.
     names: BTreeMap<String, String>,
+    /// Row label → the `headers_command` behind it, for the rows that have
+    /// one.
+    helpers: BTreeMap<String, String>,
     /// The rows that are not failures at all: a server behind OAuth is
     /// working, and what it needs is a login on this machine. Kept beside
     /// the rows the way the gateway pass keeps its own, so they are counted
@@ -580,6 +611,17 @@ impl ProbeReport {
     fn name<'a>(&'a self, label: &'a str) -> &'a str {
         self.names.get(label).map_or(label, String::as_str)
     }
+
+    /// `" (headers from command …)"` for a row that has one, nothing for the
+    /// rest.
+    fn helper_note(&self, label: &str) -> String {
+        self.helpers.get(label).map_or_else(String::new, |command| {
+            format!(
+                " (headers {} {command})",
+                mcpgw_core::doctor::HEADERS_FROM_COMMAND
+            )
+        })
+    }
 }
 
 fn run_probes(
@@ -588,12 +630,16 @@ fn run_probes(
     timeout: Duration,
 ) -> ProbeReport {
     let mut names: BTreeMap<String, String> = BTreeMap::new();
+    let mut helpers: BTreeMap<String, String> = BTreeMap::new();
     let mut results = runtime.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         let mut labels: BTreeMap<tokio::task::Id, String> = BTreeMap::new();
         for target in plan.targets.into_values() {
             let label = target.labels.join(", ");
             names.insert(label.clone(), target.name);
+            if let Some(helper) = target.helper {
+                helpers.insert(label.clone(), helper);
+            }
             let server = target.server;
             let handle = set.spawn({
                 let label = label.clone();
@@ -617,6 +663,7 @@ fn run_probes(
     ProbeReport {
         results,
         names,
+        helpers,
         findings,
     }
 }
@@ -728,6 +775,7 @@ pub(super) async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutco
         tags: Vec::new(),
         transport: Transport::Http {
             url: url.to_owned(),
+            headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
     };
@@ -817,11 +865,16 @@ fn render_probes(probes: &ProbeReport, color: bool) {
     // is the whole diagnosis.
     heading("probes — direct to each server", color);
     for (label, outcome) in &probes.results {
+        // On every row, not only the healthy ones: how a target
+        // authenticates is a property of the target, and a failed row is
+        // where a reader most needs to know that the credential was minted
+        // rather than read out of the config.
+        let helper = probes.helper_note(label);
         match outcome {
             Ok(success) => {
                 let line = format!(
-                    "{label}: {} {}, {} tools",
-                    success.server_name, success.server_version, success.tool_count
+                    "{label}: {} {}, {} tools{helper}",
+                    success.server_name, success.server_version, success.tool_count,
                 );
                 ok_line(&line, color);
             }
@@ -829,9 +882,12 @@ fn render_probes(probes: &ProbeReport, color: bool) {
             // and the sentence that says so is the finding's own, so the two
             // renderings cannot drift apart.
             Err(ProbeError::AuthRequired) => {
-                warn_line(&format!("{label}: {}", probes.oauth_message(label)), color);
+                warn_line(
+                    &format!("{label}: {}{helper}", probes.oauth_message(label)),
+                    color,
+                );
             }
-            Err(err) => bad_line(&format!("{label}: {err}"), color),
+            Err(err) => bad_line(&format!("{label}: {err}{helper}"), color),
         }
     }
 }

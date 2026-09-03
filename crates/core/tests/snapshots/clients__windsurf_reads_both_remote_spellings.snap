@@ -9,6 +9,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://mcp.figma.com/mcp",
+                headers_command: [],
                 headers: {},
             },
         },
@@ -31,6 +32,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://mcp.linear.app/mcp",
+                headers_command: [],
                 headers: {
                     "Authorization": "Bearer ${env:LINEAR_TOKEN}",
                 },
@@ -41,6 +43,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://notes.example/mcp",
+                headers_command: [],
                 headers: {},
             },
         },

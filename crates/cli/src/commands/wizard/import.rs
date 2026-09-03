@@ -461,7 +461,21 @@ fn summarize(server: &Server) -> String {
                 .join(" ");
             format!("{line}{}", keys("env", env))
         }
-        Transport::Http { url, headers } => format!("{url}{}", keys("headers", headers)),
+        Transport::Http {
+            url,
+            headers_command,
+            headers,
+        } => {
+            // The command line, not what it prints: the summary is read out
+            // loud in a terminal, and everything else on this line is
+            // already a name rather than a value.
+            let helper = if headers_command.is_empty() {
+                String::new()
+            } else {
+                format!(" (headers from command {})", headers_command.join(" "))
+            };
+            format!("{url}{helper}{}", keys("headers", headers))
+        }
     };
     truncate(&line, 72)
 }

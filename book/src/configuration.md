@@ -69,7 +69,74 @@ Common to both transports:
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `url` | string | required | Streamable HTTP endpoint |
+| `headers_command` | list of strings | `[]` | run per connect; its headers win over `headers` |
 | `headers` | table of strings | `{}` | sent on every request |
+
+#### `headers_command`
+
+A token you paste into `headers` lasts as long as the token does. Anything an
+SSO, an STS, `gcloud auth print-identity-token` or a Vault lease hands you is
+short-lived by design, and this is where it goes instead:
+
+```toml
+[servers.internal]
+type = "http"
+url = "https://mcp.corp.example/mcp"
+headers_command = ["corp-auth", "print-mcp-headers"]
+```
+
+The command must print a JSON object of header names and values on stdout:
+
+```json
+{"Authorization": "Bearer eyJ…", "X-Corp-Tenant": "acme"}
+```
+
+That is the same contract Claude Code's `headersHelper` and Codex's
+`http_headers_helper` use, and `mcpgw import` maps both onto this field, so a
+server that authenticated before it moved behind the gateway still does.
+`mcpgw eject` writes them back.
+
+Rules, all of them:
+
+- **It is argv, not a shell line.** `["corp-auth", "print-mcp-headers"]`, not
+  `corp-auth print-mcp-headers | jq`. Nothing is expanded, globbed or split by
+  a shell — the same treatment `command` and `args` get, and for the same
+  reason: a path with a space in it should not become two arguments, and a `;`
+  in an argument should not become a second command. A bare string is accepted
+  and split on whitespace, because that is how both clients above spell theirs;
+  anything that needs quoting is written as an array.
+- It runs **on every connect**, and once more if the server answers `401` to
+  that connect. Nothing is cached: a helper that wants to reuse a token caches
+  it itself.
+- Its output is **merged over `headers`**, so a name the command prints
+  replaces the one written down. Static headers are the fallback.
+- A `401` on a live call is treated as an expired credential: the connection is
+  dropped and the next call reconnects, rerunning the command. A rotating
+  token costs one failed call, not a restart.
+- It gets **10 seconds**, and is killed after that.
+- It runs with the process environment inherited and the working directory set
+  to your home, never the gateway's — which under a service manager is a
+  directory you did not choose.
+- **Its output is a credential and is treated as one.** It is never logged,
+  never captured, and never quoted into an error. `mcpgw list` shows the
+  command; `mcpgw doctor` says the headers come *from command*; a failure
+  reports the command line and a tail of its **stderr**, which is the
+  diagnostic half.
+
+`mcpgw add` takes it as one line:
+
+```sh
+mcpgw add internal --url https://mcp.corp.example/mcp \
+  --headers-command "corp-auth print-mcp-headers"
+```
+
+**Under a daemon, give an absolute path.** launchd, systemd and the Windows
+service manager start the gateway with a `PATH` of their own, which usually
+does not include `/opt/homebrew/bin` or `~/.local/bin`. `mcpgw doctor`
+resolves the command the same way it resolves a stdio `command` and reports
+one that is not found — but a `PATH` that differs between your terminal and
+your service is exactly the case a passing `doctor` cannot rule out. See
+[Running as a daemon](./daemon.md).
 
 ### Everything at once
 

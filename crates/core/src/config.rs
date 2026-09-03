@@ -66,9 +66,65 @@ pub enum Transport {
     },
     Http {
         url: String,
+        /// A command whose stdout is a JSON object of header names and
+        /// values, merged over [`headers`](Self::Http::headers) every time
+        /// the upstream connects. The answer to a credential that expires:
+        /// an SSO or STS token belongs in a command, not in a literal string
+        /// that stops working an hour after it was pasted.
+        ///
+        /// Stored as argv rather than as the single string Claude Code and
+        /// Codex spell theirs with, and run with no shell, for the same
+        /// reason `command`/`args` are: a string has to be split by
+        /// somebody, and every splitter is either a shell — which turns a
+        /// path with a space, a `$` or a `;` into something else entirely —
+        /// or a whitespace split that quietly disagrees with one. A config
+        /// copied from either client still parses: a bare string is read as
+        /// whitespace-separated argv, which is what those two do for
+        /// everything that is not already quoted.
+        ///
+        /// Written ahead of `headers` because TOML wants an array before a
+        /// table within one section.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "argv"
+        )]
+        headers_command: Vec<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
     },
+}
+
+/// Reads a `headers_command` as argv, from either spelling.
+///
+/// # Errors
+///
+/// An empty command, or one carrying an empty argument, is a config error
+/// rather than a value the gateway discovers it cannot run at connect time.
+fn argv<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Spelling {
+        Line(String),
+        Argv(Vec<String>),
+    }
+
+    let argv = match Spelling::deserialize(deserializer)? {
+        Spelling::Line(line) => line.split_whitespace().map(str::to_owned).collect(),
+        Spelling::Argv(argv) => argv,
+    };
+    if argv.is_empty() {
+        return Err(serde::de::Error::custom("headers_command is empty"));
+    }
+    if argv.iter().any(String::is_empty) {
+        return Err(serde::de::Error::custom(
+            "headers_command has an empty argument",
+        ));
+    }
+    Ok(argv)
 }
 
 fn default_true() -> bool {

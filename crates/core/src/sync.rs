@@ -324,6 +324,7 @@ pub fn per_server_gateway_server(
     let transport = if kind.supports_http_entries() {
         Transport::Http {
             url: crate::endpoints::per_server_url(base_url, name)?,
+            headers_command: Vec::new(),
             headers: BTreeMap::new(),
         }
     } else {

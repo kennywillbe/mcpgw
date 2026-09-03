@@ -37,6 +37,10 @@ pub struct Finding {
 /// The code on the finding for a server that answered 401.
 pub const NEEDS_OAUTH: &str = "needs_oauth";
 
+/// The two words every report uses for a header set a command produces, so
+/// `doctor` and the probe rows cannot describe the same thing differently.
+pub const HEADERS_FROM_COMMAND: &str = "from command";
+
 /// The finding for a server whose own OAuth the gateway cannot stand in for.
 ///
 /// A warning rather than an error: nothing on this machine is misconfigured
@@ -91,17 +95,42 @@ pub fn check_server(
                 )]
             }
         }
-        Transport::Http { url, .. } => match url::Url::parse(url) {
-            Err(err) => vec![finding(
-                Severity::Error,
-                format!("invalid url {url:?}: {err}"),
-            )],
-            Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => vec![finding(
-                Severity::Warning,
-                format!("unusual url scheme {:?}", parsed.scheme()),
-            )],
-            Ok(_) => Vec::new(),
-        },
+        Transport::Http {
+            url,
+            headers_command,
+            ..
+        } => {
+            let mut findings = match url::Url::parse(url) {
+                Err(err) => vec![finding(
+                    Severity::Error,
+                    format!("invalid url {url:?}: {err}"),
+                )],
+                Ok(parsed) if !matches!(parsed.scheme(), "http" | "https") => vec![finding(
+                    Severity::Warning,
+                    format!("unusual url scheme {:?}", parsed.scheme()),
+                )],
+                Ok(_) => Vec::new(),
+            };
+            // Resolved exactly like a stdio `command`, and with the same
+            // lookup, because it is one: a program mcpgw spawns. The advice
+            // is longer because this one is spawned by whatever is running
+            // the gateway, and a service manager hands it a PATH that has
+            // almost nothing on it.
+            if let Some(program) = crate::headers::program(headers_command)
+                && !command_exists(program)
+            {
+                findings.push(finding(
+                    Severity::Error,
+                    format!(
+                        "headers {HEADERS_FROM_COMMAND} {} — {program:?} not found in PATH \
+                         (an installed service runs with a PATH of its own, so give an \
+                         absolute path)",
+                        crate::headers::display(headers_command)
+                    ),
+                ));
+            }
+            findings
+        }
     }
 }
 

@@ -195,12 +195,23 @@ impl EntrySchema {
             // hand-written `type` is understood rather than rejected.
             Self::McpServers | Self::VsCode | Self::Zed | Self::Amp => parse_mcp_servers(obj),
         }
-        .map(|(server, note)| {
+        .map(|(mut server, note)| {
             // Only a remote entry can have a credential the client holds:
             // a local one is a process mcpgw starts, and its environment
             // comes across whole.
-            let auth = match server.transport {
-                Transport::Http { .. } => client_managed_auth(self, obj),
+            let auth = match &mut server.transport {
+                Transport::Http {
+                    headers_command, ..
+                } => {
+                    // The one thing a client can say about a credential that
+                    // mcpgw has a field for: not the token, but the command
+                    // that mints it. Read here rather than in the per-client
+                    // parsers because only this level knows which schema is
+                    // being read, and the key differs between the two clients
+                    // that define one.
+                    *headers_command = helper_argv(self, obj);
+                    client_managed_auth(self, obj)
+                }
                 Transport::Stdio { .. } => None,
             };
             let note = match (note, auth) {
@@ -209,6 +220,39 @@ impl EntrySchema {
             };
             (server, note)
         })
+    }
+
+    /// The key this client spells a dynamic-headers command with, if it has
+    /// one.
+    ///
+    /// Two of the thirteen do, and both agree on the contract mcpgw's own
+    /// `headers_command` implements: a local command whose stdout is a JSON
+    /// object of header names and values, run per connection, overriding the
+    /// static headers beside it. Only the key differs, so importing either
+    /// keeps a setup that already worked, and ejecting hands it back.
+    ///
+    /// `headersHelper` is Claude Code's, reached through the `mcpServers`
+    /// schema it shares with Cursor and Claude Desktop. Sharing it costs
+    /// nothing: mcpgw only ever writes the key for an entry that has a
+    /// command, a client that does not know it ignores it, and a user who
+    /// wrote it by hand meant exactly this.
+    #[must_use]
+    pub fn helper_field(self) -> Option<&'static str> {
+        match self {
+            Self::McpServers => Some("headersHelper"),
+            Self::Codex => Some("http_headers_helper"),
+            // Not "none of these has one" so much as "none of these
+            // documents one": a key invented here would be written into a
+            // file its owner's schema validator rejects.
+            Self::VsCode
+            | Self::Gemini
+            | Self::Opencode
+            | Self::Windsurf
+            | Self::Zed
+            | Self::Cline
+            | Self::Amp
+            | Self::ZooCode => None,
+        }
     }
 
     /// Fields on an entry that belong to the client, not to mcpgw.
@@ -270,7 +314,11 @@ impl EntrySchema {
                     obj.insert("env".to_owned(), string_map(env));
                 }
             }
-            Transport::Http { url, headers } => {
+            Transport::Http {
+                url,
+                headers_command,
+                headers,
+            } => {
                 let headers_key = match self {
                     Self::Gemini => {
                         // `url` here would mean SSE to Gemini; streamable
@@ -323,6 +371,17 @@ impl EntrySchema {
                 };
                 if !headers.is_empty() {
                     obj.insert(headers_key.to_owned(), string_map(headers));
+                }
+                // Joined back into the one line both clients spell it with.
+                // Nothing is quoted on the way out because neither has a
+                // quoting rule to quote by — they hand the string to a
+                // shell — so an argument carrying a space is the one shape
+                // that cannot make the round trip, and mcpgw's own array is
+                // where such a command belongs.
+                if let Some(key) = self.helper_field()
+                    && !headers_command.is_empty()
+                {
+                    obj.insert(key.to_owned(), headers_command.join(" ").into());
                 }
             }
         }
@@ -404,6 +463,23 @@ fn client_managed_auth(schema: EntrySchema, obj: &Map<String, Value>) -> Option<
     }
 }
 
+/// The argv of the helper command an entry names, or empty when this client
+/// has no such field or this entry does not use it.
+///
+/// Split on whitespace, which is where both clients and mcpgw agree. They
+/// hand the string to a shell and mcpgw does not, so a helper whose arguments
+/// need quoting cannot be read out of a client file at all — it is written as
+/// an array in the canonical config, where argv is spelled directly.
+fn helper_argv(schema: EntrySchema, obj: &Map<String, Value>) -> Vec<String> {
+    let Some(key) = schema.helper_field() else {
+        return Vec::new();
+    };
+    match obj.get(key) {
+        Some(Value::String(line)) => line.split_whitespace().map(str::to_owned).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The `mcpServers` entry shape shared by Claude Desktop, Claude Code, Cursor
 /// and VS Code: an optional `type`, and otherwise `command` for stdio or
 /// `url` for remote.
@@ -454,6 +530,7 @@ fn parse_mcp_servers(obj: &Map<String, Value>) -> Result<(Server, Option<String>
     } else {
         Transport::Http {
             url: string_field(obj, "url")?.ok_or("missing `url`")?,
+            headers_command: Vec::new(),
             headers: string_object(obj, "headers")?,
         }
     };
@@ -546,6 +623,7 @@ fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), St
             }
             Transport::Http {
                 url: http_url,
+                headers_command: Vec::new(),
                 headers: string_object(obj, "headers")?,
             }
         }
@@ -555,6 +633,7 @@ fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), St
             note = Some("legacy `sse` transport read as http".to_owned());
             Transport::Http {
                 url: sse_url,
+                headers_command: Vec::new(),
                 headers: string_object(obj, "headers")?,
             }
         }
@@ -599,6 +678,7 @@ fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), Str
         },
         (None, Some(url)) => Transport::Http {
             url,
+            headers_command: Vec::new(),
             headers: string_object(obj, "http_headers")?,
         },
         (Some(_), Some(_)) => return Err("has both `command` and `url`".to_owned()),
@@ -663,6 +743,7 @@ fn parse_opencode(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
             // interpolation, which is kept verbatim: expanding it here would
             // bake a secret into the canonical config.
             url: string_field(obj, "url")?.ok_or("missing `url`")?,
+            headers_command: Vec::new(),
             headers: string_object(obj, "headers")?,
         }
     };
@@ -690,7 +771,7 @@ fn emit_opencode(server: &Server) -> Value {
                 obj.insert("environment".to_owned(), string_map(env));
             }
         }
-        Transport::Http { url, headers } => {
+        Transport::Http { url, headers, .. } => {
             obj.insert("type".to_owned(), "remote".into());
             obj.insert("url".to_owned(), url.as_str().into());
             if !headers.is_empty() {

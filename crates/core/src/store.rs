@@ -256,9 +256,20 @@ fn server_table(server: &Server) -> Table {
             table["args"] = value(string_array(args));
             table["env"] = value(string_map(env));
         }
-        Transport::Http { url, headers } => {
+        Transport::Http {
+            url,
+            headers_command,
+            headers,
+        } => {
             table["type"] = value("http");
             table["url"] = value(url);
+            // The one generated field that is omitted when empty: `[]`
+            // beside a `headers` table reads as an entry that uses a helper
+            // and got nothing back, which is a different claim from an entry
+            // that has no helper.
+            if !headers_command.is_empty() {
+                table["headers_command"] = value(string_array(headers_command));
+            }
             table["headers"] = value(string_map(headers));
         }
     }

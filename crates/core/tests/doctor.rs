@@ -106,6 +106,7 @@ fn http(url: &str) -> mcpgw_core::Server {
         tags: Vec::new(),
         transport: mcpgw_core::Transport::Http {
             url: url.to_owned(),
+            headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
         },
     }
@@ -294,4 +295,40 @@ fn a_gateway_error_naming_the_login_is_its_own_fault_kind() {
         classify_gateway_failure("upstream \"linear\" failed after 3 attempt(s): refused"),
         GatewayFault::Failed
     );
+}
+
+/// A `headers_command` is a program mcpgw spawns, so it is resolved exactly
+/// like a stdio `command` — and the advice says the one thing that is
+/// different about it: whatever runs the gateway decides its PATH.
+#[test]
+fn a_headers_command_is_resolved_like_a_stdio_command() {
+    let config = parse(
+        r#"
+version = 1
+[servers.corp]
+type = "http"
+url = "https://mcp.corp.example/mcp"
+headers_command = "corp-auth print-mcp-headers"
+[servers.found]
+type = "http"
+url = "https://ok.example/mcp"
+headers_command = ["present"]
+"#,
+    );
+    let exists = |cmd: &str| cmd == "present";
+    assert!(
+        check_server(None, "found", &config.servers["found"], &exists).is_empty(),
+        "a command on PATH earns no finding"
+    );
+
+    let findings = check_server(None, "corp", &config.servers["corp"], &exists);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].severity, Severity::Error);
+    let message = &findings[0].message;
+    assert!(
+        message.contains(mcpgw_core::doctor::HEADERS_FROM_COMMAND),
+        "{message}"
+    );
+    assert!(message.contains("corp-auth print-mcp-headers"), "{message}");
+    assert!(message.contains("absolute path"), "{message}");
 }

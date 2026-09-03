@@ -20,6 +20,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://mcp.linear.app/sse",
+                headers_command: [],
                 headers: {},
             },
         },
@@ -41,6 +42,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "${SRC_ENDPOINT}/.api/mcp/v1",
+                headers_command: [],
                 headers: {
                     "Authorization": "token ${SRC_ACCESS_TOKEN}",
                 },

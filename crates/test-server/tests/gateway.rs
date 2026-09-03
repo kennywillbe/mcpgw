@@ -220,6 +220,7 @@ async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<Up
         tags: Vec::new(),
         transport: Transport::Http {
             url: format!("http://{addr}/mcp"),
+            headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
     };
@@ -1433,6 +1434,7 @@ fn remote_manager(addr: std::net::SocketAddr) -> Arc<UpstreamManager> {
         tags: Vec::new(),
         transport: Transport::Http {
             url: format!("http://{addr}/mcp"),
+            headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
     };

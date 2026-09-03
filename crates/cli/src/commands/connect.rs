@@ -122,6 +122,7 @@ fn bridge(url: &str, startup: &Startup) -> Gateway {
         tags: Vec::new(),
         transport: Transport::Http {
             url: url.to_owned(),
+            headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
     };

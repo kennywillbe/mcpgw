@@ -19,6 +19,13 @@
 //! since it has to prove both that an untouched server keeps the *same*
 //! child and that a call already in flight still lands on it).
 //!
+//! Four modes serve no MCP at all and stand in for a `headers_command`
+//! instead: `headers <file>` prints an `Authorization` header built from the
+//! first line of that file, consuming it unless it is the last (a token store
+//! whose successive runs can disagree), `headers-fail` exits non-zero with a
+//! complaint on stderr, `headers-hang` never answers, and `headers-garbage`
+//! prints something that is not a JSON object.
+//!
 //! `healthy` decorates its answers with the caching fields a 2026-07-28
 //! server sends (`ttlMs`, `cacheScope`) and with `_meta`, because a pipe
 //! that hands back anything less than what the upstream wrote is what
@@ -39,12 +46,42 @@ fn main() {
         .unwrap_or_else(|| "healthy".to_owned());
     match mode.as_str() {
         "exit" => std::process::exit(1),
+        // A token store, read fresh on every run — which is the whole point,
+        // since what makes this a `headers_command` and not a header is that
+        // two runs can disagree. The file holds one token per line; each run
+        // takes the first and consumes it, keeping the last one forever, so a
+        // test scripts a rotation by writing the sequence it wants.
+        "headers" => {
+            let path = std::env::args().nth(2).expect("headers needs a token file");
+            let text = std::fs::read_to_string(&path).expect("token file");
+            let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+            let token = lines.next().expect("token file is empty").trim().to_owned();
+            let rest: Vec<&str> = lines.collect();
+            if !rest.is_empty() {
+                std::fs::write(&path, rest.join("\n")).expect("token file");
+            }
+            println!(
+                "{}",
+                serde_json::json!({ "Authorization": format!("Bearer {token}") })
+            );
+            std::io::stdout().flush().unwrap();
+        }
+        "headers-fail" => {
+            eprintln!("no vault session; run `corp-auth login`");
+            std::process::exit(3);
+        }
+        "headers-garbage" => {
+            println!("Authorization: Bearer not-json");
+            std::io::stdout().flush().unwrap();
+        }
         "garbage" => {
             println!("this is definitely not json-rpc");
             std::io::stdout().flush().unwrap();
             park();
         }
-        "slow" => park(),
+        // A helper that never answers is the same nothing a server that
+        // never answers is; both are what a timeout is for.
+        "slow" | "headers-hang" => park(),
         mode => serve(mode),
     }
 }

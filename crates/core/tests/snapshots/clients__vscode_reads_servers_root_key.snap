@@ -20,6 +20,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://example.com/mcp",
+                headers_command: [],
                 headers: {
                     "Authorization": "Bearer ${input:api-key}",
                 },

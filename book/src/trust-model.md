@@ -140,6 +140,13 @@ server to everything that dials it. The `401` is not retried either: it will
 still be a `401` on the third attempt, so it is reported at once instead of
 after a backoff ladder.
 
+A credential that expires can be minted per connect instead of written down —
+see [`headers_command`](./configuration.md#headers_command). What that command
+prints is treated as a credential end to end: it goes to the transport and
+nowhere else, and no log line, capture record or error message carries it. The
+command line itself is not a secret and is shown; so is a tail of its stderr,
+because a helper that fails has to be fixable. mcpgw runs it with no shell.
+
 ## The short version
 
 - Anything running as you can use the gateway. That was already true of your
@@ -148,4 +155,5 @@ after a backoff ladder.
 - The log redacts what looks like a credential; that is a filter, not a
   proof. `--capture-bodies off` and `--no-capture` are the stronger answers.
 - Do not `--bind` past loopback without putting authentication in front.
+- A short-lived credential belongs in `headers_command`, not in `headers`.
 - Nothing here is a substitute for not running MCP servers you do not trust.

@@ -20,6 +20,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://mcp.linear.app/sse",
+                headers_command: [],
                 headers: {},
             },
         },
