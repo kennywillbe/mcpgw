@@ -163,6 +163,9 @@ async fn an_already_finished_machine_gets_the_status_card() {
         .spawn()
         .unwrap();
     let url = gateway_url(&mut gateway).await;
+    // And answering on a build that is not this one, which is the other
+    // half the card reports: the two are different facts and both print.
+    util::rewrite_record_version(dir.path(), &url, "0.0.1").await;
 
     let child = command(dir.path())
         .args(["init", "--yes", "--gateway-url", &url])
@@ -184,6 +187,13 @@ async fn an_already_finished_machine_gets_the_status_card() {
     assert!(stdout.contains("Cursor"), "{stdout}");
     assert!(stdout.contains("which is gone"), "{stdout}");
     assert!(stdout.contains("mcpgw daemon install"), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "runs mcpgw 0.0.1; you are running {}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{stdout}"
+    );
     for suggestion in ["mcpgw list", "mcpgw watch", "mcpgw doctor --probe"] {
         assert!(stdout.contains(suggestion), "{stdout}");
     }

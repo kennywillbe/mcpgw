@@ -95,6 +95,7 @@ pub fn run(
         &command_exists,
     );
     findings.extend(stale_service_exe());
+    findings.extend(stale_service_version());
 
     let (probe_results, gateway_report) = match probe {
         Some(timeout) => {
@@ -227,6 +228,39 @@ fn stale_service_exe() -> Option<Finding> {
     let state_dir = mcpgw_core::paths::state_dir()?;
     let spec = mcpgw_core::daemon::load_spec(&state_dir)?;
     mcpgw_core::daemon_check::service_exe(&spec)?.finding()
+}
+
+/// The warning for a service that is answering on a build other than this
+/// one — the state a `brew upgrade` leaves behind, where every command looks
+/// healthy and the new binary is serving nobody.
+///
+/// The one check in doctor that dials, `--probe` or not: what the running
+/// gateway published is only worth reading together with a live answer on
+/// its port, so there is no version of this that costs nothing. The dial is
+/// paid for only where a gateway has published something at the address the
+/// service was installed with — a machine with no service, or one whose
+/// gateway predates the record, gets no connect out of `doctor` at all.
+fn stale_service_version() -> Option<Finding> {
+    let state_dir = mcpgw_core::paths::state_dir()?;
+    let spec = mcpgw_core::daemon::load_spec(&state_dir)?;
+    mcpgw_core::runtime::read_record(&state_dir, spec.port)
+        .ok()
+        .flatten()?;
+    let reach = reach_gateway(&spec.url());
+    mcpgw_core::daemon_check::service_version(&state_dir, spec.port, reach).finding()
+}
+
+/// One loopback probe on a runtime built for it and dropped again, the way
+/// the wizard does it: doctor's own runtime exists only under `--probe`, and
+/// this question is asked either way.
+fn reach_gateway(url: &str) -> mcpgw_core::daemon::GatewayReach {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return mcpgw_core::daemon::GatewayReach::Down;
+    };
+    runtime.block_on(mcpgw_core::daemon::probe_gateway(url, REACH_TIMEOUT))
 }
 
 /// mcpgw's record of which client entries it wrote, or an empty one when the

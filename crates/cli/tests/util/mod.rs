@@ -227,3 +227,28 @@ pub fn record_installed_spec(home: &Path, exe: &Path, bind: &str, port: u16) {
     )
     .unwrap();
 }
+
+/// Rewrites the version in the record the gateway at `url` published, so a
+/// test can meet an upgraded machine without owning two builds of mcpgw.
+///
+/// The record lands around the bind rather than before the banner, so it is
+/// polled for first — rewriting a file that is not there yet would be a
+/// gateway that publishes over the doctored version a moment later.
+#[allow(dead_code)]
+pub async fn rewrite_record_version(home: &Path, url: &str, version: &str) {
+    let state = home.join("state");
+    let port = mcpgw_core::daemon_check::url_port(url).unwrap();
+    let deadline = std::time::Instant::now() + BANNER_DEADLINE;
+    loop {
+        if let Some(mut record) = mcpgw_core::runtime::read_record(&state, port).unwrap() {
+            version.clone_into(&mut record.version);
+            mcpgw_core::runtime::write_record(&state, &record).unwrap();
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no gateway record for port {port} within {BANNER_DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

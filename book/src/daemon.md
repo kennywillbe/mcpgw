@@ -296,6 +296,19 @@ from the one in the Cellar it points at. In `doctor` this is a warning rather
 than an error: the gateway may be answering perfectly well on the old binary,
 and the only thing actually broken is that upgrading it changes nothing.
 
+The same three also say when the gateway that is *answering* is a different
+version than the mcpgw you are typing — a service keeps running the build it
+was started with, so `brew upgrade` leaves yesterday's gateway on the port
+until something restarts it:
+
+```text
+service   runs mcpgw 0.4.0; you are running 0.4.1 — run `mcpgw daemon install` to restart it on this build
+```
+
+That one is only ever said about a gateway that answered the probe: the
+running gateway writes down what it is, and a file left behind by a crash is
+not a version anybody is serving.
+
 ## Status
 
 ```sh

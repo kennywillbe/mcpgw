@@ -138,6 +138,53 @@ fn json_warns_about_a_service_installed_from_a_binary_that_is_gone() {
     assert!(out.status.success(), "{}", stdout(&out));
 }
 
+/// The upgrade that changed nothing: a service installed on this port, a
+/// gateway answering there, and the build it is answering on is not the one
+/// running `doctor`. Needs all three — the record alone is a file a crash
+/// could have left.
+#[tokio::test]
+async fn json_warns_about_a_gateway_answering_on_another_build() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        util::fixture_config(&["fx1"]),
+    )
+    .unwrap();
+    let (mut child, addr, _endpoints) = util::serve(dir.path(), &[]).await;
+    let url = format!("http://{addr}/mcp");
+    util::record_installed_spec(
+        dir.path(),
+        &fixture_binary(),
+        "127.0.0.1",
+        mcpgw_core::daemon_check::url_port(&url).unwrap(),
+    );
+    util::rewrite_record_version(dir.path(), &url, "0.0.1").await;
+
+    let home = dir.path().to_owned();
+    let out = tokio::task::spawn_blocking(move || run_doctor(&home, None, &["--json"]))
+        .await
+        .unwrap();
+    child.kill().await.unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    let stale = findings
+        .iter()
+        .find(|f| f["message"].as_str().unwrap().contains("runs mcpgw 0.0.1"))
+        .unwrap_or_else(|| panic!("no stale-version finding: {findings:?}"));
+    assert_eq!(stale["severity"], "warning");
+    assert_eq!(
+        stale["message"],
+        format!(
+            "the gateway service runs mcpgw 0.0.1; you are running {} — run \
+             `mcpgw daemon install` to restart it on this build",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    // A warning, so doctor still exits zero.
+    assert!(out.status.success(), "{}", stdout(&out));
+}
+
 /// No service recorded, nothing to say about one.
 #[test]
 fn a_machine_with_no_service_gets_no_stale_binary_warning() {

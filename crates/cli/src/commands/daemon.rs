@@ -462,6 +462,17 @@ fn status(url: Option<&str>) -> anyhow::Result<u8> {
     {
         println!("service   {advice}");
     }
+    // A different fact from the line above, and printed beside it rather
+    // than instead of it: a service can be aimed at the right binary and
+    // still be answering on the build it was started with, which is what
+    // every in-place upgrade leaves behind.
+    if let Some(advice) = mcpgw_core::daemon_check::url_port(url)
+        .map(|port| mcpgw_core::daemon_check::service_version(&state_dir, port, reach))
+        .as_ref()
+        .and_then(mcpgw_core::daemon_check::ServiceVersion::advice)
+    {
+        println!("service   {advice}");
+    }
 
     let logs = LogPaths::under_state_dir(&state_dir);
     println!("logs      {}", describe_log(&logs.stdout));

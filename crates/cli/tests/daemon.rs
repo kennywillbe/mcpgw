@@ -147,6 +147,64 @@ fn status_names_a_service_running_a_different_binary_than_you_are() {
     assert_eq!(output.status.code(), Some(1), "{text}");
 }
 
+/// The state a `brew upgrade` leaves behind: the gateway on the port keeps
+/// answering on the build it was started with, and until now every line of
+/// `status` said it was fine. The record is doctored rather than a second
+/// mcpgw being built, which is the only difference from the real thing.
+#[tokio::test]
+async fn status_names_a_gateway_answering_on_another_build() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, url) = serve(dir.path()).await;
+    util::rewrite_record_version(dir.path(), &url, "0.0.1").await;
+
+    let home = dir.path().to_owned();
+    let probed = url.clone();
+    let output = tokio::task::spawn_blocking(move || daemon(&home, &["status", "--url", &probed]))
+        .await
+        .unwrap();
+
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!(
+            "service   runs mcpgw 0.0.1; you are running {}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("run `mcpgw daemon install` to restart it on this build"),
+        "{text}"
+    );
+    // A gateway is answering, which is the only thing the exit code tracks.
+    assert_eq!(output.status.code(), Some(0), "{text}");
+
+    child.kill().await.unwrap();
+}
+
+/// The record a crash leaves behind names a version nobody is serving. It
+/// must not become a line about a running gateway: only the live probe makes
+/// the file worth reading, and here it fails.
+#[tokio::test]
+async fn a_record_left_by_a_dead_gateway_says_nothing_about_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, url) = serve(dir.path()).await;
+    util::rewrite_record_version(dir.path(), &url, "0.0.1").await;
+    // SIGKILL, so the record outlives the process exactly as a crash leaves
+    // it — a clean shutdown would withdraw it and prove nothing.
+    child.kill().await.unwrap();
+
+    let home = dir.path().to_owned();
+    let probed = url.clone();
+    let output = tokio::task::spawn_blocking(move || daemon(&home, &["status", "--url", &probed]))
+        .await
+        .unwrap();
+
+    let text = stdout(&output);
+    assert!(text.contains("gateway   not running"), "{text}");
+    assert!(!text.contains("runs mcpgw"), "{text}");
+    assert_eq!(output.status.code(), Some(1), "{text}");
+}
+
 /// Every install made before 0.3.1, and every machine with no service at
 /// all: nothing recorded, so the default is what gets probed.
 #[test]
