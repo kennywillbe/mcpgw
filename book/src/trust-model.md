@@ -42,22 +42,30 @@ is written down. That is the feature — it is why `mcpgw watch` can show you
 what your agent did — and it is also a file that did not exist before. See
 below.
 
-## Captured traffic is truncated, not redacted
+## Captured traffic is redacted, not private
 
-The capture log records each request's arguments and the response, **cut at
-2 KB and marked `…[truncated]`, with nothing removed**. A token passed as a
-tool argument lands in that file in full.
+The capture log records each request's arguments, the response and the error
+text, and **redacts before it truncates**. Keys named like credentials,
+`Bearer`/`Basic` values, known issuer prefixes (`ghp_`, `sk-`, `AKIA…`, JWTs),
+credential-looking URL query values and high-entropy tokens are replaced on
+the way to the disk; only what is left is then cut at 2 KB.
 
 ```sh
-mcpgw serve --no-capture      # no traffic log at all
+mcpgw serve                        # --capture-bodies redacted (default)
+mcpgw serve --capture-bodies off   # metadata only — no bodies at all
+mcpgw serve --capture-bodies full  # verbatim
+mcpgw serve --no-capture           # no traffic log at all
 ```
 
-The file lives under your state directory at mode `0600`, and `mcpgw watch`
-masks `args` and `response` in `--json` output unless you pass
-`--show-secrets` (the human view never printed them). That bounds how far the
-bodies spread; it does not change what is in the file. `--no-capture` is the
-switch, and [Watching traffic](./traffic.md) is the longer version of this
-paragraph.
+That is a filter over shapes, not a proof. A secret with no marker and low
+entropy — a short passphrase, a PIN, a sentence that happens to be the
+password — looks like ordinary text and stays in the file. The rest of the
+answer is the same as it always was: the file is mode `0600` under your state
+directory, `mcpgw watch` does not put bodies back on your terminal, and `off`
+and `--no-capture` are there for anyone who would rather not have the file.
+
+[Watching traffic](./traffic.md) lists every rule, and how to add your own
+under `[capture] redact`.
 
 ## Binding anywhere else
 
@@ -122,6 +130,7 @@ behalf.
 - Anything running as you can use the gateway. That was already true of your
   server credentials.
 - One process now holds all of them, and one log now records every call.
-- The log is not redacted. `--no-capture` turns it off.
+- The log redacts what looks like a credential; that is a filter, not a
+  proof. `--capture-bodies off` and `--no-capture` are the stronger answers.
 - Do not `--bind` past loopback without putting authentication in front.
 - Nothing here is a substitute for not running MCP servers you do not trust.

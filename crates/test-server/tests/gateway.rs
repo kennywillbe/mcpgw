@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mcpgw_core::capture::{CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER};
+use mcpgw_core::capture::{
+    Bodies, CapturePolicy, CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER,
+};
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{Gateway, resolve, serve_http, serve_http_with};
 use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
@@ -366,6 +368,67 @@ async fn capture_truncates_oversized_bodies() {
         let kept = body.strip_suffix(TRUNCATION_MARKER).unwrap();
         assert!(kept.len() <= MAX_BODY_BYTES);
     }
+}
+
+/// A token handed to a tool as an argument, which the fixture echoes back —
+/// so one call puts the same credential on both sides of a record.
+const FAKE_TOKEN: &str = "ghp_0123456789abcdefghij";
+
+#[tokio::test]
+async fn a_credential_in_a_tool_argument_never_reaches_the_file() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let manager = manager(&[("fx", "healthy")]);
+    let gateway =
+        Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
+    let client = connect(gateway).await;
+
+    client.call_tool(call("echo", FAKE_TOKEN)).await.unwrap();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    // The raw bytes, not the parsed record: what is on disk is the claim.
+    let file = daily_file(writer.dir());
+    assert!(!file.contains(FAKE_TOKEN), "{file}");
+    assert!(file.contains("[redacted:ghp_…]"), "{file}");
+
+    let records = captured(writer.dir());
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0].bodies, Bodies::Redacted);
+    // Still a usable record: the tool, the outcome and the argument's shape
+    // are all there.
+    assert_eq!(records[0].tool.as_deref(), Some("echo"));
+    assert!(records[0].args.as_deref().unwrap().contains("message"));
+}
+
+/// The escape hatch, and the reason it needs one: `full` is what people
+/// debugging a tool call want, and it is not the default.
+#[tokio::test]
+async fn capture_bodies_full_keeps_the_credential() {
+    let state = tempfile::tempdir().unwrap();
+    let writer =
+        Arc::new(CaptureWriter::under_state_dir(state.path()).with_policy(CapturePolicy::full()));
+    let manager = manager(&[("fx", "healthy")]);
+    let gateway =
+        Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
+    let client = connect(gateway).await;
+
+    client.call_tool(call("echo", FAKE_TOKEN)).await.unwrap();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let file = daily_file(writer.dir());
+    assert!(file.contains(FAKE_TOKEN), "{file}");
+}
+
+/// Everything in the traffic dir, as bytes. Redaction is a claim about what
+/// is written, so the tests that make it read the file rather than a record
+/// that has been through serde twice.
+fn daily_file(dir: &std::path::Path) -> String {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect()
 }
 
 #[tokio::test]

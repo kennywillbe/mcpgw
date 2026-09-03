@@ -10,8 +10,36 @@ pub const SUPPORTED_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
+    // Ahead of `servers` because TOML wants every table of one section
+    // written before the next section starts, and both of these are tables.
+    #[serde(default, skip_serializing_if = "Capture::is_default")]
+    pub capture: Capture,
     #[serde(default)]
     pub servers: BTreeMap<String, Server>,
+}
+
+/// The `[capture]` table: what the gateway's traffic log is allowed to keep.
+///
+/// Absent from a config that never mentions it, and skipped on the way out
+/// again, so adding the table here does not rewrite everybody's file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capture {
+    /// Extra regexes whose matches are replaced in captured bodies, on top of
+    /// the built-in credential rules — the site-specific shapes only the
+    /// person running the gateway knows about (an internal ticket id, a
+    /// customer number).
+    ///
+    /// Validated at parse time: an unusable pattern is a config error, not a
+    /// rule that quietly matches nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redact: Vec<String>,
+}
+
+impl Capture {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.redact.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +88,7 @@ impl Config {
     pub fn empty() -> Self {
         Self {
             version: SUPPORTED_VERSION,
+            capture: Capture::default(),
             servers: BTreeMap::new(),
         }
     }
@@ -71,8 +100,10 @@ impl Config {
     ///
     /// Returns [`Error::Parse`] for malformed TOML or schema violations,
     /// [`Error::UnsupportedVersion`] for a version this build does not know,
-    /// and [`Error::InvalidName`] for server names outside `[a-z0-9-_]` or
-    /// containing the reserved `__` separator.
+    /// [`Error::InvalidName`] for server names outside `[a-z0-9-_]` or
+    /// containing the reserved `__` separator, and
+    /// [`Error::InvalidRedaction`] for an unusable `[capture] redact`
+    /// pattern.
     pub fn parse(text: &str, path: &Path) -> Result<Self, Error> {
         let parse_err = |source| Error::Parse {
             path: path.to_owned(),
@@ -88,6 +119,10 @@ impl Config {
         for name in config.servers.keys() {
             validate_name(name)?;
         }
+        // Compiled and thrown away: the gateway builds its own rules later,
+        // and the point here is that `mcpgw serve` never starts believing it
+        // is redacting with a pattern the engine rejected.
+        crate::capture::RedactionRules::compile(&config.capture.redact)?;
         Ok(config)
     }
 

@@ -99,6 +99,28 @@ tags = ["work"]
 Values must come before sub-tables within a section — that's TOML, not mcpgw.
 `env` and `headers` are sub-tables, so they go last.
 
+## `[capture]`
+
+Optional, and absent from a config that never mentions it. One key today:
+
+```toml
+version = 1
+
+[capture]
+redact = ["ACME-[0-9]{4}"]
+
+[servers.github]
+type = "stdio"
+command = "npx"
+```
+
+`redact` is a list of [`regex`](https://docs.rs/regex) patterns whose matches
+are replaced in the traffic log, on top of the built-in credential rules — the
+site-specific shapes only you know about. A pattern that does not compile is a
+config error naming the pattern, so a rule can never quietly match nothing.
+Read once at gateway startup, so an edit needs a restart. See
+[Watching traffic](./traffic.md) for what is redacted without it.
+
 ## Project-level client files
 
 Several clients read a second MCP config from inside the repository, next to
@@ -147,7 +169,7 @@ the repo root.
 ├── backups/
 │   └── cursor/           timestamped copies, newest 5 kept per client
 └── traffic/
-    └── 2026-09-01.jsonl  daily capture log, mode 0600
+    └── 2026-09-01.jsonl  daily capture log, mode 0600, bodies redacted
 ```
 
 Resolution order:
