@@ -623,9 +623,20 @@ fn stale_stamp(dir: &Path) -> PathBuf {
 }
 
 /// A gateway serving one fixture server, killed when the test drops it.
+///
+/// Its stderr is drained by a thread from the moment it starts, so a test
+/// can wait for a line the gateway has yet to print rather than only for
+/// everything it printed before it died.
 struct Gateway {
     child: std::process::Child,
     addr: String,
+    /// The lines the reader thread has produced but no test has taken yet.
+    /// Ends when the gateway does, which is what lets [`Gateway::logs`]
+    /// know it has them all.
+    lines: std::sync::mpsc::Receiver<String>,
+    /// The ones already taken, kept so waiting for a line does not consume
+    /// the log a later assertion prints.
+    taken: String,
 }
 
 impl Drop for Gateway {
@@ -636,17 +647,38 @@ impl Drop for Gateway {
 }
 
 impl Gateway {
-    /// Everything the gateway wrote to stderr, read once it is gone —
-    /// which is what makes the read terminate, and is also the only moment
-    /// a test has nothing left to wait for.
+    /// Waits for `needle` to appear in the gateway's stderr.
+    ///
+    /// The only sound way to assert on a line a background task prints:
+    /// every other signal the task leaves behind — the stamp above all —
+    /// lands *before* the line does, so a test that kills the gateway on
+    /// one of those is racing the print it is about to assert on.
+    fn wait_for_log(&mut self, needle: &str) {
+        let deadline = std::time::Instant::now() + CHECK_DEADLINE;
+        while !self.taken.contains(needle) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let line = self.lines.recv_timeout(left).unwrap_or_else(|_| {
+                panic!(
+                    "the gateway did not log {needle:?} within {CHECK_DEADLINE:?}; \
+                     it logged {:?}",
+                    self.taken
+                )
+            });
+            self.taken.push_str(&line);
+        }
+    }
+
+    /// Everything the gateway wrote to stderr, collected once it is gone —
+    /// which is what makes the reader terminate, and is also the only moment
+    /// a test asserting that a line was *never* printed has nothing left to
+    /// wait for.
     fn logs(mut self) -> String {
         let _ = self.child.kill();
-        let mut logs = String::new();
-        if let Some(errors) = self.child.stderr.as_mut() {
-            use std::io::Read as _;
-            let _ = errors.read_to_string(&mut logs);
+        let _ = self.child.wait();
+        while let Ok(line) = self.lines.recv() {
+            self.taken.push_str(&line);
         }
-        logs
+        std::mem::take(&mut self.taken)
     }
 }
 
@@ -685,7 +717,28 @@ fn serve(dir: &Path, base: &str, args: &[&str], no_check: bool) -> Gateway {
         .and_then(|rest| rest.split("/mcp").next())
         .unwrap_or_else(|| panic!("no address in banner: {banner}"))
         .to_owned();
-    Gateway { child, addr }
+
+    // Drained from here on, rather than at the kill: a pipe nobody reads
+    // fills up, and a line nobody can see until the process is dead cannot
+    // be waited for.
+    let errors = child.stderr.take().unwrap();
+    let (lines, taken) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(errors);
+        let mut line = String::new();
+        while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+            if lines.send(std::mem::take(&mut line)).is_err() {
+                return;
+            }
+        }
+    });
+
+    Gateway {
+        child,
+        addr,
+        lines: taken,
+        taken: String::new(),
+    }
 }
 
 /// Waits for the stamp to say the gateway has seen `version`.
@@ -711,19 +764,17 @@ fn a_supervised_gateway_does_the_daily_check_by_itself() {
     let dir = tempfile::tempdir().unwrap();
     let host = ReleaseHost::with_latest(NEWER);
     let stamp = stale_stamp(dir.path());
-    let gateway = serve(dir.path(), &host.base, &["--supervised"], false);
-    wait_for_last_seen(&stamp, NEWER);
+    let mut gateway = serve(dir.path(), &host.base, &["--supervised"], false);
 
     // One line in the daemon's log, because a service has no reader to
-    // print a notice to.
-    let logs = gateway.logs();
-    assert!(
-        logs.contains(&format!(
-            "mcpgw {NEWER} is available (this gateway is running {}) — run `mcpgw self-update`",
-            current()
-        )),
-        "{logs}"
-    );
+    // print a notice to. Waited for directly: it is the last thing the
+    // check does, so the stamp being up to date does not yet mean it was
+    // said.
+    gateway.wait_for_log(&format!(
+        "mcpgw {NEWER} is available (this gateway is running {}) — run `mcpgw self-update`",
+        current()
+    ));
+    wait_for_last_seen(&stamp, NEWER);
 }
 
 /// The two gateways that must leave the stamp exactly as they found it: the
