@@ -554,8 +554,23 @@ mod tests {
         let mut state = State::new(&args(), dir.path().to_path_buf());
         let mut follow = Follow::new(dir.path().to_path_buf());
         drain(&mut state, &mut follow);
-        assert!(state.notice.is_some());
-        assert!(frame(&state).contains("retrying"));
+
+        // The io error's wording is the platform's, not ours: a directory
+        // where the day's file belongs opens fine and fails on read here,
+        // and fails on open under Windows, so the two notices share neither
+        // phrasing nor length. What the test pins is the part `watch` owns —
+        // the failure becomes a notice that promises a retry, and that notice
+        // is what the footer row paints, as much of it as the width allows.
+        let notice = state
+            .notice
+            .clone()
+            .expect("the failure is held as a notice");
+        assert!(notice.ends_with("— retrying"), "{notice}");
+        let screen = frame(&state);
+        // `TestBackend` prints every row quoted and padded out to the width.
+        let painted = screen.lines().last().unwrap().trim_matches('"').trim_end();
+        assert!(!painted.is_empty(), "{screen}");
+        assert!(format!("watch: {notice}").starts_with(painted), "{screen}");
 
         std::fs::remove_dir(&blocked).unwrap();
         std::fs::write(
