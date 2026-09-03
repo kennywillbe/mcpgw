@@ -256,3 +256,33 @@ async fn logs_follow_prints_lines_appended_after_it_started() {
     child.kill().await.unwrap();
     assert!(found, "--follow never printed the appended line");
 }
+
+/// The other half of #116: reinstalling over our own service is allowed, but
+/// a gateway somebody is running in a terminal is not ours to take, and the
+/// refusal has to hold even though it answers exactly like a service would.
+#[tokio::test]
+async fn install_still_refuses_a_port_a_foreground_gateway_answers_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut child, url) = serve(dir.path()).await;
+    let port = url
+        .rsplit_once(':')
+        .and_then(|(_, tail)| tail.split('/').next())
+        .unwrap()
+        .to_owned();
+
+    let home = dir.path().to_owned();
+    let output = tokio::task::spawn_blocking(move || daemon(&home, &["install", "--port", &port]))
+        .await
+        .unwrap();
+
+    let text = stderr(&output);
+    assert!(text.contains("something already listens"), "{text}");
+    assert!(!output.status.success(), "{text}");
+    assert!(
+        !stdout(&output).contains("stopping the running service"),
+        "{}",
+        stdout(&output)
+    );
+
+    child.kill().await.unwrap();
+}

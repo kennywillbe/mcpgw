@@ -173,6 +173,8 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
     let up = wait_until_up(home, &url);
     assert_eq!(up.status.code(), Some(0), "{}", stdout(&up));
 
+    reinstall_over_the_running_service(home, &plist, port, &url);
+
     // Uninstall: out of the domain, off the disk, off the port.
     let removed = daemon(home, &["uninstall"]);
     assert!(
@@ -198,4 +200,25 @@ fn the_launch_agent_installs_runs_stops_and_leaves_nothing_behind() {
 
     // Uninstalling twice is the same end state, not an error.
     assert!(daemon(home, &["uninstall"]).status.success());
+}
+
+/// The #116 step, in a function of its own so the cycle above stays readable:
+/// a service that is running is reinstalled over rather than refused, and the
+/// gateway is back afterwards.
+fn reinstall_over_the_running_service(home: &Path, plist: &Path, port: u16, url: &str) {
+    let again = daemon(home, &["install", "--port", &port.to_string()]);
+    let text = stdout(&again);
+    let errors = String::from_utf8_lossy(&again.stderr).into_owned();
+    assert!(again.status.success(), "reinstall failed: {errors}");
+    assert!(!errors.contains("already listens"), "{errors}");
+    assert!(
+        text.contains("stopping the running service to reinstall it"),
+        "{text}"
+    );
+    assert!(plist.exists(), "{}", plist.display());
+
+    let up = wait_until_up(home, url);
+    let text = stdout(&up);
+    assert_eq!(up.status.code(), Some(0), "{text}");
+    assert!(text.contains("installed under launchd, running"), "{text}");
 }

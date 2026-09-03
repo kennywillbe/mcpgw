@@ -177,6 +177,8 @@ fn the_service_installs_runs_stops_and_leaves_nothing_behind() {
     let up = wait_until_up(home, &url);
     assert_eq!(up.status.code(), Some(0), "{}", stdout(&up));
 
+    reinstall_over_the_running_service(home, port, &url);
+
     // Uninstall: out of the database, off the port.
     let removed = daemon(home, &["uninstall"]);
     assert!(
@@ -195,4 +197,31 @@ fn the_service_installs_runs_stops_and_leaves_nothing_behind() {
 
     // Uninstalling twice is the same end state, not an error.
     assert!(daemon(home, &["uninstall"]).status.success());
+}
+
+/// The #116 step, in a function of its own so the cycle above stays readable:
+/// a running service is stopped, re-registered against the binary running now
+/// and started again, all by one `daemon install`.
+fn reinstall_over_the_running_service(home: &Path, port: u16, url: &str) {
+    let again = daemon(home, &["install", "--port", &port.to_string()]);
+    let text = stdout(&again);
+    let errors = stderr(&again);
+    assert!(again.status.success(), "reinstall failed: {errors}");
+    assert!(!errors.contains("already listens"), "{errors}");
+    assert!(
+        text.contains("stopping the running service to reinstall it"),
+        "{text}"
+    );
+    // The note that used to stand in for the stop and the start this command
+    // now does itself.
+    assert!(!text.contains("it was already running"), "{text}");
+    assert!(registered(), "the reinstall left no registration");
+
+    let up = wait_until_up(home, url);
+    let text = stdout(&up);
+    assert_eq!(up.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("installed under the Windows service manager, running"),
+        "{text}"
+    );
 }

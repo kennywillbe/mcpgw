@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
@@ -98,14 +98,19 @@ const SUPERVISE_POLL: Duration = Duration::from_millis(250);
 /// the service hung.
 const STOP_HINT: Duration = Duration::from_secs(10);
 
+/// How long a stop is given to become a stopped service. Longer than
+/// [`STOP_HINT`], because the service is allowed to use the whole of what it
+/// promised the SCM before anything here calls it stuck.
+const STOPPED_DEADLINE: Duration = Duration::from_secs(20);
+
+/// How often the SCM is asked whether the stop has landed.
+const STOPPED_POLL: Duration = Duration::from_millis(200);
+
 /// `ERROR_SERVICE_DOES_NOT_EXIST`.
 const NO_SUCH_SERVICE: i32 = 1060;
 
 /// `ERROR_SERVICE_EXISTS`.
 const SERVICE_EXISTS: i32 = 1073;
-
-/// `ERROR_SERVICE_ALREADY_RUNNING`.
-const ALREADY_RUNNING: i32 = 1056;
 
 /// The Windows service control manager.
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +278,14 @@ pub fn install_here(spec: &DaemonSpec) -> Result<Installed, DaemonError> {
             let service = scm
                 .open_service(SERVICE_NAME, access)
                 .map_err(|err| service_error(&err))?;
+            // The old process keeps running the old binary from the old
+            // registration until it is stopped — `change_config` only
+            // decides what the next start runs — and it holds the port the
+            // new one has to bind. Reinstalling over a running service is
+            // how someone points it at an mcpgw that has moved, so the stop
+            // and the start belong to this command rather than to a note
+            // telling the user to run two more.
+            stop_and_wait(&service)?;
             service
                 .change_config(&info)
                 .map_err(|err| service_error(&err))?;
@@ -301,10 +314,6 @@ pub fn install_here(spec: &DaemonSpec) -> Result<Installed, DaemonError> {
     let outcome = match service.start(NO_ARGUMENTS) {
         Ok(()) => {
             "it is running now, and starts again at every boot — before anyone logs in".to_owned()
-        }
-        Err(err) if is_code(&err, ALREADY_RUNNING) => {
-            "it was already running — `mcpgw daemon stop` then `start` to pick up these settings"
-                .to_owned()
         }
         Err(err) => format!(
             "it is registered but would not start ({err}) — `mcpgw daemon logs`, then \
@@ -345,13 +354,40 @@ fn start_here() -> Result<(), DaemonError> {
 
 fn stop_here() -> Result<(), DaemonError> {
     let service = open_for(ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?;
-    if current_state(&service)? == ServiceState::Stopped {
+    stop_and_wait(&service)
+}
+
+/// Asks the SCM to stop the service and waits until it says it really did.
+///
+/// The wait is the whole point, and it is why `stop` and the reinstall
+/// inside [`install_here`] share one spelling of this: `Service::stop` only
+/// delivers the control code. The gateway then has to notice it, shut its
+/// child down and release the port — and a reinstall that started the new
+/// service before all of that had happened would be racing the old one for
+/// its own socket.
+fn stop_and_wait(service: &windows_service::service::Service) -> Result<(), DaemonError> {
+    if current_state(service)? == ServiceState::Stopped {
         return Ok(());
     }
     service
         .stop()
         .map(|_| ())
-        .map_err(|err| service_error(&err))
+        .map_err(|err| service_error(&err))?;
+    let deadline = Instant::now() + STOPPED_DEADLINE;
+    loop {
+        let state = current_state(service)?;
+        if state == ServiceState::Stopped {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(refusal(format!(
+                "the service was asked to stop but is still {state:?} after {} seconds — \
+                 `mcpgw daemon status`, then `mcpgw daemon logs` for what it is doing",
+                STOPPED_DEADLINE.as_secs()
+            )));
+        }
+        std::thread::sleep(STOPPED_POLL);
+    }
 }
 
 fn current_state(service: &windows_service::service::Service) -> Result<ServiceState, DaemonError> {

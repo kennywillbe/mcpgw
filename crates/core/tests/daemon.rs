@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use mcpgw_core::daemon::{
-    DaemonError, DaemonSpec, GatewayReach, LogPaths, PROBE_TIMEOUT, preflight, prepare_logs,
-    probe_gateway,
+    DaemonError, DaemonSpec, GatewayReach, LogPaths, PROBE_TIMEOUT, PortPolicy, ServiceStatus,
+    port_policy, preflight, prepare_logs, probe_gateway,
 };
 
 fn spec(bind: &str, port: u16, state_dir: &std::path::Path) -> DaemonSpec {
@@ -26,7 +26,7 @@ fn spec(bind: &str, port: u16, state_dir: &std::path::Path) -> DaemonSpec {
 fn a_non_loopback_bind_is_refused_with_the_reason_spelled_out() {
     let dir = tempfile::tempdir().unwrap();
     for bind in ["0.0.0.0", "192.168.1.10", "::", "gateway.internal"] {
-        let err = preflight(&spec(bind, 0, dir.path())).unwrap_err();
+        let err = preflight(&spec(bind, 0, dir.path()), PortPolicy::MustBeFree).unwrap_err();
         assert!(
             matches!(&err, DaemonError::NonLoopbackBind { bind: got } if got == bind),
             "{bind}: {err}"
@@ -42,7 +42,10 @@ fn every_loopback_spelling_passes_the_bind_check() {
     let dir = tempfile::tempdir().unwrap();
     // Port 0 never conflicts, so only the bind check can fail here.
     for bind in ["127.0.0.1", "127.0.0.53", "::1", "localhost"] {
-        assert!(preflight(&spec(bind, 0, dir.path())).is_ok(), "{bind}");
+        assert!(
+            preflight(&spec(bind, 0, dir.path()), PortPolicy::MustBeFree).is_ok(),
+            "{bind}"
+        );
     }
 }
 
@@ -54,7 +57,7 @@ fn a_taken_port_is_refused_by_name_and_points_at_status() {
     let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = held.local_addr().unwrap().port();
 
-    let err = preflight(&spec("127.0.0.1", port, dir.path())).unwrap_err();
+    let err = preflight(&spec("127.0.0.1", port, dir.path()), PortPolicy::MustBeFree).unwrap_err();
     let text = err.to_string();
     assert!(matches!(err, DaemonError::PortInUse { .. }), "{text}");
     assert!(text.contains(&format!("127.0.0.1:{port}")), "{text}");
@@ -264,4 +267,110 @@ fn windows_answers_a_query_without_rights_and_without_changing_anything() {
         assert!(!status.running);
         assert!(status.unit_path.is_none());
     }
+}
+
+/// A stand-in for a gateway that is already up: it answers every connection
+/// with a response line, which is the whole of what a probe reads. Kept
+/// alive by the returned task, so the port stays held for the test.
+async fn answering_gateway() -> (tokio::task::JoinHandle<()>, u16) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serving = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 512];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+    (serving, port)
+}
+
+fn service(installed: bool, running: bool) -> ServiceStatus {
+    ServiceStatus {
+        installed,
+        running,
+        unit_path: None,
+        detail: None,
+    }
+}
+
+/// The bug in #116: a service installed while mcpgw lived in `~/.cargo/bin`
+/// could not be reinstalled to point at a Homebrew binary, because its own
+/// listening socket was read as somebody else's.
+#[tokio::test]
+async fn our_own_running_service_is_reinstalled_over_rather_than_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (serving, port) = answering_gateway().await;
+    let ours = spec("127.0.0.1", port, dir.path());
+
+    let policy = port_policy(Some(&service(true, true)), &ours).await;
+    assert_eq!(policy, PortPolicy::OwnServiceReinstall);
+    assert!(preflight(&ours, policy).is_ok());
+    // The bind refusal is not part of the bargain: a reinstall onto an
+    // address the network can reach is still an unattended, unauthenticated
+    // gateway.
+    let exposed = spec("0.0.0.0", port, dir.path());
+    assert!(matches!(
+        preflight(&exposed, PortPolicy::OwnServiceReinstall).unwrap_err(),
+        DaemonError::NonLoopbackBind { .. }
+    ));
+
+    serving.abort();
+}
+
+/// The refusal has to survive the fix: the port is only ours when the
+/// supervisor holds a running job *and* a gateway answers on it.
+#[tokio::test]
+async fn a_port_that_is_not_our_running_service_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (serving, port) = answering_gateway().await;
+    let answering = spec("127.0.0.1", port, dir.path());
+
+    // A gateway answering with nothing installed is a foreground
+    // `mcpgw serve`, which a service must never be installed on top of.
+    for queried in [
+        None,
+        Some(service(false, false)),
+        Some(service(true, false)),
+    ] {
+        let policy = port_policy(queried.as_ref(), &answering).await;
+        assert_eq!(policy, PortPolicy::MustBeFree, "{queried:?}");
+        assert!(
+            matches!(
+                preflight(&answering, policy).unwrap_err(),
+                DaemonError::PortInUse { .. }
+            ),
+            "{queried:?}"
+        );
+    }
+    serving.abort();
+
+    // A running service and a port held by something that does not speak
+    // HTTP: the job is ours, the socket is not.
+    let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = held.local_addr().unwrap().port();
+    let parking = tokio::spawn(async move {
+        let mut open = Vec::new();
+        while let Ok((stream, _)) = held.accept().await {
+            open.push(stream);
+        }
+    });
+    let silent = spec("127.0.0.1", port, dir.path());
+    let policy = port_policy(Some(&service(true, true)), &silent).await;
+    assert_eq!(policy, PortPolicy::MustBeFree);
+    assert!(matches!(
+        preflight(&silent, policy).unwrap_err(),
+        DaemonError::PortInUse { .. }
+    ));
+    parking.abort();
 }

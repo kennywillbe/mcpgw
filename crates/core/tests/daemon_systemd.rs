@@ -163,7 +163,7 @@ fn a_space_is_quoted_and_a_percent_is_doubled_for_the_unit_parser() {
 }
 
 #[test]
-fn install_writes_the_unit_then_reloads_then_enables_it_now() {
+fn install_writes_the_unit_then_reloads_then_enables_and_restarts_it() {
     let dir = tempfile::tempdir().unwrap();
     let unit_path = dir.path().join("systemd/user/mcpgw.service");
     let fake = Fake::new(vec![("show-user", Ok(Ran::ok("Linger=yes")))]);
@@ -184,12 +184,14 @@ fn install_writes_the_unit_then_reloads_then_enables_it_now() {
         render_unit(&spec(dir.path()), Some("/opt/bin"))
     );
     // The reload must come first: systemd will not enable a unit it has not
-    // read yet.
+    // read yet. The restart is what makes a reinstall land on the binary the
+    // new definition names, rather than leaving the old process serving.
     assert_eq!(
-        fake.calls()[..2],
+        fake.calls()[..3],
         [
             "systemctl --user daemon-reload".to_owned(),
-            "systemctl --user enable --now mcpgw.service".to_owned(),
+            "systemctl --user enable mcpgw.service".to_owned(),
+            "systemctl --user restart mcpgw.service".to_owned(),
         ]
     );
     // The three things an install leaves a user needing to know: whether it

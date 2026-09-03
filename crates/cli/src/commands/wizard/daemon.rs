@@ -73,8 +73,13 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
     }
 
     // The port belongs to whoever holds it, and an install that would fail on
-    // it has its own conversation rather than the general one.
-    if let Err(err) = mcpgw_core::daemon::preflight(&spec) {
+    // it has its own conversation rather than the general one — unless the
+    // holder is our own running service, which this install replaces.
+    let policy = match crate::commands::daemon::port_policy(queried.as_ref().ok(), &spec) {
+        Ok(policy) => policy,
+        Err(err) => return Ok(no_service(cx, &format!("{err:#}"))),
+    };
+    if let Err(err) = mcpgw_core::daemon::preflight(&spec, policy) {
         return match err {
             DaemonError::PortInUse { .. } => port_taken(cx, &service, &spec),
             other => Ok(no_service(cx, &other.to_string())),
@@ -182,13 +187,23 @@ fn install(
     // `mcpgw_core::daemon`): logs exist and preflight has passed before
     // `install` is called. Preflight runs again here rather than only before
     // the question, because the conversation above took time and the port may
-    // have been taken during it.
+    // have been taken — or freed, or handed to a service — during it.
     match mcpgw_core::daemon::prepare_logs(&spec.state_dir) {
         Ok(logs) => spec.logs = logs,
         Err(err) => return Ok(no_service(cx, &err.to_string())),
     }
-    if let Err(err) = mcpgw_core::daemon::preflight(&spec) {
+    let policy = match crate::commands::daemon::port_policy(service.query().ok().as_ref(), &spec) {
+        Ok(policy) => policy,
+        Err(err) => return Ok(no_service(cx, &format!("{err:#}"))),
+    };
+    if let Err(err) = mcpgw_core::daemon::preflight(&spec, policy) {
         return Ok(no_service(cx, &err.to_string()));
+    }
+    if policy == mcpgw_core::daemon::PortPolicy::OwnServiceReinstall {
+        println!(
+            "  {}",
+            crate::commands::daemon::reinstall_notice(&spec.state_dir)
+        );
     }
     crate::commands::daemon::warn_about_protected_paths(&spec);
 
