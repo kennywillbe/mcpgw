@@ -537,7 +537,10 @@ fn project_configs_get_their_own_section() {
     assert!(text.contains("project configs"), "{text}");
     assert!(text.contains(".mcp.json"), "{text}");
     assert!(text.contains("Claude Code, 2 servers"), "{text}");
-    assert!(text.contains("build: mirrors canonical"), "{text}");
+    assert!(
+        text.contains("build: mirrors canonical, not managed"),
+        "{text}"
+    );
     assert!(
         text.contains("scratch: not managed: direct entry stays live after sync"),
         "{text}"
@@ -547,7 +550,7 @@ fn project_configs_get_their_own_section() {
         "{text}"
     );
     assert!(
-        text.contains("`mcpgw import` cannot read project files yet"),
+        text.contains("`mcpgw import --project` adopts them"),
         "{text}"
     );
 }
@@ -580,8 +583,8 @@ fn json_lists_project_configs_and_their_standing() {
     assert_eq!(
         projects[0]["servers"],
         serde_json::json!([
-            { "name": "build", "mirrors_canonical": true },
-            { "name": "scratch", "mirrors_canonical": false },
+            { "name": "build", "mirrors_canonical": true, "managed": false },
+            { "name": "scratch", "mirrors_canonical": false, "managed": false },
         ])
     );
     // The warning joins the one findings array, the way the gateway pass's
@@ -706,4 +709,56 @@ fn a_server_behind_oauth_is_a_warning_naming_the_login() {
     ));
     assert!(text.contains("run mcpgw auth login linear"), "{text}");
     assert!(text.contains("0 errors, 1 warnings"), "{text}");
+}
+
+/// Once `sync --project` owns an entry the section says so: "mcpgw writes
+/// this" and "this is right today and nobody's to keep right" are different
+/// facts, and the whole reason the section exists is to tell them apart.
+#[test]
+fn the_project_section_separates_managed_entries_from_the_rest() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = fake_repo(workspace.path());
+
+    // The record a `sync --project` leaves: `build` is mcpgw's, `scratch`
+    // is the repo's own. Keyed by the resolved path, because that is what
+    // the running process gets back for its own working directory and so
+    // what the state file it writes will hold.
+    let repo = std::fs::canonicalize(&repo).unwrap();
+    let state = home.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("managed.json"),
+        serde_json::json!({
+            "clients": {},
+            "files": {
+                repo.join(".mcp.json").to_string_lossy(): {
+                    "client": "claude-code",
+                    "managed": ["build"],
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let out = run_doctor_in(home.path(), &repo, Some(HEALTHY), &[]);
+    let text = stdout(&out);
+    assert!(text.contains("build: managed by sync"), "{text}");
+    assert!(
+        text.contains("scratch: not managed: direct entry stays live after sync"),
+        "{text}"
+    );
+
+    let json = run_doctor_in(home.path(), &repo, Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    assert_eq!(
+        value["projects"][0]["servers"],
+        serde_json::json!([
+            { "name": "build", "mirrors_canonical": true, "managed": true },
+            { "name": "scratch", "mirrors_canonical": false, "managed": false },
+        ])
+    );
+    // Still one warning: the entry nobody manages is still live.
+    assert_eq!(value["warnings"], 1);
 }

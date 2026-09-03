@@ -3,7 +3,7 @@ use std::io::IsTerminal as _;
 
 use anyhow::Context as _;
 use mcpgw_core::import::{ImportCandidate, ImportPlan, SameAddress, plan_import};
-use mcpgw_core::state::ManagedState;
+use mcpgw_core::state::{ManagedState, Scope};
 use mcpgw_core::{ClientKind, ConfigStore, Detection, paths};
 
 #[derive(clap::Args)]
@@ -15,6 +15,9 @@ pub struct ImportArgs {
         long_help = super::client_ids_help("Only import from these clients")
     )]
     pub from: Vec<String>,
+    /// Also read the repo-local MCP configs found from this directory
+    #[arg(long)]
+    pub project: bool,
     /// Show what would be imported without writing anything
     #[arg(long)]
     pub dry_run: bool,
@@ -43,13 +46,26 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     let targets = super::select_clients(&args.from)?;
 
     let mut sources: Vec<(String, mcpgw_core::ClientRead)> = Vec::new();
-    for kind in targets {
+    for kind in &targets {
         if let Detection::Configured(path) = kind.detect() {
             match kind.load(&path) {
-                Ok(read) => sources.push((kind.id().to_owned(), read)),
+                Ok(read) => sources.push((Scope::Home(*kind).origin_key(), read)),
                 Err(err) => println!("skipping {}: {err}", kind.display_name()),
             }
         }
+    }
+    // After the per-user files, so a definition a repo and a machine share is
+    // filed under the per-user entry's name and the repo file is recorded as
+    // a second origin of it.
+    if args.project {
+        let found = project_sources(&targets);
+        if found.is_empty() {
+            println!(
+                "no repo-local MCP config here — --project had nothing to read \
+                 (`mcpgw doctor` lists the files it looks for)"
+            );
+        }
+        sources.extend(found);
     }
 
     let config_path = super::canonical_config_path()?;
@@ -386,11 +402,34 @@ fn ask_same_address(questions: &[SharedAddress]) -> anyhow::Result<BTreeSet<Stri
     Ok(skip)
 }
 
-fn display(client_id: &str) -> String {
-    ClientKind::from_id(client_id).map_or_else(
-        || client_id.to_owned(),
-        |kind| kind.display_name().to_owned(),
-    )
+/// The repo-local files this run may read, already parsed by discovery,
+/// minus any client `--from` left out.
+///
+/// A file that would not parse is kept with its problem rather than dropped:
+/// `plan_import` reads its (empty) server map and the problem is already
+/// what `doctor` reports about it.
+fn project_sources(targets: &[ClientKind]) -> Vec<(String, mcpgw_core::ClientRead)> {
+    mcpgw_core::projects::discover_cwd()
+        .into_iter()
+        .filter(|config| targets.contains(&config.kind))
+        .map(|config| (config.scope().origin_key(), config.read))
+        .collect()
+}
+
+/// An origin as an import line names it: the client id, and for a repo-local
+/// file the path too.
+fn origin_label(origin: &str) -> String {
+    Scope::from_origin(origin).map_or_else(|| origin.to_owned(), |scope| scope.origin_label())
+}
+
+/// How an origin names itself in prose.
+///
+/// A per-user file is its client's name; a repo-local one is that name and
+/// the path, because "from cursor" would be the same words for two different
+/// files and the whole question the user has is which of them an entry came
+/// from.
+fn display(origin: &str) -> String {
+    Scope::from_origin(origin).map_or_else(|| origin.to_owned(), |scope| scope.label())
 }
 
 /// The name a conflict would be adopted under if both copies are kept.
@@ -407,12 +446,10 @@ pub fn adopt_as(candidate: &ImportCandidate) -> String {
 }
 
 fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
-    for (client_id, original) in &candidate.origins {
-        state
-            .clients
-            .entry(client_id.clone())
-            .or_default()
-            .insert(original.clone());
+    for (origin, original) in &candidate.origins {
+        if let Some(scope) = Scope::from_origin(origin) {
+            scope.adopt(state, original);
+        }
     }
 }
 
@@ -423,21 +460,19 @@ fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
 /// recorded as standing for the name it already carries is how "the user was
 /// asked and said leave it alone" is remembered.
 pub fn resolve_to(state: &mut ManagedState, candidate: &ImportCandidate, canonical: &str) {
-    for (client_id, original) in &candidate.origins {
-        state
-            .resolved
-            .entry(client_id.clone())
-            .or_default()
-            .insert(original.clone(), canonical.to_owned());
+    for (origin, original) in &candidate.origins {
+        if let Some(scope) = Scope::from_origin(origin) {
+            scope.resolve_to(state, original, canonical);
+        }
     }
 }
 
 fn describe(candidate: &ImportCandidate) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let clients: Vec<&str> = candidate
+    let clients: Vec<String> = candidate
         .origins
         .iter()
-        .map(|(id, _)| id.as_str())
+        .map(|(origin, _)| origin_label(origin))
         .collect();
     parts.push(format!("from {}", clients.join(", ")));
     if candidate.command_missing {

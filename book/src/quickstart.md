@@ -99,7 +99,14 @@ answer that cannot cost you an account — and prints the reason anyway.
 mcpgw import --dry-run          # look before you leap
 mcpgw import --from cursor      # only one client (repeatable)
 mcpgw import --yes              # never prompt; keep canonical on conflict
+mcpgw import --project          # the repo's own files too, from this directory
 ```
+
+`--project` adds the MCP configs your repo commits — `.mcp.json`,
+`.cursor/mcp.json` and the rest — to whatever `import` was already reading;
+`mcpgw sync --project` then points those same files at the gateway. Inside a
+repo the wizard offers both, and `mcpgw init --yes` takes the offer and says
+so. See [Project-level client files](./configuration.md#project-level-client-files).
 
 A client entry that differs from a canonical entry you already wrote is a
 conflict, and `import` asks what to do with it. There are three answers: keep

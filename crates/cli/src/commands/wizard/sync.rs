@@ -18,13 +18,13 @@ use std::time::Duration;
 use anyhow::Context as _;
 use mcpgw_core::Detection;
 use mcpgw_core::doctor::{GatewayEntry, GatewayPlan};
-use mcpgw_core::state::ManagedState;
+use mcpgw_core::state::{ManagedState, Scope};
 use mcpgw_core::sync::{SyncPlan, per_server_gateway_servers};
 
 use super::{Ctx, Outcome};
 use crate::commands::doctor::{GatewayOutcome, bad_line, ok_line, probe_endpoint, warn_line};
 use crate::commands::sync::{
-    Applied, Planned, PlannedClient, apply_client, bridge_command, plan_client,
+    Applied, Planned, PlannedClient, apply_client, bridge_command, plan_client, plan_project,
 };
 use crate::ui;
 
@@ -53,7 +53,7 @@ pub fn pending(cx: &Ctx) -> bool {
     // still go on to point the clients at the gateway — telling that user
     // there was nothing to push would leave the machine half set up, which
     // is the one thing this step exists to prevent.
-    match plan_all(cx) {
+    match plan_all(cx, true) {
         Ok(plans) => plans.ready.iter().any(|p| p.plan.has_changes()),
         // A plan that will not build is not a step with nothing to do:
         // `run` reaches the same failure and reports it in full.
@@ -70,7 +70,8 @@ pub fn pending(cx: &Ctx) -> bool {
 /// client file that exists cannot be read, or if a write — backup, state or
 /// client file — fails.
 pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
-    let plans = plan_all(cx)?;
+    let include_project = ask_about_project_files(cx)?;
+    let plans = plan_all(cx, include_project)?;
     announce(cx, &plans);
 
     let changing = plans.ready.iter().filter(|p| p.plan.has_changes()).count();
@@ -122,7 +123,7 @@ struct Plans {
 /// Clients that are not installed are left out entirely rather than listed as
 /// skipped: the survey step already said how many there are, and repeating
 /// eleven "not found" lines here would bury the two the user actually has.
-fn plan_all(cx: &Ctx) -> anyhow::Result<Plans> {
+fn plan_all(cx: &Ctx, include_project: bool) -> anyhow::Result<Plans> {
     // Checked once, before a single client is read: a base URL that cannot
     // take an endpoint path is wrong for all of them, and finding out halfway
     // would leave some clients flipped and some not.
@@ -140,21 +141,56 @@ fn plan_all(cx: &Ctx) -> anyhow::Result<Plans> {
         }
         let desired =
             per_server_gateway_servers(*kind, &cx.config.servers, &cx.gateway_url, &bridge)?;
-        let managed = cx.state.clients.get(kind.id()).cloned().unwrap_or_default();
+        let managed = Scope::Home(*kind).managed(&cx.state);
         match plan_client(*kind, &desired, &managed)? {
             Planned::Ready(planned) => plans.ready.push(*planned),
             Planned::Skipped(reason) => plans.skipped.push((kind.display_name(), reason)),
         }
     }
+    if include_project {
+        for config in mcpgw_core::projects::discover_cwd() {
+            let desired = per_server_gateway_servers(
+                config.kind,
+                &cx.config.servers,
+                &cx.gateway_url,
+                &bridge,
+            )?;
+            let scope = config.scope();
+            match plan_project(&config, &desired, &scope.managed(&cx.state))? {
+                Planned::Ready(planned) => plans.ready.push(*planned),
+                Planned::Skipped(reason) => {
+                    plans.skipped.push((config.kind.display_name(), reason));
+                }
+            }
+        }
+    }
     Ok(plans)
+}
+
+/// Names the repo-local files and asks whether to write them too.
+///
+/// The same show-and-confirm the import step makes, for the same reason: a
+/// file that gets committed and reviewed is not one to rewrite without
+/// having offered. `--yes` includes them and says so.
+fn ask_about_project_files(cx: &Ctx) -> anyhow::Result<bool> {
+    let found = mcpgw_core::projects::discover_cwd();
+    if found.is_empty() {
+        return Ok(false);
+    }
+    ui::step(
+        "This repo carries MCP configs of its own.",
+        &crate::commands::project_bullets(&found),
+        cx.color,
+    );
+    cx.confirm("\nPoint these at the gateway too?")
 }
 
 fn announce(cx: &Ctx, plans: &Plans) {
     let width = plans
         .ready
         .iter()
-        .map(|p| p.kind.display_name())
-        .chain(plans.skipped.iter().map(|(name, _)| *name))
+        .map(|p| p.scope.label())
+        .chain(plans.skipped.iter().map(|(name, _)| (*name).to_owned()))
         .map(|name| name.chars().count())
         .max()
         .unwrap_or(0);
@@ -163,7 +199,7 @@ fn announce(cx: &Ctx, plans: &Plans) {
         .ready
         .iter()
         .map(|planned| {
-            let name = planned.kind.display_name();
+            let name = planned.scope.label();
             format!("{name:width$}  {}", summary(&planned.plan, cx.color))
         })
         .collect();
@@ -251,6 +287,8 @@ fn apply_all(cx: &Ctx, plans: Plans) -> anyhow::Result<()> {
         if !planned.plan.has_changes() {
             continue;
         }
+        // The client and the file it wrote, which for a repo-local one is
+        // the only thing that says which of that client's files it was.
         let name = planned.kind.display_name();
         match apply_client(&mut planned, &mut state, &state_dir, &state_path)? {
             Applied::Written => ok_line(&format!("{name} — {}", planned.path.display()), cx.color),
@@ -412,9 +450,10 @@ fn managed_targets(cx: &Ctx) -> Vec<mcpgw_core::doctor::GatewayTarget> {
         let Detection::Configured(path) = detection else {
             continue;
         };
-        let Some(mine) = cx.state.clients.get(kind.id()) else {
+        let mine = Scope::Home(*kind).managed(&cx.state);
+        if mine.is_empty() {
             continue;
-        };
+        }
         let Ok(read) = kind.load(path) else {
             continue;
         };

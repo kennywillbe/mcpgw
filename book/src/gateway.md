@@ -195,6 +195,15 @@ There is no other shape. `sync` has no modes and nothing to choose between:
 every enabled server gets its own entry pointing at its own endpoint, in every
 client, and that is all mcpgw does to a client config.
 
+```sh
+mcpgw sync --project               # the repo's committed files as well
+```
+
+`--project` adds the repo-local configs found from your working directory —
+`.mcp.json`, `.cursor/mcp.json` and the rest — to the same run, written the
+same way and with a diff kept small enough to review. See
+[Project-level client files](./configuration.md#project-level-client-files).
+
 Up to 0.3.x there was a second one — `sync --aggregate`, a single `mcpgw` entry
 per client pointing at `/mcp`, with every tool namespaced `server__tool`. The
 flag is gone. A config that still holds that entry is migrated by the next

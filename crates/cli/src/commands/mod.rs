@@ -59,3 +59,28 @@ pub fn select_clients(ids: &[String]) -> anyhow::Result<Vec<mcpgw_core::ClientKi
         })
         .collect()
 }
+
+/// The repo-local MCP configs around the working directory, as bullets
+/// naming each file, its client and how much it holds.
+///
+/// Shared by the wizard's import and sync steps: both offer the same set of
+/// files, and a user who was shown one wording before the read and another
+/// before the write would reasonably wonder whether they were the same files.
+pub fn project_bullets(found: &[mcpgw_core::projects::ProjectConfig]) -> Vec<String> {
+    found
+        .iter()
+        .map(|config| {
+            let count = config.read.servers.len();
+            let plural = if count == 1 { "server" } else { "servers" };
+            format!(
+                "{}  {} — {count} {plural}",
+                config
+                    .path
+                    .strip_prefix(&config.dir)
+                    .unwrap_or(&config.path)
+                    .display(),
+                config.kind.display_name(),
+            )
+        })
+        .collect()
+}

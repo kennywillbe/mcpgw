@@ -233,6 +233,30 @@ impl ClientKind {
         }
     }
 
+    /// The same codec, as a repo-local file has to be read and written.
+    ///
+    /// One difference from [`ClientKind::codec`], and it is the whole point:
+    /// a client whose per-user file is strict JSON gets the JSONC document
+    /// here. JSON is a subset of JSONC, so nothing is read differently — but
+    /// the JSONC document edits through a CST, and a project file is a file
+    /// somebody reviews in a pull request. Re-serializing it whole would
+    /// reorder nothing and change everything: indentation, key spacing and
+    /// the trailing comma style all become mcpgw's rather than the repo's,
+    /// and the one entry that actually changed is lost in the diff. Through
+    /// the CST only the entries the plan owns move, and a `//` comment a
+    /// teammate wrote above a server survives the sync.
+    #[must_use]
+    pub fn project_codec(self) -> Codec {
+        let codec = self.codec();
+        match codec.format {
+            Format::Json => Codec {
+                format: Format::Jsonc,
+                ..codec
+            },
+            Format::Jsonc | Format::Toml => codec,
+        }
+    }
+
     /// Where the client keeps a list of server names it refuses to start,
     /// as a path of literal object keys.
     ///
@@ -346,8 +370,9 @@ impl ClientKind {
     /// spells them identically, VS Code's `servers` and Claude Code's
     /// `mcpServers` included.
     ///
-    /// Discovery only — [`crate::projects`] reads these and nothing writes
-    /// them. `sync` still owns the home-dir file alone.
+    /// [`crate::projects`] finds these; `import --project` and `sync
+    /// --project` read and write them, through
+    /// [`ClientKind::project_codec`].
     #[must_use]
     pub fn project_config_names(self) -> &'static [&'static str] {
         match self {
@@ -436,6 +461,17 @@ impl ClientKind {
     /// Returns [`Error::NotFound`] / [`Error::Io`] for filesystem failures
     /// and [`Error::ClientParse`] when the file is not valid JSON.
     pub fn load(self, path: &Path) -> Result<ClientRead, Error> {
+        self.load_with(self.codec(), path)
+    }
+
+    /// [`ClientKind::load`] through a codec of the caller's choosing, which
+    /// is how a repo-local file is read by [`ClientKind::project_codec`]
+    /// while the per-user file keeps its own.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`ClientKind::load`].
+    pub fn load_with(self, codec: Codec, path: &Path) -> Result<ClientRead, Error> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
                 Error::NotFound {
@@ -448,7 +484,7 @@ impl ClientKind {
                 }
             }
         })?;
-        self.read_text(&text, path)
+        self.read_text_with(codec, &text, path)
     }
 
     /// Parses client config text. `path` is only used in error messages.
@@ -459,12 +495,25 @@ impl ClientKind {
     /// client's format or its root is not an object. Broken entries are
     /// collected as problems.
     pub fn read_text(self, text: &str, path: &Path) -> Result<ClientRead, Error> {
+        self.read_text_with(self.codec(), text, path)
+    }
+
+    /// [`ClientKind::read_text`] through a codec of the caller's choosing.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`ClientKind::read_text`].
+    pub fn read_text_with(
+        self,
+        codec: Codec,
+        text: &str,
+        path: &Path,
+    ) -> Result<ClientRead, Error> {
         let parse_err = |source| Error::ClientParse {
             client: self.display_name(),
             path: path.to_owned(),
             source: Box::new(source),
         };
-        let codec = self.codec();
         let root = codec.parse_value(text).map_err(parse_err)?;
         if !root.is_object() {
             return Err(parse_err(serde::de::Error::custom("root is not an object")));

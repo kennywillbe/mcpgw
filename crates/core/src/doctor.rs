@@ -442,9 +442,9 @@ pub fn classify_gateway_failure(message: &str) -> GatewayFault {
 /// server is a thing a team may well have chosen. What it is not is
 /// invisible.
 ///
-/// The message names no flag because there is none. `mcpgw import` reads a
-/// client's per-user file and only that, so there is nothing to run yet —
-/// saying so is more useful than inventing a command that would fail.
+/// The message names the two commands that end the state it reports, in the
+/// order they have to be run: the entries have to be in the canonical config
+/// before anything can point at them through the gateway.
 #[must_use]
 pub fn project_unmanaged(client: &str, path: &std::path::Path, count: usize) -> Finding {
     let entries = if count == 1 { "entry" } else { "entries" };
@@ -454,8 +454,8 @@ pub fn project_unmanaged(client: &str, path: &std::path::Path, count: usize) -> 
         severity: Severity::Warning,
         message: format!(
             "{} holds {count} direct MCP {entries} mcpgw does not manage — \
-             `mcpgw import` cannot read project files yet, so `mcpgw sync` \
-             leaves them live alongside the gateway",
+             they stay live alongside the gateway until `mcpgw import --project` \
+             adopts them and `mcpgw sync --project` points them at it",
             path.display()
         ),
         code: None,
