@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use assert_cmd::Command;
@@ -60,6 +60,42 @@ impl Sandbox {
         let path = self.home.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, json).unwrap();
+    }
+
+    /// The same run from a working directory of the test's choosing —
+    /// `--project` reads the repo the process is standing in.
+    fn ok_in(&self, cwd: &Path, args: &[&str]) -> String {
+        let out = Command::cargo_bin("mcpgw")
+            .unwrap()
+            .current_dir(cwd)
+            .env("MCPGW_NO_UPDATE_CHECK", "1")
+            .args(args)
+            .env("MCPGW_CONFIG", self.home.join("config.toml"))
+            .env("MCPGW_STATE_DIR", self.home.join("state"))
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("APPDATA", self.home.join("AppData"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// A repo with a committed `.mcp.json` and a hand-written
+    /// `.cursor/mcp.json`, the two files a team most often has.
+    fn fake_repo(&self, claude: &str, cursor: &str) -> PathBuf {
+        let repo = self.home.join("work/api");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+        std::fs::write(repo.join(".mcp.json"), claude).unwrap();
+        std::fs::write(repo.join(".cursor/mcp.json"), cursor).unwrap();
+        repo
     }
 }
 
@@ -800,4 +836,61 @@ fn dry_run_names_all_three_outcomes_and_the_second_name() {
     let out = sb.ok(&["import", "--from", "cursor", "--dry-run"]);
     assert!(out.contains("keep both as github-2"), "{out}");
     assert!(out.contains("overwrite it"), "{out}");
+}
+
+/// The whole point of `--project`: the servers a team committed become
+/// canonical servers, adopted per file so a later sync owns those entries.
+#[test]
+fn project_files_are_read_and_adopted_per_file() {
+    let sb = Sandbox::new();
+    let cmd = real_command();
+    let repo = sb.fake_repo(
+        &format!(r#"{{"mcpServers": {{"shared": {{"command": {cmd}}}}}}}"#),
+        &format!(
+            "{{\n  // ours\n  \"mcpServers\": {{\n    \"shared\": {{\"command\": {cmd}}},\n    \
+             \"notes\": {{\"command\": {cmd}, \"args\": [\"notes\"]}},\n  }}\n}}"
+        ),
+    );
+
+    let out = sb.ok_in(&repo, &["import", "--project", "--yes"]);
+    // The origin names the file, because "from cursor" would be the same
+    // words for the repo's file and the user's own.
+    assert!(out.contains(".cursor"), "{out}");
+    assert!(out.contains("+ shared"), "{out}");
+    assert!(out.contains("+ notes"), "{out}");
+
+    let list: serde_json::Value = serde_json::from_str(&sb.ok(&["list", "--json"])).unwrap();
+    let names: Vec<&String> = list["servers"].as_object().unwrap().keys().collect();
+    assert_eq!(names, vec!["notes", "shared"]);
+
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.home.join("state/managed.json")).unwrap())
+            .unwrap();
+    // One record per file, and none for either client's per-user config —
+    // mcpgw has not written those and must not claim them.
+    let files = state["files"].as_object().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(state["clients"], serde_json::json!({}));
+    let cursor = files
+        .iter()
+        .find(|(path, _)| path.contains(".cursor"))
+        .unwrap()
+        .1;
+    assert_eq!(cursor["client"], "cursor");
+    assert_eq!(cursor["managed"], serde_json::json!(["notes", "shared"]));
+}
+
+/// Without the flag the repo is not read at all, whatever the process is
+/// standing in.
+#[test]
+fn a_plain_import_ignores_the_repo() {
+    let sb = Sandbox::new();
+    let cmd = real_command();
+    let repo = sb.fake_repo(
+        &format!(r#"{{"mcpServers": {{"shared": {{"command": {cmd}}}}}}}"#),
+        r#"{"mcpServers": {}}"#,
+    );
+
+    let out = sb.ok_in(&repo, &["import"]);
+    assert!(out.contains("nothing to import"), "{out}");
 }

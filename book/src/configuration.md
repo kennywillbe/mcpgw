@@ -137,26 +137,61 @@ the code and committed with it:
 | Amp | `.amp/settings.json` | `amp.mcpServers` |
 | Zoo Code | `.roo/mcp.json` | `mcpServers` |
 
-**`mcpgw sync` does not write any of them.** It writes the per-user file only,
-so an entry in a repo-local file keeps talking to its server directly — the
-gateway is not in that path, and neither is `mcpgw disable`.
+These are the files a team commits and reviews, so mcpgw only touches them
+when you ask for it by name:
 
-`mcpgw doctor` reports them, so at least they are not invisible. Run it from
-inside the repo and it adds a **project configs** section listing each file,
-what it holds, and whether each entry mirrors something your canonical config
-already has:
+```sh
+mcpgw import --project     # adopt what the repo's files hold
+mcpgw sync --project       # point the repo's files at the gateway
+```
+
+Both flags are additive: they do everything the plain command does and then
+the repo-local files found from your working directory. Without them nothing
+in the repo is read or written, which is exactly what earlier releases did.
+
+`import --project` reads those files under the same rules as a per-user one —
+slugified names, cross-client dedupe, and keep / overwrite / keep-both for a
+conflict, with `--yes` keeping the canonical entry. Each entry's origin names
+the file it came from, because "from cursor" would otherwise mean two
+different files.
+
+`sync --project` writes the same gateway entries it writes anywhere else, with
+the same guarantees: an entry mcpgw never wrote is never touched, the file is
+backed up first, `--dry-run` shows the plan and `--rollback` undoes it.
+
+One thing is different, because these files end up in a pull request. They are
+edited through the comment-preserving reader even where the client's own
+per-user file is strict JSON, so a sync changes the entries it owns and
+nothing else — no reordered keys, no reindented file, and the `//` comment a
+teammate wrote above a server is still there afterwards. A sync with nothing
+to do writes nothing at all, so re-running it leaves the repo with nothing to
+commit.
+
+`mcpgw eject` restores these files along with the per-user ones, without a
+flag: what mcpgw wrote is in its record, wherever it is.
+
+`mcpgw doctor` run from inside the repo adds a **project configs** section
+listing each file, what it holds, and where each entry stands:
 
 ```text
-project configs — not managed by sync yet
-  /work/api/.mcp.json — Claude Code, 2 servers
-      github: mirrors canonical
+project configs
+  /work/api/.mcp.json — Claude Code, 3 servers
+      github: managed by sync
+      linear: mirrors canonical, not managed
       scratch: not managed: direct entry stays live after sync
   ⚠ /work/api/.mcp.json holds 1 direct MCP entry mcpgw does not manage — …
 ```
 
-`--json` carries the same thing as a `projects` array. `mcpgw import` does not
-read these files, so adopting one means copying the entry into the canonical
-config by hand.
+`managed by sync` is an entry mcpgw writes and keeps current.
+`mirrors canonical, not managed` is right today and nobody's to keep right —
+change the canonical entry and this file will not follow. `--json` carries the
+same thing as a `projects` array, with a `managed` flag per entry.
+
+Bookkeeping is per file. A repo's `.cursor/mcp.json` and your own
+`~/.cursor/mcp.json` are two records in `managed.json`, so managing one never
+claims or deletes anything in the other, and two repos on one machine are
+independent. A state file written before this existed loads unchanged and
+means what it always meant.
 
 Only the repo root and your working directory are looked at, and never above
 the repo root.
@@ -165,9 +200,10 @@ the repo root.
 
 ```text
 ~/.local/share/mcpgw/
-├── managed.json          which server names mcpgw wrote into which client
+├── managed.json          which server names mcpgw wrote into which file
 ├── backups/
-│   └── cursor/           timestamped copies, newest 5 kept per client
+│   ├── cursor/           timestamped copies, newest 5 kept per file
+│   └── cursor-1f0c…/     a repo's .cursor/mcp.json, keyed by its path
 └── traffic/
     └── 2026-09-01.jsonl  daily capture log, mode 0600, bodies redacted
 ```

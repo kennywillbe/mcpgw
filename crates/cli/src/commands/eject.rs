@@ -14,6 +14,14 @@
 //! directly synced one, and `mcpgw sync --rollback` undoes this run exactly
 //! as it undoes any other.
 //!
+//! Repo-local files come along for the ride: anything `sync --project`
+//! wrote is in mcpgw's record with its own path, so eject restores those
+//! files too — including the ones in a repo the user is not standing in,
+//! because a committed entry pointing at a gateway nobody runs any more is
+//! exactly the leftover this command exists to remove. No flag: a restore
+//! that skipped half of what was written would be a worse promise than the
+//! one it makes.
+//!
 //! What eject deliberately does not do is delete anything of the user's. The
 //! canonical config, the state directory and the binary stay; the closing
 //! screen names all three and leaves the decision where it belongs.
@@ -23,12 +31,12 @@ use std::path::Path;
 
 use anyhow::{Context as _, bail};
 use mcpgw_core::daemon::{DaemonError, ServiceManager as _};
-use mcpgw_core::state::ManagedState;
+use mcpgw_core::state::{ManagedState, Scope};
 use mcpgw_core::sync::SyncPlan;
 use mcpgw_core::{ClientKind, Config, Error, paths};
 use owo_colors::OwoColorize as _;
 
-use super::sync::{Applied, Planned, PlannedClient, apply_client, plan_client};
+use super::sync::{Applied, Planned, PlannedClient, apply_client, plan_client, plan_file};
 use crate::ui;
 use crate::update::{self, InstallMethod};
 
@@ -72,7 +80,7 @@ pub fn run(args: &EjectArgs, color: bool) -> anyhow::Result<u8> {
     println!("mcpgw eject — putting every client back the way it was.");
     println!();
     for client in &plans {
-        heading(client.kind, &summary(&client.plan), color);
+        heading(&client.scope, &summary(&client.plan), color);
         print_restore(&client.plan, color);
     }
     for note in &notes {
@@ -134,18 +142,34 @@ fn plan(
 ) -> anyhow::Result<(Vec<PlannedClient>, Vec<String>)> {
     let mut plans = Vec::new();
     let mut notes = Vec::new();
-    for kind in ClientKind::ALL {
-        let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
+    let scopes = ClientKind::ALL
+        .into_iter()
+        .map(Scope::Home)
+        // Every repo-local file mcpgw wrote to, wherever it is: the record
+        // is the only thing that knows about them, and a cwd is not it.
+        .chain(state.project_scopes());
+    for scope in scopes {
+        let managed = scope.managed(state);
         if managed.is_empty() {
             continue;
         }
         // Under the client's own names, so an entry that has stood for a
         // second canonical copy since a keep-both is restored to *that*
         // definition rather than to the one it happens to be named after.
-        let resolved = state.resolved.get(kind.id()).cloned().unwrap_or_default();
+        let resolved = scope.resolved(state);
         let desired = mcpgw_core::sync::under_client_names(canonical.clone(), &resolved).desired;
-        let name = kind.display_name();
-        match plan_client(kind, &desired, &managed)? {
+        let name = scope.label();
+        let planned = match scope.path() {
+            None => plan_client(scope.kind(), &desired, &managed)?,
+            Some(path) => plan_file(
+                scope.clone(),
+                path.to_path_buf(),
+                path.is_file(),
+                &desired,
+                &managed,
+            )?,
+        };
+        match planned {
             Planned::Skipped(reason) => notes.push(format!("{name} — {reason}")),
             // Sync would create the file and write the entries into it.
             // Eject must not: a client config that is gone was deleted by
@@ -165,11 +189,12 @@ fn plan(
     Ok((plans, notes))
 }
 
-fn heading(kind: ClientKind, text: &str, color: bool) {
+fn heading(scope: &Scope, text: &str, color: bool) {
+    let line = format!("{} — {text}", scope.label());
     if color {
-        println!("{}", format!("{} — {text}", kind.display_name()).bold());
+        println!("{}", line.bold());
     } else {
-        println!("{} — {text}", kind.display_name());
+        println!("{line}");
     }
 }
 

@@ -7,16 +7,20 @@
 //! the home-dir file only, so a repo-local entry keeps pointing straight at
 //! its server after a sync and nothing says so.
 //!
-//! This module is the reading half of saying so. It never writes: discovery
-//! and reporting only, so that `doctor` and the wizard can name the files
-//! while project-scoped sync is still unbuilt.
+//! This module is the discovery half. It never writes: it finds the files
+//! and reads them, and `import --project`, `sync --project` and `eject` do
+//! the rest through the same plan, backup and state machinery the per-user
+//! files go through.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use std::collections::BTreeSet;
+
 use crate::clients::{ClientKind, ClientRead, Problem};
 use crate::config::Server;
+use crate::state::{ManagedState, Scope};
 
 /// One repo-local client config that exists on disk, already read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +38,11 @@ pub struct ProjectConfig {
 /// Where a repo-local entry stands relative to the canonical config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
+    /// mcpgw wrote this entry and rewrites it on every `sync --project`.
+    Managed,
     /// The canonical config holds the same name pointing at the same place,
-    /// so `sync` is already speaking for this entry.
+    /// but mcpgw never wrote it — so it is correct today and nobody's to
+    /// keep correct.
     Mirrors,
     /// Nothing canonical matches it. It stays live exactly as written after
     /// a sync, and mcpgw is not the thing that would change it.
@@ -43,10 +50,39 @@ pub enum Standing {
 }
 
 impl ProjectConfig {
+    /// The scope this file's bookkeeping lives under.
+    #[must_use]
+    pub fn scope(&self) -> Scope {
+        Scope::Project {
+            kind: self.kind,
+            path: self.path.clone(),
+        }
+    }
+
     /// Every server in the file, in name order, with its standing against
-    /// the canonical config.
+    /// the canonical config, for a caller with no state to consult.
     #[must_use]
     pub fn standings(&self, canonical: &BTreeMap<String, Server>) -> Vec<(&str, Standing)> {
+        self.standings_with(canonical, &BTreeSet::new())
+    }
+
+    /// The same, told what mcpgw manages in this file — which is the
+    /// difference between an entry that stays correct by itself and one
+    /// `sync` keeps correct.
+    #[must_use]
+    pub fn standings_in(
+        &self,
+        canonical: &BTreeMap<String, Server>,
+        state: &ManagedState,
+    ) -> Vec<(&str, Standing)> {
+        self.standings_with(canonical, &self.scope().managed(state))
+    }
+
+    fn standings_with(
+        &self,
+        canonical: &BTreeMap<String, Server>,
+        managed: &BTreeSet<String>,
+    ) -> Vec<(&str, Standing)> {
         self.read
             .servers
             .iter()
@@ -57,22 +93,32 @@ impl ProjectConfig {
                 let mirrors = canonical
                     .get(name)
                     .is_some_and(|mine| mine.transport == server.transport);
-                (
-                    name.as_str(),
-                    if mirrors {
-                        Standing::Mirrors
-                    } else {
-                        Standing::Unmanaged
-                    },
-                )
+                let standing = if managed.contains(name) {
+                    Standing::Managed
+                } else if mirrors {
+                    Standing::Mirrors
+                } else {
+                    Standing::Unmanaged
+                };
+                (name.as_str(), standing)
             })
             .collect()
     }
 
-    /// How many of this file's entries `sync` would leave live.
+    /// How many of this file's entries a plain `sync` would leave live.
     #[must_use]
     pub fn unmanaged(&self, canonical: &BTreeMap<String, Server>) -> usize {
-        self.standings(canonical)
+        self.unmanaged_in(canonical, &ManagedState::default())
+    }
+
+    /// The same, counting an entry mcpgw already writes as managed.
+    #[must_use]
+    pub fn unmanaged_in(
+        &self,
+        canonical: &BTreeMap<String, Server>,
+        state: &ManagedState,
+    ) -> usize {
+        self.standings_in(canonical, state)
             .iter()
             .filter(|(_, standing)| *standing == Standing::Unmanaged)
             .count()
@@ -170,7 +216,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
 /// error the caller has to handle: the other project files are still worth
 /// reporting, which is the same rule the lenient entry reader follows.
 fn read_or_problem(kind: ClientKind, path: &Path) -> ClientRead {
-    match kind.load(path) {
+    // The project codec, not the per-user one: a committed `.mcp.json` with
+    // a comment in it is a file people really write, and reading it as
+    // strict JSON would report the whole file as broken.
+    match kind.load_with(kind.project_codec(), path) {
         Ok(read) => read,
         Err(err) => ClientRead {
             servers: BTreeMap::new(),

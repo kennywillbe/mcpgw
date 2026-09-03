@@ -17,8 +17,9 @@ use std::io::Write as _;
 
 use anyhow::Context as _;
 use mcpgw_core::import::{ImportCandidate, ImportPlan, plan_import};
-use mcpgw_core::state::ManagedState;
-use mcpgw_core::{ClientKind, ClientRead, ConfigStore, Detection, Server, Transport, paths};
+use mcpgw_core::projects::ProjectConfig;
+use mcpgw_core::state::{ManagedState, Scope};
+use mcpgw_core::{ClientRead, ConfigStore, Detection, Server, Transport, paths};
 
 use super::{Ctx, Outcome};
 use crate::commands::import::{
@@ -37,6 +38,12 @@ pub fn pending(cx: &Ctx) -> bool {
     unimported(cx).is_some() || conflicted(cx)
 }
 
+/// The repo-local configs the step would offer, or nothing when the working
+/// directory has none.
+fn project_configs() -> Vec<ProjectConfig> {
+    mcpgw_core::projects::discover_cwd()
+}
+
 /// True when a client holds a server under a name the canonical config holds
 /// under a *different* definition, and nobody has been asked about it yet.
 ///
@@ -50,7 +57,7 @@ pub fn pending(cx: &Ctx) -> bool {
 /// same snapshot, and a step that opens on one rule and reports on another
 /// opens with nothing to say.
 fn conflicted(cx: &Ctx) -> bool {
-    let (sources, _) = sources(cx);
+    let (sources, _) = sources(cx, true);
     let sources = undecided(cx, sources);
     !plan_import(
         &sources,
@@ -73,12 +80,13 @@ fn undecided(cx: &Ctx, sources: Vec<(String, ClientRead)>) -> Vec<(String, Clien
     sources
         .into_iter()
         .map(|(id, mut read)| {
-            let managed = cx.state.clients.get(&id);
-            let answered = cx.state.resolved.get(&id);
-            read.servers.retain(|name, _| {
-                !managed.is_some_and(|mine| mine.contains(name))
-                    && !answered.is_some_and(|mine| mine.contains_key(name))
-            });
+            let Some(scope) = Scope::from_origin(&id) else {
+                return (id, read);
+            };
+            let managed = scope.managed(&cx.state);
+            let answered = scope.resolved(&cx.state);
+            read.servers
+                .retain(|name, _| !managed.contains(name) && !answered.contains_key(name));
             (id, read)
         })
         .collect()
@@ -91,7 +99,8 @@ fn undecided(cx: &Ctx, sources: Vec<(String, ClientRead)>) -> Vec<(String, Clien
 /// Returns a failure if the terminal cannot be read, or if the canonical
 /// config or the adoption record cannot be written.
 pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
-    let (sources, unreadable) = sources(cx);
+    let include_project = ask_about_project_files(cx)?;
+    let (sources, unreadable) = sources(cx, include_project);
     // Whatever this install has already settled is not planned again: see
     // [`undecided`].
     let sources = undecided(cx, sources);
@@ -188,7 +197,7 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
 
 /// Reads every configured client, keeping the ones that fail to parse so the
 /// step can say so rather than silently importing less than it found.
-fn sources(cx: &Ctx) -> (Vec<(String, ClientRead)>, Vec<&'static str>) {
+fn sources(cx: &Ctx, include_project: bool) -> (Vec<(String, ClientRead)>, Vec<&'static str>) {
     let mut sources = Vec::new();
     let mut unreadable = Vec::new();
     for (kind, detection) in &cx.detections {
@@ -196,11 +205,42 @@ fn sources(cx: &Ctx) -> (Vec<(String, ClientRead)>, Vec<&'static str>) {
             continue;
         };
         match kind.load(path) {
-            Ok(read) => sources.push((kind.id().to_owned(), read)),
+            Ok(read) => sources.push((Scope::Home(*kind).origin_key(), read)),
             Err(_) => unreadable.push(kind.display_name()),
         }
     }
+    // After the per-user files, so a definition a repo and a machine share
+    // keeps the per-user entry's name and the repo file is recorded as a
+    // second origin of it.
+    if include_project {
+        sources.extend(
+            project_configs()
+                .into_iter()
+                .map(|config| (config.scope().origin_key(), config.read)),
+        );
+    }
     (sources, unreadable)
+}
+
+/// Names the repo-local files and asks whether to read them too.
+///
+/// Never silent, in either direction: these are files a team shares, and
+/// adopting what one of them holds is the kind of thing a user has to have
+/// seen offered. `--yes` takes the recommended answer — include them, which
+/// is what makes `mcpgw init --yes` in a repo do the whole job — and
+/// [`Ctx::confirm`] echoes the question and the answer so the transcript
+/// still shows what was agreed to.
+fn ask_about_project_files(cx: &Ctx) -> anyhow::Result<bool> {
+    let found = project_configs();
+    if found.is_empty() {
+        return Ok(false);
+    }
+    ui::step(
+        "This repo carries MCP configs of its own.",
+        &crate::commands::project_bullets(&found),
+        cx.color,
+    );
+    cx.confirm("\nRead these too?")
 }
 
 /// The plan, as bullets: the two surprising outcomes first and loudly, then
@@ -617,12 +657,10 @@ fn apply(
 }
 
 fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
-    for (client_id, original) in &candidate.origins {
-        state
-            .clients
-            .entry(client_id.clone())
-            .or_default()
-            .insert(original.clone());
+    for (origin, original) in &candidate.origins {
+        if let Some(scope) = Scope::from_origin(origin) {
+            scope.adopt(state, original);
+        }
     }
 }
 
@@ -639,11 +677,8 @@ fn client_names<'a>(candidates: impl IntoIterator<Item = &'a ImportCandidate>) -
     names
 }
 
-fn display(client_id: &str) -> String {
-    ClientKind::from_id(client_id).map_or_else(
-        || client_id.to_owned(),
-        |kind| kind.display_name().to_owned(),
-    )
+fn display(origin: &str) -> String {
+    Scope::from_origin(origin).map_or_else(|| origin.to_owned(), |scope| scope.label())
 }
 
 /// `a, b and c` — prose, because these appear mid-sentence.
@@ -665,14 +700,26 @@ fn servers(n: usize) -> String {
 
 /// The id of the first client holding an unknown server, for [`pending`].
 fn unimported(cx: &Ctx) -> Option<&'static str> {
-    cx.detections.iter().find_map(|(kind, detection)| {
-        let Detection::Configured(path) = detection else {
-            return None;
-        };
-        let read = kind.load(path).ok()?;
+    let unknown = |read: &ClientRead| {
         read.servers
             .keys()
             .any(|name| !cx.config.servers.contains_key(name))
-            .then_some(kind.id())
-    })
+    };
+    cx.detections
+        .iter()
+        .find_map(|(kind, detection)| {
+            let Detection::Configured(path) = detection else {
+                return None;
+            };
+            unknown(&kind.load(path).ok()?).then_some(kind.id())
+        })
+        // A repo whose committed config holds a server the canonical config
+        // has never heard of is exactly as much of a reason to open this
+        // step as a client that does.
+        .or_else(|| {
+            project_configs()
+                .iter()
+                .find(|config| unknown(&config.read))
+                .map(|config| config.kind.id())
+        })
 }

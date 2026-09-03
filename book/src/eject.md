@@ -23,6 +23,13 @@ update over the entry it already occupies, not a remove and an add.
 Everything else in the file is left alone: entries mcpgw never wrote, other
 settings, comments, formatting.
 
+Repo-local files come with it. Anything `mcpgw sync --project` wrote is in
+mcpgw's record along with its path, so eject restores those files too — no
+flag, and including a repo you are not standing in, because a committed entry
+pointing at a gateway nobody runs any more is exactly the leftover this
+command exists to remove. See
+[Project-level client files](./configuration.md#project-level-client-files).
+
 ## Show and confirm
 
 Like every command that touches your files, eject prints the whole plan first

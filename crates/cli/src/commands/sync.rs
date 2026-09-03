@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use mcpgw_core::clients::codec::ClientDocument;
+use mcpgw_core::projects::ProjectConfig;
+use mcpgw_core::state::{ManagedState, Scope};
 use mcpgw_core::sync::{
     SyncPlan, apply_plan_to, per_server_gateway_servers, plan_client_context, plan_sync,
 };
-use mcpgw_core::{
-    ClientKind, Config, Detection, Error, Server, backup, paths, state::ManagedState,
-};
+use mcpgw_core::{ClientKind, Config, Detection, Error, Server, backup, paths};
 use owo_colors::OwoColorize as _;
 
 #[derive(clap::Args)]
@@ -22,6 +22,9 @@ pub struct SyncArgs {
         long_help = super::client_ids_help("Only sync these clients")
     )]
     pub clients: Vec<String>,
+    /// Also write the repo-local MCP configs found from this directory
+    #[arg(long)]
+    pub project: bool,
     /// Show what would change without writing anything
     #[arg(long)]
     pub dry_run: bool,
@@ -39,7 +42,7 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
 
     if args.rollback {
-        return rollback(&targets, &state_dir);
+        return rollback(&targets, &state_dir, args.project);
     }
 
     // The entries mirror the canonical servers by name, so the canonical
@@ -62,62 +65,38 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     let _state_lock = ManagedState::lock(&state_path)?;
     let mut state = ManagedState::load(&state_path)?;
 
+    let run = Run {
+        args,
+        color,
+        state_dir: &state_dir,
+        state_path: &state_path,
+    };
     // Set at the end of the run rather than after the first client: two
     // clients flipped by one command both deserve the explanation, and the
     // flag is what stops the *next* run from repeating it.
     let mut notified = false;
-    for kind in targets {
-        let heading = |text: &str| {
-            if color {
-                println!("{}", format!("{} — {text}", kind.display_name()).bold());
-            } else {
-                println!("{} — {text}", kind.display_name());
-            }
-        };
-        let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
-        let resolved = state.resolved.get(kind.id()).cloned().unwrap_or_default();
-        let desired = gateway_entries(kind, args, &canonical, &bridge, &resolved)?;
-        let mut planned = match plan_client(kind, &desired.desired, &managed)? {
-            Planned::Ready(planned) => planned,
-            Planned::Skipped(reason) => {
-                heading(&reason);
-                continue;
-            }
-        };
+    for kind in targets.iter().copied() {
+        let scope = Scope::Home(kind);
+        let desired = gateway_entries(kind, args, &canonical, &bridge, &scope.resolved(&state))?;
+        let planned = plan_client(kind, &desired.desired, &scope.managed(&state))?;
+        run.one(&scope, planned, &desired, &mut state, &mut notified)?;
+    }
 
-        heading(&describe(&planned.plan));
-        print_plan_lines(&planned.plan, color);
-        for name in &desired.displaced {
+    if args.project {
+        let found = project_targets(&targets);
+        if found.is_empty() {
             println!(
-                "  {}",
-                crate::ui::dim(
-                    &format!(
-                        "! {name} not written here — this client's {name:?} entry is your own \
-                         server, kept when you said the two were different"
-                    ),
-                    color,
-                )
+                "no repo-local MCP config here — --project had nothing to write \
+                 (`mcpgw doctor` lists the files it looks for)"
             );
         }
-
-        if !planned.plan.has_changes() {
-            continue;
-        }
-        if args.dry_run {
-            continue;
-        }
-
-        // Asked before the plan is applied: afterwards the document holds the
-        // gateway entries and every answer is "already there".
-        let migrating = !state.migrated && planned.migrates_to_gateway(&args.gateway_url);
-
-        match apply_client(&mut planned, &mut state, &state_dir, &state_path)? {
-            Applied::Refused(reason) => println!("  {reason}"),
-            Applied::Written if migrating => {
-                print_migration_notice(color);
-                notified = true;
-            }
-            Applied::Written => {}
+        for config in found {
+            let kind = config.kind;
+            let scope = config.scope();
+            let desired =
+                gateway_entries(kind, args, &canonical, &bridge, &scope.resolved(&state))?;
+            let planned = plan_project(&config, &desired.desired, &scope.managed(&state))?;
+            run.one(&scope, planned, &desired, &mut state, &mut notified)?;
         }
     }
 
@@ -126,6 +105,88 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         state.save(&state_path)?;
     }
     Ok(())
+}
+
+/// The repo-local files this run may write: the ones discovery found, minus
+/// any client `--client` left out.
+fn project_targets(targets: &[ClientKind]) -> Vec<ProjectConfig> {
+    mcpgw_core::projects::discover_cwd()
+        .into_iter()
+        .filter(|config| targets.contains(&config.kind))
+        .collect()
+}
+
+/// What one sync run is, apart from the file it is pointed at.
+///
+/// Every file goes through exactly the same show-then-apply, whether it is a
+/// client's per-user config or one committed in a repo — which is the point
+/// of the whole change, and the reason this is one function taking a
+/// [`Scope`] rather than two loops that could drift.
+struct Run<'a> {
+    args: &'a SyncArgs,
+    color: bool,
+    state_dir: &'a Path,
+    state_path: &'a Path,
+}
+
+impl Run<'_> {
+    fn one(
+        &self,
+        scope: &Scope,
+        planned: Planned,
+        desired: &mcpgw_core::sync::ClientNames,
+        state: &mut ManagedState,
+        notified: &mut bool,
+    ) -> anyhow::Result<()> {
+        let heading = |text: &str| {
+            let line = format!("{} — {text}", scope.label());
+            if self.color {
+                println!("{}", line.bold());
+            } else {
+                println!("{line}");
+            }
+        };
+        let mut planned = match planned {
+            Planned::Ready(planned) => planned,
+            Planned::Skipped(reason) => {
+                heading(&reason);
+                return Ok(());
+            }
+        };
+
+        heading(&describe(&planned.plan));
+        print_plan_lines(&planned.plan, self.color);
+        for name in &desired.displaced {
+            println!(
+                "  {}",
+                crate::ui::dim(
+                    &format!(
+                        "! {name} not written here — this client's {name:?} entry is your own \
+                         server, kept when you said the two were different"
+                    ),
+                    self.color,
+                )
+            );
+        }
+
+        if !planned.plan.has_changes() || self.args.dry_run {
+            return Ok(());
+        }
+
+        // Asked before the plan is applied: afterwards the document holds the
+        // gateway entries and every answer is "already there".
+        let migrating = !state.migrated && planned.migrates_to_gateway(&self.args.gateway_url);
+
+        match apply_client(&mut planned, state, self.state_dir, self.state_path)? {
+            Applied::Refused(reason) => println!("  {reason}"),
+            Applied::Written if migrating => {
+                print_migration_notice(self.color);
+                *notified = true;
+            }
+            Applied::Written => {}
+        }
+        Ok(())
+    }
 }
 
 /// The one-time explanation of what just happened to a client's entries.
@@ -162,6 +223,9 @@ fn print_migration_notice(color: bool) {
 /// any of it.
 pub struct PlannedClient {
     pub kind: ClientKind,
+    /// Which file this is, and so which bookkeeping and which backup stack
+    /// it belongs to.
+    pub scope: Scope,
     pub path: PathBuf,
     /// Whether the file was already there. One that was not is created, and
     /// there is nothing to back up. Public because `eject` reads it to make
@@ -194,8 +258,40 @@ pub fn plan_client(
         Ok(target) => target,
         Err(reason) => return Ok(Planned::Skipped(reason.to_owned())),
     };
+    plan_file(Scope::Home(kind), path, exists, desired, managed)
+}
 
-    let codec = kind.codec();
+/// The same for one repo-local file, which is always already there —
+/// discovery is what found it, and `sync --project` never creates a project
+/// config the repo does not have.
+///
+/// # Errors
+///
+/// Same failure as [`plan_client`].
+pub fn plan_project(
+    config: &ProjectConfig,
+    desired: &BTreeMap<String, Server>,
+    managed: &BTreeSet<String>,
+) -> anyhow::Result<Planned> {
+    plan_file(config.scope(), config.path.clone(), true, desired, managed)
+}
+
+/// Reads one file and plans `desired` over what it holds.
+///
+/// # Errors
+///
+/// Returns a failure only if a file that is there cannot be read; a file that
+/// cannot be *parsed* is a skip rather than an error, because the remaining
+/// files are still worth syncing.
+pub fn plan_file(
+    scope: Scope,
+    path: PathBuf,
+    exists: bool,
+    desired: &BTreeMap<String, Server>,
+    managed: &BTreeSet<String>,
+) -> anyhow::Result<Planned> {
+    let kind = scope.kind();
+    let codec = scope.codec();
     let doc = if exists {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read {}", path.display()))?;
@@ -221,6 +317,7 @@ pub fn plan_client(
 
     Ok(Planned::Ready(Box::new(PlannedClient {
         kind,
+        scope,
         path,
         exists,
         doc,
@@ -282,7 +379,7 @@ pub fn apply_client(
         )));
     }
     if planned.exists {
-        backup::backup_file(state_dir, planned.kind.id(), &planned.path)?;
+        backup::backup_file(state_dir, &planned.scope.backup_key(), &planned.path)?;
     }
     // Intent first: the state file records what this run is about to write
     // *before* the client file is touched. A crash in between then leaves
@@ -290,9 +387,7 @@ pub fn apply_client(
     // repairs. The reverse order fails the other way — entries in the client
     // file that mcpgw never claimed are foreign forever, and sync refuses to
     // touch them.
-    state
-        .clients
-        .insert(planned.kind.id().to_owned(), planned.plan.managed_after());
+    planned.scope.claim(state, planned.plan.managed_after());
     state.save(state_path)?;
     write_text(&planned.path, &planned.doc.to_text()?)?;
     Ok(Applied::Written)
@@ -315,6 +410,9 @@ fn announce(args: &SyncArgs) -> anyhow::Result<String> {
          on the gateway at {} (serve it with `mcpgw serve`)",
         args.gateway_url
     );
+    if args.project {
+        println!("--project: the repo-local configs found from here are written too");
+    }
     Ok(bridge_command())
 }
 
@@ -428,13 +526,25 @@ fn print_plan_lines(plan: &mcpgw_core::sync::SyncPlan, color: bool) {
     }
 }
 
-fn rollback(targets: &[ClientKind], state_dir: &Path) -> anyhow::Result<()> {
+fn rollback(targets: &[ClientKind], state_dir: &Path, project: bool) -> anyhow::Result<()> {
+    let mut scopes: Vec<(Scope, Option<PathBuf>)> = targets
+        .iter()
+        .map(|kind| (Scope::Home(*kind), kind.config_path()))
+        .collect();
+    if project {
+        scopes.extend(
+            project_targets(targets)
+                .into_iter()
+                .map(|config| (config.scope(), Some(config.path))),
+        );
+    }
+
     let mut restored = 0;
-    for kind in targets {
-        let Some(backup_path) = backup::latest_backup(state_dir, kind.id())? else {
+    for (scope, config_path) in scopes {
+        let Some(backup_path) = backup::latest_backup(state_dir, &scope.backup_key())? else {
             continue;
         };
-        let Some(config_path) = kind.config_path() else {
+        let Some(config_path) = config_path else {
             continue;
         };
         let text = std::fs::read_to_string(&backup_path)
@@ -445,7 +555,7 @@ fn rollback(targets: &[ClientKind], state_dir: &Path) -> anyhow::Result<()> {
         // also re-stamps the stack, so repeated rollbacks alternate between
         // the last two states rather than silently re-applying one snapshot.
         if config_path.exists() {
-            backup::backup_file(state_dir, kind.id(), &config_path)?;
+            backup::backup_file(state_dir, &scope.backup_key(), &config_path)?;
         }
         write_text(&config_path, &text)?;
         println!(

@@ -5,7 +5,7 @@
 //! it was, and the only honest check of that is that the file it leaves
 //! behind is indistinguishable from one mcpgw never pointed at a gateway.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use assert_cmd::Command;
@@ -48,6 +48,31 @@ impl Sandbox {
 
     fn ok(&self, args: &[&str]) -> String {
         let out = self.mcpgw(args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// A run from a working directory of the test's choosing — the project
+    /// steps read the repo the process is standing in.
+    fn ok_in(&self, cwd: &Path, args: &[&str]) -> String {
+        let out = Command::cargo_bin("mcpgw")
+            .unwrap()
+            .current_dir(cwd)
+            .env("MCPGW_NO_UPDATE_CHECK", "1")
+            .args(args)
+            .env("MCPGW_CONFIG", &self.config)
+            .env("MCPGW_STATE_DIR", &self.state)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("APPDATA", self.home.join("AppData"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap();
         assert!(
             out.status.success(),
             "{}",
@@ -374,4 +399,67 @@ fn the_closing_screen_names_everything_eject_does_not_delete() {
     // one rather than a prompt.
     assert!(out.contains("gateway service"), "{out}");
     assert!(sb.config.exists() && sb.state.exists());
+}
+
+/// A repo carrying one committed server, with the `.git` that makes it one.
+fn fake_repo(home: &Path) -> PathBuf {
+    let repo = home.join("work/api");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join(".mcp.json"),
+        "{\n  // ours\n  \"mcpServers\": {\n    \"github\": {\"command\": \"cargo\", \
+         \"args\": [\"run\"]}\n  }\n}\n",
+    )
+    .unwrap();
+    repo
+}
+
+/// Eject covers a repo-local file without being asked to: whatever `sync
+/// --project` wrote is in mcpgw's record, and a committed entry pointing at
+/// a gateway nobody runs any more is the leftover eject exists to remove.
+#[test]
+fn eject_restores_the_repo_files_sync_wrote() {
+    let sb = Sandbox::new();
+    let repo = fake_repo(&sb.home);
+    let path = repo.join(".mcp.json");
+    std::fs::write(
+        &sb.config,
+        "version = 1\n[servers.github]\ntype = \"stdio\"\ncommand = \"cargo\"\nargs = [\"run\"]\n",
+    )
+    .unwrap();
+
+    sb.ok_in(&repo, &["import", "--project", "--yes"]);
+    sb.ok_in(&repo, &["sync", "--project"]);
+    let synced = std::fs::read_to_string(&path).unwrap();
+    assert!(synced.contains("/s/github"), "{synced}");
+
+    let out = sb.ok_in(&repo, &["eject", "--yes"]);
+    assert!(out.contains(".mcp.json"), "{out}");
+    let restored = std::fs::read_to_string(&path).unwrap();
+    // The definition is the one the repo committed, and the comment around
+    // it never moved.
+    assert!(restored.contains("// ours"), "{restored}");
+    assert!(!restored.contains("/s/github"), "{restored}");
+    // Parsed with the comment line dropped: the assertion is about the entry
+    // the repo gets back, and `serde_json` is not the reader that has to
+    // tolerate JSONC.
+    let bare: String = restored
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value: serde_json::Value = serde_json::from_str(&bare).unwrap();
+    assert_eq!(
+        value["mcpServers"]["github"],
+        serde_json::json!({"command": "cargo", "args": ["run"]})
+    );
+
+    // Ejecting again has nothing to do, so it writes nothing at all.
+    sb.ok_in(&repo, &["eject", "--yes"]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), restored);
+
+    // And syncing again lands on exactly the bytes the first sync wrote:
+    // eject is a round trip, not a reformat.
+    sb.ok_in(&repo, &["sync", "--project"]);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), synced);
 }

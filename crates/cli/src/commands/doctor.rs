@@ -127,7 +127,7 @@ pub fn run(
     // Reported from the working directory, not from the machine: a
     // repo-local file is only in front of the user when they are standing in
     // that repo, and doctor is run there.
-    let projects = ProjectReport::gather(&canonical_servers);
+    let projects = ProjectReport::gather(&canonical_servers, &managed);
 
     let (probe_results, gateway_report) = match probe {
         Some(timeout) => {
@@ -337,7 +337,7 @@ struct ProjectReport {
 }
 
 impl ProjectReport {
-    fn gather(canonical: &BTreeMap<String, Server>) -> Self {
+    fn gather(canonical: &BTreeMap<String, Server>, state: &ManagedState) -> Self {
         let mut report = Self {
             files: Vec::new(),
             findings: Vec::new(),
@@ -358,14 +358,14 @@ impl ProjectReport {
                             finding
                         }),
                 );
-            let unmanaged = config.unmanaged(canonical);
+            let unmanaged = config.unmanaged_in(canonical, state);
             if unmanaged > 0 {
                 report
                     .findings
                     .push(project_unmanaged(name, &config.path, unmanaged));
             }
             let servers = config
-                .standings(canonical)
+                .standings_in(canonical, state)
                 .into_iter()
                 .map(|(name, standing)| (name.to_owned(), standing))
                 .collect();
@@ -384,7 +384,11 @@ impl ProjectReport {
                     .map(|(name, standing)| {
                         serde_json::json!({
                             "name": name,
-                            "mirrors_canonical": *standing == Standing::Mirrors,
+                            // Two flags rather than one enum string: the
+                            // older one keeps meaning what it meant, and
+                            // "mcpgw writes this entry" is the new question.
+                            "mirrors_canonical": *standing != Standing::Unmanaged,
+                            "managed": *standing == Standing::Managed,
                         })
                     })
                     .collect();
@@ -409,7 +413,10 @@ impl ProjectReport {
 /// section exists to say.
 fn standing_text(standing: Standing) -> &'static str {
     match standing {
-        Standing::Mirrors => "mirrors canonical",
+        Standing::Managed => "managed by sync",
+        // Right today and nobody's to keep right: the canonical entry can
+        // change tomorrow and this file will not follow it.
+        Standing::Mirrors => "mirrors canonical, not managed",
         Standing::Unmanaged => "not managed: direct entry stays live after sync",
     }
 }
@@ -421,7 +428,7 @@ fn render_projects(report: &ProjectReport, color: bool) {
         return;
     }
     println!();
-    heading("project configs — not managed by sync yet", color);
+    heading("project configs", color);
     for row in &report.files {
         let count = row.servers.len();
         let plural = if count == 1 { "server" } else { "servers" };

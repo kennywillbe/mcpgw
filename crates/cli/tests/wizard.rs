@@ -1166,9 +1166,9 @@ async fn yes_keeps_canonical_without_recording_an_answer() {
     );
 }
 
-/// The survey names the repo-local config it found, once and dimly. It is
-/// the file a user would otherwise assume the sync step took care of, and
-/// nothing in the wizard touches it.
+/// The survey names the repo-local config it found, once and dimly — the
+/// file a user would otherwise assume the sync step took care of. The steps
+/// that act on it ask for themselves.
 #[tokio::test]
 async fn the_survey_names_a_repo_local_config() {
     let dir = tempfile::tempdir().unwrap();
@@ -1205,8 +1205,61 @@ async fn the_survey_names_a_repo_local_config() {
         stdout.contains("also found .mcp.json in this repo with 2 servers"),
         "{stdout}"
     );
+    assert!(stdout.contains("I'll ask about them"), "{stdout}");
+}
+
+/// `init --yes` inside a repo takes the recommended answer for the repo's
+/// own files — include them — and says so at both steps that touch them:
+/// the entries are imported, and the committed file ends up pointing at the
+/// gateway.
+#[tokio::test]
+async fn init_yes_includes_the_repo_files_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let path = repo.join(".mcp.json");
+    std::fs::write(
+        &path,
+        format!(
+            "{{\n  // committed with the code\n  \"mcpServers\": {{\n    \
+             \"shared\": {{\"command\": {}, \"args\": [\"healthy\"]}}\n  }}\n}}\n",
+            real_command()
+        ),
+    )
+    .unwrap();
+
+    let blocked = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", blocked.local_addr().unwrap());
+
+    let child = command(dir.path())
+        .current_dir(&repo)
+        .args(["init", "--yes", "--gateway-url", &url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = finish(child, "`mcpgw init --yes` inside a repo").await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    // Offered, not assumed: `--yes` echoes both questions and the answer it
+    // took on the user's behalf.
+    assert!(stdout.contains("Read these too? [Y/n] y"), "{stdout}");
     assert!(
-        stdout.contains("project files are not managed yet"),
+        stdout.contains("Point these at the gateway too? [Y/n] y"),
         "{stdout}"
     );
+    assert!(
+        stdout.contains(".mcp.json  Claude Code — 1 server"),
+        "{stdout}"
+    );
+
+    // The server came in and the committed file now goes through the
+    // gateway, with the comment above it untouched.
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("[servers.shared]"), "{config}");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("/s/shared"), "{written}");
+    assert!(written.contains("// committed with the code"), "{written}");
 }

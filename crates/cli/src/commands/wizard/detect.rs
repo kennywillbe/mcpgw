@@ -109,9 +109,9 @@ fn servers_cell(kind: ClientKind, path: &std::path::Path) -> String {
 ///
 /// Said here because the wizard's first promise is that it will name what it
 /// found, and a `.mcp.json` sitting in the repo is exactly the thing a user
-/// would otherwise assume the sync step took care of. It is dim and it is one
-/// line: nothing in the wizard acts on these files, so a bigger say than that
-/// would be a promise it cannot keep.
+/// would otherwise assume the sync step took care of. One dim line and no
+/// more: the import and sync steps ask about these files properly, and
+/// asking twice would be the survey doing a step's job.
 fn project_line() -> Option<String> {
     let found = mcpgw_core::projects::discover_cwd();
     if found.is_empty() {
@@ -131,7 +131,7 @@ fn project_line() -> Option<String> {
     let servers: usize = found.iter().map(|config| config.read.servers.len()).sum();
     let plural = if servers == 1 { "server" } else { "servers" };
     Some(format!(
-        "also found {} in this repo with {servers} {plural}; project files are not managed yet",
+        "also found {} in this repo with {servers} {plural}; I'll ask about them",
         names.join(", ")
     ))
 }

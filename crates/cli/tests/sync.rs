@@ -1,7 +1,42 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use assert_cmd::Command;
+
+/// The repo's own Claude Code config, as it stands before mcpgw sees it.
+const PROJECT_CLAUDE: &str = r#"{
+  "mcpServers": {
+    "github": {
+      "command": "cargo",
+      "args": ["run"]
+    }
+  }
+}
+"#;
+
+/// The same file with an entry that arrived after the import — nobody
+/// adopted it, so nothing mcpgw does may touch it.
+const PROJECT_CLAUDE_WITH_A_STRANGER: &str = r#"{
+  "mcpServers": {
+    "github": {
+      "command": "cargo",
+      "args": ["run"]
+    },
+    "housekeeping": {
+      "command": "make"
+    }
+  }
+}
+"#;
+
+/// The repo's Cursor config, hand-written the way one really is.
+const PROJECT_CURSOR: &str = r#"{
+  // the server we all share
+  "mcpServers": {
+    "github": { "command": "cargo", "args": ["run"] },
+  }
+}
+"#;
 
 struct Sandbox {
     _dir: tempfile::TempDir,
@@ -47,6 +82,48 @@ impl Sandbox {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// The same run from a working directory of the test's choosing —
+    /// `--project` reports on the repo the process is standing in, so a test
+    /// about it has to say where that is.
+    fn mcpgw_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        Command::cargo_bin("mcpgw")
+            .unwrap()
+            .current_dir(cwd)
+            .env("MCPGW_NO_UPDATE_CHECK", "1")
+            .args(args)
+            .env("MCPGW_CONFIG", &self.config)
+            .env("MCPGW_STATE_DIR", &self.state)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("APPDATA", self.home.join("AppData"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap()
+    }
+
+    fn ok_in(&self, cwd: &Path, args: &[&str]) -> String {
+        let out = self.mcpgw_in(cwd, args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// A repo with the two project files a team really commits: Claude
+    /// Code's plain `.mcp.json` and a `.cursor/mcp.json` with a comment and
+    /// a trailing comma in it.
+    fn fake_repo(&self) -> PathBuf {
+        let repo = self.home.join("work/api");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".cursor")).unwrap();
+        std::fs::write(repo.join(".mcp.json"), PROJECT_CLAUDE).unwrap();
+        std::fs::write(repo.join(".cursor/mcp.json"), PROJECT_CURSOR).unwrap();
+        repo
     }
 
     fn install_cursor(&self, config: Option<&str>) -> PathBuf {
@@ -1770,4 +1847,142 @@ fn a_dry_run_writes_nothing() {
     let out = sb.ok(&["sync", "--client", "cursor", "--dry-run"]);
     assert!(out.contains("+ github"), "{out}");
     assert!(!sb.home.join(".cursor/mcp.json").exists());
+}
+
+/// The canonical config a repo-local sync pushes: one server the project
+/// files already name, one they do not.
+const PROJECT_CANONICAL: &str = r#"
+version = 1
+[servers.github]
+type = "stdio"
+command = "cargo"
+args = ["run"]
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+"#;
+
+/// `import --project` first, so the entries the repo already had are mcpgw's
+/// to rewrite rather than conflicts it must leave alone.
+fn adopted_repo(sb: &Sandbox) -> PathBuf {
+    let repo = sb.fake_repo();
+    std::fs::write(&sb.config, PROJECT_CANONICAL).unwrap();
+    sb.ok_in(&repo, &["import", "--project", "--yes"]);
+    // Added after the adoption, so it is an entry mcpgw has never claimed —
+    // which is the only kind a sync has to promise not to touch.
+    std::fs::write(repo.join(".mcp.json"), PROJECT_CLAUDE_WITH_A_STRANGER).unwrap();
+    repo
+}
+
+/// Without the flag nothing about a repo-local file changes — the promise
+/// that this feature costs nothing to anyone who does not ask for it.
+#[test]
+fn a_plain_sync_does_not_touch_the_repo() {
+    let sb = Sandbox::new();
+    let repo = adopted_repo(&sb);
+    let before = std::fs::read_to_string(repo.join(".mcp.json")).unwrap();
+
+    let out = sb.ok_in(&repo, &["sync"]);
+    assert!(!out.contains(".mcp.json"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".mcp.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn a_project_dry_run_names_both_files_and_writes_nothing() {
+    let sb = Sandbox::new();
+    let repo = adopted_repo(&sb);
+    let before = std::fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap();
+
+    let out = sb.ok_in(&repo, &["sync", "--project", "--dry-run"]);
+    assert!(out.contains(".mcp.json"), "{out}");
+    assert!(out.contains(".cursor"), "{out}");
+    // `linear` is not in either file yet; `github` is, and moves.
+    assert!(out.contains("+ linear"), "{out}");
+    assert!(out.contains("~ github"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn a_project_sync_writes_the_repo_files_and_stops_there() {
+    let sb = Sandbox::new();
+    let repo = adopted_repo(&sb);
+
+    sb.ok_in(&repo, &["sync", "--project"]);
+    let claude = std::fs::read_to_string(repo.join(".mcp.json")).unwrap();
+    let cursor = std::fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap();
+    assert!(claude.contains("/s/github"), "{claude}");
+    assert!(claude.contains("/s/linear"), "{claude}");
+    // Never written by mcpgw, so never touched by it.
+    assert!(claude.contains(r#""command": "make""#), "{claude}");
+    // The comment is what a teammate wrote; a sync that ate it would be a
+    // diff nobody would approve.
+    assert!(cursor.contains("// the server we all share"), "{cursor}");
+
+    // The record is keyed by the file, so the client's own per-user config
+    // is not claimed along with it.
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.state.join("managed.json")).unwrap())
+            .unwrap();
+    let files = state["files"].as_object().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(
+        files
+            .keys()
+            .any(|path| path.ends_with(".mcp.json") && path.contains("work")),
+        "{files:?}"
+    );
+    assert_eq!(state["clients"], serde_json::json!({}));
+
+    // Nothing left to do, and so nothing written: the second run leaves the
+    // repo with nothing to commit.
+    let again = sb.ok_in(&repo, &["sync", "--project"]);
+    assert!(again.contains("no changes"), "{again}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".mcp.json")).unwrap(),
+        claude
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap(),
+        cursor
+    );
+}
+
+#[test]
+fn a_project_rollback_puts_the_repo_files_back() {
+    let sb = Sandbox::new();
+    let repo = adopted_repo(&sb);
+    let before = std::fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap();
+
+    sb.ok_in(&repo, &["sync", "--project"]);
+    assert_ne!(
+        std::fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap(),
+        before
+    );
+
+    let out = sb.ok_in(&repo, &["sync", "--project", "--rollback"]);
+    assert!(out.contains("restored"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".cursor/mcp.json")).unwrap(),
+        before
+    );
+}
+
+/// A directory with nothing to find says so rather than reporting a clean
+/// run over an empty set — `--project` was asked for, and silence would read
+/// as "done".
+#[test]
+fn project_sync_outside_a_repo_says_it_found_nothing() {
+    let sb = Sandbox::new();
+    std::fs::write(&sb.config, PROJECT_CANONICAL).unwrap();
+    let empty = sb.home.join("elsewhere");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let out = sb.ok_in(&empty, &["sync", "--project"]);
+    assert!(out.contains("no repo-local MCP config here"), "{out}");
 }
