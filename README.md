@@ -73,7 +73,8 @@ hand. Your comments and ordering survive every write.
 
 Installed from the script or an archive? `mcpgw self-update` replaces the
 binary with the latest release (checksum-verified); package-manager installs
-are left to `brew upgrade` / `cargo install`.
+are left to `brew upgrade` / `cargo install`. Either way, an installed
+service notices the new binary and restarts itself onto it.
 
 ## How it works
 
