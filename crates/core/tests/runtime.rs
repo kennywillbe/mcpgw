@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use mcpgw_core::Error;
 use mcpgw_core::runtime::{GatewayRecord, read_record, record_path, remove_record, write_record};
+use mcpgw_core::upgrade::{ExeStamp, UpgradeRestart};
 
 fn record(port: u16) -> GatewayRecord {
     GatewayRecord {
@@ -13,6 +14,7 @@ fn record(port: u16) -> GatewayRecord {
         bind: "127.0.0.1".to_owned(),
         port,
         started_at: 1_700_000_000,
+        last_upgrade_restart: None,
     }
 }
 
@@ -117,4 +119,39 @@ fn a_second_write_replaces_the_first() {
         .filter(|name| name != "gateway-8137.json")
         .collect();
     assert!(strays.is_empty(), "{strays:?}");
+}
+
+/// The other direction of the same leniency: a record written before the
+/// upgrade watcher existed is what every gateway on disk right now leaves,
+/// and reading one must not need a field it never wrote.
+#[test]
+fn a_record_without_the_upgrade_field_still_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut json = serde_json::to_value(record(8137)).unwrap();
+    json.as_object_mut().unwrap().remove("last_upgrade_restart");
+    std::fs::write(
+        record_path(dir.path(), 8137),
+        serde_json::to_vec(&json).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(read_record(dir.path(), 8137).unwrap(), Some(record(8137)));
+}
+
+/// The restart guard only works if it survives the process that wrote it.
+#[test]
+fn the_restart_a_gateway_recorded_reaches_the_gateway_that_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut written = record(8137);
+    written.last_upgrade_restart = Some(UpgradeRestart {
+        stamp: ExeStamp {
+            mtime: Some(1_700_000_500),
+            len: 9_000_000,
+        },
+        at: 1_700_000_501,
+    });
+
+    write_record(dir.path(), &written).unwrap();
+
+    assert_eq!(read_record(dir.path(), 8137).unwrap(), Some(written));
 }

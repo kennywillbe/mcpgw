@@ -51,7 +51,17 @@ pub fn fixture_config(names: &[&str]) -> String {
 /// the test itself was started in.
 #[allow(dead_code)]
 pub fn mcpgw(home: &Path) -> Command {
-    let mut command = mcpgw_keeping_the_real_home(home);
+    mcpgw_binary(&assert_cmd::cargo::cargo_bin("mcpgw"), home)
+}
+
+/// The same sandbox around a different `mcpgw` on disk.
+///
+/// Only the upgrade tests want this: the file they replace has to be a copy,
+/// because the binary cargo built is the one every other test in the run is
+/// about to execute.
+#[allow(dead_code)]
+pub fn mcpgw_binary(exe: &Path, home: &Path) -> Command {
+    let mut command = sandboxed(exe, home);
     command
         .env("HOME", home)
         .env("USERPROFILE", home)
@@ -68,7 +78,13 @@ pub fn mcpgw(home: &Path) -> Command {
 /// systemctl never sees.
 #[allow(dead_code)]
 pub fn mcpgw_keeping_the_real_home(sandbox: &Path) -> Command {
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin("mcpgw"));
+    sandboxed(&assert_cmd::cargo::cargo_bin("mcpgw"), sandbox)
+}
+
+/// The config and state redirection every invocation gets, whichever binary
+/// is being run and whatever is done about the home directory.
+fn sandboxed(exe: &Path, sandbox: &Path) -> Command {
+    let mut command = Command::new(exe);
     command
         // Hermetic: no test may phone home for a version notice.
         .env("MCPGW_NO_UPDATE_CHECK", "1")
@@ -166,6 +182,56 @@ pub async fn serve(home: &Path, args: &[&str]) -> (tokio::process::Child, String
         .spawn()
         .unwrap();
 
+    let (addr, endpoints) = banner(&mut child).await;
+    (child, addr, endpoints)
+}
+
+/// The same gateway, run from `exe` and with its stderr collected into a
+/// string the test can read while it is still running.
+///
+/// Both halves are what the upgrade tests need: the binary they replace must
+/// not be the one the rest of the suite runs, and the line the gateway
+/// prints about that replacement is the thing under test.
+#[allow(dead_code)]
+pub async fn serve_binary(
+    exe: &Path,
+    home: &Path,
+    args: &[&str],
+) -> (
+    tokio::process::Child,
+    String,
+    String,
+    std::sync::Arc<std::sync::Mutex<String>>,
+) {
+    let mut command = tokio::process::Command::from(mcpgw_binary(exe, home));
+    let mut child = command
+        .arg("serve")
+        .args(["--port", "0", "--no-capture"])
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let errors = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    tokio::spawn({
+        let errors = std::sync::Arc::clone(&errors);
+        async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut errors = errors.lock().unwrap();
+                errors.push_str(&line);
+                errors.push('\n');
+            }
+        }
+    });
+    let (addr, endpoints) = banner(&mut child).await;
+    (child, addr, endpoints, errors)
+}
+
+/// Reads the two banner lines off a freshly spawned gateway and returns the
+/// address it bound with the endpoint line, leaving stdout drained.
+async fn banner(child: &mut tokio::process::Child) -> (String, String) {
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let listening = banner_line(&mut lines).await;
     let endpoints = banner_line(&mut lines).await;
@@ -180,7 +246,7 @@ pub async fn serve(home: &Path, args: &[&str]) -> (tokio::process::Child, String
     // hits EPIPE panics — which killed the gateway mid-test whenever the
     // third banner line happened to land after this function returned.
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    (child, addr, endpoints)
+    (addr, endpoints)
 }
 
 /// One line of the startup banner, waited for to a deadline.

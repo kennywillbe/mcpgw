@@ -118,6 +118,11 @@ impl DaemonSpec {
     /// The argument vector the service should run: `serve` with this spec's
     /// address, spelled out rather than left to defaults so a service keeps
     /// pointing where it was installed even if a default later moves.
+    ///
+    /// `--supervised` rides along here rather than being set per platform,
+    /// which is what makes a gateway notice its own binary being upgraded on
+    /// all three at once — and what keeps a foreground `mcpgw serve` from
+    /// ever exiting because somebody rebuilt. See [`crate::upgrade`].
     #[must_use]
     pub fn serve_args(&self) -> Vec<String> {
         vec![
@@ -126,6 +131,7 @@ impl DaemonSpec {
             self.bind.clone(),
             "--port".to_owned(),
             self.port.to_string(),
+            "--supervised".to_owned(),
         ]
     }
 }

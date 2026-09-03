@@ -46,6 +46,7 @@ const EXPECTED_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 		<string>127.0.0.1</string>
 		<string>--port</string>
 		<string>8137</string>
+		<string>--supervised</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>

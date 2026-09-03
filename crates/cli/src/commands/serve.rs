@@ -7,7 +7,14 @@ use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{Gateway, ServerList, serve_http_with};
 use mcpgw_core::reload::{POLL_INTERVAL, Reloader};
 use mcpgw_core::runtime::GatewayRecord;
+use mcpgw_core::upgrade::{self, UpgradeRestart};
 use mcpgw_core::upstream::UpstreamManager;
+
+/// How long the gateway keeps draining before it stands aside for a new
+/// binary. The point of the restart is to be over quickly, and an SSE stream
+/// a client is parked on would otherwise hold the old build up for as long
+/// as that client cares to stay.
+const UPGRADE_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(clap::Args)]
 pub struct ServeArgs {
@@ -28,6 +35,12 @@ pub struct ServeArgs {
     /// Do not write the JSONL traffic log
     #[arg(long)]
     pub no_capture: bool,
+    /// Set by `mcpgw daemon install` in the service definition, never by
+    /// hand: it makes the gateway end itself when its own binary is
+    /// upgraded, which is only safe under something that will start it
+    /// again. See `mcpgw_core::upgrade`.
+    #[arg(long, hide = true)]
+    pub supervised: bool,
 }
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
@@ -36,28 +49,8 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 
     let selected = select(args, &config, &config_path)?;
 
-    // The same classification `mcpgw daemon` refuses to install past, so a
-    // bind that only warns here can never quietly become one that passes there.
-    if !mcpgw_core::daemon::is_loopback(&args.bind) {
-        eprintln!(
-            "warning: binding to {} without any authentication — anyone who can reach \
-             this address can call your MCP servers; keep it behind a trusted network \
-             or reverse proxy until the auth milestone lands",
-            args.bind
-        );
-    }
-
-    let capture = if args.no_capture {
-        None
-    } else {
-        let state_dir = mcpgw_core::paths::state_dir()
-            .context("cannot determine a home directory to resolve the state directory")?;
-        Some(Arc::new(CaptureWriter::under_state_dir(&state_dir)))
-    };
-    let capture_note = match &capture {
-        Some(writer) => format!("capturing traffic to {}", writer.dir().display()),
-        None => "traffic capture disabled (--no-capture)".to_owned(),
-    };
+    warn_if_reachable(&args.bind);
+    let (capture, capture_note) = capture_writer(args.no_capture)?;
 
     // Started empty and filled by the first `apply` below, so the servers
     // present at boot arrive through exactly the code path a reload uses.
@@ -106,28 +99,15 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         // Published only once the listener is bound, so `--port 0` records
         // the port the kernel actually handed out rather than the zero it
         // asked for.
-        let state_dir = publish_record(&args.bind, addr.port());
-        let shape = if pipe {
-            format!("piping {:?}", serving.join(", "))
-        } else {
-            format!(
-                "aggregating {} server(s): {}",
-                serving.len(),
-                serving.join(", ")
-            )
-        };
-        println!("mcpgw gateway listening on http://{addr}/mcp — {shape}");
-        let urls: Vec<String> = serving
-            .iter()
-            .map(|name| format!("http://{addr}{}", endpoint_path(name)))
-            .collect();
-        println!("per-server endpoints: {}", urls.join(", "));
-        println!("{capture_note}");
+        let (state_dir, record) = publish_record(&args.bind, addr.port(), args.supervised).unzip();
+        print_banner(addr, pipe, &serving, &capture_note);
 
         // `notify_one` rather than `notify_waiters`: it leaves a permit
         // behind, so the watcher is stopped even if Ctrl-C lands while it is
-        // between two `select!` registrations.
+        // between two `select!` registrations. One notify per watcher, since
+        // a permit is handed to a single waiter.
         let stop = Arc::new(tokio::sync::Notify::new());
+        let stop_upgrades = Arc::new(tokio::sync::Notify::new());
         let watcher = tokio::spawn({
             let stop = Arc::clone(&stop);
             async move {
@@ -137,47 +117,234 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             }
         });
 
-        let shutdown = {
-            let stop = Arc::clone(&stop);
+        let (decision, decided) = tokio::sync::watch::channel(None);
+        let exe_watcher = args.supervised.then(|| {
+            watch_for_upgrades(
+                state_dir.as_deref(),
+                record.as_ref().and_then(|r| r.last_upgrade_restart.clone()),
+                Arc::clone(&stop_upgrades),
+                decision,
+            )
+        });
+
+        let shutdown = shutdown_signal(
+            Arc::clone(&stop),
+            Arc::clone(&stop_upgrades),
+            decided.clone(),
+        );
+        let mut served = std::pin::pin!(serve_http_with(
+            gateway,
+            Some(endpoints),
+            listener,
+            shutdown
+        ));
+        let drain = {
+            let mut decided = decided.clone();
             async move {
-                let _ = tokio::signal::ctrl_c().await;
-                println!("\nshutting down");
-                stop.notify_one();
+                upgrade_decided(&mut decided).await;
+                tokio::time::sleep(UPGRADE_DRAIN).await;
             }
         };
-        let served = serve_http_with(gateway, Some(endpoints), listener, shutdown).await;
+        // Only the upgrade path is ever cut short: `drain` cannot resolve
+        // before the watcher has decided, and a Ctrl-C shutdown is allowed
+        // to take as long as its clients need.
+        let served = tokio::select! {
+            result = &mut served => Some(result),
+            () = drain => None,
+        };
         // Covers the paths Ctrl-C did not take (a bind that dies under us):
-        // the watcher must not outlive the gateway it reloads.
+        // neither watcher may outlive the gateway it watches for.
         stop.notify_one();
+        stop_upgrades.notify_one();
         let _ = watcher.await;
+        if let Some(exe_watcher) = exe_watcher {
+            let _ = exe_watcher.await;
+        }
+
+        let restart = decided.borrow().clone();
+        if let Some(restart) = restart {
+            stand_aside(restart, state_dir.as_deref(), record, &manager).await;
+        }
+
         // Withdrawn before the error is propagated: this gateway is gone
         // either way, and a record left behind by a bind that died under us
         // is exactly the stale one readers should not have to reason about.
         if let Some(dir) = &state_dir {
             mcpgw_core::runtime::remove_record(dir, addr.port());
         }
-        served?;
+        if let Some(served) = served {
+            served?;
+        }
         // Ctrl-C fell through the graceful shutdown: kill the children too.
         manager.shutdown().await;
         Ok(())
     })
 }
 
+/// Says once, loudly, that this gateway is reachable by other people.
+///
+/// The same classification `mcpgw daemon` refuses to install past, so a bind
+/// that only warns here can never quietly become one that passes there.
+fn warn_if_reachable(bind: &str) {
+    if !mcpgw_core::daemon::is_loopback(bind) {
+        eprintln!(
+            "warning: binding to {bind} without any authentication — anyone who can reach \
+             this address can call your MCP servers; keep it behind a trusted network \
+             or reverse proxy until the auth milestone lands"
+        );
+    }
+}
+
+/// The traffic log this gateway writes, with the banner line that says where
+/// it goes — or that there is none.
+fn capture_writer(disabled: bool) -> anyhow::Result<(Option<Arc<CaptureWriter>>, String)> {
+    if disabled {
+        return Ok((None, "traffic capture disabled (--no-capture)".to_owned()));
+    }
+    let state_dir = mcpgw_core::paths::state_dir()
+        .context("cannot determine a home directory to resolve the state directory")?;
+    let writer = CaptureWriter::under_state_dir(&state_dir);
+    let note = format!("capturing traffic to {}", writer.dir().display());
+    Ok((Some(Arc::new(writer)), note))
+}
+
+/// The three lines a gateway prints once it is listening.
+fn print_banner(addr: std::net::SocketAddr, pipe: bool, serving: &[String], capture_note: &str) {
+    let shape = if pipe {
+        format!("piping {:?}", serving.join(", "))
+    } else {
+        format!(
+            "aggregating {} server(s): {}",
+            serving.len(),
+            serving.join(", ")
+        )
+    };
+    println!("mcpgw gateway listening on http://{addr}/mcp — {shape}");
+    let urls: Vec<String> = serving
+        .iter()
+        .map(|name| format!("http://{addr}{}", endpoint_path(name)))
+        .collect();
+    println!("per-server endpoints: {}", urls.join(", "));
+    println!("{capture_note}");
+}
+
+/// Starts the watcher that ends this gateway when the binary underneath it
+/// is replaced, publishing its verdict through `decision`.
+fn watch_for_upgrades(
+    state_dir: Option<&std::path::Path>,
+    guard: Option<UpgradeRestart>,
+    stop: Arc<tokio::sync::Notify>,
+    decision: tokio::sync::watch::Sender<Option<UpgradeRestart>>,
+) -> tokio::task::JoinHandle<()> {
+    let exe = upgrade::watched_exe(state_dir).unwrap_or_default();
+    let watcher = upgrade::Watcher::new(exe, upgrade::stamp).with_guard(guard);
+    // On stderr, which is where the daemon's log is: it is the one line that
+    // says which of two plausible paths — the installed service's or this
+    // process's own image — an upgrade has to land on to be noticed.
+    eprintln!(
+        "watching {} for an upgrade; a new binary there restarts this gateway",
+        watcher.path().display()
+    );
+    tokio::spawn(async move {
+        let ended = watcher
+            .watch(upgrade::POLL_INTERVAL, async move { stop.notified().await })
+            .await;
+        if let Some(restart) = ended {
+            let _ = decision.send(Some(restart));
+        }
+    })
+}
+
+/// Ends this process so its supervisor starts the binary that replaced it.
+///
+/// The runtime record is left in place rather than withdrawn: another gateway
+/// is about to come up on this port within seconds, and the restart written
+/// into the record here is the only thing that will stop *that* one from
+/// standing aside for the same binary all over again.
+async fn stand_aside(
+    restart: UpgradeRestart,
+    state_dir: Option<&std::path::Path>,
+    record: Option<GatewayRecord>,
+    manager: &UpstreamManager,
+) -> ! {
+    if let (Some(dir), Some(mut record)) = (state_dir, record) {
+        record.last_upgrade_restart = Some(restart);
+        if let Err(err) = mcpgw_core::runtime::write_record(dir, &record) {
+            eprintln!(
+                "warning: could not record this restart, so the gateway that replaces this one \
+                 may restart for the same binary again: {:#}",
+                anyhow::Error::from(err)
+            );
+        }
+    }
+    // Bounded like the drain, and for the same reason: a stdio server that
+    // will not die must not keep the old binary running.
+    let _ = tokio::time::timeout(UPGRADE_DRAIN, manager.shutdown()).await;
+    std::process::exit(i32::from(upgrade::UPGRADE_EXIT));
+}
+
+/// What the HTTP server drains on: Ctrl-C, or the exe watcher deciding this
+/// gateway must stand aside for the binary that replaced it. Either way both
+/// watchers are stopped on the way out.
+async fn shutdown_signal(
+    stop: Arc<tokio::sync::Notify>,
+    stop_upgrades: Arc<tokio::sync::Notify>,
+    mut decided: tokio::sync::watch::Receiver<Option<UpgradeRestart>>,
+) {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => println!("\nshutting down"),
+        // Announced by the watcher already, which is the only party that
+        // can say which binary changed.
+        () = upgrade_decided(&mut decided) => {}
+    }
+    stop.notify_one();
+    stop_upgrades.notify_one();
+}
+
+/// Resolves once the exe watcher has decided this gateway must stand aside.
+///
+/// A channel with no senders left — which is every run without
+/// `--supervised`, where the watcher was never spawned — never resolves.
+/// That is the whole difference the flag makes at this end.
+async fn upgrade_decided(upgraded: &mut tokio::sync::watch::Receiver<Option<UpgradeRestart>>) {
+    if upgraded.wait_for(Option::is_some).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Publishes what this gateway is, returning the state directory it went
-/// into so the shutdown path can withdraw it again.
+/// into — so the shutdown path can withdraw the record again — and the
+/// record itself, which the upgrade path amends rather than rebuilds.
 ///
 /// A state directory that cannot be written costs a later `status` its
 /// version comparison; it is not worth costing the user their gateway, so
 /// the failure is said once and serving continues.
-fn publish_record(bind: &str, port: u16) -> Option<std::path::PathBuf> {
+fn publish_record(
+    bind: &str,
+    port: u16,
+    supervised: bool,
+) -> Option<(std::path::PathBuf, GatewayRecord)> {
     let dir = mcpgw_core::paths::state_dir()?;
-    if let Err(err) = mcpgw_core::runtime::write_record(&dir, &runtime_record(bind, port)) {
+    let mut record = runtime_record(bind, port);
+    // Read before it is overwritten. A supervised gateway is very often the
+    // successor of one that stood aside for an upgrade, and the restart that
+    // predecessor recorded is the only reason this one will not do the same
+    // thing to the same binary. A foreground `serve` on the same port
+    // inherits nothing: it never restarts itself, so a guard it dragged
+    // forward would only go stale.
+    if supervised {
+        record.last_upgrade_restart = mcpgw_core::runtime::read_record(&dir, port)
+            .ok()
+            .flatten()
+            .and_then(|previous| previous.last_upgrade_restart);
+    }
+    if let Err(err) = mcpgw_core::runtime::write_record(&dir, &record) {
         eprintln!(
             "warning: could not record what this gateway is running: {:#}",
             anyhow::Error::from(err)
         );
     }
-    Some(dir)
+    Some((dir, record))
 }
 
 /// What this process publishes about itself while it is serving.
@@ -200,6 +367,9 @@ fn runtime_record(bind: &str, port: u16) -> GatewayRecord {
         started_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs()),
+        // Filled in by `publish_record` from what the previous gateway on
+        // this port left behind, if anything did.
+        last_upgrade_restart: None,
     }
 }
 

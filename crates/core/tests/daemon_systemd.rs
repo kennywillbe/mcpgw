@@ -113,7 +113,7 @@ fn the_unit_is_rendered_exactly() {
             "Environment=MCPGW_CONFIG=/home/u/.config/mcpgw/config.toml\n",
             "Environment=MCPGW_STATE_DIR=/home/u/.local/share/mcpgw\n",
             "Environment=PATH=/home/u/.local/bin:/usr/bin:/bin\n",
-            "ExecStart=/usr/local/bin/mcpgw serve --bind 127.0.0.1 --port 8137\n",
+            "ExecStart=/usr/local/bin/mcpgw serve --bind 127.0.0.1 --port 8137 --supervised\n",
             "Restart=on-failure\n",
             "RestartSec=2\n",
             "StandardOutput=append:/home/u/.local/share/mcpgw/logs/daemon.out.log\n",
@@ -145,7 +145,9 @@ fn a_space_is_quoted_and_a_percent_is_doubled_for_the_unit_parser() {
     let unit = render_unit(&spec, Some("/home/100% sure/bin"));
 
     assert!(
-        unit.contains("ExecStart=\"/opt/my tools/mcpgw\" serve --bind 127.0.0.1 --port 8137\n"),
+        unit.contains(
+            "ExecStart=\"/opt/my tools/mcpgw\" serve --bind 127.0.0.1 --port 8137 --supervised\n"
+        ),
         "{unit}"
     );
     assert!(
