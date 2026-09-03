@@ -72,6 +72,9 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
             cx.color,
         ));
     }
+    if let Some(line) = project_line() {
+        bullets.push(ui::dim(&line, cx.color));
+    }
 
     let heading = if rows.is_empty() {
         "Looking around — no MCP client is installed on this machine yet.".to_owned()
@@ -99,4 +102,36 @@ fn servers_cell(kind: ClientKind, path: &std::path::Path) -> String {
         },
         Err(_) => "unreadable".to_owned(),
     }
+}
+
+/// The one line about repo-local MCP configs, or nothing when the working
+/// directory has none.
+///
+/// Said here because the wizard's first promise is that it will name what it
+/// found, and a `.mcp.json` sitting in the repo is exactly the thing a user
+/// would otherwise assume the sync step took care of. It is dim and it is one
+/// line: nothing in the wizard acts on these files, so a bigger say than that
+/// would be a promise it cannot keep.
+fn project_line() -> Option<String> {
+    let found = mcpgw_core::projects::discover_cwd();
+    if found.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = found
+        .iter()
+        .map(|config| {
+            config
+                .path
+                .strip_prefix(&config.dir)
+                .unwrap_or(&config.path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    let servers: usize = found.iter().map(|config| config.read.servers.len()).sum();
+    let plural = if servers == 1 { "server" } else { "servers" };
+    Some(format!(
+        "also found {} in this repo with {servers} {plural}; project files are not managed yet",
+        names.join(", ")
+    ))
 }

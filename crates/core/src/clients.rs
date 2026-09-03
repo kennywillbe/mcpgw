@@ -336,6 +336,47 @@ impl ClientKind {
         names.iter().map(|name| dir.join(name)).collect()
     }
 
+    /// Where this client looks for a repo-local MCP config, relative to a
+    /// project directory and always spelled with `/`.
+    ///
+    /// Empty for a client with no documented project-level file — most of
+    /// them. A file listed here is read with the same [`ClientKind::codec`]
+    /// as the home-dir one, which is what makes the whole feature a path
+    /// list rather than a second set of adapters: every client that has both
+    /// spells them identically, VS Code's `servers` and Claude Code's
+    /// `mcpServers` included.
+    ///
+    /// Discovery only — [`crate::projects`] reads these and nothing writes
+    /// them. `sync` still owns the home-dir file alone.
+    #[must_use]
+    pub fn project_config_names(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &[".mcp.json"],
+            Self::Cursor => &[".cursor/mcp.json"],
+            Self::VsCode => &[".vscode/mcp.json"],
+            Self::Gemini => &[".gemini/settings.json"],
+            // Both spellings are first-class in a project the same way they
+            // are in the config dir.
+            Self::Opencode => &["opencode.json", "opencode.jsonc"],
+            // Codex loads a project file only for a project the user has
+            // marked trusted. Reading one it would ignore is still worth
+            // reporting: the file is there, and it is live the moment that
+            // trust is given.
+            Self::Codex => &[".codex/config.toml"],
+            Self::Amp => &[".amp/settings.json"],
+            // Zoo Code kept the `.roo` directory of the project it forked
+            // rather than renaming it, so this is not a typo.
+            Self::ZooCode => &[".roo/mcp.json"],
+            // Windsurf, both Cline surfaces and Claude Desktop read MCP
+            // servers from one per-user file only; a repo can carry
+            // instructions for them, not servers. Zed is here because its
+            // project settings are documented without saying whether
+            // `context_servers` is one of the keys they may carry — an
+            // unverified path would report a file mcpgw cannot vouch for.
+            Self::ClaudeDesktop | Self::Windsurf | Self::Zed | Self::Cline | Self::ClineCli => &[],
+        }
+    }
+
     /// A path whose existence indicates the client is installed at all,
     /// independent of MCP configuration.
     #[must_use]

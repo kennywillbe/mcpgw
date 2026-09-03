@@ -386,3 +386,29 @@ pub fn classify_gateway_failure(message: &str) -> GatewayFault {
         detail.to_owned()
     })
 }
+
+/// The one finding for a repo-local config holding entries `sync` will not
+/// touch.
+///
+/// A warning, not an error: the entries work, and two live paths to the same
+/// server is a thing a team may well have chosen. What it is not is
+/// invisible.
+///
+/// The message names no flag because there is none. `mcpgw import` reads a
+/// client's per-user file and only that, so there is nothing to run yet —
+/// saying so is more useful than inventing a command that would fail.
+#[must_use]
+pub fn project_unmanaged(client: &str, path: &std::path::Path, count: usize) -> Finding {
+    let entries = if count == 1 { "entry" } else { "entries" };
+    Finding {
+        client: Some(client.to_owned()),
+        server: None,
+        severity: Severity::Warning,
+        message: format!(
+            "{} holds {count} direct MCP {entries} mcpgw does not manage — \
+             `mcpgw import` cannot read project files yet, so `mcpgw sync` \
+             leaves them live alongside the gateway",
+            path.display()
+        ),
+    }
+}

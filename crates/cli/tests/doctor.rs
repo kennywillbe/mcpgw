@@ -9,12 +9,20 @@ use util::fixture_binary;
 /// Runs doctor in a fully sandboxed home: every env key any adapter looks at
 /// points into the temp dir, so the real machine never leaks into the test.
 fn run_doctor(home: &Path, config_text: Option<&str>, args: &[&str]) -> Output {
+    run_doctor_in(home, home, config_text, args)
+}
+
+/// The same run from a working directory of the test's choosing — the
+/// project-config pass reports what is around the cwd, so a test about it
+/// has to say where the process stands.
+fn run_doctor_in(home: &Path, cwd: &Path, config_text: Option<&str>, args: &[&str]) -> Output {
     let config = home.join("config.toml");
     if let Some(text) = config_text {
         std::fs::write(&config, text).unwrap();
     }
     Command::cargo_bin("mcpgw")
         .unwrap()
+        .current_dir(cwd)
         // Hermetic: no test may phone home for a version notice.
         .env("MCPGW_NO_UPDATE_CHECK", "1")
         .arg("doctor")
@@ -501,4 +509,104 @@ fn without_managed_gateway_entries_there_is_no_gateway_section() {
     // never ran `sync` gets no new noise.
     assert!(value.get("gateway").is_none(), "{value}");
     assert_eq!(value["errors"], 0);
+}
+
+/// A repo holding one entry the canonical config already speaks for and one
+/// it does not — the split the project section exists to report.
+fn fake_repo(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(
+        repo.join(".mcp.json"),
+        r#"{"mcpServers": {"build": {"command": "cargo"}, "scratch": {"command": "cargo", "args": ["run"]}}}"#,
+    )
+    .unwrap();
+    repo
+}
+
+#[test]
+fn project_configs_get_their_own_section() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = fake_repo(workspace.path());
+
+    let out = run_doctor_in(home.path(), &repo, Some(HEALTHY), &[]);
+    let text = stdout(&out);
+    // Warnings only: the entries work, they are just nobody's to move.
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("project configs"), "{text}");
+    assert!(text.contains(".mcp.json"), "{text}");
+    assert!(text.contains("Claude Code, 2 servers"), "{text}");
+    assert!(text.contains("build: mirrors canonical"), "{text}");
+    assert!(
+        text.contains("scratch: not managed: direct entry stays live after sync"),
+        "{text}"
+    );
+    assert!(
+        text.contains("holds 1 direct MCP entry mcpgw does not manage"),
+        "{text}"
+    );
+    assert!(
+        text.contains("`mcpgw import` cannot read project files yet"),
+        "{text}"
+    );
+}
+
+/// The section is about the repo the user is standing in, so a run from
+/// anywhere else must not mention it at all.
+#[test]
+fn a_directory_with_no_project_config_gets_no_section() {
+    let home = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+
+    let out = run_doctor_in(home.path(), empty.path(), Some(HEALTHY), &[]);
+    let text = stdout(&out);
+    assert!(!text.contains("project configs"), "{text}");
+    assert!(text.contains("0 errors, 0 warnings"), "{text}");
+}
+
+#[test]
+fn json_lists_project_configs_and_their_standing() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = fake_repo(workspace.path());
+
+    let out = run_doctor_in(home.path(), &repo, Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let projects = value["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["client_id"], "claude-code");
+    assert_eq!(projects[0]["unmanaged"], 1);
+    assert_eq!(
+        projects[0]["servers"],
+        serde_json::json!([
+            { "name": "build", "mirrors_canonical": true },
+            { "name": "scratch", "mirrors_canonical": false },
+        ])
+    );
+    // The warning joins the one findings array, the way the gateway pass's
+    // findings do — a consumer counting problems reads one place.
+    assert_eq!(value["warnings"], 1);
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding["client"] == "Claude Code"
+                && finding["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("direct MCP entry"))
+        }),
+        "{findings:?}"
+    );
+}
+
+/// An empty array rather than a missing key: "no project configs" and "an
+/// mcpgw that does not look" have to be different answers.
+#[test]
+fn json_always_carries_the_projects_array() {
+    let home = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+
+    let out = run_doctor_in(home.path(), empty.path(), Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(value["projects"], serde_json::json!([]));
 }
