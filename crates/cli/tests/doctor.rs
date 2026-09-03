@@ -721,10 +721,12 @@ fn the_project_section_separates_managed_entries_from_the_rest() {
     let repo = fake_repo(workspace.path());
 
     // The record a `sync --project` leaves: `build` is mcpgw's, `scratch`
-    // is the repo's own. Keyed by the resolved path, because that is what
-    // the running process gets back for its own working directory and so
-    // what the state file it writes will hold.
-    let repo = std::fs::canonicalize(&repo).unwrap();
+    // is the repo's own. Keyed through the same normalisation the product
+    // keys by, which is the only spelling a state file ever holds — on
+    // Windows a bare `canonicalize` here would write the verbatim
+    // `\\?\C:\...` form the running process never sees for its own cwd.
+    let repo = mcpgw_core::paths::normalize(&repo);
+    let key = mcpgw_core::paths::normalize(&repo.join(".mcp.json"));
     let state = home.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(
@@ -732,7 +734,7 @@ fn the_project_section_separates_managed_entries_from_the_rest() {
         serde_json::json!({
             "clients": {},
             "files": {
-                repo.join(".mcp.json").to_string_lossy(): {
+                key.to_string_lossy(): {
                     "client": "claude-code",
                     "managed": ["build"],
                 },
