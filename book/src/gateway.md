@@ -254,5 +254,28 @@ mcpgw connect --server github --url http://127.0.0.1:9000/mcp
 gateway is and the server's endpoint is resolved on it — which is what `sync`
 writes for a stdio-only client.
 
-`sync` writes this for you; you rarely type it. If the gateway isn't running, the client sees a plain message saying so and telling you to start it
-— not a transport error.
+`sync` writes this for you; you rarely type it.
+
+If nothing is listening when the bridge starts, and the address is loopback,
+`connect` serves a gateway itself for as long as the client keeps the bridge
+open, and says so on stderr — which is where the client's MCP log is:
+
+```text
+mcpgw connect: no gateway at http://127.0.0.1:8137/s/github; serving one for this session (install a service with `mcpgw daemon install` to keep it running)
+```
+
+That gateway is the same one `mcpgw serve` raises — every enabled server, the
+aggregate on `/mcp`, a face per server, the config watched for edits — and it
+goes away when the client quits, taking your stdio servers with it. It is the
+fallback, not the arrangement: `mcpgw daemon install` gives you one gateway
+that every client shares and that survives the client restarting.
+
+Two clients launching their bridges at the same moment is fine. Only one can
+bind the port; the other notices, waits for it, and bridges to it.
+
+Two cases where the bridge starts nothing. A service is installed on that port
+and is not running — the bridge says `the installed service is not running` and
+points at `mcpgw daemon start`, because a gateway the supervisor does not know
+about would only mask that. And a port held by something that is not a gateway,
+which fails the way it always did. Either way the client sees a plain message
+saying what to start — not a transport error.

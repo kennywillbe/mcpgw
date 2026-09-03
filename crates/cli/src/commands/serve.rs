@@ -74,44 +74,14 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     let selected = select(args, &config, &config_path)?;
 
     warn_if_reachable(&args.bind);
-    let (capture, capture_note) = capture_writer(args.no_capture)?;
-
-    // Started empty and filled by the first `apply` below, so the servers
-    // present at boot arrive through exactly the code path a reload uses.
-    // One construction site means an added server cannot end up served
-    // differently from one that was in the config all along.
-    let manager = Arc::new(UpstreamManager::new(std::collections::BTreeMap::new()));
-    let endpoints = Endpoints::new(EndpointTable::new(Vec::new()));
-    let mut reloader = Reloader::new(config_path, Arc::clone(&manager), endpoints.clone());
-    if !args.server.is_empty() {
-        reloader = reloader.with_selection(selected.clone());
-    }
-    if let Some(writer) = &capture {
-        reloader = reloader.with_capture(Arc::clone(writer));
-    }
-
-    // One explicit --server keeps the M9 shape: a pure pipe with untouched
-    // tool names. Everything else aggregates under `server__tool`.
-    let (gateway, pipe) = match selected.as_slice() {
-        [single] if !args.server.is_empty() => {
-            (Gateway::new(Arc::clone(&manager), single.clone()), true)
-        }
-        _ => {
-            // The aggregate's list is shared with the reloader rather than
-            // fixed here: a server added later has to appear on `/mcp` too,
-            // and the `/mcp` service is built once, for the whole process.
-            let servers = ServerList::new(Vec::new());
-            reloader = reloader.with_aggregate(servers.clone());
-            (
-                Gateway::aggregate_shared(Arc::clone(&manager), servers),
-                false,
-            )
-        }
-    };
-    let gateway = match &capture {
-        Some(writer) => gateway.with_capture(Arc::clone(writer)),
-        None => gateway,
-    };
+    let Built {
+        manager,
+        endpoints,
+        reloader,
+        gateway,
+        pipe,
+        capture_note,
+    } = build(config_path, &args.server, &selected, args.no_capture)?;
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
@@ -201,6 +171,81 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         // Ctrl-C fell through the graceful shutdown: kill the children too.
         manager.shutdown().await;
         Ok(())
+    })
+}
+
+/// Everything a gateway needs before it can be handed a listener.
+///
+/// Named and returned as a whole so `connect` can raise the same gateway
+/// in-process as `serve` does: a bridge that starts its own must serve what
+/// the daemon would have served, down to the reload behaviour, or the two
+/// ways of reaching mcpgw quietly become two products.
+pub(crate) struct Built {
+    pub(crate) manager: Arc<UpstreamManager>,
+    pub(crate) endpoints: Endpoints,
+    pub(crate) reloader: Reloader,
+    pub(crate) gateway: Gateway,
+    /// Whether `/mcp` is one server's unprefixed pipe rather than the
+    /// aggregate. Only the banner cares.
+    pub(crate) pipe: bool,
+    pub(crate) capture_note: String,
+}
+
+/// Builds that gateway. `selection` is what the user asked for by name (empty
+/// means "every enabled server") and `selected` is what [`select`] resolved
+/// it to.
+pub(crate) fn build(
+    config_path: std::path::PathBuf,
+    selection: &[String],
+    selected: &[String],
+    no_capture: bool,
+) -> anyhow::Result<Built> {
+    let (capture, capture_note) = capture_writer(no_capture)?;
+
+    // Started empty and filled by the first `apply` in the caller, so the
+    // servers present at boot arrive through exactly the code path a reload
+    // uses. One construction site means an added server cannot end up served
+    // differently from one that was in the config all along.
+    let manager = Arc::new(UpstreamManager::new(std::collections::BTreeMap::new()));
+    let endpoints = Endpoints::new(EndpointTable::new(Vec::new()));
+    let mut reloader = Reloader::new(config_path, Arc::clone(&manager), endpoints.clone());
+    if !selection.is_empty() {
+        reloader = reloader.with_selection(selected.to_vec());
+    }
+    if let Some(writer) = &capture {
+        reloader = reloader.with_capture(Arc::clone(writer));
+    }
+
+    // One explicit --server keeps the M9 shape: a pure pipe with untouched
+    // tool names. Everything else aggregates under `server__tool`.
+    let (gateway, pipe) = match selected {
+        [single] if !selection.is_empty() => {
+            (Gateway::new(Arc::clone(&manager), single.clone()), true)
+        }
+        _ => {
+            // The aggregate's list is shared with the reloader rather than
+            // fixed here: a server added later has to appear on `/mcp` too,
+            // and the `/mcp` service is built once, for the whole process.
+            let servers = ServerList::new(Vec::new());
+            reloader = reloader.with_aggregate(servers.clone());
+            (
+                Gateway::aggregate_shared(Arc::clone(&manager), servers),
+                false,
+            )
+        }
+    };
+    let gateway = match &capture {
+        Some(writer) => gateway.with_capture(Arc::clone(writer)),
+        None => gateway,
+    };
+
+    Ok(Built {
+        manager,
+        endpoints,
+        reloader,
+        gateway,
+        pipe,
+        capture_note,
     })
 }
 
@@ -414,7 +459,7 @@ async fn upgrade_decided(upgraded: &mut tokio::sync::watch::Receiver<Option<Upgr
 /// A state directory that cannot be written costs a later `status` its
 /// version comparison; it is not worth costing the user their gateway, so
 /// the failure is said once and serving continues.
-fn publish_record(
+pub(crate) fn publish_record(
     bind: &str,
     port: u16,
     supervised: bool,
@@ -468,6 +513,31 @@ fn runtime_record(bind: &str, port: u16) -> GatewayRecord {
     }
 }
 
+/// Every enabled server in `config`, which is what a gateway serves when
+/// nobody named one — `serve` without `--server`, and the gateway `connect`
+/// raises for itself.
+///
+/// # Errors
+///
+/// Fails when there is nothing to serve: a gateway with no servers answers
+/// every client with an empty tool list, which is worse than a refusal that
+/// names the file.
+pub(crate) fn enabled_servers(
+    config: &Config,
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    let enabled: Vec<String> = config
+        .servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if enabled.is_empty() {
+        bail!("no enabled servers in {}", path.display());
+    }
+    Ok(enabled)
+}
+
 /// The servers to serve at startup, refusing the mistakes worth refusing.
 ///
 /// Strict where a reload is lenient, and deliberately so: a typo in
@@ -480,16 +550,7 @@ fn select(
     path: &std::path::Path,
 ) -> anyhow::Result<Vec<String>> {
     if args.server.is_empty() {
-        let enabled: Vec<String> = config
-            .servers
-            .iter()
-            .filter(|(_, server)| server.enabled)
-            .map(|(name, _)| name.clone())
-            .collect();
-        if enabled.is_empty() {
-            bail!("no enabled servers in {}", path.display());
-        }
-        return Ok(enabled);
+        return enabled_servers(config, path);
     }
     for name in &args.server {
         let Some(server) = config.servers.get(name) else {
