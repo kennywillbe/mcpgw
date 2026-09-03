@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod state;
 pub mod store;
 pub mod sync;
+pub mod upgrade;
 pub mod upstream;
 
 pub use clients::{ClientKind, ClientRead, Detection, Problem};

@@ -73,6 +73,7 @@ fn the_gateway_record_is_owner_only_under_an_owner_only_dir() {
         bind: "127.0.0.1".to_owned(),
         port: 8137,
         started_at: 1_700_000_000,
+        last_upgrade_restart: None,
     };
 
     mcpgw_core::runtime::write_record(&state, &record).unwrap();

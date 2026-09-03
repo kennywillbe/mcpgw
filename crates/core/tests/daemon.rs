@@ -121,7 +121,14 @@ fn a_spec_names_the_url_and_the_serve_arguments_a_service_will_run() {
     assert_eq!(loopback.authority(), "127.0.0.1:8137");
     assert_eq!(
         loopback.serve_args(),
-        ["serve", "--bind", "127.0.0.1", "--port", "8137"]
+        [
+            "serve",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "8137",
+            "--supervised"
+        ]
     );
     // An IPv6 literal has to come back bracketed or the URL is unparseable.
     assert_eq!(spec("::1", 9000, dir.path()).url(), "http://[::1]:9000/mcp");

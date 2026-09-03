@@ -117,7 +117,7 @@ Type=simple
 Environment=MCPGW_CONFIG=/home/you/.config/mcpgw/config.toml
 Environment=MCPGW_STATE_DIR=/home/you/.local/share/mcpgw
 Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/you/.local/bin/mcpgw serve --bind 127.0.0.1 --port 8137
+ExecStart=/home/you/.local/bin/mcpgw serve --bind 127.0.0.1 --port 8137 --supervised
 Restart=on-failure
 RestartSec=2
 StandardOutput=append:/home/you/.local/share/mcpgw/logs/daemon.out.log
@@ -127,8 +127,12 @@ StandardError=append:/home/you/.local/share/mcpgw/logs/daemon.err.log
 WantedBy=default.target
 ```
 
-Three of those lines are decisions rather than defaults:
+Four of those lines are decisions rather than defaults:
 
+- **`--supervised` on the serve command.** It is what makes an upgrade of
+  the binary itself get picked up without a reinstall — see *After an
+  upgrade* below. It appears here rather than in anything you type, because
+  it only makes sense under something that will start the gateway again.
 - **`Type=simple`, and no readiness notification.** sd-notify would mean a
   dependency and a socket protocol to assert something `mcpgw daemon status`
   already checks better — by asking the gateway for an HTTP response on the
@@ -255,6 +259,31 @@ mean mcpgw asking for and storing your password, which it will not do. So:
 
 If that trade is wrong for you, `mcpgw serve` in a terminal is the same
 gateway with none of it.
+
+## After an upgrade
+
+An upgrade in place — `brew upgrade mcpgw`, `cargo install mcpgw`, `mcpgw
+self-update` — writes a new binary at the same path the service was installed
+with, and no service manager notices: launchd, systemd and the Windows
+service manager all restart a job that *ends*, not one whose file changed
+underneath it. So the gateway watches that file itself. When it is replaced,
+the gateway says so and exits with a failing status, and the supervisor
+starts the new one a couple of seconds later:
+
+```text
+the mcpgw binary at /opt/homebrew/bin/mcpgw changed; restarting so the service runs it (see mcpgw daemon logs)
+```
+
+Three things about that are worth knowing:
+
+- **Only the service does it.** A gateway you started in a terminal keeps
+  running whatever it was started with, because nothing would bring it back.
+- **A service installed by an older mcpgw does not do it yet.** Run `mcpgw
+  daemon install` once and it will.
+- **It restarts once per binary.** The gateway writes down which one it stood
+  aside for, so an upgrade that will not come up cannot be turned into a
+  restart loop. Past that, the throttling is the supervisor's own — a binary
+  that cannot start at all is a question for `mcpgw daemon logs`.
 
 ## After mcpgw itself moves
 

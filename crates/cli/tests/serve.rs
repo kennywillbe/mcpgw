@@ -219,3 +219,184 @@ async fn a_clean_shutdown_withdraws_the_record() {
         None
     );
 }
+
+/// A copy of the binary under test, outside the target directory.
+///
+/// The two tests below replace the file they run, and the file cargo built
+/// is the one every other test in the run is about to execute. Unix only,
+/// for the same reason those two are.
+#[cfg(unix)]
+fn binary_copy(dir: &Path) -> std::path::PathBuf {
+    let copy = dir.join(format!("mcpgw{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(assert_cmd::cargo::cargo_bin("mcpgw"), &copy).unwrap();
+    copy
+}
+
+/// Publishes a new binary at `path` the way every real upgrade does: the
+/// bytes go to a sibling file and that file is renamed over the target.
+///
+/// Not a write in place, for two reasons. Linux refuses one against an image
+/// that is executing (`ETXTBSY`), which is exactly the situation the tests
+/// below set up; and a rename is what cargo, Homebrew and `self_replace` all
+/// do, so the signal under test is the real one — a new inode at the same
+/// path, whole from the first tick that sees it.
+fn replace_binary(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes.extend_from_slice(b"an upgrade");
+    let published = path.with_extension("new");
+    std::fs::write(&published, bytes).unwrap();
+    // Carried over so the replacement is a plausible binary rather than a
+    // 0644 file wearing its name.
+    let mode = std::fs::metadata(path).unwrap().permissions();
+    std::fs::set_permissions(&published, mode).unwrap();
+    std::fs::rename(&published, path).unwrap();
+}
+
+/// Waits for `needle` to show up on the gateway's stderr.
+///
+/// The line the exe watcher prints when it starts is the only signal that it
+/// has taken its baseline stamp — and a binary replaced before that baseline
+/// is simply the binary the gateway started with, which is not the situation
+/// any of these tests is about.
+async fn wait_for_stderr(errors: &std::sync::Mutex<String>, needle: &str) {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        let said = errors.lock().unwrap().clone();
+        if said.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gateway never said {needle:?} within {READY_DEADLINE:?}: {said}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Waits for the gateway to end, and says which line it ended on.
+async fn wait_for_exit(
+    child: &mut tokio::process::Child,
+    errors: &std::sync::Mutex<String>,
+) -> i32 {
+    let ended = tokio::time::timeout(READY_DEADLINE, child.wait()).await;
+    let status = ended.unwrap_or_else(|_| {
+        panic!(
+            "the gateway was still running after {READY_DEADLINE:?}: {}",
+            errors.lock().unwrap()
+        )
+    });
+    status.unwrap().code().expect("the gateway was signalled")
+}
+
+/// The whole point of the flag: an upgrade lands on disk, and the gateway
+/// gets out of the way with a status its supervisor restarts on.
+///
+/// Unix only, because the running image is what makes it safe to write over
+/// the file at all — Windows locks a binary that is executing, which is also
+/// why nothing there can produce this situation in the first place.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_supervised_gateway_stands_aside_when_its_binary_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = binary_copy(dir.path());
+    let state = dir.path().join("state");
+    write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
+    let (mut child, addr, _, errors) =
+        util::serve_binary(&copy, dir.path(), &["--supervised"]).await;
+    let port = port_of(&addr);
+    wait_for_record(&state, port).await;
+    wait_for_stderr(&errors, "watching").await;
+
+    replace_binary(&copy);
+
+    assert_eq!(
+        wait_for_exit(&mut child, &errors).await,
+        i32::from(mcpgw_core::upgrade::UPGRADE_EXIT)
+    );
+    let said = errors.lock().unwrap().clone();
+    assert!(
+        said.contains("changed; restarting so the service runs it"),
+        "{said}"
+    );
+
+    // Left behind rather than withdrawn: the gateway the supervisor starts
+    // next reads it to find out which binary it has already stood aside for,
+    // which is the only thing between a bad upgrade and a restart loop.
+    let record = mcpgw_core::runtime::read_record(&state, port)
+        .unwrap()
+        .expect("the record has to survive an upgrade restart");
+    let restart = record
+        .last_upgrade_restart
+        .expect("the restart has to be recorded for the process that replaces this one");
+    assert_eq!(restart.stamp.len, std::fs::metadata(&copy).unwrap().len());
+}
+
+/// The flag is the whole gate. A gateway somebody is running in a terminal
+/// must not disappear because a `cargo build` finished in another one.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_gateway_without_the_flag_serves_straight_through_a_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = binary_copy(dir.path());
+    write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
+    let (mut child, addr, _, _errors) = util::serve_binary(&copy, dir.path(), &[]).await;
+
+    replace_binary(&copy);
+    // The one fixed wait in this file, because the assertion is that nothing
+    // happens: there is no event to poll for, and a gateway that was going
+    // to react to the new binary would have done it within three polls.
+    tokio::time::sleep(3 * mcpgw_core::upgrade::POLL_INTERVAL).await;
+
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the gateway exited without being asked to supervise itself"
+    );
+    assert_eq!(
+        tool_names(&format!("http://{addr}/s/fx1")).await,
+        ["echo", "reverse"]
+    );
+
+    child.kill().await.unwrap();
+}
+
+/// Which binary is watched is not "the one this process is running": it is
+/// the one the supervisor will relaunch, which the installed spec names. The
+/// two differ exactly when it matters — a service installed against
+/// `/opt/homebrew/bin/mcpgw` runs a Cellar file no upgrade ever touches.
+#[tokio::test]
+async fn a_supervised_gateway_watches_the_binary_its_service_was_installed_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let installed = dir.path().join("installed-mcpgw");
+    // Never executed, only stat-ed: this stands for the path on a machine
+    // where the service was installed from somewhere the running image is
+    // not.
+    std::fs::write(&installed, b"the installed binary").unwrap();
+    let spec = mcpgw_core::daemon::DaemonSpec {
+        exe: installed.clone(),
+        config_path: dir.path().join("config.toml"),
+        state_dir: state.clone(),
+        bind: "127.0.0.1".to_owned(),
+        port: 8137,
+        logs: mcpgw_core::daemon::LogPaths::under_state_dir(&state),
+    };
+    mcpgw_core::daemon::save_spec(&spec).unwrap();
+    write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
+
+    let (mut child, _, _, errors) = util::serve_binary(
+        &assert_cmd::cargo::cargo_bin("mcpgw"),
+        dir.path(),
+        &["--supervised"],
+    )
+    .await;
+    wait_for_stderr(&errors, &installed.display().to_string()).await;
+
+    replace_binary(&installed);
+
+    assert_eq!(
+        wait_for_exit(&mut child, &errors).await,
+        i32::from(mcpgw_core::upgrade::UPGRADE_EXIT)
+    );
+    let said = errors.lock().unwrap().clone();
+    assert!(said.contains(&installed.display().to_string()), "{said}");
+}

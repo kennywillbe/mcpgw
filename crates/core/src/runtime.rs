@@ -48,6 +48,16 @@ pub struct GatewayRecord {
     pub port: u16,
     /// Unix seconds at which the record was written, which is startup.
     pub started_at: u64,
+    /// The last restart this gateway made for a replaced binary, carried
+    /// across that restart by the process the supervisor started next.
+    ///
+    /// A process that ends on purpose cannot keep a counter in memory, so
+    /// the one fact its successor needs — which binary it already stood
+    /// aside for, and when — travels through this file. [`None`] for a
+    /// gateway that has never done it, and for every record written by a
+    /// build from before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upgrade_restart: Option<crate::upgrade::UpgradeRestart>,
 }
 
 /// Where the gateway on `port` publishes its [`GatewayRecord`].

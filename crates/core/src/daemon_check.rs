@@ -252,6 +252,7 @@ mod tests {
                 bind: "127.0.0.1".to_owned(),
                 port,
                 started_at: 0,
+                last_upgrade_restart: None,
             },
         )
         .unwrap();
