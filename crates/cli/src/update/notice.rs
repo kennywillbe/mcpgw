@@ -42,6 +42,30 @@ pub fn print_if_due(current: &str) {
     }
 }
 
+/// Prints the notice from what the last check already found, without any
+/// network use and without touching the stamp.
+///
+/// For the callers that run after a command has failed: they must not add a
+/// request to a path the user is already unhappy with, and they must not
+/// spend today's check on it either — the exit-0 path stays the only thing
+/// that decides when to ask the release host again.
+pub fn print_cached(current: &str) {
+    if let Some(latest) = cached()
+        && super::is_newer(&latest, current)
+    {
+        eprintln!("mcpgw {latest} is available (you have {current}) — run `mcpgw self-update`");
+    }
+}
+
+/// The version the last successful check saw, if there was one.
+fn cached() -> Option<String> {
+    if std::env::var_os(NO_CHECK_ENV).is_some_and(|value| !value.is_empty()) {
+        return None;
+    }
+    let stamp = mcpgw_core::paths::state_dir()?.join(STAMP_FILE);
+    last_seen(&std::fs::read_to_string(stamp).ok()?)
+}
+
 /// Runs the throttled lookup, returning the latest version when a check
 /// actually happened. `None` covers "not due", "switched off" and every
 /// failure alike — the caller has nothing useful to say about any of them.

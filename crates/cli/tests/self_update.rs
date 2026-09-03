@@ -509,3 +509,94 @@ fn a_failed_command_gets_no_notice() {
     assert!(!out.status.success());
     assert!(!stderr(&out).contains("self-update"), "{}", stderr(&out));
 }
+
+/// A stamp of the shape today's check leaves behind, dated now so nothing
+/// downstream of it is due.
+fn stamp_seeing(dir: &Path, seen: &str) -> PathBuf {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let path = dir.join("update-check.json");
+    std::fs::write(
+        &path,
+        format!(r#"{{"last_check": {now}, "last_seen": "{seen}"}}"#),
+    )
+    .unwrap();
+    path
+}
+
+fn notice_line() -> String {
+    format!(
+        "mcpgw {NEWER} is available (you have {}) — run `mcpgw self-update`",
+        current()
+    )
+}
+
+#[test]
+fn a_gateway_that_will_not_answer_is_told_it_may_be_an_old_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = stamp_seeing(dir.path(), NEWER);
+    let before = std::fs::read(&stamp).unwrap();
+    // Port 1 for both the gateway and the release host: status exits 1
+    // because nothing answers, and any attempt to check for a release
+    // rather than read the stamp would be a refused connection, not a
+    // notice.
+    let out = run(
+        &built_binary(),
+        "http://127.0.0.1:1",
+        dir.path(),
+        &["daemon", "status", "--url", "http://127.0.0.1:1/mcp"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stderr(&out).contains(&notice_line()), "{}", stderr(&out));
+    // Read, never rewritten: a failing command must not spend today's check.
+    assert_eq!(std::fs::read(&stamp).unwrap(), before);
+}
+
+#[test]
+fn a_failing_status_on_the_latest_release_says_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    stamp_seeing(dir.path(), current());
+    let out = run(
+        &built_binary(),
+        "http://127.0.0.1:1",
+        dir.path(),
+        &["daemon", "status", "--url", "http://127.0.0.1:1/mcp"],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(!stderr(&out).contains("self-update"), "{}", stderr(&out));
+}
+
+#[test]
+fn the_kill_switch_stops_the_cached_notice_too() {
+    let dir = tempfile::tempdir().unwrap();
+    stamp_seeing(dir.path(), NEWER);
+    let out = Command::new(built_binary())
+        .args(["daemon", "status", "--url", "http://127.0.0.1:1/mcp"])
+        .env("MCPGW_UPDATE_BASE_URL", "http://127.0.0.1:1")
+        .env("MCPGW_STATE_DIR", dir.path())
+        .env("MCPGW_NO_UPDATE_CHECK", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(!stderr(&out).contains("self-update"), "{}", stderr(&out));
+}
+
+#[test]
+fn a_command_that_worked_stays_quiet_until_the_next_check_is_due() {
+    let dir = tempfile::tempdir().unwrap();
+    stamp_seeing(dir.path(), NEWER);
+    // The cached line belongs to the failure path only: on a command that
+    // worked the daily check still decides, and today's has happened.
+    let out = Command::new(built_binary())
+        .args(["list", "--json"])
+        .env("MCPGW_CONFIG", dir.path().join("config.toml"))
+        .env("MCPGW_UPDATE_BASE_URL", "http://127.0.0.1:1")
+        .env("MCPGW_STATE_DIR", dir.path())
+        .env_remove("MCPGW_NO_UPDATE_CHECK")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+}
