@@ -150,10 +150,26 @@ mod tests {
         let link = dir.path().join("mcpgw-link");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        // Windows needs a privilege for symlinks that CI does not grant; a
-        // hard link resolves to the same file and proves the same thing.
+        // A hard link is not a stand-in for a symlink here: it is a second
+        // directory entry for one file, and `canonicalize` resolves it to
+        // itself rather than to the other name, so the assertions below can
+        // never hold. The case worth guarding is Homebrew's symlink, so the
+        // test creates one.
         #[cfg(windows)]
-        std::fs::hard_link(&real, &link).unwrap();
+        if let Err(err) = std::os::windows::fs::symlink_file(&real, &link) {
+            // Creating a symlink on Windows needs SeCreateSymbolicLink,
+            // which CI's runners hold and a locked-down account does not.
+            // That is a fact about the account, not about the code, so it
+            // skips rather than fails; every other error still panics.
+            const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                || err.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD)
+            {
+                eprintln!("skipped: symlinks need a privilege this account lacks");
+                return;
+            }
+            panic!("could not create a symlink at {}: {err}", link.display());
+        }
 
         assert_eq!(check_service_exe(&link, &real), ServiceExe::Matches);
         assert_eq!(check_service_exe(&real, &link), ServiceExe::Matches);
