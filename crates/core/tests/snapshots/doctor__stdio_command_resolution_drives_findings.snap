@@ -10,5 +10,6 @@ expression: findings
         ),
         severity: Error,
         message: "command \"absent\" not found in PATH",
+        code: None,
     },
 ]

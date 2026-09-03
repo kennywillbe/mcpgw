@@ -22,7 +22,7 @@ use mcpgw_core::state::ManagedState;
 use mcpgw_core::sync::{SyncPlan, per_server_gateway_servers};
 
 use super::{Ctx, Outcome};
-use crate::commands::doctor::{GatewayOutcome, bad_line, ok_line, probe_endpoint};
+use crate::commands::doctor::{GatewayOutcome, bad_line, ok_line, probe_endpoint, warn_line};
 use crate::commands::sync::{
     Applied, Planned, PlannedClient, apply_client, bridge_command, plan_client,
 };
@@ -332,6 +332,15 @@ fn verify(cx: &Ctx) {
             GatewayOutcome::Unserved(detail) => {
                 bad_line(&format!("{label}  {} — {detail}", endpoint.url), cx.color);
             }
+            // Served, reachable, and waiting on a login: the sync landed,
+            // so this is not a red row.
+            GatewayOutcome::NeedsOAuth(name) => warn_line(
+                &format!(
+                    "{label}  {} — needs OAuth; run mcpgw auth login {name}",
+                    endpoint.url
+                ),
+                cx.color,
+            ),
             GatewayOutcome::Failed(err) => {
                 bad_line(&format!("{label}  {} — {err}", endpoint.url), cx.color);
             }
@@ -455,7 +464,12 @@ fn client_lines(
 ) -> Vec<Result<String, String>> {
     let mut per_client: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for (endpoint, outcome) in results {
-        let answering = matches!(outcome, GatewayOutcome::Ok(_));
+        // An endpoint waiting on a login answered: what this line is about
+        // is whether the client's entries reach the gateway at all.
+        let answering = matches!(
+            outcome,
+            GatewayOutcome::Ok(_) | GatewayOutcome::NeedsOAuth(_)
+        );
         for entry in &endpoint.entries {
             let counts = per_client.entry(entry.client.as_str()).or_insert((0, 0));
             counts.1 += 1;

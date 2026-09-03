@@ -26,6 +26,36 @@ pub struct Finding {
     pub server: Option<String>,
     pub severity: Severity,
     pub message: String,
+    /// A stable tag for the findings a `--json` consumer is expected to act
+    /// on differently rather than print. Most findings have none: their
+    /// message is the whole of what they are, and inventing a code per
+    /// sentence would be an API surface nobody asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+}
+
+/// The code on the finding for a server that answered 401.
+pub const NEEDS_OAUTH: &str = "needs_oauth";
+
+/// The finding for a server whose own OAuth the gateway cannot stand in for.
+///
+/// A warning rather than an error: nothing on this machine is misconfigured
+/// and nothing is down — the server is working exactly as an OAuth-protected
+/// server should. What is missing is a login, and it has to happen here,
+/// because relaying the server's `WWW-Authenticate` to the client would have
+/// the client send that server's token through the gateway.
+#[must_use]
+pub fn needs_oauth(client: Option<&str>, name: &str) -> Finding {
+    Finding {
+        client: client.map(str::to_owned),
+        server: Some(name.to_owned()),
+        severity: Severity::Warning,
+        message: format!(
+            "{name} needs OAuth — the gateway cannot complete a client-side login; \
+             run mcpgw auth login {name}"
+        ),
+        code: Some(NEEDS_OAUTH),
+    }
 }
 
 /// Static health checks for one server entry: command resolution for stdio,
@@ -48,6 +78,7 @@ pub fn check_server(
         server: Some(name.to_owned()),
         severity,
         message,
+        code: None,
     };
     match &server.transport {
         Transport::Stdio { command, .. } => {
@@ -98,6 +129,7 @@ pub fn classify_problems(client: &str, read: &ClientRead) -> Vec<Finding> {
                     Severity::Error
                 },
                 message: problem.message.clone(),
+                code: None,
             }
         })
         .collect()
@@ -322,6 +354,7 @@ pub fn gateway_unreachable(base: &str) -> Finding {
         server: None,
         severity: Severity::Error,
         message: format!("gateway not reachable at {base} — start it with `mcpgw serve`"),
+        code: None,
     }
 }
 
@@ -340,6 +373,7 @@ pub fn unserved_endpoint(target: &GatewayTarget, detail: &str) -> Vec<Finding> {
                 "points at {}, which the running gateway does not serve — {detail}",
                 target.url
             ),
+            code: None,
         })
         .collect()
 }
@@ -359,7 +393,18 @@ pub enum GatewayFault {
     /// The address was right and the session still failed — a dead upstream,
     /// a timeout, a protocol error. A different problem with a different fix.
     Failed,
+    /// The gateway answered and said the server behind that endpoint is
+    /// waiting on a login. Nothing here is broken.
+    NeedsOAuth,
 }
+
+/// The phrase the gateway's own error carries for an upstream behind OAuth.
+///
+/// Matched as text for the same reason the 404 below is: a JSON-RPC error
+/// reaches a probe as the transport's message and nothing else. Unlike the
+/// 404 this is mcpgw's own sentence on both ends, pinned by the tests that
+/// assert it.
+const NEEDS_OAUTH_PHRASE: &str = "needs OAuth; run mcpgw auth login";
 
 /// Sorts a failed gateway probe into "wrong address" and "right address, bad
 /// session".
@@ -371,6 +416,9 @@ pub enum GatewayFault {
 /// half of the message needs no second request.
 #[must_use]
 pub fn classify_gateway_failure(message: &str) -> GatewayFault {
+    if message.contains(NEEDS_OAUTH_PHRASE) {
+        return GatewayFault::NeedsOAuth;
+    }
     let Some((_, rest)) = message.split_once("HTTP 404") else {
         return GatewayFault::Failed;
     };
@@ -410,5 +458,6 @@ pub fn project_unmanaged(client: &str, path: &std::path::Path, count: usize) -> 
              leaves them live alongside the gateway",
             path.display()
         ),
+        code: None,
     }
 }

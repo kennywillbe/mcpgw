@@ -132,7 +132,11 @@ vanishing from `tools/list`, which is the failure mode that costs you an
 afternoon.
 
 stdio and HTTP upstreams run through the same lifecycle; from a client's side
-they're indistinguishable.
+they're indistinguishable. With one exception: a remote server that answers
+`401` is not retried at all. Its endpoint reports `needs OAuth`, `mcpgw doctor
+--probe` says the same thing as a warning rather than a failure, and calls
+through it fail naming the login rather than a server that is down — see
+[Remote servers and OAuth](./trust-model.md#remote-servers-and-oauth).
 
 ## Config reload
 

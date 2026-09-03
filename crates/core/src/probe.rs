@@ -60,6 +60,12 @@ pub enum ProbeError {
     #[error("MCP handshake failed: {message}")]
     Handshake { message: String },
 
+    /// The server answered 401. Its own variant because the report says
+    /// something else entirely about it: nothing here is broken, and no
+    /// retry, timeout bump or restart is the fix.
+    #[error("the server requires OAuth")]
+    AuthRequired,
+
     /// The probe never produced an outcome — its task panicked or was
     /// cancelled. Reported like any other failure so one broken target
     /// costs one row instead of the whole report.
@@ -145,8 +151,16 @@ async fn connect_http(
         .map_err(|message| ProbeError::Handshake { message })?;
     let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
     // Connect errors (refused, TLS, 4xx) arrive as handshake failures —
-    // there is no separate "spawn" step for a remote server.
-    ().serve(transport).await.map_err(handshake)
+    // there is no separate "spawn" step for a remote server. The 401 is the
+    // exception, and rmcp answers for it rather than the message being
+    // matched: see `upstream::connect_once`.
+    ().serve(transport).await.map_err(|err| {
+        if err.is_authorization_required() {
+            ProbeError::AuthRequired
+        } else {
+            handshake(err)
+        }
+    })
 }
 
 fn handshake(err: impl std::fmt::Display) -> ProbeError {

@@ -347,3 +347,117 @@ async fn a_dead_child_stays_on_the_ladder_instead_of_latching_failed() {
     assert!(!Arc::ptr_eq(&first, &second), "must be a fresh instance");
     mgr.shutdown().await;
 }
+
+/// A bare http server that answers every request `401` with an RFC 9728
+/// challenge, plus the count of requests it has seen. It speaks no MCP at
+/// all, which is exactly what an OAuth-protected server does to a client
+/// with no token.
+fn unauthorized_server() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let app = axum::Router::new().fallback(move || {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                axum::http::StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Bearer resource_metadata=\"https://auth.example.com/.well-known/\
+                     oauth-protected-resource\"",
+                )],
+            )
+        }
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, hits)
+}
+
+/// The whole point of the state: a server behind OAuth is not a broken
+/// server, and the ladder has nothing to offer it.
+#[tokio::test]
+async fn a_401_upstream_is_auth_required_and_never_laddered() {
+    let (addr, hits) = unauthorized_server();
+    let mgr = manager(&[("linear", http_server(&format!("http://{addr}/mcp"), &[]))]);
+
+    let started = Instant::now();
+    let err = mgr.ready("linear").await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    let UpstreamError::AuthRequired {
+        name,
+        resource_metadata,
+    } = &err
+    else {
+        panic!("expected AuthRequired, got {err}");
+    };
+    assert_eq!(name, "linear");
+    assert_eq!(
+        resource_metadata.as_deref(),
+        Some("https://auth.example.com/.well-known/oauth-protected-resource")
+    );
+    // The text a client is shown has to name the command that fixes it.
+    assert_eq!(
+        err.to_string(),
+        "upstream \"linear\" needs OAuth; run mcpgw auth login linear on this machine"
+    );
+    assert_eq!(
+        mgr.status("linear").await,
+        Some(UpstreamStatus::AuthRequired {
+            resource_metadata: Some(
+                "https://auth.example.com/.well-known/oauth-protected-resource".to_owned()
+            )
+        })
+    );
+    // No ladder: three attempts would have slept 50ms + 100ms between them,
+    // and the server would have counted a second and a third handshake.
+    assert!(elapsed < Duration::from_millis(150), "elapsed {elapsed:?}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Latched like `Failed`: one fresh attempt per new demand, still no
+    // ladder, because the credential may have arrived in between.
+    let err = mgr.ready("linear").await.unwrap_err();
+    assert!(matches!(err, UpstreamError::AuthRequired { .. }), "{err}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    mgr.shutdown().await;
+}
+
+/// The other half of the rule: only a 401 is a 401. A server that answers
+/// and then fails, or one that never answers at all, is the failure the
+/// ladder exists for and must not be reported as a missing login.
+#[tokio::test]
+async fn a_live_server_that_fails_is_never_auth_required() {
+    let mgr = manager(&[
+        // Answers the handshake, then dies on the first request.
+        ("live", stdio_server("die-on-tools")),
+        // Never answers at all.
+        ("gone", http_server("http://127.0.0.1:1/mcp", &[])),
+    ]);
+
+    let service = mgr.ready("live").await.unwrap();
+    let err = service.list_all_tools().await.unwrap_err();
+    assert!(
+        !matches!(
+            mgr.status("live").await,
+            Some(UpstreamStatus::AuthRequired { .. })
+        ),
+        "a JSON-RPC/transport failure is not a missing login: {err}"
+    );
+
+    let err = mgr.ready("gone").await.unwrap_err();
+    assert!(
+        matches!(err, UpstreamError::Failed { attempts: 3, .. }),
+        "{err}"
+    );
+    assert!(matches!(
+        mgr.status("gone").await,
+        Some(UpstreamStatus::Failed(_))
+    ));
+    mgr.shutdown().await;
+}

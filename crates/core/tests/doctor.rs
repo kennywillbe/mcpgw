@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use mcpgw_core::doctor::{
-    GatewayFault, GatewayPlan, Severity, check_server, classify_gateway_failure, classify_problems,
-    gateway_unreachable, unserved_endpoint,
+    GatewayFault, GatewayPlan, NEEDS_OAUTH, Severity, check_server, classify_gateway_failure,
+    classify_problems, gateway_unreachable, needs_oauth, unserved_endpoint,
 };
 use mcpgw_core::{ClientKind, Config};
 
@@ -250,6 +250,48 @@ fn a_404_is_the_only_failure_that_means_wrong_address() {
     );
     assert_eq!(
         classify_gateway_failure("unexpected server response: HTTP 500"),
+        GatewayFault::Failed
+    );
+}
+
+/// A server behind OAuth is not a broken server: the report says so as a
+/// warning, names the login, and tags the finding so a `--json` consumer can
+/// act on it without matching prose.
+#[test]
+fn a_server_needing_oauth_is_a_tagged_warning_naming_the_login() {
+    let finding = needs_oauth(None, "linear");
+    assert_eq!(finding.severity, Severity::Warning);
+    assert_eq!(finding.server.as_deref(), Some("linear"));
+    assert_eq!(
+        finding.message,
+        "linear needs OAuth — the gateway cannot complete a client-side login; \
+         run mcpgw auth login linear"
+    );
+    assert_eq!(finding.code, Some(NEEDS_OAUTH));
+
+    let json = serde_json::to_value(&finding).unwrap();
+    assert_eq!(json["code"], "needs_oauth");
+    assert_eq!(json["severity"], "warning");
+    // Every other finding stays exactly the shape it was: no code key at all.
+    let plain = gateway_unreachable("http://127.0.0.1:8137");
+    assert!(serde_json::to_value(&plain).unwrap().get("code").is_none());
+}
+
+/// The gateway's own answer for an upstream behind OAuth is not a broken
+/// session: it is the one failure whose fix is a login, and the report has
+/// to sort it out of the pile the same way it sorts a 404.
+#[test]
+fn a_gateway_error_naming_the_login_is_its_own_fault_kind() {
+    assert_eq!(
+        classify_gateway_failure(
+            "when send message: upstream \"linear\" needs OAuth; \
+             run mcpgw auth login linear on this machine"
+        ),
+        GatewayFault::NeedsOAuth
+    );
+    // A server that failed for any other reason still reads as a failure.
+    assert_eq!(
+        classify_gateway_failure("upstream \"linear\" failed after 3 attempt(s): refused"),
         GatewayFault::Failed
     );
 }

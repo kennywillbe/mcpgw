@@ -64,6 +64,19 @@ pub enum UpstreamError {
         message: String,
     },
 
+    /// The upstream answered 401. Its own error rather than a
+    /// [`Failed`](Self::Failed) message because the fix is a login on this
+    /// machine, not a retry, and every layer above has to be able to say so
+    /// without reading error text.
+    #[error("upstream {name:?} needs OAuth; run mcpgw auth login {name} on this machine")]
+    AuthRequired {
+        name: String,
+        /// The `resource_metadata` URL from the server's `WWW-Authenticate`
+        /// challenge, when it sent one. Recorded for the broker that will
+        /// use it; nothing reads it yet.
+        resource_metadata: Option<String>,
+    },
+
     #[error("upstream {name:?} was shut down while connecting")]
     ShutDown { name: String },
 }
@@ -92,6 +105,14 @@ pub enum UpstreamStatus {
     Ready,
     /// Latched after exhausting attempts; the next request gets one chance.
     Failed(String),
+    /// The server answered 401. Kept apart from `Failed` because the ladder
+    /// is not the answer to it — a 401 will still be a 401 three attempts
+    /// later — and because the fix a user is owed names a login, not a
+    /// server that is down.
+    AuthRequired {
+        /// The `resource_metadata` URL from the challenge, if there was one.
+        resource_metadata: Option<String>,
+    },
 }
 
 enum Slot {
@@ -102,6 +123,7 @@ enum Slot {
     Connecting(Arc<AtomicBool>),
     Ready(Arc<UpstreamService>),
     Failed(String),
+    AuthRequired(Option<String>),
 }
 
 impl Slot {
@@ -338,6 +360,9 @@ impl UpstreamManager {
             // An abandoned claim included: nothing is running.
             Slot::Idle | Slot::Ready(_) | Slot::Connecting(_) => UpstreamStatus::Idle,
             Slot::Failed(message) => UpstreamStatus::Failed(message.clone()),
+            Slot::AuthRequired(resource_metadata) => UpstreamStatus::AuthRequired {
+                resource_metadata: resource_metadata.clone(),
+            },
         })
     }
 
@@ -418,8 +443,10 @@ impl UpstreamManager {
                         *slot = Slot::Connecting(Arc::clone(&live));
                         Claim::Own(ATTEMPTS, live)
                     }
-                    // Latched: one fresh chance per demand.
-                    Slot::Failed(_) => {
+                    // Latched: one fresh chance per demand. A 401 slot is
+                    // given the same single attempt — the credential may
+                    // have arrived since — but never the ladder.
+                    Slot::Failed(_) | Slot::AuthRequired(_) => {
                         let live = Arc::new(AtomicBool::new(true));
                         *slot = Slot::Connecting(Arc::clone(&live));
                         Claim::Own(1, live)
@@ -472,7 +499,12 @@ impl UpstreamManager {
             }
             Err(err) => {
                 if !abandoned {
-                    *slot = Slot::Failed(err.to_string());
+                    *slot = match &err {
+                        UpstreamError::AuthRequired {
+                            resource_metadata, ..
+                        } => Slot::AuthRequired(resource_metadata.clone()),
+                        _ => Slot::Failed(err.to_string()),
+                    };
                 }
                 Err(err)
             }
@@ -652,6 +684,10 @@ impl UpstreamManager {
             }
             match self.connect_once(name, server).await {
                 Ok(service) => return Ok(service),
+                // Retrying a 401 only asks the same question again, more
+                // slowly: the credential this connection lacks cannot appear
+                // between two attempts of one ladder.
+                Err(err @ UpstreamError::AuthRequired { .. }) => return Err(err),
                 Err(err) => last = err.to_string(),
             }
         }
@@ -700,10 +736,48 @@ impl UpstreamManager {
                 // host surfaces here as a normal connect failure and feeds
                 // the same backoff ladder as a stdio spawn failure.
                 let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
-                handshake(tokio::time::timeout(self.connect_timeout, ().serve(transport)).await)
+                match tokio::time::timeout(self.connect_timeout, ().serve(transport)).await {
+                    Err(_) => Err(failed(format!(
+                        "no handshake within {:?}",
+                        self.connect_timeout
+                    ))),
+                    Ok(Ok(service)) => Ok(service),
+                    // Asked of the error rather than matched on its text:
+                    // rmcp buries the 401 in a `Box<dyn Error>` chain whose
+                    // Display is a bare "Auth required", and this is the
+                    // accessor it exposes for exactly this question. A 403
+                    // (a token that is real but too narrow) is deliberately
+                    // not this state — nothing on this machine minted that
+                    // token, so there is nothing here to widen.
+                    Ok(Err(err)) if err.is_authorization_required() => {
+                        Err(UpstreamError::AuthRequired {
+                            name: name.to_owned(),
+                            resource_metadata: err.auth_challenge().and_then(resource_metadata),
+                        })
+                    }
+                    Ok(Err(err)) => Err(failed(format!("handshake failed: {err}"))),
+                }
             }
         }
     }
+}
+
+/// The `resource_metadata` URL out of a `WWW-Authenticate` challenge.
+///
+/// Parsed here rather than through rmcp's own `WWWAuthenticateParams`
+/// because that type lives behind the `auth` feature, which this workspace
+/// does not enable — and turning it on to read one quoted parameter would
+/// pull a whole OAuth client in.
+fn resource_metadata(challenge: &str) -> Option<String> {
+    let at = challenge.find("resource_metadata=")? + "resource_metadata=".len();
+    let rest = challenge[at..].trim_start();
+    let value = match rest.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        // Unquoted is not what RFC 9728 shows, but a parameter list ends at
+        // the comma either way.
+        None => rest.split(',').next()?.trim(),
+    };
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 /// Builds the streamable-http client config for `url`, passing the canonical
@@ -755,6 +829,31 @@ mod tests {
     fn expired_sessions_are_reinitialized() {
         let config = http_config("https://mcp.example.com/mcp", &BTreeMap::new()).unwrap();
         assert!(config.reinit_on_expired_session);
+    }
+
+    /// The one thing worth keeping out of a `WWW-Authenticate` challenge:
+    /// where the protected-resource metadata lives, for the broker that will
+    /// need it. Everything else in the header is the upstream's business.
+    #[test]
+    fn the_resource_metadata_url_is_read_off_the_challenge() {
+        use super::resource_metadata;
+
+        assert_eq!(
+            resource_metadata(
+                r#"Bearer realm="mcp", resource_metadata="https://a.example/.well-known/x", error="invalid_token""#
+            )
+            .as_deref(),
+            Some("https://a.example/.well-known/x")
+        );
+        // Unquoted is not what RFC 9728 shows, but the parameter list ends
+        // at the comma either way.
+        assert_eq!(
+            resource_metadata("Bearer resource_metadata=https://a.example/x, scope=\"read\"")
+                .as_deref(),
+            Some("https://a.example/x")
+        );
+        assert_eq!(resource_metadata("Bearer realm=\"mcp\""), None);
+        assert_eq!(resource_metadata("Bearer resource_metadata=\"\""), None);
     }
 
     #[test]

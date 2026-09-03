@@ -125,6 +125,21 @@ was: with a token you put in the config as a header. mcpgw forwards it. It
 does not broker the flow, hold a refresh token, or renew anything on your
 behalf.
 
+A server that answers `401` is a server mcpgw stops at, and it says so. The
+endpoint reports `needs OAuth`, `mcpgw doctor --probe` reports a warning
+rather than a failure, and a call through the endpoint comes back as
+`upstream "linear" needs OAuth; run mcpgw auth login linear on this machine`.
+That command is not in this release; the message names where the login will
+live, so the error is not a dead end today.
+
+The `WWW-Authenticate` challenge the server sent is not relayed to your
+client. Passing it on invites the client to run the flow and send the
+resulting token back through the gateway, which is the token passthrough the
+MCP spec forbids a resource server to accept — and the gateway is a resource
+server to everything that dials it. The `401` is not retried either: it will
+still be a `401` on the third attempt, so it is reported at once instead of
+after a backoff ladder.
+
 ## The short version
 
 - Anything running as you can use the gateway. That was already true of your
