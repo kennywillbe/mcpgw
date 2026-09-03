@@ -89,7 +89,14 @@ fn main() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
     let color = std::io::stdout().is_terminal();
     let Some(command) = cli.command else {
-        return bare(color);
+        let code = bare(color)?;
+        // The wizard opened with no subcommand at all is the same wizard
+        // `mcpgw init` opens, and gets the same cached line — read from the
+        // stamp, so four steps of prose never end on a network wait.
+        if code == 0 {
+            update::notice::print_cached(env!("CARGO_PKG_VERSION"));
+        }
+        return Ok(ExitCode::from(code));
     };
     // `serve` and `connect` run until they are killed and own the terminal
     // (connect owns stdio outright), and `self-update` reports on releases
@@ -110,13 +117,24 @@ fn main() -> anyhow::Result<ExitCode> {
                 command: commands::daemon::DaemonCommand::Status { .. },
             })
     );
+    // The commands that report on the machine rather than change it. They
+    // fall back to the cached line whenever the check itself had nothing to
+    // say, which since 0.5 is the ordinary case and not the exception: a
+    // supervised gateway spends the daily check on its own, so by the time
+    // the user asks what is running, today's check has usually happened in
+    // a process they never see.
+    let notice_from_cache = notice_when_failed || matches!(command, Command::Init(_));
     let code = dispatch(command, color)?;
     // Only after a command that worked, and only once its own output is
     // out: a notice is a footnote, never the last word on a failure.
     if notice {
-        if code == 0 {
-            update::notice::print_if_due(env!("CARGO_PKG_VERSION"));
-        } else if notice_when_failed {
+        let said = code == 0 && update::notice::print_if_due(env!("CARGO_PKG_VERSION"));
+        let cached = if code == 0 {
+            notice_from_cache
+        } else {
+            notice_when_failed
+        };
+        if !said && cached {
             update::notice::print_cached(env!("CARGO_PKG_VERSION"));
         }
     }
@@ -130,18 +148,18 @@ fn main() -> anyhow::Result<ExitCode> {
 /// prints the same help clap printed when a subcommand was mandatory, and
 /// exits 2: a wizard that cannot ask is not a wizard, and a script that
 /// piped us somewhere expects an error, not four steps of prose.
-fn bare(color: bool) -> anyhow::Result<ExitCode> {
+fn bare(color: bool) -> anyhow::Result<u8> {
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         let args = commands::wizard::InitArgs {
             yes: false,
             gateway_url: mcpgw_core::endpoints::DEFAULT_URL.to_owned(),
         };
-        return Ok(ExitCode::from(commands::wizard::run(&args, color)?));
+        return commands::wizard::run(&args, color);
     }
     // stderr, byte for byte where clap put it: this is still the
     // missing-subcommand failure it always was.
     eprint!("{}", Cli::command().render_help());
-    Ok(ExitCode::from(2))
+    Ok(2)
 }
 
 /// Runs one command, returning its process exit code.

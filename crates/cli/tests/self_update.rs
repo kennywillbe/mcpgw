@@ -595,3 +595,181 @@ fn a_command_that_worked_stays_quiet_until_the_next_check_is_due() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stderr(&out), "");
 }
+
+/// How long a test waits for the supervised gateway to have done its check,
+/// and how often it looks. Generous: the gateway has to start, bind, and
+/// spawn a fixture server first, on a runner that is building everything
+/// else at the same time.
+const CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const CHECK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A stamp from last week, so the next check is due immediately.
+fn stale_stamp(dir: &Path) -> PathBuf {
+    let week_ago = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 7 * 24 * 60 * 60;
+    let path = dir.join("update-check.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"last_check": {week_ago}, "last_seen": "{}"}}"#,
+            current()
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// A gateway serving one fixture server, killed when the test drops it.
+struct Gateway {
+    child: std::process::Child,
+    addr: String,
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Gateway {
+    /// Everything the gateway wrote to stderr, read once it is gone —
+    /// which is what makes the read terminate, and is also the only moment
+    /// a test has nothing left to wait for.
+    fn logs(mut self) -> String {
+        let _ = self.child.kill();
+        let mut logs = String::new();
+        if let Some(errors) = self.child.stderr.as_mut() {
+            use std::io::Read as _;
+            let _ = errors.read_to_string(&mut logs);
+        }
+        logs
+    }
+}
+
+/// Starts a gateway on an ephemeral port inside the sandbox, with the first
+/// release check brought forward so a test does not wait out the five
+/// minutes a real service does.
+fn serve(dir: &Path, base: &str, args: &[&str], no_check: bool) -> Gateway {
+    let config = dir.join("config.toml");
+    std::fs::write(&config, util::fixture_config(&["fx"])).unwrap();
+    let mut command = std::process::Command::new(built_binary());
+    command
+        .args(["serve", "--port", "0", "--no-capture"])
+        .args(args)
+        .env("MCPGW_CONFIG", &config)
+        .env("MCPGW_STATE_DIR", dir)
+        .env("MCPGW_UPDATE_BASE_URL", base)
+        .env("MCPGW_UPDATE_FIRST_CHECK_MS", "0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if no_check {
+        command.env("MCPGW_NO_UPDATE_CHECK", "1");
+    } else {
+        command.env_remove("MCPGW_NO_UPDATE_CHECK");
+    }
+    let mut child = util::retrying_while_busy(&built_binary(), || command.spawn());
+
+    // The first banner line, which is printed once the listener is bound
+    // and carries the port the kernel handed out.
+    let mut banner = String::new();
+    BufReader::new(child.stdout.as_mut().unwrap())
+        .read_line(&mut banner)
+        .unwrap();
+    let addr = banner
+        .split("http://")
+        .nth(1)
+        .and_then(|rest| rest.split("/mcp").next())
+        .unwrap_or_else(|| panic!("no address in banner: {banner}"))
+        .to_owned();
+    Gateway { child, addr }
+}
+
+/// Waits for the stamp to say the gateway has seen `version`.
+fn wait_for_last_seen(stamp: &Path, version: &str) {
+    let deadline = std::time::Instant::now() + CHECK_DEADLINE;
+    loop {
+        let text = std::fs::read_to_string(stamp).unwrap_or_default();
+        if text.contains(&format!(r#""last_seen":"{version}""#))
+            || text.contains(&format!(r#""last_seen": "{version}""#))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the gateway did not record {version} within {CHECK_DEADLINE:?}; the stamp is {text}"
+        );
+        std::thread::sleep(CHECK_POLL);
+    }
+}
+
+#[test]
+fn a_supervised_gateway_does_the_daily_check_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = ReleaseHost::with_latest(NEWER);
+    let stamp = stale_stamp(dir.path());
+    let gateway = serve(dir.path(), &host.base, &["--supervised"], false);
+    wait_for_last_seen(&stamp, NEWER);
+
+    // One line in the daemon's log, because a service has no reader to
+    // print a notice to.
+    let logs = gateway.logs();
+    assert!(
+        logs.contains(&format!(
+            "mcpgw {NEWER} is available (this gateway is running {}) — run `mcpgw self-update`",
+            current()
+        )),
+        "{logs}"
+    );
+}
+
+/// The two gateways that must leave the stamp exactly as they found it: the
+/// one told not to check, and the foreground `serve` that was never asked to.
+///
+/// Both are the absence of an event, so they are given a moment in which the
+/// check would have happened — its delay is zero here — and then the stamp
+/// is compared byte for byte.
+fn no_check_is_made(args: &[&str], no_check: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let host = ReleaseHost::with_latest(NEWER);
+    let stamp = stale_stamp(dir.path());
+    let before = std::fs::read(&stamp).unwrap();
+    let gateway = serve(dir.path(), &host.base, args, no_check);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(std::fs::read(&stamp).unwrap(), before);
+    assert!(!gateway.logs().contains("self-update"));
+}
+
+#[test]
+fn the_kill_switch_stops_the_gateways_check_too() {
+    no_check_is_made(&["--supervised"], true);
+}
+
+#[test]
+fn a_foreground_gateway_never_checks() {
+    no_check_is_made(&[], false);
+}
+
+#[test]
+fn status_reports_what_the_gateway_found_without_a_request_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = ReleaseHost::with_latest(NEWER);
+    let stamp = stale_stamp(dir.path());
+    let gateway = serve(dir.path(), &host.base, &["--supervised"], false);
+    wait_for_last_seen(&stamp, NEWER);
+
+    // Port 1 as the release host: nothing listens there, so a line that
+    // appears was read from the stamp the gateway wrote and not fetched.
+    let url = format!("http://{}/mcp", gateway.addr);
+    let out = run(
+        &built_binary(),
+        "http://127.0.0.1:1",
+        dir.path(),
+        &["daemon", "status", "--url", &url],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains(&notice_line()), "{}", stderr(&out));
+}

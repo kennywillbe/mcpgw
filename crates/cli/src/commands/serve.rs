@@ -16,6 +16,30 @@ use mcpgw_core::upstream::UpstreamManager;
 /// as that client cares to stay.
 const UPGRADE_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a supervised gateway waits before its first release check, and
+/// how often it asks again afterwards whether the day has turned.
+///
+/// Not at boot: a machine that has just logged in — or has just restarted
+/// this service onto a new binary — is busy with things somebody is waiting
+/// for, and nobody is waiting for this. The hourly poll only decides how
+/// soon a gateway that has been up for weeks notices midnight; how often it
+/// actually reaches the network is the stamp's business, and the stamp says
+/// once a day for the CLI and the daemon together.
+// Spelled in seconds for the reason `update::notice::INTERVAL` gives: the
+// larger-unit constructors clippy asks for here are too new to name in a
+// workspace that pins no rust-version.
+#[allow(clippy::duration_suboptimal_units)]
+const FIRST_UPDATE_CHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+#[allow(clippy::duration_suboptimal_units)]
+const UPDATE_CHECK_POLL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Brings the first check forward, in milliseconds. A test seam, and
+/// debug-only like `MCPGW_UPDATE_BASE_URL`: the suite has to watch a gateway
+/// do in a moment what a real one does after five minutes, and nothing
+/// outside the suite has any business rescheduling it.
+#[cfg(debug_assertions)]
+const FIRST_UPDATE_CHECK_ENV: &str = "MCPGW_UPDATE_FIRST_CHECK_MS";
+
 #[derive(clap::Args)]
 pub struct ServeArgs {
     /// Port to listen on
@@ -127,6 +151,12 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             )
         });
 
+        // Next to the upgrade watcher, and gated on the same flag for the
+        // same reason: only a service nobody is looking at needs to find
+        // out about a release on its own. A foreground `serve` is a command
+        // in a terminal, and the notice after that command covers it.
+        watch_for_releases(args.supervised, state_dir.as_deref());
+
         let shutdown = shutdown_signal(
             Arc::clone(&stop),
             Arc::clone(&stop_upgrades),
@@ -138,19 +168,12 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             listener,
             shutdown
         ));
-        let drain = {
-            let mut decided = decided.clone();
-            async move {
-                upgrade_decided(&mut decided).await;
-                tokio::time::sleep(UPGRADE_DRAIN).await;
-            }
-        };
-        // Only the upgrade path is ever cut short: `drain` cannot resolve
+        // Only the upgrade path is ever cut short: the drain cannot resolve
         // before the watcher has decided, and a Ctrl-C shutdown is allowed
         // to take as long as its clients need.
         let served = tokio::select! {
             result = &mut served => Some(result),
-            () = drain => None,
+            () = drain_for_an_upgrade(decided.clone()) => None,
         };
         // Covers the paths Ctrl-C did not take (a bind that dies under us):
         // neither watcher may outlive the gateway it watches for.
@@ -255,6 +278,70 @@ fn watch_for_upgrades(
     })
 }
 
+/// Starts the daily release check a supervised gateway does on its own
+/// behalf, so a machine whose owner never types `mcpgw` still learns that a
+/// newer one exists.
+///
+/// It only writes the stamp the CLI already reads, which is what makes
+/// `daemon status`, `doctor` and the wizard able to say "0.6.0 is
+/// available" without a request of their own. Nothing is downloaded and
+/// nothing restarts: the daemon learns, the human decides.
+///
+/// Detached rather than stopped like the two watchers above, because it
+/// holds nothing the shutdown path has to reclaim — no listener, no child,
+/// no record — and it is dropped with the runtime a moment later. The only
+/// thing it can delay is a shutdown that lands inside a check, which the
+/// lookup's own two-second deadline bounds.
+fn watch_for_releases(supervised: bool, state_dir: Option<&std::path::Path>) {
+    let Some(state_dir) = state_dir
+        .filter(|_| supervised)
+        .map(std::path::Path::to_path_buf)
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(first_update_check()).await;
+        let mut announced: Option<String> = None;
+        loop {
+            let dir = state_dir.clone();
+            // The lookup is a blocking HTTP call; the runtime's threads are
+            // for serving MCP traffic, not for waiting on github.com.
+            let latest =
+                tokio::task::spawn_blocking(move || crate::update::notice::check_and_stamp(&dir))
+                    .await
+                    .ok()
+                    .flatten();
+            let current = env!("CARGO_PKG_VERSION");
+            if let Some(latest) = latest
+                && announced.as_deref() != Some(latest.as_str())
+                && crate::update::is_newer(&latest, current)
+            {
+                // The one thing this task ever says, and it says it once per
+                // release: a daemon log nobody reads daily is no place for a
+                // line that repeats.
+                eprintln!(
+                    "mcpgw {latest} is available (this gateway is running {current}) — \
+                     run `mcpgw self-update`"
+                );
+                announced = Some(latest);
+            }
+            tokio::time::sleep(UPDATE_CHECK_POLL).await;
+        }
+    });
+}
+
+/// How long to wait for the first check — see [`FIRST_UPDATE_CHECK`].
+fn first_update_check() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(FIRST_UPDATE_CHECK_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    FIRST_UPDATE_CHECK
+}
+
 /// Ends this process so its supervisor starts the binary that replaced it.
 ///
 /// The runtime record is left in place rather than withdrawn: another gateway
@@ -281,6 +368,14 @@ async fn stand_aside(
     // will not die must not keep the old binary running.
     let _ = tokio::time::timeout(UPGRADE_DRAIN, manager.shutdown()).await;
     std::process::exit(i32::from(upgrade::UPGRADE_EXIT));
+}
+
+/// How long the gateway keeps serving after the exe watcher has decided it
+/// must stand aside: the clients mid-request get their answers, and the ones
+/// parked on a stream do not get to hold the old binary up.
+async fn drain_for_an_upgrade(mut decided: tokio::sync::watch::Receiver<Option<UpgradeRestart>>) {
+    upgrade_decided(&mut decided).await;
+    tokio::time::sleep(UPGRADE_DRAIN).await;
 }
 
 /// What the HTTP server drains on: Ctrl-C, or the exe watcher deciding this
