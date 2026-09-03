@@ -7,6 +7,16 @@ use mcpgw_core::probe::{ProbeError, probe_server};
 use mcpgw_core::upstream::UpstreamManager;
 use mcpgw_core::{Server, Transport};
 
+/// The budget every probe that is *not* testing the timeout gets.
+///
+/// These tests race a real child process against a tokio timer, so a budget
+/// tuned to an idle machine turns a slow spawn on a loaded runner into a
+/// `Timeout` where the test expected a handshake outcome. The number is far
+/// larger than the work needs because nothing here waits for it: a probe that
+/// is going to succeed or fail on the handshake does so immediately, and only
+/// a genuinely wedged one spends the budget.
+const GENEROUS: u64 = 60_000;
+
 fn stdio_server(command: &str, args: &[&str]) -> Server {
     Server {
         enabled: true,
@@ -30,7 +40,7 @@ async fn probe_mode(
 
 #[tokio::test]
 async fn healthy_server_reports_identity_and_tools() {
-    let success = probe_mode("healthy", 5000).await.unwrap();
+    let success = probe_mode("healthy", GENEROUS).await.unwrap();
     assert_eq!(success.server_name, "mcpgw-test-server");
     assert_eq!(success.server_version, "9.9.9");
     assert_eq!(success.tool_count, 2);
@@ -38,13 +48,20 @@ async fn healthy_server_reports_identity_and_tools() {
 
 #[tokio::test]
 async fn unresponsive_server_times_out() {
+    // The one test that wants a short budget, and the only one a slow runner
+    // cannot flip: the `slow` fixture never answers, so waiting longer only
+    // ever produces the same timeout.
     let err = probe_mode("slow", 300).await.unwrap_err();
     assert!(matches!(err, ProbeError::Timeout { .. }), "got: {err}");
 }
 
 #[tokio::test]
 async fn garbage_output_fails_the_handshake() {
-    let err = probe_mode("garbage", 3000).await.unwrap_err();
+    // Not GENEROUS: whichever way the transport treats bad frames, either
+    // outcome is accepted below, so a budget this test can spend in full is a
+    // budget it *will* spend in full. Short enough to keep the suite quick,
+    // long enough that a slow spawn still gets to produce a handshake error.
+    let err = probe_mode("garbage", 5000).await.unwrap_err();
     // Non-JSON output either breaks the handshake outright or starves it
     // into the timeout, depending on how the transport treats bad frames.
     assert!(
@@ -58,14 +75,14 @@ async fn garbage_output_fails_the_handshake() {
 
 #[tokio::test]
 async fn immediate_exit_fails_the_handshake() {
-    let err = probe_mode("exit", 3000).await.unwrap_err();
+    let err = probe_mode("exit", GENEROUS).await.unwrap_err();
     assert!(matches!(err, ProbeError::Handshake { .. }), "got: {err}");
 }
 
 #[tokio::test]
 async fn missing_binary_is_a_spawn_error() {
     let server = stdio_server("/nonexistent/mcpgw-no-such-binary", &[]);
-    let err = probe_server(&server, Duration::from_millis(1000))
+    let err = probe_server(&server, Duration::from_millis(GENEROUS))
         .await
         .unwrap_err();
     assert!(
@@ -87,7 +104,7 @@ async fn http_server_reports_identity_and_tools() {
         },
     };
 
-    let success = probe_server(&server, Duration::from_secs(10))
+    let success = probe_server(&server, Duration::from_millis(GENEROUS))
         .await
         .unwrap();
     assert_eq!(success.server_name, "mcpgw");
@@ -106,7 +123,7 @@ async fn unreachable_http_server_fails_the_handshake() {
             headers: BTreeMap::new(),
         },
     };
-    let err = probe_server(&server, Duration::from_secs(5))
+    let err = probe_server(&server, Duration::from_millis(GENEROUS))
         .await
         .unwrap_err();
     assert!(matches!(err, ProbeError::Handshake { .. }), "got: {err}");
@@ -124,7 +141,9 @@ async fn fixture_gateway() -> (std::net::SocketAddr, Arc<UpstreamManager>) {
     .collect();
     let manager = Arc::new(
         UpstreamManager::new(servers)
-            .with_connect_timeout(Duration::from_secs(5))
+            // Long enough that spawning the fixture under parallel load stays
+            // inside it; this gateway is scenery, not the thing under test.
+            .with_connect_timeout(Duration::from_secs(30))
             .with_backoff_base(Duration::from_millis(20)),
     );
     let gateway = Gateway::new(Arc::clone(&manager), "fx".to_owned());

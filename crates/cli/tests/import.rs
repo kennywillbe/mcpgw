@@ -760,3 +760,44 @@ fn a_piped_run_explains_a_shared_address_and_keeps_both() {
     assert!(json["servers"]["ctx"].is_object());
     assert!(json["servers"]["context7"].is_object());
 }
+
+/// The third outcome #82 added is offered, not taken: a run that cannot ask
+/// still keeps the canonical entry, and must not invent the second copy on
+/// the user's behalf.
+#[test]
+fn a_run_that_cannot_ask_never_writes_the_second_copy() {
+    let sb = Sandbox::new();
+    sb.ok(&["add", "github", "--", "npx", "canonical-version"]);
+    sb.write_client(
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {"github": {"command": "npx", "args": ["client-version"]}}}"#,
+    );
+
+    let out = sb.ok(&["import", "--from", "cursor"]);
+    assert!(
+        out.contains("! github differs from the canonical entry (skipped — not a terminal, keeping canonical)"),
+        "{out}"
+    );
+
+    let list = sb.ok(&["list", "--json"]);
+    let json: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(json["servers"]["github"]["args"][0], "canonical-version");
+    assert!(json["servers"].get("github-2").is_none(), "{list}");
+}
+
+/// A dry run is where someone finds out that a conflict has three answers and
+/// what the third one would be called — the interactive run is the only place
+/// they can be given, and they have to know it is worth starting one.
+#[test]
+fn dry_run_names_all_three_outcomes_and_the_second_name() {
+    let sb = Sandbox::new();
+    sb.ok(&["add", "github", "--", "npx", "canonical-version"]);
+    sb.write_client(
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {"github": {"command": "npx", "args": ["client-version"]}}}"#,
+    );
+
+    let out = sb.ok(&["import", "--from", "cursor", "--dry-run"]);
+    assert!(out.contains("keep both as github-2"), "{out}");
+    assert!(out.contains("overwrite it"), "{out}");
+}

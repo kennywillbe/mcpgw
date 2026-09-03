@@ -75,8 +75,9 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             }
         };
         let managed = state.clients.get(kind.id()).cloned().unwrap_or_default();
-        let desired = gateway_entries(kind, args, &canonical, &bridge)?;
-        let mut planned = match plan_client(kind, &desired, &managed)? {
+        let resolved = state.resolved.get(kind.id()).cloned().unwrap_or_default();
+        let desired = gateway_entries(kind, args, &canonical, &bridge, &resolved)?;
+        let mut planned = match plan_client(kind, &desired.desired, &managed)? {
             Planned::Ready(planned) => planned,
             Planned::Skipped(reason) => {
                 heading(&reason);
@@ -86,6 +87,18 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
 
         heading(&describe(&planned.plan));
         print_plan_lines(&planned.plan, color);
+        for name in &desired.displaced {
+            println!(
+                "  {}",
+                crate::ui::dim(
+                    &format!(
+                        "! {name} not written here — this client's {name:?} entry is your own \
+                         server, kept when you said the two were different"
+                    ),
+                    color,
+                )
+            );
+        }
 
         if !planned.plan.has_changes() {
             continue;
@@ -313,18 +326,19 @@ fn announce(args: &SyncArgs) -> anyhow::Result<String> {
 /// earlier sync managed under a name that is not a canonical server's, the
 /// single `mcpgw` entry a 0.3.x `--aggregate` run wrote included, falls out
 /// of the plan as a remove.
+///
+/// The exception is a name this client resolved to a different server: there
+/// the entry keeps the client's name and points at the server that name has
+/// stood for since the user kept both copies.
 fn gateway_entries(
     kind: ClientKind,
     args: &SyncArgs,
     canonical: &BTreeMap<String, mcpgw_core::Server>,
     bridge: &str,
-) -> anyhow::Result<BTreeMap<String, mcpgw_core::Server>> {
-    Ok(per_server_gateway_servers(
-        kind,
-        canonical,
-        &args.gateway_url,
-        bridge,
-    )?)
+    resolved: &BTreeMap<String, String>,
+) -> anyhow::Result<mcpgw_core::sync::ClientNames> {
+    let desired = per_server_gateway_servers(kind, canonical, &args.gateway_url, bridge)?;
+    Ok(mcpgw_core::sync::under_client_names(desired, resolved))
 }
 
 /// The file this client's sync reads and writes, and whether it is there

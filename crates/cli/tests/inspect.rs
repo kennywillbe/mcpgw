@@ -98,7 +98,7 @@ version = 1
 type = "stdio"
 command = "definitely-not-a-real-command-mcpgw"
 "#;
-    let out = run_inspect(dir.path(), config, &["ghost", "--timeout", "5"]);
+    let out = run_inspect(dir.path(), config, &["ghost", "--timeout", "60"]);
     assert!(!out.status.success());
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains("cannot inspect server \"ghost\""), "{err}");

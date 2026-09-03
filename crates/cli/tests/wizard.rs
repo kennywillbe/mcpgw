@@ -557,6 +557,81 @@ async fn import_never_overwrites_what_the_config_already_says() {
     assert!(config.contains("[servers.notes]"), "{config}");
 }
 
+/// The third answer #82 added: keep the canonical entry *and* bring the
+/// client's differing one in beside it, so the client stops being an
+/// unmanaged entry talking to its origin behind the gateway's back.
+#[tokio::test]
+async fn a_conflict_can_be_kept_both_ways() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"]},
+            "notes": {"command": "notes-mcp"}
+        }}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    // Yes to the survey, yes to the import, then the second option: keep both.
+    let stdout = wizard(dir.path(), &url, &[], "y\ny\n2\n").await;
+
+    assert!(
+        stdout.contains("Keep both — bring your client's copy in as github-2"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("github-2 brought in — your github is untouched"),
+        "{stdout}"
+    );
+
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("command = \"mine\""), "{config}");
+    assert!(config.contains("[servers.github-2]"), "{config}");
+    assert!(config.contains("server-github"), "{config}");
+    // Adopted, which is the whole point: the next sync owns that entry and
+    // points it at the gateway.
+    let state = std::fs::read_to_string(dir.path().join("state").join("managed.json")).unwrap();
+    assert!(state.contains("github"), "{state}");
+}
+
+/// The same question's third answer, which is the one that loses data — so
+/// it is last in the list and has to be picked on purpose.
+#[tokio::test]
+async fn a_conflict_can_be_overwritten_on_purpose() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        r#"{"mcpServers": {
+            "github": {"command": "npx", "args": ["server-github"]},
+            "notes": {"command": "notes-mcp"}
+        }}"#,
+    );
+
+    let (_held, url) = dead_gateway();
+    let stdout = wizard(dir.path(), &url, &[], "y\ny\n3\n").await;
+
+    assert!(
+        stdout.contains("github replaced with your client's copy"),
+        "{stdout}"
+    );
+    let config = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(config.contains("server-github"), "{config}");
+    assert!(!config.contains("command = \"mine\""), "{config}");
+    assert!(!config.contains("[servers.github-2]"), "{config}");
+}
+
 /// Reads the served address out of the gateway's own banner and keeps
 /// draining its stdout, so a later banner line cannot hit a closed pipe.
 async fn gateway_url(child: &mut tokio::process::Child) -> String {
@@ -935,4 +1010,141 @@ async fn a_server_this_machine_cannot_start_is_imported_switched_off() {
     let entries = json_at(&dir.path().join(".cursor/mcp.json"))["mcpServers"].clone();
     assert!(entries["node_repl"].get("url").is_none(), "{entries}");
     assert_eq!(entries["notes"]["url"], url.replace("/mcp", "/s/notes"));
+}
+
+/// Runs a plain `mcpgw` subcommand against a wizard sandbox and returns its
+/// stdout, so a test can carry on past `init` into the sync and eject that
+/// act on what the wizard recorded.
+async fn mcpgw(home: &Path, args: &[&str]) -> String {
+    let output = command(home).args(args).output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "mcpgw {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Keep-both, followed all the way to the client file — which is where the
+/// answer either means what the user said or does the opposite of it.
+///
+/// The user was asked whether their client's `github` was the canonical
+/// `github`, and said no. So their entry follows *their* server, which came
+/// in as `github-2`; pointing it at `/s/github` would repoint it at the one
+/// server they had just ruled out. The canonical `github` is not written into
+/// this client at all — that name is spoken for here — and it is said out
+/// loud rather than dropped in silence.
+#[tokio::test]
+async fn a_conflict_answered_keep_both_is_adopted_beside_canonical() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    let client = dir.path().join(".cursor/mcp.json");
+    let original = format!(
+        r#"{{"mcpServers": {{"github": {{"command": {}, "args": ["healthy"]}}}}}}"#,
+        real_command()
+    );
+    write_client(dir.path(), ".cursor/mcp.json", &original);
+
+    let (_held, url) = dead_gateway();
+    // The import step opens even though the client holds no unknown name, and
+    // the conflict it opens for is answered with the second option: keep both.
+    let stdout = wizard(dir.path(), &url, &[], "y\n2\n").await;
+    assert!(
+        stdout.contains("github-2 brought in — your github is untouched"),
+        "{stdout}"
+    );
+
+    let state: serde_json::Value = json_at(&dir.path().join("state/managed.json"));
+    assert_eq!(state["clients"]["cursor"][0], "github");
+    assert_eq!(state["resolved"]["cursor"]["github"], "github-2");
+
+    let out = mcpgw(dir.path(), &["sync", "--gateway-url", &url]).await;
+    let entries = json_at(&client)["mcpServers"].clone();
+    assert_eq!(
+        entries["github"]["url"],
+        url.replace("/mcp", "/s/github-2"),
+        "{entries}"
+    );
+    // Their server, under their name, and nothing else added beside it.
+    assert_eq!(entries.as_object().unwrap().len(), 1, "{entries}");
+    assert!(out.contains("github not written here"), "{out}");
+
+    // And the way back: the entry goes to the definition it stood for, under
+    // the name it has always had.
+    mcpgw(dir.path(), &["eject", "--yes"]).await;
+    assert_eq!(
+        json_at(&client),
+        serde_json::from_str::<serde_json::Value>(&original).unwrap()
+    );
+}
+
+/// The conflict question is asked once. An answer of "keep yours" writes
+/// nothing, so the only thing that can stop the next `mcpgw init` asking
+/// again is the record of having asked.
+#[tokio::test]
+async fn a_conflict_left_alone_is_not_asked_about_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {}, "args": ["healthy"]}}}}}}"#,
+            real_command()
+        ),
+    );
+
+    let (_held, url) = dead_gateway();
+    let first = wizard(dir.path(), &url, &[], "y\n1\n").await;
+    assert!(
+        first.contains("differs from the canonical entry"),
+        "{first}"
+    );
+
+    let second = wizard(dir.path(), &url, &[], "y\n1\n").await;
+    assert!(
+        !second.contains("differs from the canonical entry"),
+        "{second}"
+    );
+}
+
+/// `--yes` reaches keep-canonical by taking the default, not by asking. That
+/// is not an answer, so it must not be remembered as one — the next run at a
+/// real terminal still owes the user the question.
+#[tokio::test]
+async fn yes_keeps_canonical_without_recording_an_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[servers.github]\ntype = \"stdio\"\ncommand = \"mine\"\n",
+    )
+    .unwrap();
+    write_client(
+        dir.path(),
+        ".cursor/mcp.json",
+        &format!(
+            r#"{{"mcpServers": {{"github": {{"command": {}, "args": ["healthy"]}}}}}}"#,
+            real_command()
+        ),
+    );
+
+    let (_held, url) = dead_gateway();
+    wizard(dir.path(), &url, &["--yes"], "").await;
+
+    let state: serde_json::Value = json_at(&dir.path().join("state/managed.json"));
+    assert!(state["resolved"].get("cursor").is_none(), "{state}");
+
+    let asked = wizard(dir.path(), &url, &[], "y\n1\n").await;
+    assert!(
+        asked.contains("differs from the canonical entry"),
+        "{asked}"
+    );
 }

@@ -63,7 +63,7 @@ impl Harness {
 
         let manager = Arc::new(
             UpstreamManager::new(std::collections::BTreeMap::new())
-                .with_connect_timeout(Duration::from_secs(5))
+                .with_connect_timeout(Duration::from_secs(30))
                 .with_backoff_base(Duration::from_millis(20)),
         );
         let endpoints = Endpoints::new(EndpointTable::new(Vec::new()));

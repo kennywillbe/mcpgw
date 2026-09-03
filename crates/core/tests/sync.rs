@@ -4,7 +4,7 @@ use std::path::Path;
 use mcpgw_core::state::ManagedState;
 use mcpgw_core::sync::{
     apply_plan, apply_plan_to, client_entry, per_server_gateway_server, per_server_gateway_servers,
-    plan_client_context, plan_sync,
+    plan_client_context, plan_sync, under_client_names,
 };
 use mcpgw_core::{ClientKind, Config, backup};
 
@@ -309,16 +309,26 @@ fn entry_shapes_per_client() {
     assert!(windsurf_http.get("url").is_none());
     assert!(windsurf_http.get("type").is_none());
 
-    // Zed is the shared shape plus the `source` Zed silently requires; an
-    // entry written without it is one Zed drops on the floor.
+    // Zed is the shared stdio shape plus the `source` a Zed old enough to
+    // discriminate on it requires — an entry written without it is one that
+    // Zed drops on the floor. A remote entry gets no `source`: Zed's remote
+    // shape is a bare `{url, headers}`, and a discriminator naming the
+    // variant that carries `command` has no business on one that carries a
+    // URL instead.
     let zed_stdio = client_entry(ClientKind::Zed, &canonical["github"]);
     let zed_http = client_entry(ClientKind::Zed, &canonical["linear"]);
     assert_eq!(zed_stdio["source"], "custom");
-    assert_eq!(zed_http["source"], "custom");
     assert_eq!(zed_stdio["command"], "npx");
     assert_eq!(zed_stdio["env"]["TOKEN"], "t");
+    assert!(zed_http.get("source").is_none(), "{zed_http}");
     assert_eq!(zed_http["url"], "https://mcp.linear.app/mcp");
     assert!(zed_http.get("type").is_none());
+    // Which leaves it byte-identical to Amp's remote shape, and that is the
+    // shape Zed documents.
+    assert_eq!(
+        zed_http,
+        client_entry(ClientKind::Amp, &canonical["linear"])
+    );
 
     // Cline is the shared stdio shape; a remote entry needs its camelCase
     // `type`, because an untyped one means the legacy SSE transport there.
@@ -453,10 +463,10 @@ fn per_server_gateway_entry_shapes_per_client() {
             http(serde_json::json!({ "type": "http" }))
         }
         ClientKind::Gemini => serde_json::json!({ "httpUrl": url }),
-        ClientKind::Codex | ClientKind::Amp => http(serde_json::json!({})),
+        // A gateway entry is remote, so Zed's `source` is not on it either.
+        ClientKind::Codex | ClientKind::Amp | ClientKind::Zed => http(serde_json::json!({})),
         ClientKind::Opencode => http(serde_json::json!({ "type": "remote" })),
         ClientKind::Windsurf => serde_json::json!({ "serverUrl": url }),
-        ClientKind::Zed => http(serde_json::json!({ "source": "custom" })),
         ClientKind::Cline | ClientKind::ClineCli => {
             http(serde_json::json!({ "type": "streamableHttp" }))
         }
@@ -689,6 +699,32 @@ fn a_state_file_written_before_the_migrated_flag_still_loads() {
     let state = ManagedState::load(&path).unwrap();
     assert_eq!(state.clients["cursor"], managed(&["github"]));
     assert!(!state.migrated);
+    // Same for the entry→server mapping: an old file names no mapping, which
+    // reads as every entry standing for the server it is named after.
+    assert!(state.resolved.is_empty());
+}
+
+/// The mapping survives a write and a read, because it is the only record of
+/// which server a client's entry was kept for — losing it points that entry
+/// back at the canonical name it collided with.
+#[test]
+fn the_entry_mapping_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("managed.json");
+
+    let mut state = ManagedState::default();
+    state
+        .clients
+        .insert("cursor".to_owned(), managed(&["github"]));
+    state.resolved.insert(
+        "cursor".to_owned(),
+        [("github".to_owned(), "github-2".to_owned())]
+            .into_iter()
+            .collect(),
+    );
+    state.save(&path).unwrap();
+
+    assert_eq!(ManagedState::load(&path).unwrap(), state);
 }
 
 #[test]
@@ -697,4 +733,99 @@ fn client_ids_round_trip() {
         assert_eq!(ClientKind::from_id(kind.id()), Some(kind));
     }
     assert_eq!(ClientKind::from_id("emacs"), None);
+}
+
+/// Zed's `source` is the discriminator of a shape that carries `command`.
+/// Putting it on a `url` entry described a variant the entry does not match,
+/// and an entry Zed cannot deserialize is one it drops without a word — a
+/// server synced and then silently never loaded.
+#[test]
+fn zed_writes_source_on_stdio_entries_only() {
+    let stdio = mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: mcpgw_core::Transport::Stdio {
+            command: "npx".to_owned(),
+            args: vec!["server-github".to_owned()],
+            env: std::collections::BTreeMap::new(),
+        },
+    };
+    let remote = mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers: [("Authorization".to_owned(), "Bearer t".to_owned())]
+                .into_iter()
+                .collect(),
+        },
+    };
+
+    let written = client_entry(ClientKind::Zed, &stdio);
+    assert_eq!(written["source"], "custom");
+
+    let written = client_entry(ClientKind::Zed, &remote);
+    assert!(written.get("source").is_none(), "{written}");
+    // And nothing else was traded away for it: the documented remote shape is
+    // exactly these two keys.
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "url": "https://mcp.linear.app/mcp",
+            "headers": {"Authorization": "Bearer t"},
+        })
+    );
+}
+
+/// The mapping keep-both leaves behind: the client's own entry name follows
+/// the server that name stood for, not the canonical entry it collided with.
+#[test]
+fn a_resolved_entry_follows_its_own_server() {
+    let canonical = canonical();
+    let resolved: BTreeMap<String, String> = [("github".to_owned(), "github-2".to_owned())]
+        .into_iter()
+        .collect();
+    let mut desired = canonical.clone();
+    desired.insert("github-2".to_owned(), canonical["linear"].clone());
+
+    let names = under_client_names(desired, &resolved);
+
+    // The client's `github` entry is the server it kept, under its own name.
+    assert_eq!(names.desired["github"], canonical["linear"]);
+    // And the canonical `github` is not written here at all: taking that name
+    // is exactly what the user said not to do.
+    assert!(
+        !names.desired.contains_key("github-2"),
+        "{:?}",
+        names.desired
+    );
+    assert_eq!(names.displaced, vec!["github".to_owned()]);
+    // Everything nobody resolved keeps its own name.
+    assert_eq!(names.desired["linear"], canonical["linear"]);
+    assert!(names.desired.contains_key("parked"));
+}
+
+/// An entry resolved to the name it already carries is a recorded answer, not
+/// a rename: it must leave the desired set exactly as it found it.
+#[test]
+fn resolving_an_entry_to_its_own_name_changes_nothing() {
+    let canonical = canonical();
+    let resolved: BTreeMap<String, String> = [("github".to_owned(), "github".to_owned())]
+        .into_iter()
+        .collect();
+
+    let names = under_client_names(canonical.clone(), &resolved);
+
+    assert_eq!(names.desired, canonical);
+    assert!(names.displaced.is_empty());
+}
+
+/// Every state file written before the mapping existed, and every client that
+/// never answered a conflict.
+#[test]
+fn no_mapping_is_the_map_it_was_handed() {
+    let canonical = canonical();
+    let names = under_client_names(canonical.clone(), &BTreeMap::new());
+    assert_eq!(names.desired, canonical);
+    assert!(names.displaced.is_empty());
 }

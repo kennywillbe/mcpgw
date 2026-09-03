@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal as _;
 
 use anyhow::Context as _;
@@ -21,6 +21,22 @@ pub struct ImportArgs {
     /// Skip the conflict prompt and keep the canonical entry
     #[arg(long)]
     pub yes: bool,
+}
+
+/// What to do about a client entry whose name matches a canonical entry but
+/// whose definition does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictChoice {
+    /// Leave the canonical entry alone and leave the client's copy where it
+    /// is. The answer every run that cannot ask takes, because it is the only
+    /// one that writes nothing.
+    KeepCanonical,
+    /// Replace the canonical entry with the client's definition.
+    Overwrite,
+    /// Keep the canonical entry untouched *and* import the client's copy
+    /// under a second name, so it stops being an unmanaged entry talking to
+    /// its origin behind the gateway's back.
+    KeepBoth,
 }
 
 pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
@@ -85,20 +101,24 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     // fallback alone leaves scripted callers unable to promise they will not
     // block.
     let non_interactive = args.yes || !std::io::stdin().is_terminal();
-    let conflicts: Vec<String> = plan.conflicts.iter().map(|c| c.name.clone()).collect();
-    let (mut store, plan, overwrite, skip) =
+    let conflicts: Vec<(String, String)> = plan
+        .conflicts
+        .iter()
+        .map(|c| (c.name.clone(), adopt_as(c)))
+        .collect();
+    let (mut store, plan, answers, skip) =
         if (conflicts.is_empty() && addresses.is_empty()) || non_interactive {
             // Nothing to ask, so nothing to release: the plan already under
             // the lock is the one that gets applied. Under `--yes` that means
             // keeping both copies — the answer that loses nothing.
-            (store, plan, BTreeSet::new(), BTreeSet::new())
+            (store, plan, BTreeMap::new(), BTreeSet::new())
         } else {
             drop(store);
-            let overwrite = ask(&conflicts)?;
+            let answers = ask(&conflicts)?;
             let skip = ask_same_address(&addresses)?;
             let store = ConfigStore::edit_or_create(&config_path)?;
             let plan = plan_import(&sources, &store.config().servers, &super::command_exists);
-            (store, plan, overwrite, skip)
+            (store, plan, answers, skip)
         };
 
     let state_dir =
@@ -136,25 +156,16 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
         adopt(&mut state, candidate);
         println!("= {} already present (adopted)", candidate.name);
     }
-    for candidate in &plan.conflicts {
-        if overwrite.contains(&candidate.name) {
-            store.upsert_server(&candidate.name, &candidate.server, true)?;
-            adopt(&mut state, candidate);
-            imported += 1;
-            println!("~ {} overwritten{}", candidate.name, describe(candidate));
-        } else {
-            skipped += 1;
-            let why = if args.yes {
-                "--yes keeps canonical"
-            } else {
-                "run interactively to decide"
-            };
-            println!(
-                "! {} differs from the canonical entry (skipped — {why})",
-                candidate.name
-            );
-        }
-    }
+    let why_kept = if args.yes {
+        "--yes keeps canonical"
+    } else if non_interactive {
+        "not a terminal, keeping canonical"
+    } else {
+        "you kept canonical"
+    };
+    let (written, kept) = write_conflicts(&mut store, &mut state, &plan, &answers, why_kept)?;
+    imported += written;
+    skipped += kept;
 
     // Canonical file first, then the adoption record — deliberately the
     // reverse of the intent-first order sync uses, because the two ledgers
@@ -181,20 +192,116 @@ pub fn run(args: &ImportArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Asks about each conflicting name and returns the ones to overwrite.
+/// Writes the decided outcome for every conflict, returning how many entries
+/// were written and how many were left to the canonical config.
+///
+/// `why_kept` is the parenthetical on a kept-canonical line: the same outcome
+/// is reached by `--yes`, by a pipe and by a person answering, and which of
+/// them it was is the only thing that makes the line actionable.
+fn write_conflicts(
+    store: &mut ConfigStore,
+    state: &mut ManagedState,
+    plan: &ImportPlan,
+    answers: &BTreeMap<String, ConflictChoice>,
+    why_kept: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let (mut written, mut kept) = (0, 0);
+    for candidate in &plan.conflicts {
+        // Answers are keyed by name and only honoured where the fresh plan
+        // still calls that name a conflict; anything else falls back to the
+        // outcome that writes nothing.
+        let answer = answers.get(&candidate.name).copied();
+        match answer.unwrap_or(ConflictChoice::KeepCanonical) {
+            ConflictChoice::Overwrite => {
+                store.upsert_server(&candidate.name, &candidate.server, true)?;
+                adopt(state, candidate);
+                resolve_to(state, candidate, &candidate.name);
+                written += 1;
+                println!("~ {} overwritten{}", candidate.name, describe(candidate));
+            }
+            ConflictChoice::KeepBoth => {
+                // The second name comes from the *fresh* plan, not from the
+                // one the question was asked about: another process may have
+                // claimed it while the terminal was being read.
+                let second = adopt_as(candidate);
+                store.upsert_server(&second, &candidate.server, false)?;
+                adopt(state, candidate);
+                // The client's entry follows *its* server, not the canonical
+                // one it shares a name with — the user just said those two
+                // are different things.
+                resolve_to(state, candidate, &second);
+                written += 1;
+                println!(
+                    "+ {second} kept alongside the canonical {}{}",
+                    candidate.name,
+                    describe(candidate)
+                );
+            }
+            ConflictChoice::KeepCanonical => {
+                // Nothing is adopted, but a person's answer is still recorded:
+                // the wizard reads it to know this conflict has been put to
+                // someone already. `--yes` and a pipe reach the same outcome
+                // without anyone being asked, and must not be remembered as
+                // though they had been.
+                if answer.is_some() {
+                    resolve_to(state, candidate, &candidate.name);
+                }
+                kept += 1;
+                println!(
+                    "! {} differs from the canonical entry (skipped — {why_kept})",
+                    candidate.name
+                );
+            }
+        }
+    }
+    Ok((written, kept))
+}
+
+/// The question a conflict raises, and the name it is about.
+#[must_use]
+pub fn conflict_prompt(name: &str) -> String {
+    format!("{name:?} differs from the canonical entry — which would you like?")
+}
+
+/// The three outcomes, in the order [`conflict_choice`] decodes them.
+///
+/// Keeping canonical comes first because it is the recommended answer and the
+/// only one that writes nothing. Overwriting is last of the two that change
+/// the canonical entry: it is the single import outcome that loses data, so
+/// it is the one that has to be picked deliberately.
+#[must_use]
+pub fn conflict_options(name: &str, adopt_as: &str) -> Vec<String> {
+    vec![
+        format!("Keep {name} as it is — your client's copy stays unmanaged"),
+        format!("Keep both — bring your client's copy in as {adopt_as}"),
+        format!("Overwrite {name} with your client's copy"),
+    ]
+}
+
+/// Reads an index from [`conflict_options`] back as an outcome. Anything out
+/// of range is the safe answer, which is also the default the prompt offers.
+#[must_use]
+pub fn conflict_choice(picked: usize) -> ConflictChoice {
+    match picked {
+        1 => ConflictChoice::KeepBoth,
+        2 => ConflictChoice::Overwrite,
+        _ => ConflictChoice::KeepCanonical,
+    }
+}
+
+/// Asks about each conflict — `(canonical name, name to adopt it under)` —
+/// and returns what was decided per name.
 ///
 /// Takes names rather than the plan so the caller cannot accidentally keep a
 /// lock alive across the prompt: this runs with none held.
-fn ask(names: &[String]) -> anyhow::Result<BTreeSet<String>> {
-    let mut overwrite = BTreeSet::new();
-    for name in names {
-        if super::confirm(&format!(
-            "{name:?} differs from the canonical entry — overwrite canonical?"
-        ))? {
-            overwrite.insert(name.clone());
-        }
+fn ask(conflicts: &[(String, String)]) -> anyhow::Result<BTreeMap<String, ConflictChoice>> {
+    let mut answers = BTreeMap::new();
+    for (name, adopt_as) in conflicts {
+        let picked =
+            crate::ui::choose(&conflict_prompt(name), &conflict_options(name, adopt_as), 0)?;
+        answers.insert(name.clone(), conflict_choice(picked));
     }
-    Ok(overwrite)
+    Ok(answers)
 }
 
 /// Why an entry is coming in switched off, and what turns it back on. Shared
@@ -286,6 +393,19 @@ fn display(client_id: &str) -> String {
     )
 }
 
+/// The name a conflict would be adopted under if both copies are kept.
+///
+/// The planner fills this in for every conflict. The fallback is only here so
+/// that a plan without one cannot panic a run halfway through writing — and
+/// it is a name that is inserted, never overwritten, so a bad guess fails
+/// loudly on the duplicate rather than quietly replacing something.
+pub fn adopt_as(candidate: &ImportCandidate) -> String {
+    candidate
+        .adopt_as
+        .clone()
+        .unwrap_or_else(|| format!("{}-2", candidate.name))
+}
+
 fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
     for (client_id, original) in &candidate.origins {
         state
@@ -293,6 +413,22 @@ fn adopt(state: &mut ManagedState, candidate: &ImportCandidate) {
             .entry(client_id.clone())
             .or_default()
             .insert(original.clone());
+    }
+}
+
+/// Records which canonical server each of a conflict's client entries stands
+/// for, so sync and eject follow the client's name to the right server.
+///
+/// Called for every answered conflict, keep-canonical included: an entry
+/// recorded as standing for the name it already carries is how "the user was
+/// asked and said leave it alone" is remembered.
+pub fn resolve_to(state: &mut ManagedState, candidate: &ImportCandidate, canonical: &str) {
+    for (client_id, original) in &candidate.origins {
+        state
+            .resolved
+            .entry(client_id.clone())
+            .or_default()
+            .insert(original.clone(), canonical.to_owned());
     }
 }
 
@@ -324,6 +460,40 @@ fn report_dry(plan: &mcpgw_core::import::ImportPlan) {
         println!("= {} already present (would adopt)", candidate.name);
     }
     for candidate in &plan.conflicts {
-        println!("! {} differs from the canonical entry", candidate.name);
+        println!(
+            "! {} differs from the canonical entry (run interactively to keep yours, \
+             overwrite it, or keep both as {})",
+            candidate.name,
+            adopt_as(candidate)
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConflictChoice, conflict_choice, conflict_options};
+
+    /// The prompt's order and the decoder's order are one contract split
+    /// across two functions, and the one that must never drift is which index
+    /// overwrites: getting it wrong replaces a canonical entry the user asked
+    /// to keep.
+    #[test]
+    fn the_offered_order_is_the_decoded_order() {
+        let options = conflict_options("context7", "context7-2");
+        assert_eq!(options.len(), 3);
+        assert!(options[0].contains("Keep context7 as it is"), "{options:?}");
+        assert!(options[1].contains("as context7-2"), "{options:?}");
+        assert!(options[2].contains("Overwrite context7"), "{options:?}");
+
+        assert_eq!(conflict_choice(0), ConflictChoice::KeepCanonical);
+        assert_eq!(conflict_choice(1), ConflictChoice::KeepBoth);
+        assert_eq!(conflict_choice(2), ConflictChoice::Overwrite);
+    }
+
+    /// An index the prompt never offered is the safe answer, not a panic:
+    /// this decodes a number that came off a terminal.
+    #[test]
+    fn an_answer_off_the_end_keeps_canonical() {
+        assert_eq!(conflict_choice(99), ConflictChoice::KeepCanonical);
     }
 }

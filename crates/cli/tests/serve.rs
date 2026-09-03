@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use rmcp::ServiceExt as _;
 use rmcp::transport::TokioChildProcess;
@@ -11,6 +12,18 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 mod util;
 use util::fixture_binary;
+
+/// How long a banner line may take to arrive. Generous because it covers a
+/// cold process start on a runner that is compiling and testing everything
+/// else at the same time.
+const BANNER_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long the gateway has to answer on an endpoint. It covers both the
+/// listener becoming ready after the banner and, for the reload test, the
+/// two-second config poll noticing an edit.
+const READY_DEADLINE: Duration = Duration::from_secs(90);
+
+const POLL: Duration = Duration::from_millis(250);
 
 /// A config with one healthy fixture server per name.
 fn config(names: &[&str]) -> String {
@@ -65,8 +78,8 @@ async fn serve_config(
         .unwrap();
 
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    let listening = lines.next_line().await.unwrap().unwrap();
-    let endpoints = lines.next_line().await.unwrap().unwrap();
+    let listening = banner_line(&mut lines).await;
+    let endpoints = banner_line(&mut lines).await;
     let addr = listening
         .split("http://")
         .nth(1)
@@ -81,9 +94,42 @@ async fn serve_config(
     (child, addr, endpoints)
 }
 
+/// One line of the startup banner, waited for to a deadline.
+///
+/// The child has to spawn, bind and flush before its first line lands, and on
+/// a loaded runner none of that is instant. A deadline turns "slower than the
+/// test expected" into "waited a minute", and only a genuinely wedged gateway
+/// still fails — with a message that says so.
+async fn banner_line(
+    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+) -> String {
+    tokio::time::timeout(BANNER_DEADLINE, lines.next_line())
+        .await
+        .expect("the gateway printed no banner line before the deadline")
+        .expect("reading the gateway banner")
+        .expect("the gateway closed stdout before finishing its banner")
+}
+
 /// Bridges to `url` with the binary's own stdio bridge and lists its tools.
+///
+/// Polled to a deadline rather than attempted once: the banner is printed
+/// around the bind, so the first connect can arrive before the listener is
+/// accepting — and after a config edit the endpoint only appears once the
+/// gateway's poll has got round to the file.
 async fn tool_names(url: &str) -> Vec<String> {
-    try_tool_names(url).await.unwrap()
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        match try_tool_names(url).await {
+            Ok(names) => return names,
+            Err(err) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "{url} never answered within {READY_DEADLINE:?}: {err:#}"
+                );
+                tokio::time::sleep(POLL).await;
+            }
+        }
+    }
 }
 
 /// The same, for the paths where not answering yet is an expected state.
@@ -133,21 +179,10 @@ async fn a_server_added_to_the_config_is_served_without_a_restart() {
 
     write_config(&dir.path().join("config.toml"), &config(&["fx1", "fx2"]));
 
-    // Polled to a deadline rather than slept on: the gateway looks at the
-    // file every two seconds, and a busy CI runner can take considerably
-    // longer than that to get round to it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-    loop {
-        if let Ok(names) = try_tool_names(&format!("http://{addr}/s/fx2")).await {
-            assert_eq!(names, ["echo", "reverse"]);
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the gateway never picked up the added server"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
+    assert_eq!(
+        tool_names(&format!("http://{addr}/s/fx2")).await,
+        ["echo", "reverse"]
+    );
 
     // The server that was there all along is still served, by the same
     // gateway process.

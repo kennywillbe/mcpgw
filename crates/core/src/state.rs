@@ -14,6 +14,27 @@ use crate::error::Error;
 pub struct ManagedState {
     #[serde(default)]
     pub clients: BTreeMap<String, BTreeSet<String>>,
+    /// Per client, the canonical server a client entry stands for, for the
+    /// entries mcpgw had to ask about.
+    ///
+    /// [`Self::clients`] says which entries mcpgw owns and rewrites; this says
+    /// what they *mean*, which differs from the entry's own name only after a
+    /// keep-both: the client called its server `github`, the canonical config
+    /// already used that name for a different one, so the client's copy came
+    /// in as `github-2` and the client's `github` entry has stood for
+    /// `github-2` ever since. Without the mapping the next sync would point
+    /// that entry at the canonical `github` — the server the user had just
+    /// said was a different one.
+    ///
+    /// An entry mapped to its own name is a decision too: it records that the
+    /// user was asked about the conflict and chose to leave the entry alone,
+    /// which is what stops the wizard asking again every run.
+    ///
+    /// Absent from every state file written before the field existed, and
+    /// empty for every entry adopted under its own name — both of which load
+    /// as "the entry stands for the canonical server it is named after".
+    #[serde(default)]
+    pub resolved: BTreeMap<String, BTreeMap<String, String>>,
     /// Whether this install has already been told that its client entries now
     /// reach the servers through the gateway.
     ///

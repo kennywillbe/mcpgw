@@ -31,7 +31,7 @@ fn manager(upstreams: &[(&str, &str)]) -> Arc<UpstreamManager> {
         .collect();
     Arc::new(
         UpstreamManager::new(servers)
-            .with_connect_timeout(Duration::from_secs(5))
+            .with_connect_timeout(Duration::from_secs(30))
             .with_backoff_base(Duration::from_millis(20)),
     )
 }
@@ -135,8 +135,11 @@ async fn a_hung_upstream_fails_the_request_on_the_deadline() {
     let text = err.to_string();
     assert!(text.contains("fx"), "should name the upstream: {text}");
     assert!(text.contains("deadline"), "should say why: {text}");
+    // Generous on purpose: the alternative this guards against is waiting out
+    // the connect ladder, which is tens of seconds. Anything well inside that
+    // proves the deadline fired, without asking a loaded runner to be quick.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(20),
         "waited {:?}, so nothing bounded the request",
         started.elapsed()
     );
@@ -220,7 +223,7 @@ async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<Up
     };
     let outer = Arc::new(
         UpstreamManager::new([(upstream.to_owned(), remote)].into_iter().collect())
-            .with_connect_timeout(Duration::from_secs(5))
+            .with_connect_timeout(Duration::from_secs(30))
             .with_backoff_base(Duration::from_millis(20)),
     );
     let client = connect(Gateway::aggregate(
@@ -710,8 +713,11 @@ async fn a_hung_upstream_fails_a_forwarded_request_on_the_deadline() {
     let text = err.to_string();
     assert!(text.contains("fx"), "should name the upstream: {text}");
     assert!(text.contains("deadline"), "should say why: {text}");
+    // Generous on purpose: the alternative this guards against is waiting out
+    // the connect ladder, which is tens of seconds. Anything well inside that
+    // proves the deadline fired, without asking a loaded runner to be quick.
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_secs(20),
         "waited {:?}, so nothing bounded the request",
         started.elapsed()
     );

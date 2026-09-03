@@ -1278,20 +1278,21 @@ fn zed_sync_marks_entries_custom_and_leaves_the_rest_of_the_settings_alone() {
         "postgres://localhost/dev"
     );
 
-    // Without `source: custom` Zed ignores an entry without a word, so both
-    // transports carry it.
-    assert_eq!(json["context_servers"]["github"]["source"], "custom");
+    // Both entries point at the gateway, which makes both of them remote —
+    // and Zed's remote shape is a bare `{url, headers}`. `source` belongs to
+    // the stdio shape it discriminated, so neither carries it.
     assert_eq!(
         json["context_servers"]["github"]["url"],
         "http://127.0.0.1:8137/s/github"
     );
+    assert!(json["context_servers"]["github"].get("source").is_none());
     assert!(json["context_servers"]["github"].get("command").is_none());
     assert!(json["context_servers"]["github"].get("env").is_none());
-    assert_eq!(json["context_servers"]["linear"]["source"], "custom");
     assert_eq!(
         json["context_servers"]["linear"]["url"],
         "http://127.0.0.1:8137/s/linear"
     );
+    assert!(json["context_servers"]["linear"].get("source").is_none());
     assert!(json["context_servers"]["linear"].get("type").is_none());
 
     let again = sb.ok(&["sync", "--client", "zed"]);

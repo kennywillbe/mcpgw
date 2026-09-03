@@ -102,10 +102,26 @@ mcpgw import --yes              # never prompt; keep canonical on conflict
 ```
 
 A client entry that differs from a canonical entry you already wrote is a
-conflict, and `import` asks what to do with it. `--yes` answers "keep the
-canonical entry" without asking, so scripts and agents can run `import`
-knowing it will neither block nor overwrite anything you wrote by hand. The
-skipped entries are still listed in the output.
+conflict, and `import` asks what to do with it. There are three answers: keep
+the canonical entry as it is, keep both — the canonical entry is untouched and
+the client's copy comes in as `<name>-2`, so the gateway serves that one too —
+or overwrite the canonical entry with the client's copy. Keeping both is the
+answer when the two really are different servers that happen to share a name:
+keeping only yours leaves that client's entry unmanaged, talking to its server
+directly rather than through the gateway.
+
+Keeping both leaves that client's entry pointing at the server it always
+meant. Its `github` is now served as `github-2`, so `sync` points the entry at
+`/s/github-2` and `eject` puts your own definition of it back — you said the
+two were different servers, and the entry that made you say so keeps its own.
+The canonical `github` is not written into that client, because the name is
+spoken for there; `sync` says so on the line under the plan. Every other
+client gets it as usual.
+
+`--yes` answers "keep the canonical entry" without asking, and so does a run
+whose stdin is not a terminal, so scripts and agents can run `import` knowing
+it will neither block nor overwrite anything you wrote by hand. The skipped
+entries are still listed in the output.
 
 Client ids are `claude-desktop`, `claude-code`, `cursor`, `vscode`, `gemini`,
 `codex`, `opencode`, `windsurf`, `zed`, `cline`, `cline-cli`, `amp`, `zoo` —

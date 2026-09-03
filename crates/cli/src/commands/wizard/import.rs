@@ -22,17 +22,66 @@ use mcpgw_core::{ClientKind, ClientRead, ConfigStore, Detection, Server, Transpo
 
 use super::{Ctx, Outcome};
 use crate::commands::import::{
-    SAME_ADDRESS_PROMPT, command_missing_line, same_address_line, same_address_options,
+    ConflictChoice, SAME_ADDRESS_PROMPT, adopt_as, command_missing_line, conflict_choice,
+    conflict_options, conflict_prompt, resolve_to, same_address_line, same_address_options,
     same_address_questions,
 };
 use crate::ui;
 
-/// True when some configured client holds a server the canonical config has
-/// never heard of. A client whose file will not parse is not counted as
-/// having something to import — `mcpgw doctor` is where a broken client
-/// config gets explained, and the wizard would only be guessing.
+/// True when the step has something to ask or write: a client holding a name
+/// the canonical config has never heard of, or one it holds under a different
+/// definition. A client whose file will not parse counts as neither —
+/// `mcpgw doctor` is where a broken client config gets explained, and the
+/// wizard would only be guessing.
 pub fn pending(cx: &Ctx) -> bool {
-    unimported(cx).is_some()
+    unimported(cx).is_some() || conflicted(cx)
+}
+
+/// True when a client holds a server under a name the canonical config holds
+/// under a *different* definition, and nobody has been asked about it yet.
+///
+/// Without this the step skips a machine where every name is already known
+/// but one of them means something else, so the choice between the two
+/// definitions is never offered and the client keeps talking to its own
+/// server behind the gateway's back — the split brain keep-both exists to
+/// end.
+///
+/// Planned rather than compared inline: `run` shows a plan built from the
+/// same snapshot, and a step that opens on one rule and reports on another
+/// opens with nothing to say.
+fn conflicted(cx: &Ctx) -> bool {
+    let (sources, _) = sources(cx);
+    let sources = undecided(cx, sources);
+    !plan_import(
+        &sources,
+        &cx.config.servers,
+        &crate::commands::command_exists,
+    )
+    .conflicts
+    .is_empty()
+}
+
+/// Drops the client entries this install has already settled: the ones mcpgw
+/// manages, and the ones whose conflict has been put to someone.
+///
+/// A managed entry points at the gateway now, and planning it again reads the
+/// gateway's own address as a brand-new server to import — that is how a
+/// finished machine never settles. An answered conflict is the same problem
+/// one step later: keeping the canonical entry writes nothing, so without the
+/// record of having asked, every `mcpgw init` from here on asks again.
+fn undecided(cx: &Ctx, sources: Vec<(String, ClientRead)>) -> Vec<(String, ClientRead)> {
+    sources
+        .into_iter()
+        .map(|(id, mut read)| {
+            let managed = cx.state.clients.get(&id);
+            let answered = cx.state.resolved.get(&id);
+            read.servers.retain(|name, _| {
+                !managed.is_some_and(|mine| mine.contains(name))
+                    && !answered.is_some_and(|mine| mine.contains_key(name))
+            });
+            (id, read)
+        })
+        .collect()
 }
 
 /// Shows the whole import plan, asks once, and writes what was agreed to.
@@ -43,6 +92,9 @@ pub fn pending(cx: &Ctx) -> bool {
 /// config or the adoption record cannot be written.
 pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
     let (sources, unreadable) = sources(cx);
+    // Whatever this install has already settled is not planned again: see
+    // [`undecided`].
+    let sources = undecided(cx, sources);
     let plan = plan_import(
         &sources,
         &cx.config.servers,
@@ -91,6 +143,25 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
         }
     }
 
+    // The other per-entry question: a client entry that disagrees with a
+    // canonical one. Earlier releases only ever left these alone, which kept
+    // the wizard's promise not to touch what you already have but also left
+    // the client talking to its origin behind the gateway's back. Keeping
+    // both honours the promise and ends the split brain, so it is offered
+    // here — with keeping canonical still the default, and `--yes` still
+    // taking it.
+    let mut conflicts: BTreeMap<String, ConflictChoice> = BTreeMap::new();
+    for candidate in &plan.conflicts {
+        let adopt_as = adopt_as(candidate);
+        let picked = cx.choose(
+            &conflict_prompt(&candidate.name),
+            &conflict_options(&candidate.name, &adopt_as),
+            Some(0),
+            "mcpgw import",
+        )?;
+        conflicts.insert(candidate.name.clone(), conflict_choice(picked));
+    }
+
     // Everything the user struck out is removed at the source, not at the
     // plan: dropping a candidate would leave its client entries unadopted
     // *and* let a name it was holding stay taken, so the survivors keep
@@ -110,7 +181,7 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
         })
         .collect();
 
-    apply(cx, &kept)?;
+    apply(cx, &kept, &conflicts)?;
     cx.refresh()?;
     Ok(Outcome::Handled)
 }
@@ -231,8 +302,8 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
     if !plan.conflicts.is_empty() {
         let names: Vec<&str> = plan.conflicts.iter().map(|c| c.name.as_str()).collect();
         bullets.push(format!(
-            "{} differ from what your config already says — yours wins, I won't touch \
-             them: {}.",
+            "{} differ from what your config already says — I'll ask about each one, \
+             and yours wins unless you say otherwise: {}.",
             plan.conflicts.len(),
             names.join(", ")
         ));
@@ -352,7 +423,14 @@ fn truncate(text: &str, limit: usize) -> String {
 
 fn question(cx: &Ctx, plan: &ImportPlan) -> String {
     if plan.new.is_empty() {
-        return "\nRecord where these came from?".to_owned();
+        // A run with nothing new still has something to settle when a name
+        // means two things, and the answer to that is not yes-or-no — so the
+        // question here is only whether to go on to it.
+        return if plan.conflicts.is_empty() {
+            "\nRecord where these came from?".to_owned()
+        } else {
+            "\nGo through the entries your config disagrees with?".to_owned()
+        };
     }
     let lead = format!("\nImport {}?", servers(plan.new.len()));
     if cx.assume_yes {
@@ -418,7 +496,11 @@ fn ask(cx: &Ctx, question: &str, offered: &[String]) -> anyhow::Result<Option<BT
 /// long as the terminal goes unanswered. So the plan that is *applied* is
 /// built again from the same sources against the config the lock protects,
 /// exactly as `mcpgw import` does it.
-fn apply(cx: &Ctx, sources: &[(String, ClientRead)]) -> anyhow::Result<()> {
+fn apply(
+    cx: &Ctx,
+    sources: &[(String, ClientRead)],
+    conflicts: &BTreeMap<String, ConflictChoice>,
+) -> anyhow::Result<()> {
     let mut store = ConfigStore::edit_or_create(&cx.config_path)?;
     let plan = plan_import(
         sources,
@@ -439,10 +521,51 @@ fn apply(cx: &Ctx, sources: &[(String, ClientRead)]) -> anyhow::Result<()> {
     for candidate in &plan.already {
         adopt(&mut state, candidate);
     }
-    // Conflicts are never resolved here. The wizard's promise is that it does
-    // not touch what you already have, and overwriting a canonical entry is
-    // the one import outcome that loses something — `mcpgw import` is where
-    // that decision is offered, entry by entry.
+    // Whatever was decided above, re-read against the plan the lock protects:
+    // an answer about a name that stopped being a conflict is an answer about
+    // something that no longer exists, and falls back to keeping canonical.
+    let mut resolved: Vec<String> = Vec::new();
+    let mut left_alone: Vec<&str> = Vec::new();
+    for candidate in &plan.conflicts {
+        match conflicts
+            .get(&candidate.name)
+            .copied()
+            .unwrap_or(ConflictChoice::KeepCanonical)
+        {
+            ConflictChoice::KeepBoth => {
+                let second = adopt_as(candidate);
+                store.upsert_server(&second, &candidate.server, false)?;
+                adopt(&mut state, candidate);
+                // The client's entry follows *its* server, not the canonical
+                // one it shares a name with — the user just said those two
+                // are different things.
+                resolve_to(&mut state, candidate, &second);
+                resolved.push(format!(
+                    "  {second} brought in — your {} is untouched",
+                    candidate.name
+                ));
+            }
+            ConflictChoice::Overwrite => {
+                store.upsert_server(&candidate.name, &candidate.server, true)?;
+                adopt(&mut state, candidate);
+                resolve_to(&mut state, candidate, &candidate.name);
+                resolved.push(format!(
+                    "  {} replaced with your client's copy",
+                    candidate.name
+                ));
+            }
+            ConflictChoice::KeepCanonical => {
+                // Nothing is adopted, but the answer is recorded so the step
+                // stops re-opening for a conflict already put to someone.
+                // `--yes` takes this outcome without asking, and a decision
+                // nobody made must not stop the next run asking for real.
+                if !cx.assume_yes {
+                    resolve_to(&mut state, candidate, &candidate.name);
+                }
+                left_alone.push(&candidate.name);
+            }
+        }
+    }
 
     // Canonical config first, adoption record second: a state file claiming
     // client entries that no canonical server backs is read by the next sync
@@ -456,15 +579,15 @@ fn apply(cx: &Ctx, sources: &[(String, ClientRead)]) -> anyhow::Result<()> {
     )?;
 
     println!();
-    for candidate in &plan.conflicts {
-        println!(
-            "  {} left alone — your config already has something else under that name",
-            candidate.name
-        );
+    for name in left_alone {
+        println!("  {name} left alone — your config already has something else under that name");
+    }
+    for line in &resolved {
+        println!("{line}");
     }
     println!(
         "  Imported {}. Your config now has {}.",
-        servers(plan.new.len()),
+        servers(plan.new.len() + resolved.len()),
         servers(store.config().servers.len())
     );
     Ok(())

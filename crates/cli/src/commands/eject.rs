@@ -139,8 +139,13 @@ fn plan(
         if managed.is_empty() {
             continue;
         }
+        // Under the client's own names, so an entry that has stood for a
+        // second canonical copy since a keep-both is restored to *that*
+        // definition rather than to the one it happens to be named after.
+        let resolved = state.resolved.get(kind.id()).cloned().unwrap_or_default();
+        let desired = mcpgw_core::sync::under_client_names(canonical.clone(), &resolved).desired;
         let name = kind.display_name();
-        match plan_client(kind, canonical, &managed)? {
+        match plan_client(kind, &desired, &managed)? {
             Planned::Skipped(reason) => notes.push(format!("{name} — {reason}")),
             // Sync would create the file and write the entries into it.
             // Eject must not: a client config that is gone was deleted by
