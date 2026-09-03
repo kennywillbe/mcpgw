@@ -51,6 +51,7 @@ fn gemini_reads_both_url_shapes_and_the_excluded_list() {
         read.servers["linear"].transport,
         mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [(
                 "Authorization".to_owned(),
                 "Bearer ${LINEAR_TOKEN}".to_owned()
@@ -113,6 +114,7 @@ fn codex_reads_toml_entries_and_tolerates_the_evolving_fields() {
         read.servers["linear"].transport,
         mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [(
                 "Authorization".to_owned(),
                 "Bearer ${LINEAR_TOKEN}".to_owned()
@@ -131,10 +133,47 @@ fn codex_reads_toml_entries_and_tolerates_the_evolving_fields() {
     assert!(read.servers["github"].enabled);
     // An entry with no target field at all is a problem, not a failure.
     assert!(!read.servers.contains_key("husk"));
+    // The helper Codex mints a token with is a field mcpgw has of its own,
+    // so unlike the `auth` block above it is carried over rather than noted.
+    assert_eq!(
+        read.servers["corp"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.corp.example/mcp".to_owned(),
+            headers_command: ["corp-auth", "print-mcp-headers"]
+                .map(str::to_owned)
+                .to_vec(),
+            headers: std::collections::BTreeMap::new(),
+        }
+    );
     // The non-MCP siblings are simply not servers.
-    assert_eq!(read.servers.len(), 4);
+    assert_eq!(read.servers.len(), 5);
 
     insta::assert_debug_snapshot!(read);
+}
+
+/// Claude Code's own spelling of the same thing, read through the
+/// `mcpServers` schema it shares.
+#[test]
+fn claude_code_reads_the_headers_helper_as_a_command() {
+    let read = read_fixture(ClientKind::ClaudeCode, "claude_code_state.json");
+    assert_eq!(
+        read.servers["corp"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.corp.example/mcp".to_owned(),
+            headers_command: ["corp-auth", "print-mcp-headers"]
+                .map(str::to_owned)
+                .to_vec(),
+            headers: std::collections::BTreeMap::new(),
+        }
+    );
+    // A helper is a command, not a credential the client is holding back:
+    // nothing about this entry is lossy.
+    assert!(
+        !read
+            .problems
+            .iter()
+            .any(|p| p.server.as_deref() == Some("corp"))
+    );
 }
 
 #[test]
@@ -160,6 +199,7 @@ fn opencode_reads_a_commented_file_and_both_entry_types() {
         read.servers["linear"].transport,
         mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [(
                 "Authorization".to_owned(),
                 "Bearer {env:LINEAR_TOKEN}".to_owned()
@@ -223,6 +263,7 @@ fn windsurf_reads_both_remote_spellings() {
         read.servers["linear"].transport,
         mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [(
                 "Authorization".to_owned(),
                 "Bearer ${env:LINEAR_TOKEN}".to_owned()
@@ -237,6 +278,7 @@ fn windsurf_reads_both_remote_spellings() {
         read.servers["figma"].transport,
         mcpgw_core::Transport::Http {
             url: "https://mcp.figma.com/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
         }
     );
@@ -251,6 +293,7 @@ fn windsurf_reads_both_remote_spellings() {
         read.servers["notes"].transport,
         mcpgw_core::Transport::Http {
             url: "https://notes.example/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
         }
     );
@@ -296,6 +339,7 @@ fn zed_reads_context_servers_whatever_their_source() {
         read.servers["linear"].transport,
         mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [("Authorization".to_owned(), "Bearer token".to_owned())]
                 .into_iter()
                 .collect(),
@@ -337,6 +381,7 @@ fn cline_reads_disabled_entries_and_both_remote_spellings() {
         read.servers["linear"].transport,
         mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [("Authorization".to_owned(), "Bearer token".to_owned())]
                 .into_iter()
                 .collect(),
@@ -479,6 +524,7 @@ fn amp_reads_the_namespaced_key_and_not_a_nested_one() {
         read.servers["sourcegraph"].transport,
         mcpgw_core::Transport::Http {
             url: "${SRC_ENDPOINT}/.api/mcp/v1".to_owned(),
+            headers_command: Vec::new(),
             headers: [(
                 "Authorization".to_owned(),
                 "token ${SRC_ACCESS_TOKEN}".to_owned()

@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::path::Path;
 
 use mcpgw_core::{Config, Error, SUPPORTED_VERSION, Transport, config::validate_name};
@@ -150,4 +151,78 @@ fn an_unusable_redaction_pattern_is_a_config_error_that_names_it() {
     .unwrap_err();
     assert!(matches!(err, Error::InvalidRedaction { .. }), "{err:?}");
     insta::assert_snapshot!(err.to_string());
+}
+
+/// Both spellings land on the same argv: the array mcpgw writes, and the
+/// single line Claude Code and Codex spell their helper with, which is what
+/// a config pasted out of either looks like.
+#[test]
+fn a_headers_command_reads_as_argv_from_either_spelling() {
+    let argv = |text: &str| {
+        let config = Config::parse(text, Path::new("c.toml")).unwrap();
+        let Transport::Http {
+            headers_command, ..
+        } = &config.servers["corp"].transport
+        else {
+            panic!("corp should be http");
+        };
+        headers_command.clone()
+    };
+    let want = ["corp-auth".to_owned(), "print-mcp-headers".to_owned()];
+
+    assert_eq!(
+        argv(
+            "version = 1\n[servers.corp]\ntype = \"http\"\nurl = \"https://c.example/mcp\"\n\
+             headers_command = [\"corp-auth\", \"print-mcp-headers\"]\n"
+        ),
+        want
+    );
+    assert_eq!(
+        argv(
+            "version = 1\n[servers.corp]\ntype = \"http\"\nurl = \"https://c.example/mcp\"\n\
+             headers_command = \"corp-auth print-mcp-headers\"\n"
+        ),
+        want
+    );
+}
+
+/// A command with nothing to run is a config error, not something the gateway
+/// discovers at connect time on the one morning the token expires.
+#[test]
+fn an_empty_headers_command_is_rejected() {
+    for spelling in ["[]", "\"\"", "[\"corp-auth\", \"\"]"] {
+        let text = format!(
+            "version = 1\n[servers.corp]\ntype = \"http\"\nurl = \"https://c.example/mcp\"\n\
+             headers_command = {spelling}\n"
+        );
+        let err = Config::parse(&text, Path::new("c.toml")).unwrap_err();
+        assert!(matches!(err, Error::Parse { .. }), "{spelling}: {err}");
+        assert!(
+            err.source()
+                .unwrap()
+                .to_string()
+                .contains("headers_command")
+        );
+    }
+}
+
+/// Serialized as an array whatever it was written as, and absent entirely
+/// from an entry that has none.
+#[test]
+fn a_headers_command_round_trips_as_an_array() {
+    let config = Config::parse(
+        "version = 1\n[servers.corp]\ntype = \"http\"\nurl = \"https://c.example/mcp\"\n\
+         headers_command = \"corp-auth print-mcp-headers\"\n\
+         [servers.plain]\ntype = \"http\"\nurl = \"https://p.example/mcp\"\n",
+        Path::new("c.toml"),
+    )
+    .unwrap();
+    let text = config.to_toml_string().unwrap();
+    assert!(text.contains("headers_command = ["), "{text}");
+    assert!(text.contains("\"print-mcp-headers\""), "{text}");
+    assert_eq!(text.matches("headers_command").count(), 1, "{text}");
+    assert_eq!(
+        Config::parse(&text, Path::new("roundtrip.toml")).unwrap(),
+        config
+    );
 }

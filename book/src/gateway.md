@@ -198,6 +198,14 @@ Nothing is torn down under a request in flight: a `tools/call` that was already
 running when the config changed still gets its answer from the process it
 started on.
 
+A server with a
+[`headers_command`](./configuration.md#headers_command) is the one case where a
+`401` is not the end: its credential is minted per connect, so the command is
+rerun once and the connect retried before the server is reported as needing a
+login. A `401` on a live call drops that connection instead of latching it, and
+the next call reconnects with whatever the command prints then — which is how a
+token that expires every hour survives a gateway that has been up for a day.
+
 On Unix, `kill -HUP` the gateway to reload immediately rather than waiting for
 the next check. A config file that doesn't parse changes nothing — the gateway
 says so and keeps serving what it already had, so a typo can't take your servers

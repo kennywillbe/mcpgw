@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod endpoints;
 pub mod error;
 pub mod gateway;
+pub mod headers;
 pub mod import;
 pub mod paths;
 pub mod private;

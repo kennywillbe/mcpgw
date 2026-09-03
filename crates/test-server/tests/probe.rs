@@ -100,6 +100,7 @@ async fn http_server_reports_identity_and_tools() {
         tags: Vec::new(),
         transport: Transport::Http {
             url: format!("http://{addr}/mcp"),
+            headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
     };
@@ -120,6 +121,7 @@ async fn unreachable_http_server_fails_the_handshake() {
         transport: Transport::Http {
             // Port 1 on loopback refuses connections instantly.
             url: "http://127.0.0.1:1/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
     };
@@ -164,4 +166,31 @@ async fn a_server_with_no_initialize_is_probed_over_discover() {
     assert_eq!(success.server_name, "mcpgw-test-server-modern");
     assert_eq!(success.server_version, "9.9.9");
     assert_eq!(success.tool_count, 2);
+}
+
+/// `doctor --probe` runs the command too, because what it proves is that the
+/// server answers the way mcpgw would reach it — and a command that cannot
+/// mint a credential is the reason it would not.
+#[tokio::test]
+async fn a_failing_headers_command_fails_the_probe_by_name() {
+    let server = Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: Transport::Http {
+            url: "http://127.0.0.1:1/mcp".to_owned(),
+            headers_command: vec![
+                env!("CARGO_BIN_EXE_mcpgw-test-server").to_owned(),
+                "headers-fail".to_owned(),
+            ],
+            headers: BTreeMap::new(),
+        },
+    };
+    let err = probe_server(&server, Duration::from_millis(GENEROUS))
+        .await
+        .unwrap_err();
+    let ProbeError::HeadersCommand { message } = &err else {
+        panic!("expected HeadersCommand, got {err}");
+    };
+    assert!(message.contains("mcpgw-test-server"), "{message}");
+    assert!(message.contains("no vault session"), "{message}");
 }

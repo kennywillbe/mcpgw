@@ -30,6 +30,10 @@ auth = "oauth"
 bearer_token_env_var = "FIGMA_TOKEN"
 env_http_headers = { X-Trace = "TRACE_ID" }
 
+[mcp_servers.corp]
+url = "https://mcp.corp.example/mcp"
+http_headers_helper = "corp-auth print-mcp-headers"
+
 [mcp_servers.notes]
 command = "notes-mcp"
 enabled = false

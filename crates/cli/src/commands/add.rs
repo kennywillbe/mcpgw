@@ -17,6 +17,9 @@ pub struct AddArgs {
     /// HTTP header for an http server (repeatable)
     #[arg(long = "header", value_name = "KEY=VALUE")]
     pub headers: Vec<String>,
+    /// Command printing a JSON object of headers, re-run on every connect
+    #[arg(long = "headers-command", value_name = "COMMAND")]
+    pub headers_command: Option<String>,
     /// Tag for grouping (repeatable)
     #[arg(long = "tag")]
     pub tags: Vec<String>,
@@ -85,12 +88,18 @@ fn build_transport(args: &AddArgs) -> anyhow::Result<Transport> {
             }
             Ok(Transport::Http {
                 url: url.clone(),
+                headers_command: headers_command(args.headers_command.as_deref())?,
                 headers: parse_pairs(&args.headers, "--header")?,
             })
         }
         (None, Some((command, rest))) => {
             if !args.headers.is_empty() {
                 bail!("--header is for http servers; use --env for stdio");
+            }
+            if args.headers_command.is_some() {
+                bail!(
+                    "--headers-command is for http servers; a stdio server's credentials go in --env"
+                );
             }
             Ok(Transport::Stdio {
                 command: command.clone(),
@@ -99,6 +108,24 @@ fn build_transport(args: &AddArgs) -> anyhow::Result<Transport> {
             })
         }
     }
+}
+
+/// Splits the flag's one string into argv on whitespace.
+///
+/// A flag is a line somebody types, and a line is what both Claude Code and
+/// Codex spell their helper with, so this is the shape a user arrives with.
+/// mcpgw stores argv and runs it with no shell, so a command whose arguments
+/// carry spaces has no spelling here — it is written as an array in the
+/// config file, where argv is spelled directly.
+fn headers_command(flag: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let Some(line) = flag else {
+        return Ok(Vec::new());
+    };
+    let argv: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+    if argv.is_empty() {
+        bail!("--headers-command needs a command to run");
+    }
+    Ok(argv)
 }
 
 fn parse_pairs(pairs: &[String], flag: &str) -> anyhow::Result<BTreeMap<String, String>> {

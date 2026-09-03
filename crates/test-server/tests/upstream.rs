@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::response::IntoResponse as _;
 use mcpgw_core::upstream::{CallError, UpstreamError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
 
@@ -23,6 +24,7 @@ fn http_server(url: &str, headers: &[(&str, &str)]) -> Server {
         tags: Vec::new(),
         transport: Transport::Http {
             url: url.to_owned(),
+            headers_command: Vec::new(),
             headers: headers
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -460,4 +462,270 @@ async fn a_live_server_that_fails_is_never_auth_required() {
         Some(UpstreamStatus::Failed(_))
     ));
     mgr.shutdown().await;
+}
+
+/// An http upstream whose headers come from `mcpgw-test-server headers`,
+/// reading `token_file`.
+fn helper_server(url: &str, mode: &str, arg: Option<&std::path::Path>) -> Server {
+    let mut argv = vec![
+        env!("CARGO_BIN_EXE_mcpgw-test-server").to_owned(),
+        mode.to_owned(),
+    ];
+    if let Some(arg) = arg {
+        argv.push(arg.display().to_string());
+    }
+    Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: Transport::Http {
+            url: url.to_owned(),
+            headers_command: argv,
+            headers: BTreeMap::new(),
+        },
+    }
+}
+
+/// One in-process MCP server behind a bearer token the test can change under
+/// a live connection — a server whose credential rotates, which is the whole
+/// situation `headers_command` exists for.
+struct Guarded {
+    addr: std::net::SocketAddr,
+    /// What the guard accepts right now. Swapping it is how a test expires a
+    /// token without touching the connection holding it.
+    expected: Arc<std::sync::Mutex<String>>,
+    inner: Arc<UpstreamManager>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Guarded {
+    async fn start(token: &str) -> Self {
+        use rmcp_client_http::transport::streamable_http_server::session::local::LocalSessionManager;
+        use rmcp_client_http::transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService,
+        };
+
+        let inner = Arc::new(manager(&[("fx", stdio_server("healthy"))]));
+        let gateway =
+            mcpgw_core::gateway::Gateway::aggregate(Arc::clone(&inner), vec!["fx".to_owned()]);
+        let service = StreamableHttpService::new(
+            move || Ok(gateway.clone()),
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default(),
+        );
+        let expected = Arc::new(std::sync::Mutex::new(token.to_owned()));
+        let guard = Arc::clone(&expected);
+        let app =
+            axum::Router::new()
+                .nest_service("/mcp", service)
+                .layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        let guard = Arc::clone(&guard);
+                        async move {
+                            let want = format!("Bearer {}", guard.lock().unwrap());
+                            let got = request
+                                .headers()
+                                .get(axum::http::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned();
+                            if got == want {
+                                return next.run(request).await;
+                            }
+                            // The challenge header is not decoration: rmcp only
+                            // reports a 401 as an authorization failure when the
+                            // server sent one.
+                            (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                [(
+                                    axum::http::header::WWW_AUTHENTICATE,
+                                    "Bearer realm=\"corp\"",
+                                )],
+                            )
+                                .into_response()
+                        }
+                    },
+                ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(axum::serve(listener, app).into_future());
+        Self {
+            addr,
+            expected,
+            inner,
+            task,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/mcp", self.addr)
+    }
+
+    /// Expires the credential the connection was opened with.
+    fn rotate(&self, token: &str) {
+        token.clone_into(&mut self.expected.lock().unwrap());
+    }
+
+    async fn stop(self) {
+        self.task.abort();
+        self.inner.shutdown().await;
+    }
+}
+
+/// A token file holding `tokens`, one per line, in the order the command
+/// hands them out.
+fn token_file(dir: &tempfile::TempDir, tokens: &[&str]) -> std::path::PathBuf {
+    let path = dir.path().join("tokens");
+    std::fs::write(&path, tokens.join("\n")).unwrap();
+    path
+}
+
+async fn list_tools(mgr: &UpstreamManager, name: &str) -> Result<usize, CallError> {
+    mgr.call(
+        name,
+        |service| async move { service.list_all_tools().await },
+    )
+    .await
+    .map(|tools| tools.len())
+}
+
+/// The base case: the connection is opened with what the command printed,
+/// not with anything written in the config.
+#[tokio::test]
+async fn the_first_connect_uses_the_headers_the_command_printed() {
+    let remote = Guarded::start("alpha").await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = token_file(&dir, &["alpha"]);
+    let mgr = manager(&[(
+        "corp",
+        helper_server(&remote.url(), "headers", Some(&tokens)),
+    )]);
+
+    assert!(list_tools(&mgr, "corp").await.unwrap() > 0);
+    assert_eq!(mgr.status("corp").await, Some(UpstreamStatus::Ready));
+    mgr.shutdown().await;
+    remote.stop().await;
+}
+
+/// The point of the feature. A token that expires under a live connection
+/// costs one failed call; the next one reruns the command, reconnects with
+/// what it prints now, and works — no restart, and nothing latched.
+#[tokio::test]
+async fn a_rotated_token_is_picked_up_on_the_next_call() {
+    let remote = Guarded::start("alpha").await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = token_file(&dir, &["alpha", "beta"]);
+    let mgr = manager(&[(
+        "corp",
+        helper_server(&remote.url(), "headers", Some(&tokens)),
+    )]);
+
+    assert!(list_tools(&mgr, "corp").await.unwrap() > 0);
+
+    // The server rotates; the connection mcpgw is holding still presents the
+    // credential it was opened with.
+    remote.rotate("beta");
+    let err = list_tools(&mgr, "corp").await.unwrap_err();
+    assert!(matches!(err, CallError::Service(_)), "{err}");
+    // Released rather than latched: the server is not down, so the next
+    // demand is owed a fresh connection and not a single grudging attempt.
+    assert_eq!(mgr.status("corp").await, Some(UpstreamStatus::Idle));
+
+    assert!(
+        list_tools(&mgr, "corp").await.unwrap() > 0,
+        "the second call should have rerun the command"
+    );
+    assert_eq!(mgr.status("corp").await, Some(UpstreamStatus::Ready));
+    mgr.shutdown().await;
+    remote.stop().await;
+}
+
+/// A 401 at connect time is worth exactly one more run of the command: the
+/// token minted a moment ago may already be the stale one.
+#[tokio::test]
+async fn a_401_at_connect_gets_one_more_run_of_the_command() {
+    let remote = Guarded::start("fresh").await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = token_file(&dir, &["stale", "fresh"]);
+    let mgr = manager(&[(
+        "corp",
+        helper_server(&remote.url(), "headers", Some(&tokens)),
+    )]);
+
+    assert!(list_tools(&mgr, "corp").await.unwrap() > 0);
+    // Both tokens were handed out, so the connect that succeeded is the
+    // second one — the first was refused and the command run again.
+    assert_eq!(std::fs::read_to_string(&tokens).unwrap().trim(), "fresh");
+    mgr.shutdown().await;
+    remote.stop().await;
+}
+
+/// A command that cannot produce headers is its own outcome: named, not
+/// laddered, and carrying the command's stderr rather than its stdout.
+#[tokio::test]
+async fn a_failing_headers_command_is_reported_without_a_ladder() {
+    let remote = Guarded::start("alpha").await;
+    let mgr = manager(&[("corp", helper_server(&remote.url(), "headers-fail", None))]);
+
+    let started = Instant::now();
+    let err = mgr.ready("corp").await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    let UpstreamError::HeadersCommand { name, message } = &err else {
+        panic!("expected HeadersCommand, got {err}");
+    };
+    assert_eq!(name, "corp");
+    assert!(message.contains("mcpgw-test-server"), "{message}");
+    // The command's own diagnosis, which is what a user needs and is not
+    // where the token is.
+    assert!(message.contains("no vault session"), "{message}");
+    // One run, not three: the ladder has nothing to offer a command that
+    // exits non-zero.
+    assert!(elapsed < Duration::from_secs(5), "elapsed {elapsed:?}");
+    assert!(matches!(
+        mgr.status("corp").await,
+        Some(UpstreamStatus::Failed(_))
+    ));
+    mgr.shutdown().await;
+    remote.stop().await;
+}
+
+/// A helper that blocks — on a login prompt, on a network call nobody will
+/// answer — is killed at the ceiling rather than hanging every connect
+/// behind it.
+#[tokio::test]
+async fn a_hanging_headers_command_is_killed_at_the_timeout() {
+    let remote = Guarded::start("alpha").await;
+    let mgr = manager(&[("corp", helper_server(&remote.url(), "headers-hang", None))])
+        .with_headers_timeout(Duration::from_millis(200));
+
+    let started = Instant::now();
+    let err = mgr.ready("corp").await.unwrap_err();
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(&err, UpstreamError::HeadersCommand { message, .. } if message.contains("did not finish")),
+        "{err}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "elapsed {elapsed:?}");
+    mgr.shutdown().await;
+    remote.stop().await;
+}
+
+/// Output that is not a JSON object is a refusal, and the refusal does not
+/// quote what was printed — a half-written token is still a token.
+#[tokio::test]
+async fn unparseable_output_is_refused_without_quoting_it() {
+    let remote = Guarded::start("alpha").await;
+    let mgr = manager(&[(
+        "corp",
+        helper_server(&remote.url(), "headers-garbage", None),
+    )]);
+
+    let err = mgr.ready("corp").await.unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("JSON object of header names"), "{message}");
+    assert!(!message.contains("not-json"), "{message}");
+    mgr.shutdown().await;
+    remote.stop().await;
 }

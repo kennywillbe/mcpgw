@@ -39,6 +39,7 @@ Config {
             tags: [],
             transport: Http {
                 url: "https://mcp.linear.app/mcp",
+                headers_command: [],
                 headers: {
                     "Authorization": "Bearer test",
                 },

@@ -474,3 +474,60 @@ fn the_auth_note_is_recognisable_and_the_other_notes_are_not() {
         "legacy `sse` transport read as http"
     ));
 }
+
+/// The two clients that have a helper field of their own get it back on a
+/// write, and the eleven that do not are not handed a key their schema never
+/// defined. This is what `mcpgw eject` restores a rotating credential with.
+#[test]
+fn only_the_two_clients_with_a_helper_field_are_written_one() {
+    let server = mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        transport: mcpgw_core::Transport::Http {
+            url: "https://mcp.corp.example/mcp".to_owned(),
+            headers_command: ["corp-auth", "print-mcp-headers"]
+                .map(str::to_owned)
+                .to_vec(),
+            headers: std::collections::BTreeMap::new(),
+        },
+    };
+    assert_eq!(
+        EntrySchema::McpServers.emit(&server)["headersHelper"],
+        json!("corp-auth print-mcp-headers")
+    );
+    assert_eq!(
+        EntrySchema::Codex.emit(&server)["http_headers_helper"],
+        json!("corp-auth print-mcp-headers")
+    );
+    for schema in [
+        EntrySchema::VsCode,
+        EntrySchema::Gemini,
+        EntrySchema::Opencode,
+        EntrySchema::Windsurf,
+        EntrySchema::Zed,
+        EntrySchema::Cline,
+        EntrySchema::Amp,
+        EntrySchema::ZooCode,
+    ] {
+        let entry = schema.emit(&server);
+        let text = serde_json::to_string(&entry).unwrap();
+        assert!(!text.contains("Helper"), "{schema:?}: {text}");
+        assert!(!text.contains("helper"), "{schema:?}: {text}");
+    }
+
+    // And an entry with no command gains no empty key anywhere.
+    let mut plain = server.clone();
+    let mcpgw_core::Transport::Http {
+        headers_command, ..
+    } = &mut plain.transport
+    else {
+        panic!("http");
+    };
+    headers_command.clear();
+    assert!(
+        EntrySchema::McpServers
+            .emit(&plain)
+            .get("headersHelper")
+            .is_none()
+    );
+}

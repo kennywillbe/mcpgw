@@ -764,3 +764,63 @@ fn the_project_section_separates_managed_entries_from_the_rest() {
     // Still one warning: the entry nobody manages is still live.
     assert_eq!(value["warnings"], 1);
 }
+
+/// A `headers_command` is resolved like any other command mcpgw spawns, and
+/// the report names it rather than the credential it would have produced.
+#[test]
+fn an_unresolvable_headers_command_is_an_error_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_doctor(
+        dir.path(),
+        Some(
+            r#"
+version = 1
+[servers.corp]
+type = "http"
+url = "https://mcp.corp.example/mcp"
+headers_command = "definitely-not-a-real-command-mcpgw print-headers"
+"#,
+        ),
+        &[],
+    );
+    // Errors mean a non-zero exit, the same as any other broken command.
+    assert_eq!(out.status.code(), Some(1));
+    let text = stdout(&out);
+    assert!(text.contains("headers from command"), "{text}");
+    assert!(
+        text.contains("definitely-not-a-real-command-mcpgw print-headers"),
+        "{text}"
+    );
+    assert!(text.contains("absolute path"), "{text}");
+}
+
+/// The rule the whole feature stands on: `--probe` runs the command for real,
+/// and nothing it printed reaches the report. What does reach it is the
+/// command line, which is not the secret.
+#[test]
+fn a_probe_runs_the_headers_command_without_printing_what_it_produced() {
+    let dir = tempfile::tempdir().unwrap();
+    let tokens = dir.path().join("tokens");
+    std::fs::write(&tokens, "s3cret-rotating-token").unwrap();
+    let config = format!(
+        "version = 1\n[servers.corp]\ntype = \"http\"\n\
+         # Port 1 on loopback refuses instantly, so the probe fails *after*\n\
+         # the command has run and handed its headers over.\n\
+         url = \"http://127.0.0.1:1/mcp\"\n\
+         headers_command = ['{}', 'headers', '{}']\n",
+        fixture_binary().display(),
+        tokens.display()
+    );
+
+    let out = run_doctor(dir.path(), Some(&config), &["--probe"]);
+    let text = stdout(&out);
+    assert!(text.contains("headers from command"), "{text}");
+    assert!(
+        !text.contains("s3cret-rotating-token"),
+        "the command's output reached the report: {text}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("s3cret-rotating-token"),
+        "the command's output reached stderr"
+    );
+}

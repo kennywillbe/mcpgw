@@ -4,11 +4,24 @@ expression: read
 ---
 ClientRead {
     servers: {
+        "corp": Server {
+            enabled: true,
+            tags: [],
+            transport: Http {
+                url: "https://mcp.corp.example/mcp",
+                headers_command: [
+                    "corp-auth",
+                    "print-mcp-headers",
+                ],
+                headers: {},
+            },
+        },
         "figma": Server {
             enabled: true,
             tags: [],
             transport: Http {
                 url: "https://mcp.figma.com/mcp",
+                headers_command: [],
                 headers: {},
             },
         },
@@ -31,6 +44,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://mcp.linear.app/mcp",
+                headers_command: [],
                 headers: {
                     "Authorization": "Bearer ${LINEAR_TOKEN}",
                 },

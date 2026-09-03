@@ -894,3 +894,32 @@ fn a_plain_import_ignores_the_repo() {
     let out = sb.ok_in(&repo, &["import"]);
     assert!(out.contains("nothing to import"), "{out}");
 }
+
+/// Claude Code's `headersHelper` is the one credential field a client has
+/// that mcpgw can carry over whole, because it is a command rather than a
+/// token. A server that used it before the gateway still works behind it.
+#[test]
+fn a_claude_code_headers_helper_becomes_a_headers_command() {
+    let sb = Sandbox::new();
+    sb.write_client(
+        ".claude.json",
+        r#"{"mcpServers": {
+            "corp": {
+                "type": "http",
+                "url": "https://mcp.corp.example/mcp",
+                "headersHelper": "corp-auth print-mcp-headers"
+            }
+        }}"#,
+    );
+    let out = sb.ok(&["import", "--from", "claude-code"]);
+    assert!(out.contains("corp"), "{out}");
+    // Nothing about this entry is lossy, so it must not be flagged the way a
+    // client-held OAuth token is.
+    assert!(!out.contains("not carried over"), "{out}");
+
+    let text = std::fs::read_to_string(sb.home.join("config.toml")).unwrap();
+    assert!(
+        text.contains(r#"headers_command = ["corp-auth", "print-mcp-headers"]"#),
+        "{text}"
+    );
+}

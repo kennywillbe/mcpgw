@@ -60,6 +60,12 @@ pub enum ProbeError {
     #[error("MCP handshake failed: {message}")]
     Handshake { message: String },
 
+    /// The server's `headers_command` did not produce headers, so there was
+    /// nothing to dial with. Its own variant because what is broken is on
+    /// this machine and named in the message — the server was never asked.
+    #[error("{message}")]
+    HeadersCommand { message: String },
+
     /// The server answered 401. Its own variant because the report says
     /// something else entirely about it: nothing here is broken, and no
     /// retry, timeout bump or restart is the fix.
@@ -108,7 +114,11 @@ where
     let work = async {
         let service = match &server.transport {
             Transport::Stdio { command, args, env } => connect_stdio(command, args, env).await?,
-            Transport::Http { url, headers } => connect_http(url, headers).await?,
+            Transport::Http {
+                url,
+                headers_command,
+                headers,
+            } => connect_http(url, headers_command, headers, timeout).await?,
         };
         use_service(service).await
     };
@@ -155,8 +165,27 @@ async fn connect_stdio(
 
 async fn connect_http(
     url: &str,
+    headers_command: &[String],
     headers: &BTreeMap<String, String>,
+    timeout: Duration,
 ) -> Result<Service, ProbeError> {
+    // Run here as well as in the gateway, and for the reason `--probe`
+    // exists: what it proves is that this server answers *the way mcpgw
+    // would reach it*, and a credential mcpgw would mint at connect time is
+    // part of that. The whole probe is already racing `timeout`, so the
+    // command inherits it rather than being given a second ceiling that
+    // could outlast the probe holding it.
+    let resolved;
+    let headers = if headers_command.is_empty() {
+        headers
+    } else {
+        resolved = crate::headers::resolve(headers_command, headers, timeout)
+            .await
+            .map_err(|err| ProbeError::HeadersCommand {
+                message: err.to_string(),
+            })?;
+        &resolved
+    };
     let config = crate::upstream::http_config(url, headers)
         .map_err(|message| ProbeError::Handshake { message })?;
     let transport = || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());

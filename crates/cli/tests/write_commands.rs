@@ -171,3 +171,59 @@ fn toggle_without_config_reports_missing_file() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("no config file"));
 }
+
+/// `--headers-command` is one typed line, stored as argv and never run here.
+/// The token it would print is not in the config at all, which is the whole
+/// reason to use it — so `list` has a command to show and no value to mask.
+#[test]
+fn add_stores_a_headers_command_as_argv() {
+    let (_dir, config) = temp_config();
+    let out = mcpgw(
+        &config,
+        &[
+            "add",
+            "corp",
+            "--url",
+            "https://mcp.corp.example/mcp",
+            "--headers-command",
+            "corp-auth print-mcp-headers",
+            "--header",
+            "X-Team=platform",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains(r#"headers_command = ["corp-auth", "print-mcp-headers"]"#),
+        "{text}"
+    );
+
+    let json = list_json(&config);
+    let corp = &json["servers"]["corp"];
+    assert_eq!(corp["headers_command"][0], "corp-auth");
+    assert_eq!(corp["headers_command"][1], "print-mcp-headers");
+    // The command is not a secret and is shown whole; the header beside it
+    // is still masked, because that one is a value.
+    assert_eq!(corp["headers"]["X-Team"], "***");
+    let printed = String::from_utf8(mcpgw(&config, &["list", "--json"]).stdout).unwrap();
+    assert!(!printed.contains("platform"), "{printed}");
+}
+
+#[test]
+fn a_headers_command_is_refused_on_a_stdio_server() {
+    let (_dir, config) = temp_config();
+    let out = mcpgw(
+        &config,
+        &[
+            "add",
+            "github",
+            "--headers-command",
+            "corp-auth",
+            "--",
+            "npx",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--headers-command is for http servers"));
+}

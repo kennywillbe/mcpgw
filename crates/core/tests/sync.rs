@@ -276,6 +276,7 @@ fn entry_shapes_per_client() {
             tags: Vec::new(),
             transport: mcpgw_core::Transport::Http {
                 url: "https://h.example/mcp".to_owned(),
+                headers_command: Vec::new(),
                 headers: [("Authorization".to_owned(), "Bearer t".to_owned())]
                     .into_iter()
                     .collect(),
@@ -393,6 +394,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
         tags: Vec::new(),
         transport: mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [(
                 "Authorization".to_owned(),
                 "Bearer {env:LINEAR_TOKEN}".to_owned(),
@@ -755,6 +757,7 @@ fn zed_writes_source_on_stdio_entries_only() {
         tags: Vec::new(),
         transport: mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
             headers: [("Authorization".to_owned(), "Bearer t".to_owned())]
                 .into_iter()
                 .collect(),

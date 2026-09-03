@@ -20,7 +20,26 @@ pub fn server_table(config: &Config, color: bool) -> String {
                     };
                     ("stdio", target)
                 }
-                Transport::Http { url, .. } => ("http", url.clone()),
+                // The command, never what it prints: this column is read in
+                // a terminal and pasted into issues, and an entry whose
+                // credential is minted rather than written down otherwise
+                // looks like one with no credential at all.
+                Transport::Http {
+                    url,
+                    headers_command,
+                    ..
+                } => {
+                    let target = if headers_command.is_empty() {
+                        url.clone()
+                    } else {
+                        format!(
+                            "{url} (headers {} {})",
+                            mcpgw_core::doctor::HEADERS_FROM_COMMAND,
+                            headers_command.join(" ")
+                        )
+                    };
+                    ("http", target)
+                }
             };
             let cells = [
                 name.clone(),
@@ -103,6 +122,21 @@ enabled = false
     #[test]
     fn plain_table_layout() {
         insta::assert_snapshot!(server_table(&sample(), false));
+    }
+
+    /// The command shows because it is not a secret; nothing it would print
+    /// is anywhere near this table.
+    #[test]
+    fn a_headers_command_is_named_in_the_target_column() {
+        let config = Config::parse(
+            "version = 1\n[servers.corp]\ntype = \"http\"\n\
+             url = \"https://mcp.corp.example/mcp\"\n\
+             headers_command = \"corp-auth print-mcp-headers\"\n",
+            Path::new("sample.toml"),
+        )
+        .unwrap();
+        let table = server_table(&config, false);
+        assert!(table.contains("headers from command corp-auth"), "{table}");
     }
 
     #[test]

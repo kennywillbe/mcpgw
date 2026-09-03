@@ -46,6 +46,46 @@ fn transport_failure(err: &rmcp::service::ServiceError) -> bool {
     )
 }
 
+/// Whether a failed request was answered `401` by the remote.
+///
+/// The transport buries it: the 401 becomes an `AuthRequiredError` several
+/// links down a `Box<dyn Error>` chain, and the accessor rmcp exposes for the
+/// question ([`is_authorization_required`]) is on the *handshake* error only,
+/// so a request that fails this way has to be asked by walking the chain.
+/// Matching the type rather than the message for the same reason
+/// [`connect_once`](UpstreamManager::connect_once) asks rather than matches:
+/// the Display of the whole chain is a bare "Auth required".
+///
+/// A 403 is deliberately not this: rmcp reports it as a distinct
+/// `InsufficientScopeError`, and a token that is real but too narrow is not
+/// one a fresh run of the same command would widen.
+///
+/// [`is_authorization_required`]: rmcp::service::ClientInitializeError::is_authorization_required
+fn unauthorized(err: &rmcp::service::ServiceError) -> bool {
+    let rmcp::service::ServiceError::TransportSend(transport) = err else {
+        return false;
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(transport.error.as_ref());
+    while let Some(current) = source {
+        if current.is::<rmcp::transport::streamable_http_client::AuthRequiredError>() {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+/// The `headers_command` of an upstream, or `None` for one whose headers are
+/// literal (a stdio server included).
+fn headers_command(server: &Server) -> Option<&[String]> {
+    match &server.transport {
+        Transport::Http {
+            headers_command, ..
+        } if !headers_command.is_empty() => Some(headers_command),
+        Transport::Http { .. } | Transport::Stdio { .. } => None,
+    }
+}
+
 /// Consecutive connect attempts before latching into `Failed`.
 pub const ATTEMPTS: u32 = 3;
 
@@ -76,6 +116,16 @@ pub enum UpstreamError {
         /// use it; nothing reads it yet.
         resource_metadata: Option<String>,
     },
+
+    /// The upstream's `headers_command` did not produce headers. Its own
+    /// error rather than a [`Failed`](Self::Failed) message for the same
+    /// reason [`AuthRequired`](Self::AuthRequired) is: the connect ladder has
+    /// nothing to offer it — a command that exits non-zero exits non-zero
+    /// again half a second later — and the fix is on this machine, not on the
+    /// server. `message` is the command's own, which names it and quotes a
+    /// tail of its stderr; it never carries what the command printed.
+    #[error("upstream {name:?} has no headers: {message}")]
+    HeadersCommand { name: String, message: String },
 
     #[error("upstream {name:?} was shut down while connecting")]
     ShutDown { name: String },
@@ -291,6 +341,7 @@ pub struct UpstreamManager {
     reloading: Mutex<()>,
     connect_timeout: Duration,
     backoff_base: Duration,
+    headers_timeout: Duration,
 }
 
 fn upstream(server: Server) -> Arc<Upstream> {
@@ -315,6 +366,7 @@ impl UpstreamManager {
             reloading: Mutex::new(()),
             connect_timeout: Duration::from_secs(30),
             backoff_base: Duration::from_millis(500),
+            headers_timeout: crate::headers::TIMEOUT,
         }
     }
 
@@ -328,6 +380,15 @@ impl UpstreamManager {
     #[must_use]
     pub fn with_backoff_base(mut self, base: Duration) -> Self {
         self.backoff_base = base;
+        self
+    }
+
+    /// Test hook: shorten the ceiling a `headers_command` runs under, so a
+    /// suite can prove a hanging one is killed without waiting the ten
+    /// seconds a real gateway gives it.
+    #[must_use]
+    pub fn with_headers_timeout(mut self, timeout: Duration) -> Self {
+        self.headers_timeout = timeout;
         self
     }
 
@@ -553,7 +614,18 @@ impl UpstreamManager {
                 // child has always been given. Demotion is for the failure
                 // rmcp cannot see at all: a transport that still looks alive
                 // because its worker never noticed the far end leave.
-                if transport_failure(&err) && !dead(&service) {
+                //
+                // Ahead of both: a 401 against an upstream whose headers come
+                // from a command is neither. The connection is healthy and
+                // the credential it was opened with is not, so the slot is
+                // released rather than demoted — the next demand then rebuilds
+                // the connection, which reruns the command. Falling through to
+                // `demote` would have latched `Failed` over a server that is
+                // working and made the next demand spend its one attempt on
+                // the same expired token.
+                if unauthorized(&err) && self.expects_rotation(name) {
+                    self.release(name, &service).await;
+                } else if transport_failure(&err) && !dead(&service) {
                     self.demote(name, &service, &err).await;
                 }
                 Err(err.into())
@@ -583,6 +655,32 @@ impl UpstreamManager {
         let mut slot = upstream.slot.lock().await;
         if matches!(&*slot, Slot::Ready(live) if Arc::ptr_eq(live, stale)) {
             *slot = Slot::Failed(format!("transport failure: {err}"));
+        }
+    }
+
+    /// Whether `name` gets its headers from a command, and so has a
+    /// credential that can go stale under a live connection.
+    fn expects_rotation(&self, name: &str) -> bool {
+        self.get(name)
+            .is_some_and(|upstream| headers_command(&upstream.server.load()).is_some())
+    }
+
+    /// Puts a connection whose credential expired back to `Idle`, so the next
+    /// demand builds a new one with a fresh run of the command.
+    ///
+    /// `Idle` rather than the `Failed` [`demote`](Self::demote) writes: the
+    /// server is not down and this is not a failure to report, so the next
+    /// demand is owed the full ladder rather than the single latched attempt.
+    /// The identity check is the same one, and there for the same reason —
+    /// two requests failing at once must not undo a reconnection the first
+    /// one already made.
+    async fn release(&self, name: &str, stale: &Arc<UpstreamService>) {
+        let Some(upstream) = self.get(name) else {
+            return;
+        };
+        let mut slot = upstream.slot.lock().await;
+        if matches!(&*slot, Slot::Ready(live) if Arc::ptr_eq(live, stale)) {
+            *slot = Slot::Idle;
         }
     }
 
@@ -687,12 +785,21 @@ impl UpstreamManager {
             // is reached from every downstream request handler, whose frames
             // would all have to be big enough to hold it. One allocation per
             // connect attempt buys that back.
-            match Box::pin(self.connect_once(name, server)).await {
+            match Box::pin(self.connect_attempt(name, server)).await {
                 Ok(service) => return Ok(service),
                 // Retrying a 401 only asks the same question again, more
                 // slowly: the credential this connection lacks cannot appear
-                // between two attempts of one ladder.
-                Err(err @ UpstreamError::AuthRequired { .. }) => return Err(err),
+                // between two attempts of one ladder. A `headers_command`
+                // upstream has already had the one extra attempt that could
+                // change the answer — see `connect_attempt`.
+                //
+                // A `headers_command` that failed is the same shape of
+                // answer: it fails again on the next rung, and its message
+                // already says what to fix.
+                Err(
+                    err @ (UpstreamError::AuthRequired { .. }
+                    | UpstreamError::HeadersCommand { .. }),
+                ) => return Err(err),
                 Err(err) => last = err.to_string(),
             }
         }
@@ -701,6 +808,30 @@ impl UpstreamManager {
             attempts,
             message: last,
         })
+    }
+
+    /// One rung of the ladder, plus the single retry a rotating credential
+    /// needs.
+    ///
+    /// A `headers_command` upstream that is answered `401` gets exactly one
+    /// more connect, which runs the command again. That is the whole of how
+    /// a token that expired since the last connect is replaced without a
+    /// restart: the first attempt presents what the command last minted, the
+    /// server refuses it, and the second presents whatever the command says
+    /// now. Nothing else is retried here — for a literal credential the
+    /// second answer is the first one — and the retry happens once, so a
+    /// server that is simply protected cannot turn one demand into a loop.
+    async fn connect_attempt(
+        &self,
+        name: &str,
+        server: &Server,
+    ) -> Result<UpstreamService, UpstreamError> {
+        match self.connect_once(name, server).await {
+            Err(UpstreamError::AuthRequired { .. }) if headers_command(server).is_some() => {
+                self.connect_once(name, server).await
+            }
+            outcome => outcome,
+        }
     }
 
     async fn connect_once(
@@ -737,7 +868,27 @@ impl UpstreamManager {
                 }
                 .map_err(|err| failed(err.message))
             }
-            Transport::Http { url, headers } => {
+            Transport::Http {
+                url,
+                headers_command,
+                headers,
+            } => {
+                // Run before anything is dialed, and run again on every
+                // connect: the whole point of the field is that what it
+                // prints last time is not what it prints now.
+                let resolved;
+                let headers = if headers_command.is_empty() {
+                    headers
+                } else {
+                    resolved =
+                        crate::headers::resolve(headers_command, headers, self.headers_timeout)
+                            .await
+                            .map_err(|err| UpstreamError::HeadersCommand {
+                                name: name.to_owned(),
+                                message: err.to_string(),
+                            })?;
+                    &resolved
+                };
                 let config = http_config(url, headers).map_err(failed)?;
                 // Nothing is dialed until the handshake, so an unreachable
                 // host surfaces here as a normal connect failure and feeds

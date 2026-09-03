@@ -27,6 +27,7 @@ fn http_server(url: &str) -> Server {
         tags: vec!["work".to_owned()],
         transport: Transport::Http {
             url: url.to_owned(),
+            headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
         },
     }
@@ -148,4 +149,64 @@ fn lock_prevents_lost_updates() {
     let config = Config::load(&path).unwrap();
     assert!(config.servers.contains_key("first"));
     assert!(config.servers.contains_key("second"));
+}
+
+/// A hand-written `headers_command` is somebody's authentication, and an
+/// unrelated `enable`/`disable` must not touch it — array spelling, string
+/// spelling or the comment above either.
+#[test]
+fn an_unrelated_edit_leaves_a_hand_written_headers_command_alone() {
+    const HELPER: &str = r#"version = 1
+
+# the token lasts an hour, so it is minted per connect
+[servers.corp]
+type = "http"
+url = "https://mcp.corp.example/mcp"
+headers_command = "corp-auth print-mcp-headers"
+"#;
+    let (_dir, path) = temp_config(Some(HELPER));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store.set_enabled("corp", false).unwrap();
+    store.save().unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("headers_command = \"corp-auth print-mcp-headers\""),
+        "{text}"
+    );
+    assert!(text.contains("# the token lasts an hour"), "{text}");
+}
+
+/// A generated entry writes the command as argv, and an entry without one
+/// does not gain an empty array claiming it has a helper that printed
+/// nothing.
+#[test]
+fn a_generated_entry_writes_the_command_as_argv() {
+    let (_dir, path) = temp_config(None);
+    let mut store = ConfigStore::edit_or_create(&path).unwrap();
+    let mut corp = http_server("https://mcp.corp.example/mcp");
+    let Transport::Http {
+        headers_command, ..
+    } = &mut corp.transport
+    else {
+        panic!("http");
+    };
+    *headers_command = vec!["corp-auth".to_owned(), "print-mcp-headers".to_owned()];
+    store.upsert_server("corp", &corp, false).unwrap();
+    store
+        .upsert_server("plain", &http_server("https://p.example/mcp"), false)
+        .unwrap();
+    store.save().unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains(r#"headers_command = ["corp-auth", "print-mcp-headers"]"#),
+        "{text}"
+    );
+    assert_eq!(text.matches("headers_command").count(), 1, "{text}");
+    // And it survives the read back, which is the invariant `commit` is for.
+    assert_eq!(
+        Config::load(&path).unwrap().servers["corp"].transport,
+        corp.transport
+    );
 }

@@ -224,7 +224,7 @@ fn same_address(
     canonical: &BTreeMap<String, Server>,
     candidates: &[ImportCandidate],
 ) -> Option<SameAddress> {
-    let Transport::Http { url, headers } = &server.transport else {
+    let Transport::Http { url, headers, .. } = &server.transport else {
         return None;
     };
     if headers.is_empty() {
@@ -234,6 +234,7 @@ fn same_address(
         Transport::Http {
             url: other_url,
             headers: other_headers,
+            ..
         } => {
             canonical_url(url) == canonical_url(other_url)
                 && other_headers.keys().eq(headers.keys())
@@ -277,13 +278,19 @@ fn same_transport(a: &Transport, b: &Transport) -> bool {
         (
             Transport::Http {
                 url: a_url,
+                headers_command: a_command,
                 headers: a_headers,
             },
             Transport::Http {
                 url: b_url,
+                headers_command: b_command,
                 headers: b_headers,
             },
-        ) => a_headers == b_headers && canonical_url(a_url) == canonical_url(b_url),
+        ) => {
+            a_command == b_command
+                && a_headers == b_headers
+                && canonical_url(a_url) == canonical_url(b_url)
+        }
         _ => a == b,
     }
 }

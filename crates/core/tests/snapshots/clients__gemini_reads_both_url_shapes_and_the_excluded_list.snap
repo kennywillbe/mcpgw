@@ -9,6 +9,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://both.example.com/mcp",
+                headers_command: [],
                 headers: {},
             },
         },
@@ -31,6 +32,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://sse.example.com/sse",
+                headers_command: [],
                 headers: {},
             },
         },
@@ -39,6 +41,7 @@ ClientRead {
             tags: [],
             transport: Http {
                 url: "https://mcp.linear.app/mcp",
+                headers_command: [],
                 headers: {
                     "Authorization": "Bearer ${LINEAR_TOKEN}",
                 },
