@@ -5,7 +5,7 @@
 
 use mcpgw_core::ClientKind;
 use mcpgw_core::clients::codec::{
-    ClientDocument, Codec, EntrySchema, Format, NotAnObject, RootPath,
+    ClientDocument, Codec, EntrySchema, Format, NotAnObject, RootPath, is_client_managed_auth,
 };
 use serde_json::{Value, json};
 
@@ -378,4 +378,99 @@ fn the_shipped_clients_codecs_are_what_they_were() {
         })
         .collect();
     insta::assert_debug_snapshot!(matrix);
+}
+
+/// Three of the thirteen clients have a field that says the client itself
+/// holds a remote server's credential. Everything imported from one of them
+/// is a URL that will not authenticate, and the read has to say so; the ten
+/// that spell a credential as a header need no such note, and none is
+/// invented for them.
+#[test]
+fn client_managed_auth_is_noted_only_where_a_client_has_the_marker() {
+    let note = |schema: EntrySchema, entry: Value| schema.parse(&entry).unwrap().1;
+
+    assert_eq!(
+        note(
+            EntrySchema::Codex,
+            json!({"url": "https://mcp.figma.com/mcp", "bearer_token_env_var": "FIGMA_TOKEN"}),
+        )
+        .as_deref(),
+        Some("codex-managed auth not carried over")
+    );
+    assert_eq!(
+        note(
+            EntrySchema::Opencode,
+            json!({"type": "remote", "url": "https://mcp.figma.com/mcp", "oauth": true}),
+        )
+        .as_deref(),
+        Some("opencode-managed oauth not carried over")
+    );
+    // Gemini authenticates a remote server two ways, and either one means
+    // the credential never reaches the canonical config.
+    assert_eq!(
+        note(
+            EntrySchema::Gemini,
+            json!({"httpUrl": "https://mcp.figma.com/mcp", "authProviderType": "google_credentials"}),
+        )
+        .as_deref(),
+        Some("gemini-managed auth not carried over")
+    );
+    assert_eq!(
+        note(
+            EntrySchema::Gemini,
+            json!({"httpUrl": "https://mcp.figma.com/mcp", "oauth": {"scopes": []}}),
+        )
+        .as_deref(),
+        Some("gemini-managed auth not carried over")
+    );
+
+    // The flag switched off is not a marker.
+    assert_eq!(
+        note(
+            EntrySchema::Opencode,
+            json!({"type": "remote", "url": "https://mcp.figma.com/mcp", "oauth": false}),
+        ),
+        None
+    );
+    // A field of the same name on a client that has no such concept is the
+    // user's own key, not a marker to invent one from.
+    assert_eq!(
+        note(
+            EntrySchema::McpServers,
+            json!({"type": "http", "url": "https://mcp.figma.com/mcp", "oauth": true}),
+        ),
+        None
+    );
+    // Only a remote entry can have one: a local server is a process mcpgw
+    // starts, environment and all.
+    assert_eq!(
+        note(
+            EntrySchema::Codex,
+            json!({"command": "npx", "bearer_token_env_var": "FIGMA_TOKEN"}),
+        ),
+        None
+    );
+}
+
+/// The note travels to the CLI as a string, so the CLI has to be able to
+/// pick it out of the other lossy-read notes.
+#[test]
+fn the_auth_note_is_recognisable_and_the_other_notes_are_not() {
+    let both = EntrySchema::Gemini
+        .parse(&json!({
+            "httpUrl": "https://mcp.figma.com/mcp",
+            "url": "https://mcp.figma.com/sse",
+            "oauth": {"scopes": []},
+        }))
+        .unwrap()
+        .1
+        .unwrap();
+    assert_eq!(
+        both,
+        "`url` ignored: `httpUrl` takes precedence; gemini-managed auth not carried over"
+    );
+    assert!(is_client_managed_auth(&both));
+    assert!(!is_client_managed_auth(
+        "legacy `sse` transport read as http"
+    ));
 }

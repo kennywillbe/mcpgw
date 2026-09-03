@@ -265,30 +265,7 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
     }
 
     bullets.extend(hygiene(plan));
-
-    let rest: Vec<String> = plan
-        .new
-        .iter()
-        .filter(|c| {
-            c.origins.len() == 1
-                && !clashing.contains(c.name.as_str())
-                && !c.command_missing
-                && c.same_address.is_none()
-        })
-        .map(|c| {
-            if c.renamed {
-                format!("{} (from {:?})", c.name, c.origins[0].1)
-            } else {
-                c.name.clone()
-            }
-        })
-        .collect();
-    if !rest.is_empty() {
-        bullets.push(format!(
-            "The rest come across as they are: {}.",
-            rest.join(", ")
-        ));
-    }
+    bullets.extend(rest_line(plan, &clashing));
 
     if !plan.already.is_empty() {
         let names: Vec<&str> = plan.already.iter().map(|c| c.name.as_str()).collect();
@@ -317,12 +294,38 @@ fn report(cx: &Ctx, plan: &ImportPlan, unreadable: &[&'static str]) -> Vec<Strin
     bullets
 }
 
-/// The two things the plan does that a list of names cannot show: an entry
-/// coming in switched off because nothing on this machine can start it, and
-/// an entry that is very likely a second copy of one the user already has.
+/// The one line for everything the plan does without explanation: the
+/// entries that came from one client, under a name nobody else claimed, and
+/// that nothing above has already spoken for.
+fn rest_line(plan: &ImportPlan, clashing: &BTreeSet<&str>) -> Option<String> {
+    let rest: Vec<String> = plan
+        .new
+        .iter()
+        .filter(|c| {
+            c.origins.len() == 1
+                && !clashing.contains(c.name.as_str())
+                && !c.command_missing
+                && c.same_address.is_none()
+                && auth_note(c).is_none()
+        })
+        .map(|c| {
+            if c.renamed {
+                format!("{} (from {:?})", c.name, c.origins[0].1)
+            } else {
+                c.name.clone()
+            }
+        })
+        .collect();
+    (!rest.is_empty()).then(|| format!("The rest come across as they are: {}.", rest.join(", ")))
+}
+
+/// The three things the plan does that a list of names cannot show: an entry
+/// coming in switched off because nothing on this machine can start it, an
+/// entry that is very likely a second copy of one the user already has, and
+/// an entry whose client was the thing holding its credential.
 ///
-/// Both are kept out of the "the rest come across as they are" list, which is
-/// by definition the entries that need no explanation.
+/// All three are kept out of the "the rest come across as they are" list,
+/// which is by definition the entries that need no explanation.
 fn hygiene(plan: &ImportPlan) -> Vec<String> {
     let mut bullets: Vec<String> = plan
         .new
@@ -331,7 +334,27 @@ fn hygiene(plan: &ImportPlan) -> Vec<String> {
         .map(|c| format!("{} — {}", c.name, command_missing_line(&c.name)))
         .collect();
     bullets.extend(same_address_questions(plan).iter().map(same_address_line));
+    bullets.extend(plan.new.iter().filter_map(|c| {
+        let note = auth_note(c)?;
+        // The note names the client and what it was holding; what it cannot
+        // say is that the entry is coming across anyway, which is the part
+        // somebody reading a wizard screen has to be told.
+        Some(format!(
+            "{} — {note}, so it comes across as a plain URL and will need a \
+             credential of its own here",
+            c.name
+        ))
+    }));
     bullets
+}
+
+/// The note an entry carries because its client, not its config, held the
+/// credential — the one lossy-read note this step spells out.
+fn auth_note(candidate: &ImportCandidate) -> Option<&String> {
+    candidate
+        .notes
+        .iter()
+        .find(|note| mcpgw_core::clients::codec::is_client_managed_auth(note))
 }
 
 /// The heading over the servers that turned up in more than one client.

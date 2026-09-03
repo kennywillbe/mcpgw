@@ -5,7 +5,8 @@ use std::time::Duration;
 use mcpgw_core::doctor::project_unmanaged;
 use mcpgw_core::doctor::{
     Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
-    classify_gateway_failure, classify_problems, gateway_unreachable, unserved_endpoint,
+    classify_gateway_failure, classify_problems, endpoint_server, gateway_unreachable, needs_oauth,
+    unserved_endpoint,
 };
 use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
 use mcpgw_core::projects::{ProjectConfig, Standing};
@@ -28,9 +29,23 @@ enum TargetKey {
     Http(String, BTreeMap<String, String>),
 }
 
+/// One endpoint to dial, the sources that named it, and the name a fix would
+/// be spelled with.
+struct ProbeTarget {
+    server: Server,
+    /// `name (source)` per place this endpoint was configured; joined into
+    /// the row's label.
+    labels: Vec<String>,
+    /// The first name this endpoint was seen under. The canonical config is
+    /// collected first, so for a server mcpgw knows about this is its
+    /// canonical name — which is what any advice naming a command has to
+    /// use, since that is the name the command would take.
+    name: String,
+}
+
 #[derive(Default)]
 struct ProbePlan {
-    targets: BTreeMap<TargetKey, (Server, Vec<String>)>,
+    targets: BTreeMap<TargetKey, ProbeTarget>,
 }
 
 impl ProbePlan {
@@ -46,8 +61,12 @@ impl ProbePlan {
         };
         self.targets
             .entry(key)
-            .or_insert_with(|| (server.clone(), Vec::new()))
-            .1
+            .or_insert_with(|| ProbeTarget {
+                server: server.clone(),
+                labels: Vec::new(),
+                name: name.to_owned(),
+            })
+            .labels
             .push(format!("{name} ({source})"));
     }
 }
@@ -89,6 +108,7 @@ pub fn run(
                 server: None,
                 severity: Severity::Error,
                 message: error_chain(&err),
+                code: None,
             });
             "invalid".to_owned()
         }
@@ -125,16 +145,19 @@ pub fn run(
     let gateway_findings = gateway_report
         .as_ref()
         .map_or(&[][..], |report| &report.findings);
+    let probe_findings = probe_results
+        .as_ref()
+        .map_or(&[][..], |report| &report.findings);
     let errors = count(&findings, Severity::Error)
         + count(&projects.findings, Severity::Error)
         + count(gateway_findings, Severity::Error)
-        + probe_results
-            .as_ref()
-            .map_or(0, |p| p.results.iter().filter(|(_, r)| r.is_err()).count())
+        + count(probe_findings, Severity::Error)
+        + probe_results.as_ref().map_or(0, ProbeReport::failures)
         + gateway_report.as_ref().map_or(0, GatewayReport::failures);
     let warnings = count(&findings, Severity::Warning)
         + count(&projects.findings, Severity::Warning)
-        + count(gateway_findings, Severity::Warning);
+        + count(gateway_findings, Severity::Warning)
+        + count(probe_findings, Severity::Warning);
 
     if json {
         // Gateway findings join the same array: a consumer counting problems
@@ -142,6 +165,7 @@ pub fn run(
         let all: Vec<Finding> = findings
             .iter()
             .chain(&projects.findings)
+            .chain(probe_findings)
             .chain(gateway_findings)
             .cloned()
             .collect::<Vec<_>>();
@@ -193,6 +217,7 @@ fn scan_clients(
                     server: None,
                     severity: Severity::Warning,
                     message: "installed but has no MCP config yet".to_owned(),
+                    code: None,
                 });
             }
             Detection::Configured(config_path) => {
@@ -228,6 +253,7 @@ fn scan_clients(
                         server: None,
                         severity: Severity::Error,
                         message: error_chain(&err),
+                        code: None,
                     }),
                 }
             }
@@ -452,6 +478,11 @@ fn emit_json(
                     "server_version": success.server_version,
                     "tools": success.tool_count,
                 }),
+                Err(ProbeError::AuthRequired) => serde_json::json!({
+                    "servers": label, "ok": false,
+                    "code": mcpgw_core::doctor::NEEDS_OAUTH,
+                    "error": probes.oauth_message(label),
+                }),
                 Err(err) => serde_json::json!({
                     "servers": label, "ok": false, "error": err.to_string(),
                 }),
@@ -482,6 +513,11 @@ fn emit_json(
                         row["unserved"] = serde_json::json!(true);
                         row["error"] = serde_json::json!(detail);
                     }
+                    GatewayOutcome::NeedsOAuth(name) => {
+                        row["ok"] = serde_json::json!(false);
+                        row["code"] = serde_json::json!(mcpgw_core::doctor::NEEDS_OAUTH);
+                        row["error"] = serde_json::json!(needs_oauth(None, name).message);
+                    }
                     GatewayOutcome::Failed(err) => {
                         row["ok"] = serde_json::json!(false);
                         row["error"] = serde_json::json!(err.to_string());
@@ -508,6 +544,35 @@ type ProbeRow = (
 
 struct ProbeReport {
     results: Vec<ProbeRow>,
+    /// Row label → the name a command about that row would name.
+    names: BTreeMap<String, String>,
+    /// The rows that are not failures at all: a server behind OAuth is
+    /// working, and what it needs is a login on this machine. Kept beside
+    /// the rows the way the gateway pass keeps its own, so they are counted
+    /// once and rendered from the text they were built with.
+    findings: Vec<Finding>,
+}
+
+impl ProbeReport {
+    /// Rows that are genuinely broken, which is every failed one except the
+    /// servers waiting on a login.
+    fn failures(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|(_, outcome)| !matches!(outcome, Ok(_) | Err(ProbeError::AuthRequired)))
+            .count()
+    }
+
+    /// The finding text for `label`'s row, so the rendered line and the
+    /// `--json` entry say what the finding says rather than a second wording
+    /// of it.
+    fn oauth_message(&self, label: &str) -> String {
+        needs_oauth(None, self.name(label)).message
+    }
+
+    fn name<'a>(&'a self, label: &'a str) -> &'a str {
+        self.names.get(label).map_or(label, String::as_str)
+    }
 }
 
 fn run_probes(
@@ -515,11 +580,14 @@ fn run_probes(
     plan: ProbePlan,
     timeout: Duration,
 ) -> ProbeReport {
+    let mut names: BTreeMap<String, String> = BTreeMap::new();
     let mut results = runtime.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         let mut labels: BTreeMap<tokio::task::Id, String> = BTreeMap::new();
-        for (server, target_labels) in plan.targets.into_values() {
-            let label = target_labels.join(", ");
+        for target in plan.targets.into_values() {
+            let label = target.labels.join(", ");
+            names.insert(label.clone(), target.name);
+            let server = target.server;
             let handle = set.spawn({
                 let label = label.clone();
                 async move { (label, probe_server(&server, timeout).await) }
@@ -529,7 +597,21 @@ fn run_probes(
         collect_probes(set, &labels).await
     });
     results.sort_by(|a, b| a.0.cmp(&b.0));
-    ProbeReport { results }
+    let findings = results
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, Err(ProbeError::AuthRequired)))
+        .map(|(label, _)| {
+            needs_oauth(
+                None,
+                names.get(label).map_or(label.as_str(), String::as_str),
+            )
+        })
+        .collect();
+    ProbeReport {
+        results,
+        names,
+        findings,
+    }
 }
 
 /// What one managed entry's endpoint answered.
@@ -539,6 +621,9 @@ pub(super) enum GatewayOutcome {
     /// answer, which names what it does serve. Reported as findings rather
     /// than as a failed row, so it is counted once.
     Unserved(String),
+    /// The endpoint is served and answers; the server behind it is waiting
+    /// on a login. The string is that server's name.
+    NeedsOAuth(String),
     Failed(ProbeError),
 }
 
@@ -614,8 +699,12 @@ fn run_gateway_probes(
 
     report.results.sort_by(|a, b| a.0.url.cmp(&b.0.url));
     for (target, outcome) in &report.results {
-        if let GatewayOutcome::Unserved(detail) = outcome {
-            report.findings.extend(unserved_endpoint(target, detail));
+        match outcome {
+            GatewayOutcome::Unserved(detail) => {
+                report.findings.extend(unserved_endpoint(target, detail));
+            }
+            GatewayOutcome::NeedsOAuth(name) => report.findings.push(needs_oauth(None, name)),
+            GatewayOutcome::Ok(_) | GatewayOutcome::Failed(_) => {}
         }
     }
     report
@@ -639,6 +728,14 @@ pub(super) async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutco
         Ok(success) => GatewayOutcome::Ok(success),
         Err(err) => match classify_gateway_failure(&err.to_string()) {
             GatewayFault::Unserved(detail) => GatewayOutcome::Unserved(detail),
+            // The name comes from the path rather than from the message:
+            // `/s/<name>` is the endpoint for exactly one server, and that
+            // is the name the login would be spelled with. `/mcp` fronts
+            // every server at once and has no such name, so its error is
+            // left to say for itself which upstream it was.
+            GatewayFault::NeedsOAuth => {
+                endpoint_server(url).map_or(GatewayOutcome::Failed(err), GatewayOutcome::NeedsOAuth)
+            }
             GatewayFault::Failed => GatewayOutcome::Failed(err),
         },
     }
@@ -690,6 +787,14 @@ pub(super) fn ok_line(line: &str, color: bool) {
     }
 }
 
+pub(super) fn warn_line(line: &str, color: bool) {
+    if color {
+        println!("  {} {line}", "⚠".yellow());
+    } else {
+        println!("  ⚠ {line}");
+    }
+}
+
 pub(super) fn bad_line(line: &str, color: bool) {
     if color {
         println!("  {} {line}", "✗".red());
@@ -712,6 +817,12 @@ fn render_probes(probes: &ProbeReport, color: bool) {
                     success.server_name, success.server_version, success.tool_count
                 );
                 ok_line(&line, color);
+            }
+            // Not a failure and not rendered as one: the fix is a login,
+            // and the sentence that says so is the finding's own, so the two
+            // renderings cannot drift apart.
+            Err(ProbeError::AuthRequired) => {
+                warn_line(&format!("{label}: {}", probes.oauth_message(label)), color);
             }
             Err(err) => bad_line(&format!("{label}: {err}"), color),
         }
@@ -758,6 +869,12 @@ fn render_gateway(report: &GatewayReport, color: bool) {
                     let entry = finding.server.unwrap_or_default();
                     bad_line(&format!("{client} {entry:?} {}", finding.message), color);
                 }
+            }
+            GatewayOutcome::NeedsOAuth(name) => {
+                warn_line(
+                    &format!("{where_}: {}", needs_oauth(None, name).message),
+                    color,
+                );
             }
             GatewayOutcome::Failed(err) => bad_line(&format!("{where_}: {err}"), color),
         }

@@ -76,6 +76,7 @@ impl ServiceExe {
             server: None,
             severity: Severity::Warning,
             message: format!("the gateway service {advice}"),
+            code: None,
         })
     }
 }
@@ -177,6 +178,7 @@ impl ServiceVersion {
             server: None,
             severity: Severity::Warning,
             message: format!("the gateway service {advice}"),
+            code: None,
         })
     }
 }

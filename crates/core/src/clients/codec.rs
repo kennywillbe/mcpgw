@@ -195,6 +195,20 @@ impl EntrySchema {
             // hand-written `type` is understood rather than rejected.
             Self::McpServers | Self::VsCode | Self::Zed | Self::Amp => parse_mcp_servers(obj),
         }
+        .map(|(server, note)| {
+            // Only a remote entry can have a credential the client holds:
+            // a local one is a process mcpgw starts, and its environment
+            // comes across whole.
+            let auth = match server.transport {
+                Transport::Http { .. } => client_managed_auth(self, obj),
+                Transport::Stdio { .. } => None,
+            };
+            let note = match (note, auth) {
+                (Some(note), Some(auth)) => Some(format!("{note}; {auth}")),
+                (note, auth) => note.or(auth),
+            };
+            (server, note)
+        })
     }
 
     /// Fields on an entry that belong to the client, not to mcpgw.
@@ -335,6 +349,61 @@ impl EntrySchema {
     }
 }
 
+/// The tail every client-managed-auth note ends with, and the whole of what
+/// [`is_client_managed_auth`] recognises.
+const NOT_CARRIED_OVER: &str = "not carried over";
+
+/// Whether `note` is the one an entry gets because its client holds the
+/// credential itself.
+///
+/// A predicate over the text rather than a flag on the read: a note travels
+/// from a client read through [`crate::clients::Problem`] and an import
+/// candidate as a string, and threading a second channel the whole way for
+/// one bit would touch every one of those types. The text is generated in
+/// exactly one place — [`client_managed_auth`] — which is what keeps the two
+/// halves honest.
+#[must_use]
+pub fn is_client_managed_auth(note: &str) -> bool {
+    note.ends_with(NOT_CARRIED_OVER)
+}
+
+/// The note for a remote entry whose client mints or stores the credential
+/// itself, or `None` when this client has no such field.
+///
+/// Three of the thirteen clients do. The other ten spell a remote server's
+/// credential as a header, which is a value the canonical config has a field
+/// for and imports verbatim; there is nothing to warn about there, and no
+/// marker to invent. What these three carry cannot be copied out: an OAuth
+/// token in the client's own store, or a credential it mints per request.
+/// The imported URL is therefore real and the authentication is not, and the
+/// entry says so rather than looking healthy until it is called.
+fn client_managed_auth(schema: EntrySchema, obj: &Map<String, Value>) -> Option<String> {
+    let note = |client: &str, kind: &str| format!("{client}-managed {kind} {NOT_CARRIED_OVER}");
+    match schema {
+        // `auth` is Codex's own OAuth block; `bearer_token_env_var` names
+        // the variable it reads a token out of at call time.
+        EntrySchema::Codex => (obj.contains_key("auth")
+            || obj.contains_key("bearer_token_env_var"))
+        .then(|| note("codex", "auth")),
+        // opencode keeps the tokens in its own store, and this flag is what
+        // switches that on — so a `false` here is not a marker.
+        EntrySchema::Opencode => (!matches!(obj.get("oauth"), None | Some(Value::Bool(false))))
+            .then(|| note("opencode", "oauth")),
+        // Gemini CLI either brokers the flow itself (`oauth`) or signs the
+        // request with a Google credential — ADC, or an impersonated service
+        // account — which is what `authProviderType` selects.
+        EntrySchema::Gemini => (obj.contains_key("oauth") || obj.contains_key("authProviderType"))
+            .then(|| note("gemini", "auth")),
+        EntrySchema::McpServers
+        | EntrySchema::VsCode
+        | EntrySchema::Windsurf
+        | EntrySchema::Zed
+        | EntrySchema::Cline
+        | EntrySchema::Amp
+        | EntrySchema::ZooCode => None,
+    }
+}
+
 /// The `mcpServers` entry shape shared by Claude Desktop, Claude Code, Cursor
 /// and VS Code: an optional `type`, and otherwise `command` for stdio or
 /// `url` for remote.
@@ -459,9 +528,10 @@ fn parse_cline(obj: &Map<String, Value>) -> Result<(Server, Option<String>), Str
 /// and the two remote fields are different protocols.
 ///
 /// Everything else an entry may carry (`cwd`, `timeout`, `trust`,
-/// `includeTools`, `authProviderType`, …) is ignored on read — those fields
-/// have no canonical counterpart, and an entry mcpgw does not manage keeps
-/// them verbatim because sync never rewrites it.
+/// `includeTools`, …) is ignored on read — those fields have no canonical
+/// counterpart, and an entry mcpgw does not manage keeps them verbatim
+/// because sync never rewrites it. The two that say Gemini authenticates the
+/// server itself are read for their note alone: see [`client_managed_auth`].
 fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
     let http_url = string_field(obj, "httpUrl")?;
     let sse_url = string_field(obj, "url")?;
@@ -520,7 +590,6 @@ fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), St
 fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), String> {
     let command = string_field(obj, "command")?;
     let url = string_field(obj, "url")?;
-    let mut note = None;
 
     let transport = match (command, url) {
         (Some(command), None) => Transport::Stdio {
@@ -528,18 +597,10 @@ fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), Str
             args: string_list(obj, "args")?,
             env: string_object(obj, "env")?,
         },
-        (None, Some(url)) => {
-            if obj.contains_key("auth") || obj.contains_key("bearer_token_env_var") {
-                // Codex mints or forwards the credential itself; the
-                // canonical config has no field for that, so importing this
-                // entry yields a URL that will not authenticate on its own.
-                note = Some("codex-managed auth not carried over".to_owned());
-            }
-            Transport::Http {
-                url,
-                headers: string_object(obj, "http_headers")?,
-            }
-        }
+        (None, Some(url)) => Transport::Http {
+            url,
+            headers: string_object(obj, "http_headers")?,
+        },
         (Some(_), Some(_)) => return Err("has both `command` and `url`".to_owned()),
         (None, None) => return Err("has neither `command` nor `url`".to_owned()),
     };
@@ -550,7 +611,7 @@ fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), Str
             tags: Vec::new(),
             transport,
         },
-        note,
+        None,
     ))
 }
 
@@ -582,7 +643,6 @@ fn parse_opencode(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
         },
     };
 
-    let mut note = None;
     let transport = if local {
         let mut argv = string_list(obj, "command")?.into_iter();
         let command = argv.next().ok_or_else(|| {
@@ -598,12 +658,6 @@ fn parse_opencode(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
             env: string_object(obj, "environment")?,
         }
     } else {
-        if !matches!(obj.get("oauth"), None | Some(Value::Bool(false))) {
-            // opencode holds the OAuth tokens itself; the canonical config
-            // has no field for them, so the imported URL will not
-            // authenticate on its own.
-            note = Some("opencode-managed oauth not carried over".to_owned());
-        }
         Transport::Http {
             // Header values may carry opencode's own `{env:VAR}`
             // interpolation, which is kept verbatim: expanding it here would
@@ -619,7 +673,7 @@ fn parse_opencode(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
             tags: Vec::new(),
             transport,
         },
-        note,
+        None,
     ))
 }
 

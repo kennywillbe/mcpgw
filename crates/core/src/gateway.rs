@@ -234,6 +234,18 @@ impl Gateway {
         // Upstream failures surface as loud MCP errors — never as a silent
         // empty result.
         self.manager.call(name, call).await.map_err(|err| {
+            // A 401 upstream is the one failure the client is not supposed to
+            // fix by trying again or by starting something, so it carries its
+            // own sentence and none of the hints: the `WWW-Authenticate` the
+            // server sent is deliberately not relayed (a client that answered
+            // it would send the upstream's token through the gateway), which
+            // makes naming the command the whole of the help there is.
+            if let crate::upstream::CallError::Upstream(
+                auth @ crate::upstream::UpstreamError::AuthRequired { .. },
+            ) = &err
+            {
+                return ErrorData::internal_error(auth.to_string(), None);
+            }
             // The hint is about a gateway that cannot reach its upstream, so
             // it has no business on an answer the upstream itself gave.
             let message = match (&err, &self.unavailable_hint) {

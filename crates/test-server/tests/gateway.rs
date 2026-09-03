@@ -1549,3 +1549,56 @@ async fn a_session_expired_by_a_restart_is_reinitialized_under_the_call() {
     outer.shutdown().await;
     remote.stop().await;
 }
+
+/// A bare http server that answers every request `401` — an OAuth-protected
+/// remote, from the point of view of a gateway with no token for it.
+fn unauthorized_server() -> std::net::SocketAddr {
+    let app = axum::Router::new().fallback(|| async {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                "Bearer resource_metadata=\"https://auth.example.com/.well-known/\
+                 oauth-protected-resource\"",
+            )],
+        )
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+/// What a client at `/s/<name>` is told when the server behind it wants a
+/// login. Not the upstream's `WWW-Authenticate` — relaying that would have
+/// the client authenticate to the upstream and hand the gateway its token —
+/// but the one thing that can be done about it on this machine.
+#[tokio::test]
+async fn an_oauth_upstream_names_the_login_rather_than_relaying_the_challenge() {
+    let manager = remote_manager(unauthorized_server());
+    let client = connect(Gateway::new(Arc::clone(&manager), "remote".to_owned())).await;
+
+    let text = client.list_all_tools().await.unwrap_err().to_string();
+    assert!(
+        text.contains(
+            "upstream \"remote\" needs OAuth; run mcpgw auth login remote on this machine"
+        ),
+        "should name the login: {text}"
+    );
+    assert!(
+        !text.to_ascii_lowercase().contains("www-authenticate")
+            && !text.contains("resource_metadata"),
+        "the upstream's challenge must not be relayed: {text}"
+    );
+    assert!(matches!(
+        manager.status("remote").await,
+        Some(UpstreamStatus::AuthRequired { .. })
+    ));
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}

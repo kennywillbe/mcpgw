@@ -610,3 +610,100 @@ fn json_always_carries_the_projects_array() {
     let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(value["projects"], serde_json::json!([]));
 }
+
+/// A bare `401` responder on an ephemeral port, and the thread serving it.
+///
+/// Hand-rolled rather than an MCP fixture on purpose: an OAuth-protected
+/// server never gets as far as speaking MCP to a caller with no token, so a
+/// challenge and nothing else is exactly what doctor has to make sense of.
+fn unauthorized_server() -> String {
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            // The whole request is read before the answer goes out: a server
+            // that replies to a POST and hangs up on its unread body is a
+            // connection reset on the client, not a 401.
+            let mut reader = BufReader::new(&stream);
+            let mut length = 0usize;
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) {
+                if let Some(value) = line
+                    .to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::trim)
+                {
+                    length = value.parse().unwrap_or(0);
+                }
+                if line.trim().is_empty() {
+                    break;
+                }
+                line.clear();
+            }
+            let _ = reader.take(length as u64).read_to_end(&mut Vec::new());
+
+            let mut stream = &stream;
+            let _ = stream.write_all(
+                b"HTTP/1.1 401 Unauthorized\r\n\
+                  WWW-Authenticate: Bearer resource_metadata=\"https://auth.example.com/\
+                  .well-known/oauth-protected-resource\"\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream.flush();
+        }
+    });
+    url
+}
+
+/// The report a user of an OAuth-protected server gets: a warning naming the
+/// login, not a handshake error, and not a red exit — there is nothing wrong
+/// with the machine, and nothing `--timeout` or a restart would change.
+#[test]
+fn a_server_behind_oauth_is_a_warning_naming_the_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        "version = 1\n[servers.linear]\ntype = \"http\"\nurl = \"{}\"\n",
+        unauthorized_server()
+    );
+
+    let out = run_doctor(
+        dir.path(),
+        Some(&config),
+        &["--probe", "--timeout", "60", "--json"],
+    );
+    assert!(out.status.success(), "{}", stdout(&out));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["errors"], 0);
+    assert_eq!(value["warnings"], 1);
+
+    let finding = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "needs_oauth")
+        .unwrap_or_else(|| panic!("no needs_oauth finding in {value}"));
+    assert_eq!(finding["severity"], "warning");
+    assert_eq!(finding["server"], "linear");
+    assert_eq!(
+        finding["message"],
+        "linear needs OAuth — the gateway cannot complete a client-side login; \
+         run mcpgw auth login linear"
+    );
+
+    let row = &value["probes"]["results"][0];
+    assert_eq!(row["ok"], false);
+    assert_eq!(row["code"], "needs_oauth");
+    assert_eq!(row["error"], finding["message"]);
+
+    // And the same sentence in the rendered report, as a warning line.
+    let text = stdout(&run_doctor(
+        dir.path(),
+        Some(&config),
+        &["--probe", "--timeout", "60"],
+    ));
+    assert!(text.contains("run mcpgw auth login linear"), "{text}");
+    assert!(text.contains("0 errors, 1 warnings"), "{text}");
+}
