@@ -94,6 +94,7 @@ pub fn run(
         &managed,
         &command_exists,
     );
+    findings.extend(stale_service_exe());
 
     let (probe_results, gateway_report) = match probe {
         Some(timeout) => {
@@ -214,6 +215,18 @@ fn scan_clients(
         }
     }
     detections
+}
+
+/// The warning for a login service pointed at an mcpgw that moved.
+///
+/// Reported without probing anything, and without `--probe`: the service can
+/// be running an old binary perfectly, so there is nothing a dial would
+/// reveal. Only when a service was actually recorded — a machine with no
+/// daemon has no stale binary to be aimed at.
+fn stale_service_exe() -> Option<Finding> {
+    let state_dir = mcpgw_core::paths::state_dir()?;
+    let spec = mcpgw_core::daemon::load_spec(&state_dir)?;
+    mcpgw_core::daemon_check::service_exe(&spec)?.finding()
 }
 
 /// mcpgw's record of which client entries it wrote, or an empty one when the

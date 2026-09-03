@@ -198,3 +198,32 @@ async fn banner_line(
         .expect("reading the gateway banner")
         .expect("the gateway closed stdout before finishing its banner")
 }
+
+/// Writes the record `daemon install` leaves behind, without installing a
+/// service: a live install would register a launch agent on whatever machine
+/// ran the suite, and the behaviour under test is entirely about what the
+/// read-only commands make of what they read back out of it.
+///
+/// `exe` is a parameter because the two states worth reporting are both
+/// about which binary the record names — one that is gone, and one that is
+/// not the mcpgw being run.
+#[allow(dead_code)]
+pub fn record_installed_spec(home: &Path, exe: &Path, bind: &str, port: u16) {
+    let state = home.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let path = |name: &str| state.join(name).display().to_string();
+    std::fs::write(
+        state.join("daemon.json"),
+        format!(
+            r#"{{"exe":{:?},"config_path":{:?},"state_dir":{:?},
+                 "bind":"{bind}","port":{port},
+                 "logs":{{"stdout":{:?},"stderr":{:?}}}}}"#,
+            exe.display().to_string(),
+            home.join("config.toml").display().to_string(),
+            state.display().to_string(),
+            path("logs/daemon.out.log"),
+            path("logs/daemon.err.log"),
+        ),
+    )
+    .unwrap();
+}

@@ -325,6 +325,12 @@ fn status_card(cx: &Ctx) {
         cx.config.servers.len()
     );
     println!("  gateway   {}", describe_gateway(cx, enabled));
+    // Dim, because nothing here is broken: the card says everything is set
+    // up, and it still is — the service is just running the mcpgw you
+    // replaced rather than the one you replaced it with.
+    if let Some(advice) = stale_service_exe() {
+        println!("  service   {}", ui::dim(&advice, cx.color));
+    }
     let clients = cx.synced_clients();
     println!(
         "  clients   {}",
@@ -343,6 +349,15 @@ fn status_card(cx: &Ctx) {
     ] {
         println!("  {command:<22}{}", ui::dim(what, cx.color));
     }
+}
+
+/// The same sentence `daemon status` and `doctor` print about a service
+/// pointed at an mcpgw that moved, or nothing when there is no service or it
+/// is pointed at this one.
+fn stale_service_exe() -> Option<String> {
+    let state_dir = mcpgw_core::paths::state_dir()?;
+    let spec = mcpgw_core::daemon::load_spec(&state_dir)?;
+    mcpgw_core::daemon_check::service_exe(&spec)?.advice()
 }
 
 fn describe_gateway(cx: &Ctx, enabled: usize) -> String {

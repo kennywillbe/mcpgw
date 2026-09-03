@@ -110,6 +110,46 @@ fn broken_client_entry_fails_the_exit_code() {
     assert!(stdout(&out).contains("neither `command` nor `url`"));
 }
 
+/// A service still pointed at a binary that is gone is a warning, not an
+/// error: the gateway may be answering perfectly on it. Reported without
+/// `--probe`, because no dial could reveal it.
+#[test]
+fn json_warns_about_a_service_installed_from_a_binary_that_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let gone = dir.path().join("cargo").join("bin").join("mcpgw");
+    util::record_installed_spec(dir.path(), &gone, "127.0.0.1", 18137);
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    let stale = findings
+        .iter()
+        .find(|f| f["message"].as_str().unwrap().contains("which is gone"))
+        .unwrap_or_else(|| panic!("no stale-service finding: {findings:?}"));
+    assert_eq!(stale["severity"], "warning");
+    assert!(
+        stale["message"]
+            .as_str()
+            .unwrap()
+            .contains("`mcpgw daemon install`"),
+        "{stale:?}"
+    );
+    // Nothing here is broken, so doctor still exits zero.
+    assert!(out.status.success(), "{}", stdout(&out));
+}
+
+/// No service recorded, nothing to say about one.
+#[test]
+fn a_machine_with_no_service_gets_no_stale_binary_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--json"]);
+    assert!(
+        !stdout(&out).contains("the gateway service"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn json_output_carries_findings_and_counts() {
     let dir = tempfile::tempdir().unwrap();

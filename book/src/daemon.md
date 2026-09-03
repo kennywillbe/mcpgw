@@ -280,6 +280,22 @@ foreground `mcpgw serve` on the same port, or some other program, is left
 alone and named instead. The same command is how a moved config file or a
 changed `PATH` gets picked up.
 
+You do not have to remember that you moved, either. `mcpgw daemon status`,
+`mcpgw doctor` and the status card all compare the binary the service was
+installed from with the one you are running, and say so when the two have
+come apart — whether the recorded one is gone entirely or is simply a second
+copy the service kept running while your upgrades landed elsewhere:
+
+```text
+service   installed from ~/.cargo/bin/mcpgw, which is gone — run `mcpgw daemon install` to point it at /opt/homebrew/bin/mcpgw
+```
+
+Symlinks are followed before the two are compared, so a Homebrew mcpgw
+reached through `/opt/homebrew/bin` is not reported as a different binary
+from the one in the Cellar it points at. In `doctor` this is a warning rather
+than an error: the gateway may be answering perfectly well on the old binary,
+and the only thing actually broken is that upgrading it changes nothing.
+
 ## Status
 
 ```sh

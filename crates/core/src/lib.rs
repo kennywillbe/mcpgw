@@ -3,6 +3,7 @@ pub mod capture;
 pub mod clients;
 pub mod config;
 pub mod daemon;
+pub mod daemon_check;
 pub mod doctor;
 pub mod endpoints;
 pub mod error;
