@@ -57,6 +57,13 @@ restore these clients? [Y/n]
 
 `--yes` skips the question; the plan still prints.
 
+While that question waits, eject holds nothing: a `mcpgw sync` or `mcpgw add`
+in another window runs as usual rather than blocking on an unanswered
+terminal. The other side of that is that the files can move under the
+question, so eject reads them again once you answer and writes what it finds
+then. If the plan that comes back is not the one you were shown, eject stops
+without writing and asks you to run it again against the current plan.
+
 Eject writes through the same machinery as `mcpgw sync`, so it takes the same
 backups — `mcpgw sync --rollback` restores each client from the snapshot taken
 just before eject wrote it.

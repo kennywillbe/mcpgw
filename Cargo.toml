@@ -147,6 +147,10 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 crossterm = "0.29"
 insta = "1"
 assert_cmd = "2"
+# Dev-only, and only on unix: the eject prompt tests have to give the binary
+# a real terminal on stdin, and `openpty` is the whole of what they use it
+# for. Already in the graph under tokio, so it costs no extra resolution.
+libc = "0.2"
 # Traffic capture redacts before it writes, and `[capture] redact` lets a
 # user add patterns of their own — user-supplied regexes need a real engine,
 # and the built-in credential shapes are the same kind of match. Default

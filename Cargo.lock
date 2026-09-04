@@ -1387,6 +1387,7 @@ dependencies = [
  "crossterm",
  "flate2",
  "insta",
+ "libc",
  "mcpgw-core",
  "mcpgw-test-server",
  "owo-colors",

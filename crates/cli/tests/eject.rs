@@ -29,21 +29,30 @@ impl Sandbox {
         }
     }
 
-    fn mcpgw(&self, args: &[&str]) -> Output {
-        Command::cargo_bin("mcpgw")
-            .unwrap()
+    /// A `mcpgw` pointed at the sandbox and nothing of the real machine.
+    ///
+    /// The plain `std` command rather than `assert_cmd`'s wrapper: the
+    /// prompt test spawns one and drives it while it runs, which needs the
+    /// `Child` a wrapper does not hand back.
+    fn command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"));
+        command
             // Hermetic: no test may phone home for a version notice.
             .env("MCPGW_NO_UPDATE_CHECK", "1")
-            .args(args)
             .env("MCPGW_CONFIG", &self.config)
             .env("MCPGW_STATE_DIR", &self.state)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("APPDATA", self.home.join("AppData"))
             .env_remove("XDG_CONFIG_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .output()
-            .unwrap()
+            .env_remove("XDG_DATA_HOME");
+        command
+    }
+
+    fn mcpgw(&self, args: &[&str]) -> Output {
+        let mut command = self.command();
+        command.args(args);
+        Command::from_std(command).output().unwrap()
     }
 
     fn ok(&self, args: &[&str]) -> String {
@@ -59,20 +68,9 @@ impl Sandbox {
     /// A run from a working directory of the test's choosing — the project
     /// steps read the repo the process is standing in.
     fn ok_in(&self, cwd: &Path, args: &[&str]) -> String {
-        let out = Command::cargo_bin("mcpgw")
-            .unwrap()
-            .current_dir(cwd)
-            .env("MCPGW_NO_UPDATE_CHECK", "1")
-            .args(args)
-            .env("MCPGW_CONFIG", &self.config)
-            .env("MCPGW_STATE_DIR", &self.state)
-            .env("HOME", &self.home)
-            .env("USERPROFILE", &self.home)
-            .env("APPDATA", self.home.join("AppData"))
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .output()
-            .unwrap();
+        let mut command = self.command();
+        command.current_dir(cwd).args(args);
+        let out = Command::from_std(command).output().unwrap();
         assert!(
             out.status.success(),
             "{}",
@@ -462,4 +460,211 @@ fn eject_restores_the_repo_files_sync_wrote() {
     // eject is a round trip, not a reformat.
     sb.ok_in(&repo, &["sync", "--project"]);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), synced);
+}
+
+/// Everything below drives an `eject` that reaches its confirmation
+/// question, which it only asks when stdin is a terminal — so the tests hand
+/// it one. Unix only: a pty is `openpty` here and a whole other API on
+/// Windows, and what is under test (which locks are held while the question
+/// waits) is not platform-specific.
+#[cfg(unix)]
+mod prompted {
+    use std::io::{Read as _, Write as _};
+    use std::process::{Child, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::{CURSOR_DIRECT, Sandbox};
+
+    /// How long the prompt is waited for before the test calls the run hung.
+    /// Generous: it bounds a cold process start on a loaded runner, and only
+    /// a genuinely stuck eject still trips it.
+    const DEADLINE: Duration = Duration::from_secs(60);
+
+    /// A running `mcpgw eject` with a terminal on its stdin, its stdout
+    /// drained into a string the test can read while it is still running.
+    struct Run {
+        child: Child,
+        terminal: std::fs::File,
+        printed: Arc<Mutex<String>>,
+    }
+
+    impl Run {
+        /// Blocks until `text` has been printed, or the run ends or the
+        /// deadline passes without it.
+        fn wait_for(&mut self, text: &str) {
+            let deadline = Instant::now() + DEADLINE;
+            loop {
+                if self.printed.lock().unwrap().contains(text) {
+                    return;
+                }
+                let exited = self.child.try_wait().unwrap().is_some();
+                let printed = self.printed.lock().unwrap().clone();
+                assert!(!exited, "eject ended before printing {text:?}:\n{printed}");
+                assert!(
+                    Instant::now() < deadline,
+                    "eject did not print {text:?} within {DEADLINE:?}:\n{printed}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Types an answer at the terminal, newline and all.
+        fn answer(&mut self, line: &str) {
+            self.terminal.write_all(line.as_bytes()).unwrap();
+            self.terminal.flush().unwrap();
+        }
+
+        /// Waits the run out and returns how it ended, with everything it
+        /// printed on the way.
+        fn finish(self) -> (std::process::Output, String) {
+            let output = self.child.wait_with_output().unwrap();
+            let printed = self.printed.lock().unwrap().clone();
+            (output, printed)
+        }
+    }
+
+    /// A pty pair: the terminal end the test types at, and the device end a
+    /// child gets as its stdin.
+    fn openpty() -> (std::fs::File, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd as _;
+
+        let mut terminal = -1;
+        let mut device = -1;
+        // SAFETY: both descriptors are written through valid pointers, and
+        // the three optional arguments are null — which `openpty` documents
+        // as "take the defaults".
+        let rc = unsafe {
+            libc::openpty(
+                &raw mut terminal,
+                &raw mut device,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: `openpty` just returned both, and nothing else owns them.
+        unsafe {
+            (
+                std::fs::File::from_raw_fd(terminal),
+                std::os::fd::OwnedFd::from_raw_fd(device),
+            )
+        }
+    }
+
+    /// Starts `mcpgw eject` — no `--yes`, so it asks — on a terminal of the
+    /// test's own.
+    fn eject_on_a_terminal(sb: &Sandbox) -> Run {
+        let (terminal, device) = openpty();
+        let mut command = sb.command();
+        let mut child = command
+            .arg("eject")
+            .stdin(Stdio::from(device))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Drained on a thread of its own: the test has to read the prompt
+        // *while* the run is waiting, and a pipe nobody empties would stall
+        // the writer long before the question ever reached it.
+        let printed = Arc::new(Mutex::new(String::new()));
+        let mut stdout = child.stdout.take().unwrap();
+        let collected = Arc::clone(&printed);
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 512];
+            while let Ok(read) = stdout.read(&mut buffer)
+                && read > 0
+            {
+                collected
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buffer[..read]));
+            }
+        });
+        Run {
+            child,
+            terminal,
+            printed,
+        }
+    }
+
+    /// Whether the state lock can be taken right now — what a concurrent
+    /// `mcpgw sync` would be doing, except that it would block and a test
+    /// that blocked here would hang instead of failing.
+    fn state_lock_is_free(sb: &Sandbox) -> bool {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(sb.state.join("managed.json.lock"))
+            .unwrap();
+        file.try_lock().is_ok()
+    }
+
+    /// The prompt is a human's think-time, which is unbounded. Nothing of
+    /// mcpgw's may be locked across it: a `mcpgw sync` in the next window
+    /// would otherwise block until somebody gets back to the terminal.
+    #[test]
+    fn the_state_lock_is_free_while_eject_waits_for_an_answer() {
+        let sb = Sandbox::new();
+        sb.install_cursor(Some(r#"{"mcpServers": {"mine": {"command": "deno"}}}"#));
+        sb.add_servers();
+        sb.ok(&["sync"]);
+
+        let mut run = eject_on_a_terminal(&sb);
+        run.wait_for("restore these clients?");
+        assert!(
+            state_lock_is_free(&sb),
+            "eject held the state lock while its prompt waited for an answer"
+        );
+
+        run.answer("y\n");
+        let (output, printed) = run.finish();
+        assert!(
+            output.status.success(),
+            "{}\n{printed}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // And the answer still did what it was given for.
+        assert_eq!(sb.cursor_text(), CURSOR_DIRECT);
+    }
+
+    /// The window the released lock opens is the one the re-plan closes: an
+    /// edit that lands while the question is open is not overwritten by a
+    /// document read before it. The run stops instead, because the plan the
+    /// user said yes to is no longer the plan that would be written.
+    #[test]
+    fn a_client_edited_under_the_prompt_stops_the_run() {
+        let sb = Sandbox::new();
+        sb.install_cursor(None);
+        sb.add_servers();
+        sb.ok(&["sync"]);
+
+        let mut run = eject_on_a_terminal(&sb);
+        run.wait_for("restore these clients?");
+        // Somebody else's write into the file eject planned against.
+        let mut entries = sb.cursor_json();
+        entries["mcpServers"]["theirs"] = serde_json::json!({"command": "deno"});
+        std::fs::write(
+            sb.cursor_path(),
+            serde_json::to_string_pretty(&entries).unwrap(),
+        )
+        .unwrap();
+        let edited = sb.cursor_text();
+
+        run.answer("y\n");
+        let (output, printed) = run.finish();
+        assert!(!output.status.success(), "{printed}");
+        let err = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            err.contains("changed while that question was open"),
+            "{err}"
+        );
+        assert!(err.contains("mcpgw eject` again"), "{err}");
+        // Untouched: their entry is still there, and the gateway entries the
+        // stale plan would have replaced are still the ones on disk.
+        assert_eq!(sb.cursor_text(), edited);
+    }
 }
