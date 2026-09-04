@@ -125,6 +125,9 @@ fn bridge(url: &str, startup: &Startup) -> Gateway {
             url: url.to_owned(),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
+            // The bridge dials the gateway, which is the party holding every
+            // upstream's credential. Nothing here has a login of its own.
+            auth: None,
         },
     };
     let manager = Arc::new(UpstreamManager::new(BTreeMap::from([(

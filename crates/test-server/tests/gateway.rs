@@ -179,6 +179,7 @@ async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<Up
             url: format!("http://{addr}{}", endpoint_path("fx")),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
+            auth: None,
         },
     };
     let outer = Arc::new(
@@ -1427,6 +1428,7 @@ fn remote_manager(addr: std::net::SocketAddr) -> Arc<UpstreamManager> {
             url: format!("http://{addr}{}", endpoint_path("fx")),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
+            auth: None,
         },
     };
     Arc::new(

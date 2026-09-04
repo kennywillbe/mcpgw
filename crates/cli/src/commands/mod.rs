@@ -1,4 +1,5 @@
 pub mod add;
+pub mod auth;
 pub mod connect;
 pub mod daemon;
 pub mod doctor;

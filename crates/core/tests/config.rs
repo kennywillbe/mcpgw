@@ -268,3 +268,60 @@ fn a_tools_table_round_trips_through_toml() {
     // `tools = {}` in a written config would be a rule nobody asked for.
     assert!(!text.contains("linear.tools"));
 }
+
+/// The `[auth]` table reads back as written and survives a round trip
+/// through the plain serde form, which is what `list --json` and the reload
+/// path both go through.
+#[test]
+fn an_auth_table_round_trips() {
+    let config = Config::parse(
+        "version = 1\n\n[servers.jira]\ntype = \"http\"\nurl = \"https://mcp.atlassian.com/mcp\"\n\
+         auth = { client_id = \"abc123\", client_secret_env = \"JIRA_SECRET\", scopes = [\"read\"] }\n",
+        Path::new("t.toml"),
+    )
+    .unwrap();
+    let Transport::Http { auth, .. } = &config.servers["jira"].transport else {
+        panic!("expected an http server");
+    };
+    let auth = auth.as_ref().expect("the table is read");
+    assert_eq!(auth.client_id.as_deref(), Some("abc123"));
+    assert_eq!(auth.client_secret_env.as_deref(), Some("JIRA_SECRET"));
+    assert_eq!(auth.scopes, ["read"]);
+
+    let text = config.to_toml_string().unwrap();
+    assert_eq!(Config::parse(&text, Path::new("t.toml")).unwrap(), config);
+
+    // An entry with no table has none, rather than an empty one: the two say
+    // different things, and only the second would be written back out.
+    let plain = Config::parse(
+        "version = 1\n\n[servers.linear]\ntype = \"http\"\nurl = \"https://mcp.linear.app/mcp\"\n",
+        Path::new("t.toml"),
+    )
+    .unwrap();
+    let Transport::Http { auth, .. } = &plain.servers["linear"].transport else {
+        panic!("expected an http server");
+    };
+    assert!(auth.is_none());
+    assert!(!plain.to_toml_string().unwrap().contains("auth"));
+}
+
+/// Both fill the `Authorization` header, so an entry with both has no defined
+/// behaviour — and it is refused where it is written, not at the next connect.
+#[test]
+fn a_server_cannot_have_both_headers_command_and_auth() {
+    let err = Config::parse(
+        "version = 1\n\n[servers.linear]\ntype = \"http\"\nurl = \"https://mcp.linear.app/mcp\"\n\
+         headers_command = [\"corp-auth\"]\nauth = { client_id = \"abc\" }\n",
+        Path::new("t.toml"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::AuthConflict { name } if name == "linear"),
+        "{err}"
+    );
+    assert!(
+        err.to_string()
+            .contains("sets both headers_command and [auth]"),
+        "{err}"
+    );
+}

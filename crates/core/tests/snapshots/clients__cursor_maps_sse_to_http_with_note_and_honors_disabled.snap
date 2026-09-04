@@ -23,6 +23,7 @@ ClientRead {
                 url: "https://mcp.linear.app/sse",
                 headers_command: [],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },

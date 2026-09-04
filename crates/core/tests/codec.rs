@@ -490,6 +490,7 @@ fn only_the_two_clients_with_a_helper_field_are_written_one() {
                 .map(str::to_owned)
                 .to_vec(),
             headers: std::collections::BTreeMap::new(),
+            auth: None,
         },
     };
     assert_eq!(

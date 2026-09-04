@@ -72,6 +72,30 @@ Common to both transports:
 | `url` | string | required | Streamable HTTP endpoint |
 | `headers_command` | list of strings | `[]` | run per connect; its headers win over `headers` |
 | `headers` | table of strings | `{}` | sent on every request |
+| `auth` | table | — | OAuth client identity; see [Servers that need OAuth](./auth.md) |
+
+#### `[servers.NAME.auth]`
+
+Written by `mcpgw auth login --client-id`, and by hand for the providers that
+issue client ids out of band. With no table at all mcpgw picks its own
+identity, which is what almost every server wants.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `client_id` | string | — | a client id the provider issued out of band |
+| `client_secret_env` | string | — | the environment variable holding its secret, never the secret itself |
+| `scopes` | list of strings | `[]` | empty lets the provider's own metadata decide |
+
+```toml
+[servers.jira]
+type = "http"
+url = "https://mcp.atlassian.com/v1/sse"
+auth = { client_id = "abc123", scopes = ["read:jira-work"] }
+```
+
+`auth` and `headers_command` are mutually exclusive — both fill the
+`Authorization` header, so a config with both is refused at parse time rather
+than letting one silently win.
 
 #### `[servers.NAME.tools]`
 
@@ -313,6 +337,8 @@ the repo root.
 ```text
 ~/.local/share/mcpgw/
 ├── managed.json          which server names mcpgw wrote into which file
+├── auth/
+│   └── linear.json       OAuth tokens for one server, mode 0600
 ├── backups/
 │   ├── cursor/           timestamped copies, newest 5 kept per file
 │   └── cursor-1f0c…/     a repo's .cursor/mcp.json, keyed by its path
@@ -332,6 +358,9 @@ re-adopt them with `import`.
 
 **`backups/`** is written before every client file is rewritten. The five most
 recent per client are kept; `mcpgw sync --rollback` restores the newest.
+
+**`auth/`** holds one file per logged-in server — see
+[Servers that need OAuth](./auth.md). Deleting one is a logout.
 
 **`traffic/`** is the capture log — see [Watching traffic](./traffic.md).
 

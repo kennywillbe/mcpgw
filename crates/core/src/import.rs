@@ -280,13 +280,19 @@ fn same_transport(a: &Transport, b: &Transport) -> bool {
                 url: a_url,
                 headers_command: a_command,
                 headers: a_headers,
+                ..
             },
             Transport::Http {
                 url: b_url,
                 headers_command: b_command,
                 headers: b_headers,
+                ..
             },
         ) => {
+            // `auth` is deliberately not part of the answer: it says which
+            // client id this machine presents, not which server is being
+            // addressed, and two entries for one remote must still merge when
+            // only one of them has been logged into.
             a_command == b_command
                 && a_headers == b_headers
                 && canonical_url(a_url) == canonical_url(b_url)

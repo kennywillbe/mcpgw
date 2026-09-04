@@ -2,6 +2,7 @@
 //! transport, run whichever MCP handshake it speaks, count its tools.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use rmcp::transport::TokioChildProcess;
@@ -101,15 +102,22 @@ type Service = crate::upstream::UpstreamService;
 ///
 /// Returns [`ProbeError`] for spawn failures, handshake/protocol errors and
 /// timeouts.
-pub async fn probe_server(server: &Server, timeout: Duration) -> Result<ProbeSuccess, ProbeError> {
-    connected(server, timeout, inspect).await
+pub async fn probe_server(
+    name: &str,
+    server: &Server,
+    state_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<ProbeSuccess, ProbeError> {
+    connected(name, server, state_dir, timeout, inspect).await
 }
 
 /// Connects to `server`, hands the live service to `use_service`, and races
 /// the whole thing against `timeout`. On expiry the future is dropped, which
 /// closes the connection (and kills a spawned child with it).
 async fn connected<T, F>(
+    name: &str,
     server: &Server,
+    state_dir: Option<&Path>,
     timeout: Duration,
     use_service: impl FnOnce(Service) -> F,
 ) -> Result<T, ProbeError>
@@ -128,7 +136,8 @@ where
                 url,
                 headers_command,
                 headers,
-            } => connect_http(url, headers_command, headers, timeout).await?,
+                ..
+            } => connect_http(url, headers_command, headers, name, state_dir, timeout).await?,
         };
         use_service(service).await
     };
@@ -177,6 +186,8 @@ async fn connect_http(
     url: &str,
     headers_command: &[String],
     headers: &BTreeMap<String, String>,
+    name: &str,
+    state_dir: Option<&Path>,
     timeout: Duration,
 ) -> Result<Service, ProbeError> {
     // Run here as well as in the gateway, and for the reason `--probe`
@@ -198,14 +209,40 @@ async fn connect_http(
     };
     let config = crate::upstream::http_config(url, headers)
         .map_err(|message| ProbeError::Handshake { message })?;
-    let transport = || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
+    // The stored login, for the same reason the `headers_command` above runs:
+    // `--probe` answers whether this server works *the way mcpgw reaches it*,
+    // and a probe that ignored the token would report a healthy, logged-in
+    // server as needing OAuth.
+    let credentials = match state_dir {
+        Some(state_dir) => crate::auth::client(state_dir, name, url)
+            .await
+            .map_err(|err| ProbeError::Handshake {
+                message: err.to_string(),
+            })?,
+        None => None,
+    };
     // Connect errors (refused, TLS, 4xx) arrive as handshake failures —
     // there is no separate "spawn" step for a remote server. The 401 is the
     // exception, and rmcp answers for it rather than the message being
     // matched: see `upstream::dial`.
-    match dial(transport(), Lifecycle::Legacy).await {
-        Err(err) if err.refused_initialize => dial(transport(), Lifecycle::Modern).await,
-        other => other,
+    if let Some(client) = credentials {
+        let transport = || {
+            rmcp::transport::StreamableHttpClientTransport::with_client(
+                client.clone(),
+                config.clone(),
+            )
+        };
+        match dial(transport(), Lifecycle::Legacy).await {
+            Err(err) if err.refused_initialize => dial(transport(), Lifecycle::Modern).await,
+            other => other,
+        }
+    } else {
+        let transport =
+            || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
+        match dial(transport(), Lifecycle::Legacy).await {
+            Err(err) if err.refused_initialize => dial(transport(), Lifecycle::Modern).await,
+            other => other,
+        }
     }
     .map_err(failure)
 }
@@ -303,8 +340,13 @@ pub struct ResourceInfo {
 ///
 /// Returns [`ProbeError`] for spawn failures, handshake/protocol errors and
 /// timeouts, exactly like [`probe_server`].
-pub async fn inspect_server(server: &Server, timeout: Duration) -> Result<Inspection, ProbeError> {
-    connected(server, timeout, list_everything).await
+pub async fn inspect_server(
+    name: &str,
+    server: &Server,
+    state_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<Inspection, ProbeError> {
+    connected(name, server, state_dir, timeout, list_everything).await
 }
 
 async fn list_everything(service: Service) -> Result<Inspection, ProbeError> {

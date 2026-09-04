@@ -32,9 +32,18 @@ pub fn run(args: &InspectArgs, color: bool) -> anyhow::Result<()> {
             available: config.servers.keys().cloned().collect(),
         })?;
 
+    let state_dir = mcpgw_core::paths::state_dir();
     let runtime = tokio::runtime::Runtime::new()?;
     let inspection = runtime
-        .block_on(inspect_server(server, Duration::from_secs(args.timeout)))
+        .block_on(inspect_server(
+            &args.name,
+            server,
+            // Same reason `--probe` reaches for it: `inspect` answers what
+            // this server offers *the way mcpgw reaches it*, and for an
+            // OAuth server that includes the login the gateway would present.
+            state_dir.as_deref(),
+            Duration::from_secs(args.timeout),
+        ))
         .with_context(|| format!("cannot inspect server {:?}", args.name))?;
 
     if args.json {

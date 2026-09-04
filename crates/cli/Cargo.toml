@@ -34,6 +34,13 @@ zip.workspace = true
 insta.workspace = true
 assert_cmd.workspace = true
 rmcp.workspace = true
+# The OAuth end-to-end test drives the same in-process authorization server
+# the core suite uses, rather than a second copy of one that could disagree
+# with it.
+mcpgw-test-server = { path = "../test-server" }
+mcpgw-core = { version = "0.4.1", path = "../core" }
+tokio.workspace = true
+tempfile.workspace = true
 # The self-update end-to-end test builds the release archive it then serves,
 # so it needs the same writers the command reads with. Already in the tree,
 # so this costs no extra resolution.

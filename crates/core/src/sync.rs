@@ -326,6 +326,12 @@ pub fn per_server_gateway_server(
             url: crate::endpoints::per_server_url(base_url, name)?,
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
+            // The client entry points at the gateway, and the gateway is the
+            // one holding the upstream's credential — a client that carried
+            // the server's `[auth]` would be a client mcpgw had told to log
+            // in for itself, which is the whole thing the broker exists to
+            // stop.
+            auth: None,
         }
     } else {
         Transport::Stdio {

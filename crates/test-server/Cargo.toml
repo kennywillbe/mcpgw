@@ -8,13 +8,25 @@ publish = false
 
 [dependencies]
 serde_json.workspace = true
+# The OAuth fixture in `src/oauth.rs` is a real HTTP provider, and it is a
+# library rather than a second copy in each suite because the core tests and
+# the CLI end-to-end tests have to be talking to the same one. Nothing here
+# ships: the crate is `publish = false` and exists only to be a fixture.
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+# Only for `PkceCodeChallenge::from_code_verifier_sha256`. The fixture
+# verifies the S256 challenge for real rather than waving it through, which is
+# the difference between proving PKCE is used and proving it is sent.
+oauth2.workspace = true
 
 [dev-dependencies]
 mcpgw-core = { version = "0.4.1", path = "../core" }
-tokio.workspace = true
 rmcp-client-http.workspace = true
-axum.workspace = true
 tempfile.workspace = true
+# The "browser" in the OAuth tests: one blocking GET that follows the
+# authorization server's redirect into the login's own loopback listener.
+ureq.workspace = true
 
 [lints]
 workspace = true

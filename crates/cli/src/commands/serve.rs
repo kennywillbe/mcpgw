@@ -223,7 +223,15 @@ pub(crate) fn build(
     // servers present at boot arrive through exactly the code path a reload
     // uses. One construction site means an added server cannot end up served
     // differently from one that was in the config all along.
-    let manager = Arc::new(UpstreamManager::new(std::collections::BTreeMap::new()));
+    let mut manager = UpstreamManager::new(std::collections::BTreeMap::new());
+    // Where `mcpgw auth login` left its tokens. Absent only on a machine with
+    // no home directory to resolve, where there is nothing to have logged in
+    // with either — an upstream then dials bare and answers `401`, which is
+    // the state that names the login command.
+    if let Some(state_dir) = mcpgw_core::paths::state_dir() {
+        manager = manager.with_state_dir(state_dir);
+    }
+    let manager = Arc::new(manager);
     let endpoints = Endpoints::new(EndpointTable::new(Vec::new()));
     let mut reloader = Reloader::new(config_path, Arc::clone(&manager), endpoints.clone());
     if !selection.is_empty() {

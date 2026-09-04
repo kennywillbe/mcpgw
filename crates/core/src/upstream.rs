@@ -189,8 +189,9 @@ pub enum UpstreamError {
     AuthRequired {
         name: String,
         /// The `resource_metadata` URL from the server's `WWW-Authenticate`
-        /// challenge, when it sent one. Recorded for the broker that will
-        /// use it; nothing reads it yet.
+        /// challenge, when it sent one. Reported, not acted on: the broker
+        /// asks the server for its own challenge when a login starts rather
+        /// than trusting one a gateway recorded at some earlier point.
         resource_metadata: Option<String>,
     },
 
@@ -429,6 +430,14 @@ pub struct UpstreamManager {
     connect_timeout: Duration,
     backoff_base: Duration,
     headers_timeout: Duration,
+    /// Where `mcpgw auth login` left its tokens, when this manager is running
+    /// somewhere that has a state directory at all.
+    ///
+    /// [`None`] means no upstream is given a credential — every test manager
+    /// that never logs in, and any embedder without a home. It is not the
+    /// same as "no tokens": a manager with a state directory and no file for
+    /// a server dials that server bare, which is the state the `401` names.
+    state_dir: Option<std::path::PathBuf>,
 }
 
 fn upstream(server: Server) -> Arc<Upstream> {
@@ -465,7 +474,16 @@ impl UpstreamManager {
             connect_timeout: Duration::from_secs(30),
             backoff_base: Duration::from_millis(500),
             headers_timeout: crate::headers::TIMEOUT,
+            state_dir: None,
         }
+    }
+
+    /// Points the manager at the directory `mcpgw auth login` writes tokens
+    /// into, so an upstream that has one connects with it.
+    #[must_use]
+    pub fn with_state_dir(mut self, state_dir: std::path::PathBuf) -> Self {
+        self.state_dir = Some(state_dir);
+        self
     }
 
     #[must_use]
@@ -1041,64 +1059,131 @@ impl UpstreamManager {
                 url,
                 headers_command,
                 headers,
+                ..
             } => {
-                // Run before anything is dialed, and run again on every
-                // connect: the whole point of the field is that what it
-                // prints last time is not what it prints now.
-                let resolved;
-                let headers = if headers_command.is_empty() {
-                    headers
-                } else {
-                    resolved =
-                        crate::headers::resolve(headers_command, headers, self.headers_timeout)
-                            .await
-                            .map_err(|err| UpstreamError::HeadersCommand {
-                                name: name.to_owned(),
-                                message: err.to_string(),
-                            })?;
-                    &resolved
-                };
-                let config = http_config(url, headers).map_err(failed)?;
-                // Nothing is dialed until the handshake, so an unreachable
-                // host surfaces here as a normal connect failure and feeds
-                // the same backoff ladder as a stdio spawn failure.
-                let transport =
-                    || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
-                match dial(
-                    transport(),
-                    Lifecycle::Legacy,
-                    Some(self.connect_timeout),
-                    client.clone(),
-                )
-                .await
-                {
-                    // A 401 is not "this server has no `initialize`": it is a
-                    // server that will not answer anything without a
-                    // credential, so asking it again over the other lifecycle
-                    // only spends a second round trip on the same refusal.
-                    Err(err) if err.refused_initialize => {
-                        dial(
-                            transport(),
-                            Lifecycle::Modern,
-                            Some(self.connect_timeout),
-                            client,
-                        )
-                        .await
-                    }
-                    other => other,
-                }
-                .map_err(|err| {
-                    if err.auth_required {
-                        UpstreamError::AuthRequired {
-                            name: name.to_owned(),
-                            resource_metadata: err.resource_metadata,
-                        }
-                    } else {
-                        failed(err.message)
-                    }
-                })
+                self.connect_http(name, url, headers_command, headers, client)
+                    .await
             }
         }
+    }
+
+    /// The http half of [`connect_once`](Self::connect_once), lifted out so
+    /// each transport's ladder reads on its own.
+    async fn connect_http(
+        &self,
+        name: &str,
+        url: &str,
+        headers_command: &[String],
+        headers: &std::collections::BTreeMap<String, String>,
+        client: UpstreamClient,
+    ) -> Result<UpstreamService, UpstreamError> {
+        let failed = |message: String| UpstreamError::Failed {
+            name: name.to_owned(),
+            attempts: 1,
+            message,
+        };
+        // Run before anything is dialed, and run again on every connect: the
+        // whole point of the field is that what it prints last time is not
+        // what it prints now.
+        let resolved;
+        let headers = if headers_command.is_empty() {
+            headers
+        } else {
+            resolved = crate::headers::resolve(headers_command, headers, self.headers_timeout)
+                .await
+                .map_err(|err| UpstreamError::HeadersCommand {
+                    name: name.to_owned(),
+                    message: err.to_string(),
+                })?;
+            &resolved
+        };
+        let config = http_config(url, headers).map_err(failed)?;
+        // The stored login, when there is one. Built per connect rather than
+        // kept on the manager: it holds the discovered authorization-server
+        // metadata, and a gateway that runs for weeks must not be pinning a
+        // provider's endpoints from the first time it saw them.
+        let credentials = match &self.state_dir {
+            Some(state_dir) => crate::auth::client(state_dir, name, url)
+                .await
+                .map_err(|err| failed(err.to_string()))?,
+            None => None,
+        };
+        // Nothing is dialed until the handshake, so an unreachable host
+        // surfaces here as a normal connect failure and feeds the same backoff
+        // ladder as a stdio spawn failure.
+        //
+        // The two ladders are spelled out rather than shared behind a trait
+        // object: rmcp's transport is generic over its client, and the
+        // authorized one is a different type, not a configured one.
+        let outcome = if let Some(auth) = credentials {
+            let transport = || {
+                rmcp::transport::StreamableHttpClientTransport::with_client(
+                    auth.clone(),
+                    config.clone(),
+                )
+            };
+            match dial(
+                transport(),
+                Lifecycle::Legacy,
+                Some(self.connect_timeout),
+                client.clone(),
+            )
+            .await
+            {
+                Err(err) if err.refused_initialize => {
+                    dial(
+                        transport(),
+                        Lifecycle::Modern,
+                        Some(self.connect_timeout),
+                        client,
+                    )
+                    .await
+                }
+                other => other,
+            }
+        } else {
+            let transport =
+                || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
+            match dial(
+                transport(),
+                Lifecycle::Legacy,
+                Some(self.connect_timeout),
+                client.clone(),
+            )
+            .await
+            {
+                // A 401 is not "this server has no `initialize`": it is a
+                // server that will not answer anything without a credential,
+                // so asking it again over the other lifecycle only spends a
+                // second round trip on the same refusal.
+                Err(err) if err.refused_initialize => {
+                    dial(
+                        transport(),
+                        Lifecycle::Modern,
+                        Some(self.connect_timeout),
+                        client,
+                    )
+                    .await
+                }
+                other => other,
+            }
+        };
+        outcome.map_err(|err| {
+            if err.auth_required {
+                // The token file is deliberately left alone. A 401 that
+                // survived rmcp's own refresh-and-retry says the login has to
+                // be redone, and deleting the evidence would leave `auth
+                // status` unable to tell a login that expired from one that
+                // never happened — which are two different sentences to a
+                // user.
+                UpstreamError::AuthRequired {
+                    name: name.to_owned(),
+                    resource_metadata: err.resource_metadata,
+                }
+            } else {
+                failed(err.message)
+            }
+        })
     }
 }
 
@@ -1146,6 +1231,12 @@ pub(crate) struct DialError {
     /// The `resource_metadata` URL from that 401's `WWW-Authenticate`
     /// challenge, when it sent one.
     pub(crate) resource_metadata: Option<String>,
+    /// That challenge, whole. The broker hands it back to rmcp, which seeds
+    /// discovery from it — the provider's own `resource_metadata` URL and its
+    /// scope hint — instead of guessing the well-known path. Kept apart from
+    /// `resource_metadata` because the two have different readers: the
+    /// gateway records one URL for a report, the broker replays the header.
+    pub(crate) challenge: Option<String>,
 }
 
 /// One handshake against `transport` on `lifecycle`, under `timeout` when
@@ -1208,6 +1299,7 @@ where
             // that token, so there is nothing here to widen.
             auth_required: err.is_authorization_required(),
             resource_metadata: err.auth_challenge().and_then(resource_metadata),
+            challenge: err.auth_challenge().map(str::to_owned),
             message: format!("handshake failed: {err}"),
         }),
         Err(message) => Err(DialError {
@@ -1215,6 +1307,7 @@ where
             refused_initialize: false,
             auth_required: false,
             resource_metadata: None,
+            challenge: None,
         }),
     }
 }

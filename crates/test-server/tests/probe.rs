@@ -36,7 +36,7 @@ async fn probe_mode(
 ) -> Result<mcpgw_core::probe::ProbeSuccess, ProbeError> {
     // Same-package binaries get this env var from cargo at test build time.
     let server = stdio_server(env!("CARGO_BIN_EXE_mcpgw-test-server"), &[mode]);
-    probe_server(&server, Duration::from_millis(timeout_ms)).await
+    probe_server("fx", &server, None, Duration::from_millis(timeout_ms)).await
 }
 
 #[tokio::test]
@@ -83,7 +83,7 @@ async fn immediate_exit_fails_the_handshake() {
 #[tokio::test]
 async fn missing_binary_is_a_spawn_error() {
     let server = stdio_server("/nonexistent/mcpgw-no-such-binary", &[]);
-    let err = probe_server(&server, Duration::from_millis(GENEROUS))
+    let err = probe_server("fx", &server, None, Duration::from_millis(GENEROUS))
         .await
         .unwrap_err();
     assert!(
@@ -104,10 +104,11 @@ async fn http_server_reports_identity_and_tools() {
             url: format!("http://{addr}/s/fx"),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
+            auth: None,
         },
     };
 
-    let success = probe_server(&server, Duration::from_millis(GENEROUS))
+    let success = probe_server("fx", &server, None, Duration::from_millis(GENEROUS))
         .await
         .unwrap();
     assert_eq!(success.server_name, "mcpgw");
@@ -126,9 +127,10 @@ async fn unreachable_http_server_fails_the_handshake() {
             url: "http://127.0.0.1:1/mcp".to_owned(),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
+            auth: None,
         },
     };
-    let err = probe_server(&server, Duration::from_millis(GENEROUS))
+    let err = probe_server("fx", &server, None, Duration::from_millis(GENEROUS))
         .await
         .unwrap_err();
     assert!(matches!(err, ProbeError::Handshake { .. }), "got: {err}");
@@ -192,9 +194,10 @@ async fn a_failing_headers_command_fails_the_probe_by_name() {
                 "headers-fail".to_owned(),
             ],
             headers: BTreeMap::new(),
+            auth: None,
         },
     };
-    let err = probe_server(&server, Duration::from_millis(GENEROUS))
+    let err = probe_server("fx", &server, None, Duration::from_millis(GENEROUS))
         .await
         .unwrap_err();
     let ProbeError::HeadersCommand { message } = &err else {

@@ -13,6 +13,7 @@ ClientRead {
                 headers: {
                     "CONTEXT7_API_KEY": "REDACTED",
                 },
+                auth: None,
             },
             tools: None,
         },
@@ -26,6 +27,7 @@ ClientRead {
                     "print-mcp-headers",
                 ],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },

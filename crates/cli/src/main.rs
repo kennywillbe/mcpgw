@@ -34,6 +34,9 @@ enum Command {
     },
     /// Add a server to the canonical config
     Add(commands::add::AddArgs),
+    /// Log in to servers that need OAuth, and report on those logins
+    #[command(subcommand_help_heading = "Auth commands")]
+    Auth(commands::auth::AuthArgs),
     /// Remove a server from the canonical config
     Remove(commands::remove::RemoveArgs),
     /// Re-enable a disabled server
@@ -105,7 +108,12 @@ fn main() -> anyhow::Result<ExitCode> {
     // itself — none of them wants a version notice appended.
     let notice = !matches!(
         command,
-        Command::Serve(_) | Command::Connect(_) | Command::SelfUpdate(_)
+        Command::Serve(_)
+            | Command::Connect(_)
+            | Command::SelfUpdate(_)
+            | Command::Auth(commands::auth::AuthArgs {
+                command: commands::auth::AuthCommand::Login(_)
+            })
     );
     // The two commands a user runs *because* something is wrong. Suppressing
     // the notice on their failing exit is how the person whose gateway will
@@ -171,6 +179,7 @@ fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
             commands::list::run(json, show_secrets, color).map(|()| 0)
         }
         Command::Add(args) => commands::add::run(&args).map(|()| 0),
+        Command::Auth(args) => commands::auth::run(&args, color),
         Command::Remove(args) => commands::remove::run(&args).map(|()| 0),
         Command::Enable { name } => commands::toggle::run(&name, true).map(|()| 0),
         Command::Disable { name } => commands::toggle::run(&name, false).map(|()| 0),

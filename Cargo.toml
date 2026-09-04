@@ -52,6 +52,15 @@ rmcp = { version = "3", features = [
     # work without shipping our own CA bundle. crates/core/tests/tls.rs is
     # the guard that stops this line being deleted again.
     "reqwest",
+    # The OAuth broker behind `mcpgw auth login`. It carries the whole of the
+    # 2026-07-28 client-registration ladder — pre-registered ids, Client ID
+    # Metadata Documents, DCR — plus PKCE S256, `iss` validation and the
+    # `CredentialStore` hook the gateway refreshes through, and mcpgw would
+    # otherwise be writing a second OAuth client beside the one the SDK
+    # already ships. It pulls `oauth2` and `reqwest`; the `reqwest` feature
+    # above still decides the TLS backend, so the single-static-binary
+    # story (rustls, no native TLS) is unchanged.
+    "auth",
 ] }
 # `reqwest` is spelled out here as well as on the entry above rather than
 # left to cargo unifying the two: this alias is what the test-server crate
@@ -63,6 +72,16 @@ rmcp-client-http = { package = "rmcp", version = "3", features = ["client", "tra
 # guard in crates/core/tests/tls.rs stops compiling the moment that entry
 # loses `reqwest`. Naming a TLS feature here would defeat the whole point.
 reqwest = { version = "0.13", default-features = false }
+# The token types rmcp's `auth` feature stores and refreshes. Declared here
+# only so the credential file can be given an explicit, documented shape
+# instead of an opaque blob: the file is read back into the same
+# `StandardTokenResponse` rmcp hands the transport. Same version rmcp
+# resolves, and default features off for the same reason rmcp declares it
+# that way — no second TLS backend.
+oauth2 = { version = "5", default-features = false }
+# `CredentialStore` is an `#[async_trait]` trait, so implementing it needs
+# the same attribute macro rmcp declared it with.
+async-trait = "0.1"
 axum = "0.8"
 # The per-server endpoint table is read on every request and replaced whole
 # when the config reloads. `ArcSwap` is the read-mostly shape for exactly

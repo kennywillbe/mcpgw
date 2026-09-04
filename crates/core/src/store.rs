@@ -187,6 +187,26 @@ impl ConfigStore {
         self.commit(doc)
     }
 
+    /// Records the identity `mcpgw auth login` was told to use for `name`,
+    /// so the next login and every refresh present the same one.
+    ///
+    /// Persisted rather than asked for again because a client id issued out
+    /// of band is a property of the *server*, not of the one command that
+    /// first mentioned it: a refresh runs in the daemon, where nobody can
+    /// pass a flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownServer`] when no such entry exists,
+    /// [`Error::AuthConflict`] when the entry gets its headers from a
+    /// command, and [`Error::Parse`] if the edit somehow does not round-trip.
+    pub fn set_auth(&mut self, name: &str, auth: &crate::config::ServerAuth) -> Result<(), Error> {
+        self.ensure_known(name)?;
+        let mut doc = self.doc.clone();
+        doc["servers"][name]["auth"] = value(auth_table(auth));
+        self.commit(doc)
+    }
+
     /// Writes the current state to disk atomically (temp file + rename).
     ///
     /// # Errors
@@ -304,6 +324,7 @@ fn server_table(server: &Server) -> Table {
             url,
             headers_command,
             headers,
+            auth,
         } => {
             table["type"] = value("http");
             table["url"] = value(url);
@@ -315,6 +336,13 @@ fn server_table(server: &Server) -> Table {
                 table["headers_command"] = value(string_array(headers_command));
             }
             table["headers"] = value(string_map(headers));
+            // Omitted when absent, like `headers_command` and for the same
+            // reason: an empty `auth = {}` beside a working entry reads as a
+            // server whose login produced nothing, which is a different claim
+            // from a server that needs no login at all.
+            if let Some(auth) = auth {
+                table["auth"] = value(auth_table(auth));
+            }
         }
     }
     // Last, because it is a sub-table: TOML puts every value of a section
@@ -339,6 +367,26 @@ fn tools_table(rules: &ToolRules) -> Table {
         table["deny"] = value(string_array(&rules.deny));
     }
     table
+}
+
+/// The `auth` table as an inline value.
+///
+/// Inline rather than a standard sub-table because [`server_table`] is
+/// inserted whole into `[servers]`, and a nested standard table there would
+/// have to be ordered after every value of every *sibling* entry rather than
+/// after its own. `headers` is written inline for the same reason.
+fn auth_table(auth: &crate::config::ServerAuth) -> toml_edit::Value {
+    let mut table = toml_edit::InlineTable::new();
+    if let Some(client_id) = &auth.client_id {
+        table.insert("client_id", client_id.as_str().into());
+    }
+    if let Some(var) = &auth.client_secret_env {
+        table.insert("client_secret_env", var.as_str().into());
+    }
+    if !auth.scopes.is_empty() {
+        table.insert("scopes", string_array(&auth.scopes));
+    }
+    table.into()
 }
 
 fn string_array(items: &[String]) -> toml_edit::Value {

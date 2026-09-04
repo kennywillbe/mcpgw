@@ -140,17 +140,37 @@ clients send no `Origin` at all and are unaffected.
 
 ## Remote servers and OAuth
 
-A remote MCP server that requires OAuth is authenticated the way it always
-was: with a token you put in the config as a header. mcpgw forwards it. It
-does not broker the flow, hold a refresh token, or renew anything on your
-behalf.
+A remote MCP server that requires OAuth is logged into once, on this machine,
+with `mcpgw auth login <name>` — see [Servers that need OAuth](./auth.md) for
+the whole of it. mcpgw runs the flow, holds the refresh token and renews the
+access token on your behalf. A server whose token is a fixed string still goes
+in `headers` and is forwarded as it always was.
 
-A server that answers `401` is a server mcpgw stops at, and it says so. The
-endpoint reports `needs OAuth`, `mcpgw doctor --probe` reports a warning
-rather than a failure, and a call through the endpoint comes back as
-`upstream "linear" needs OAuth; run mcpgw auth login linear on this machine`.
-That command is not in this release; the message names where the login will
-live, so the error is not a dead end today.
+What that means for what mcpgw holds:
+
+- The tokens live in `~/.local/share/mcpgw/auth/<name>.json`, mode `0600`
+  inside the `0700` state directory, one file per server. They are never
+  logged, never captured — the traffic log has always redacted
+  `Authorization` — and never printed, by `auth status` or by anything else.
+- The refresh token is the long-lived half and is stored beside the access
+  token, because renewing without a browser is the whole point. `mcpgw auth
+  logout <name>` deletes both; it cannot revoke the grant at the provider,
+  so revoke it there too if the machine is at risk.
+- The issuer that minted a token is recorded with it and checked before it is
+  presented, so a provider that moves to another authorization server gets a
+  fresh login instead of a token offered to a stranger.
+- mcpgw identifies itself with a public, static [Client ID Metadata
+  Document](https://kennywillbe.github.io/mcpgw/client.json) — one document for
+  every install. The authorization server fetches it; it says who mcpgw is and
+  nothing about your machine.
+- **Your client's own token is never passed through.** The gateway presents the
+  token it holds for the upstream, and only that one.
+
+A server that answers `401` and has no stored login is a server mcpgw stops at,
+and it says so. The endpoint reports `needs OAuth`, `mcpgw doctor --probe`
+reports a warning rather than a failure, and a call through the endpoint comes
+back as `upstream "linear" needs OAuth; run mcpgw auth login linear on this
+machine`.
 
 The `WWW-Authenticate` challenge the server sent is not relayed to your
 client. Passing it on invites the client to run the flow and send the

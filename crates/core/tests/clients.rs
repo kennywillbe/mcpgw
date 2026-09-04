@@ -58,6 +58,7 @@ fn gemini_reads_both_url_shapes_and_the_excluded_list() {
             )]
             .into_iter()
             .collect(),
+            auth: None,
         }
     );
     // Env values keep their `$VAR` spelling: Gemini expands them, mcpgw
@@ -121,6 +122,7 @@ fn codex_reads_toml_entries_and_tolerates_the_evolving_fields() {
             )]
             .into_iter()
             .collect(),
+            auth: None,
         }
     );
     // Codex mints this server's credential itself, so the imported URL is
@@ -143,6 +145,7 @@ fn codex_reads_toml_entries_and_tolerates_the_evolving_fields() {
                 .map(str::to_owned)
                 .to_vec(),
             headers: std::collections::BTreeMap::new(),
+            auth: None,
         }
     );
     // The non-MCP siblings are simply not servers.
@@ -164,6 +167,7 @@ fn claude_code_reads_the_headers_helper_as_a_command() {
                 .map(str::to_owned)
                 .to_vec(),
             headers: std::collections::BTreeMap::new(),
+            auth: None,
         }
     );
     // A helper is a command, not a credential the client is holding back:
@@ -206,6 +210,7 @@ fn opencode_reads_a_commented_file_and_both_entry_types() {
             )]
             .into_iter()
             .collect(),
+            auth: None,
         }
     );
     // opencode holds this server's OAuth tokens itself, so the imported URL
@@ -270,6 +275,7 @@ fn windsurf_reads_both_remote_spellings() {
             )]
             .into_iter()
             .collect(),
+            auth: None,
         }
     );
     // A plain `url` is not Windsurf's spelling but appears in enough
@@ -280,6 +286,7 @@ fn windsurf_reads_both_remote_spellings() {
             url: "https://mcp.figma.com/mcp".to_owned(),
             headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
+            auth: None,
         }
     );
     assert!(
@@ -295,6 +302,7 @@ fn windsurf_reads_both_remote_spellings() {
             url: "https://notes.example/mcp".to_owned(),
             headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
+            auth: None,
         }
     );
     assert!(read.problems.iter().any(|p| {
@@ -343,6 +351,7 @@ fn zed_reads_context_servers_whatever_their_source() {
             headers: [("Authorization".to_owned(), "Bearer token".to_owned())]
                 .into_iter()
                 .collect(),
+            auth: None,
         }
     );
     // `source: custom` alone is not a server; it is a problem, not a failure.
@@ -385,6 +394,7 @@ fn cline_reads_disabled_entries_and_both_remote_spellings() {
             headers: [("Authorization".to_owned(), "Bearer token".to_owned())]
                 .into_iter()
                 .collect(),
+            auth: None,
         }
     );
     assert!(
@@ -531,6 +541,7 @@ fn amp_reads_the_namespaced_key_and_not_a_nested_one() {
             )]
             .into_iter()
             .collect(),
+            auth: None,
         }
     );
 

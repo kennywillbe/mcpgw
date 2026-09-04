@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::auth::TokenState;
 use crate::clients::ClientRead;
 use crate::config::{Server, Transport};
 use crate::endpoints;
@@ -48,16 +49,29 @@ pub const HEADERS_FROM_COMMAND: &str = "from command";
 /// server should. What is missing is a login, and it has to happen here,
 /// because relaying the server's `WWW-Authenticate` to the client would have
 /// the client send that server's token through the gateway.
+///
+/// `tokens` is what `<state>/auth/<name>.json` says, or `None` when there is
+/// no such file. It only changes the middle clause — the diagnosis is the
+/// same and so is the command — but the middle clause is the whole difference
+/// between "you have never logged in here" and "you have, and it stopped
+/// working", which are the two things a reader is trying to tell apart.
 #[must_use]
-pub fn needs_oauth(client: Option<&str>, name: &str) -> Finding {
+pub fn needs_oauth(client: Option<&str>, name: &str, tokens: Option<TokenState>) -> Finding {
+    let because = match tokens {
+        None => "the gateway cannot complete a client-side login",
+        // Past its expiry with nothing to renew it: the ordinary end of a
+        // login that has been sitting for a while.
+        Some(TokenState::Expired) => "the stored login expired",
+        // Inside its lifetime, or renewable, and still refused — revoked at
+        // the provider, or granted scopes the server has since stopped
+        // accepting. Either way the fix is the same one.
+        Some(TokenState::Valid | TokenState::Renewable) => "the stored login was refused",
+    };
     Finding {
         client: client.map(str::to_owned),
         server: Some(name.to_owned()),
         severity: Severity::Warning,
-        message: format!(
-            "{name} needs OAuth — the gateway cannot complete a client-side login; \
-             run mcpgw auth login {name}"
-        ),
+        message: format!("{name} needs OAuth — {because}; run mcpgw auth login {name}"),
         code: Some(NEEDS_OAUTH),
     }
 }

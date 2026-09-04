@@ -20,6 +20,14 @@ serde_json.workspace = true
 jsonc-parser.workspace = true
 url.workspace = true
 rmcp.workspace = true
+oauth2.workspace = true
+# The http client rmcp's `AuthClient` wraps, and the one the streamable-http
+# transport already speaks through. Declared with no TLS features of its own:
+# the backend is the one the workspace `rmcp` entry unifies in (rustls), and
+# naming one here would be a second place for the single-static-binary story
+# to be broken from.
+reqwest.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 http.workspace = true
 tokio.workspace = true
@@ -30,9 +38,6 @@ regex.workspace = true
 [dev-dependencies]
 insta.workspace = true
 tempfile.workspace = true
-# tests/tls.rs alone, and only to prove the TLS backend rmcp's `reqwest`
-# feature turns on is really compiled in — see the workspace manifest.
-reqwest.workspace = true
 
 [lints]
 workspace = true

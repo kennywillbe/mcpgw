@@ -45,6 +45,7 @@ Config {
                 headers: {
                     "Authorization": "Bearer test",
                 },
+                auth: None,
             },
             tools: None,
         },
