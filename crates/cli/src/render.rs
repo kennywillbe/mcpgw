@@ -1,3 +1,4 @@
+use mcpgw_core::capture::{RedactionRules, redact_text};
 use mcpgw_core::{Config, Transport};
 use owo_colors::OwoColorize as _;
 
@@ -5,8 +6,12 @@ const COLUMNS: usize = 5;
 const HEADER: [&str; COLUMNS] = ["NAME", "TYPE", "TARGET", "ON", "TAGS"];
 
 /// Renders the server list as an aligned table, one line per server.
+///
+/// `redact` is the rule set the `TARGET` column is run through — `None` only
+/// for `--show-secrets`, since that column is built from `args` and from a
+/// `url` whose query string can carry a token.
 #[must_use]
-pub fn server_table(config: &Config, color: bool) -> String {
+pub fn server_table(config: &Config, color: bool, redact: Option<&RedactionRules>) -> String {
     let rows: Vec<([String; COLUMNS], bool)> = config
         .servers
         .iter()
@@ -40,6 +45,10 @@ pub fn server_table(config: &Config, color: bool) -> String {
                     };
                     ("http", target)
                 }
+            };
+            let target = match redact {
+                Some(rules) => redact_text(&target, rules),
+                None => target,
             };
             let cells = [
                 name.clone(),
@@ -121,7 +130,7 @@ enabled = false
 
     #[test]
     fn plain_table_layout() {
-        insta::assert_snapshot!(server_table(&sample(), false));
+        insta::assert_snapshot!(server_table(&sample(), false, None));
     }
 
     /// The command shows because it is not a secret; nothing it would print
@@ -135,14 +144,14 @@ enabled = false
             Path::new("sample.toml"),
         )
         .unwrap();
-        let table = server_table(&config, false);
+        let table = server_table(&config, false, None);
         assert!(table.contains("headers from command corp-auth"), "{table}");
     }
 
     #[test]
     fn colored_output_carries_ansi() {
-        let plain = server_table(&sample(), false);
-        let colored = server_table(&sample(), true);
+        let plain = server_table(&sample(), false, None);
+        let colored = server_table(&sample(), true, None);
         assert!(colored.contains('\u{1b}'));
         assert!(!plain.contains('\u{1b}'));
     }
