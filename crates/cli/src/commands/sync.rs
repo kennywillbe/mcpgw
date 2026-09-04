@@ -10,7 +10,7 @@ use mcpgw_core::state::{ManagedState, Scope};
 use mcpgw_core::sync::{
     SyncPlan, apply_plan_to, per_server_gateway_servers, plan_client_context, plan_sync,
 };
-use mcpgw_core::{ClientKind, Config, Detection, Error, Server, backup, paths};
+use mcpgw_core::{ClientKind, Config, Detection, Error, Server, Transport, backup, paths};
 use owo_colors::OwoColorize as _;
 
 #[derive(clap::Args)]
@@ -174,7 +174,7 @@ impl Run<'_> {
         };
 
         heading(&describe(&planned.plan));
-        print_plan_lines(&planned.plan, self.color);
+        print_plan_lines(&planned.plan, &desired.desired, self.color);
         for name in &desired.displaced {
             println!(
                 "  {}",
@@ -548,7 +548,32 @@ fn describe(plan: &mcpgw_core::sync::SyncPlan) -> String {
     text
 }
 
-fn print_plan_lines(plan: &mcpgw_core::sync::SyncPlan, color: bool) {
+/// Where one desired entry will point, spelled the way the client file will
+/// spell it: a URL for the clients that take http entries, the bridge command
+/// for the ones that only speak stdio.
+///
+/// No headers: the only one an entry carries is the gateway token, already
+/// announced masked at the top of the run, and a dry run is output people
+/// paste into an issue.
+fn entry_target(server: &Server) -> String {
+    match &server.transport {
+        Transport::Http { url, .. } => url.clone(),
+        Transport::Stdio { command, args, .. } => std::iter::once(command.as_str())
+            .chain(args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// `desired` is this client's entry set, so an add or an update can say what
+/// it will point at. Counts and names alone cannot be checked against
+/// anything — the endpoint a scoped client gets is not derivable from the
+/// server's name, and confirming it was the reason to run `--dry-run`.
+fn print_plan_lines(
+    plan: &mcpgw_core::sync::SyncPlan,
+    desired: &BTreeMap<String, Server>,
+    color: bool,
+) {
     let line = |mark: &str, name: &str, note: &str, colored: fn(&str) -> String| {
         if color {
             println!("  {} {name}{note}", colored(mark));
@@ -556,11 +581,16 @@ fn print_plan_lines(plan: &mcpgw_core::sync::SyncPlan, color: bool) {
             println!("  {mark} {name}{note}");
         }
     };
+    let target = |name: &String| {
+        desired.get(name).map_or_else(String::new, |server| {
+            format!(" → {}", crate::ui::dim(&entry_target(server), color))
+        })
+    };
     for name in &plan.adds {
-        line("+", name, "", |m| m.green().to_string());
+        line("+", name, &target(name), |m| m.green().to_string());
     }
     for name in &plan.updates {
-        line("~", name, "", |m| m.yellow().to_string());
+        line("~", name, &target(name), |m| m.yellow().to_string());
     }
     for name in &plan.removes {
         line("-", name, "", |m| m.red().to_string());

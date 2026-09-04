@@ -554,16 +554,17 @@ fn project_configs_get_their_own_section() {
     );
 }
 
-/// The section is about the repo the user is standing in, so a run from
-/// anywhere else must not mention it at all.
+/// A section that vanishes reads as a check that never ran, so a directory
+/// with nothing to find still gets the header and an empty answer.
 #[test]
-fn a_directory_with_no_project_config_gets_no_section() {
+fn a_directory_with_no_project_config_says_the_check_ran() {
     let home = tempfile::tempdir().unwrap();
     let empty = tempfile::tempdir().unwrap();
 
     let out = run_doctor_in(home.path(), empty.path(), Some(HEALTHY), &[]);
     let text = stdout(&out);
-    assert!(!text.contains("project configs"), "{text}");
+    assert!(text.contains("project configs"), "{text}");
+    assert!(text.contains("none found from "), "{text}");
     assert!(text.contains("0 errors, 0 warnings"), "{text}");
 }
 

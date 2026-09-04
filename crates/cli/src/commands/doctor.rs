@@ -539,14 +539,25 @@ fn standing_text(standing: Standing) -> &'static str {
     }
 }
 
-/// The project section, printed only where there is a file to name — a
-/// machine-wide report has no business claiming a repo the user is not in.
+/// The project section.
+///
+/// Printed even with nothing to name: a section that disappears reads as a
+/// check that never ran, and the empty answer — no repo-local config around
+/// this directory — is one of the things people run `doctor` to find out.
 fn render_projects(report: &ProjectReport, color: bool) {
-    if report.files.is_empty() {
-        return;
-    }
     println!();
     heading("project configs", color);
+    if report.files.is_empty() {
+        let from = std::env::current_dir().map_or_else(
+            |_| "the working directory".to_owned(),
+            |dir| dir.display().to_string(),
+        );
+        println!(
+            "  {}",
+            crate::ui::dim(&format!("none found from {from}"), color)
+        );
+        return;
+    }
     for row in &report.files {
         let count = row.servers.len();
         let plural = if count == 1 { "server" } else { "servers" };
