@@ -294,6 +294,54 @@ async fn a_supervised_gateway_stands_aside_when_its_binary_is_replaced() {
     assert_eq!(restart.stamp.len, std::fs::metadata(&copy).unwrap().len());
 }
 
+/// The other half of that: a file that lands at the path and does not run is
+/// not something to stand aside for.
+///
+/// Overwriting a running Mach-O in place — a `cp -f` over the path, which no
+/// packager does but a developer with a fresh build does — leaves a file
+/// macOS kills on sight. A gateway that ended for one would be relaunched
+/// into the same refusal by its supervisor for as long as anybody was
+/// willing to watch it happen.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_supervised_gateway_stays_on_a_replacement_that_does_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = util::binary_copy(dir.path());
+    // Kept because the file at the path is about to stop being a binary, and
+    // the second half of the test needs a working one to publish.
+    let working = std::fs::read(&copy).unwrap();
+    let state = dir.path().join("state");
+    write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
+    let (mut child, addr, _, errors) =
+        util::serve_binary(&copy, dir.path(), &["--supervised"]).await;
+    let port = port_of(&addr);
+    wait_for_record(&state, port).await;
+    wait_for_stderr(&errors, "watching").await;
+
+    util::publish_binary(&copy, b"not a binary");
+    wait_for_stderr(&errors, "changed but does not run").await;
+
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the gateway stood aside for a file that cannot be executed"
+    );
+    assert_eq!(
+        tool_names(&format!("http://{addr}/s/fx1")).await,
+        ["echo", "reverse"]
+    );
+
+    // Refusing one file is not giving up on the path: the next one is
+    // verified afresh, and a working one still ends the gateway.
+    let mut upgraded = working;
+    upgraded.extend_from_slice(b"an upgrade");
+    util::publish_binary(&copy, &upgraded);
+
+    assert_eq!(
+        wait_for_exit(&mut child, &errors).await,
+        i32::from(mcpgw_core::upgrade::UPGRADE_EXIT)
+    );
+}
+
 /// The flag is the whole gate. A gateway somebody is running in a terminal
 /// must not disappear because a `cargo build` finished in another one.
 #[cfg(unix)]
@@ -331,10 +379,10 @@ async fn a_supervised_gateway_watches_the_binary_its_service_was_installed_with(
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let installed = dir.path().join("installed-mcpgw");
-    // Never executed, only stat-ed: this stands for the path on a machine
-    // where the service was installed from somewhere the running image is
-    // not.
-    std::fs::write(&installed, b"the installed binary").unwrap();
+    // A real binary, because the watcher runs its replacement before it
+    // stands aside for it. What this path stands for is a machine where the
+    // service was installed from somewhere the running image is not.
+    std::fs::copy(assert_cmd::cargo::cargo_bin("mcpgw"), &installed).unwrap();
     let spec = mcpgw_core::daemon::DaemonSpec {
         exe: installed.clone(),
         config_path: dir.path().join("config.toml"),

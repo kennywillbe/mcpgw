@@ -293,6 +293,15 @@ Three things about that are worth knowing:
   aside for, so an upgrade that will not come up cannot be turned into a
   restart loop. Past that, the throttling is the supervisor's own — a binary
   that cannot start at all is a question for `mcpgw daemon logs`.
+- **It runs the replacement first.** Publish a new build by renaming it into
+  place, the way `brew`, `cargo install` and `self-update` do; an in-place
+  overwrite of a running binary (`cp -f` over the path) leaves a file macOS
+  refuses to execute, and the gateway says so and keeps serving the build it
+  is on rather than restarting into it:
+
+```text
+warning: the mcpgw binary at /opt/homebrew/bin/mcpgw changed but does not run (signal: 9 (SIGKILL)); staying on the current build — replace it with a fresh file (rename into place), not an in-place overwrite
+```
 
 ## After mcpgw itself moves
 

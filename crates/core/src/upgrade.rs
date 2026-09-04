@@ -33,6 +33,18 @@
 //! stays down. Two ticks cost four seconds of running an old build, which
 //! nobody can perceive.
 //!
+//! # Why the replacement is executed before standing aside
+//!
+//! Standing aside is a one-way door: this process ends, and whatever is at
+//! the path is what the machine gets. Every publisher that renames a new
+//! file over the path leaves something runnable there, but a developer who
+//! copies a build over the path in place does not: overwriting the bytes of
+//! a mapped Mach-O leaves a file macOS refuses to execute at all, and the
+//! service then crash-loops under `KeepAlive` on a binary nobody can start.
+//! So a confirmed change is run once — `<path> --version` — and a
+//! replacement that cannot answer is reported and ignored rather than
+//! restarted into.
+//!
 //! # Limits, stated rather than discovered
 //!
 //! - Only a service installed with `--supervised` in its argument vector
@@ -77,6 +89,20 @@ pub const UPGRADE_EXIT: u8 = 75;
 /// the same session is still picked up.
 pub const RESTART_COOLDOWN: Duration = Duration::from_mins(10);
 
+/// How long a replacement gets to answer `--version` before it counts as one
+/// that does not run.
+///
+/// Generous by two orders of magnitude: the answer is a `println` before any
+/// config is read. The number that matters is the ceiling on how long a
+/// broken file can hold the watcher up, not how long a good one needs.
+pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the verification run is checked for having finished.
+const VERIFY_POLL: Duration = Duration::from_millis(25);
+
+/// What a working mcpgw prints first when asked for its version.
+const VERSION_PREFIX: &str = "mcpgw ";
+
 /// What a file looked like at one instant. `None` for a path that cannot be
 /// stat-ed at all, which is a state in its own right — see the module docs.
 pub type Stamp = Option<(Option<SystemTime>, u64)>;
@@ -90,6 +116,75 @@ pub fn stamp(path: &Path) -> Stamp {
     // `modified` is unsupported on a few exotic filesystems; length alone
     // still catches a version bump there.
     Some((meta.modified().ok(), meta.len()))
+}
+
+/// Runs the file at `path` once, to find out whether the supervisor would be
+/// able to.
+///
+/// `--version` because it is the cheapest proof that the file is both
+/// executable and mcpgw: it opens no config, binds no port and writes no
+/// state, so running it costs a fork and a `println` — and mcpgw is the only
+/// thing that answers it in that shape.
+///
+/// # Errors
+///
+/// A sentence rather than an error type, because the single caller puts it
+/// in parentheses in a log line and nothing branches on it: the file could
+/// not be started, it did not answer within [`VERIFY_TIMEOUT`], it ended
+/// badly — `signal: 9 (SIGKILL)` is what an in-place overwrite looks like on
+/// macOS — or what it printed was not an mcpgw version.
+pub fn verify_runs(path: &Path) -> Result<(), String> {
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        // Not the gateway's own stdin: a replacement that reads it would be
+        // eating the bytes a stdio client is sending the process that is
+        // still serving.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("it could not be started: {err}"))?;
+    let deadline = std::time::Instant::now() + VERIFY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting for it failed: {err}"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // Killed rather than left behind: the file is already suspect,
+            // and a `--version` that hangs would hang for the life of the
+            // gateway.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "it did not answer --version within {}s",
+                VERIFY_TIMEOUT.as_secs()
+            ));
+        }
+        std::thread::sleep(VERIFY_POLL);
+    };
+    if !status.success() {
+        // `ExitStatus` renders a signal as one on the platforms that have
+        // them, which is the whole story on macOS: an in-place overwrite is
+        // `signal: 9 (SIGKILL)`.
+        return Err(format!("--version ended with {status}"));
+    }
+    let mut printed = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read as _;
+        let _ = out.read_to_string(&mut printed);
+    }
+    if !printed.starts_with(VERSION_PREFIX) {
+        return Err("--version did not print an mcpgw version".to_owned());
+    }
+    Ok(())
 }
 
 /// A binary, coarsely, as it can be written down and compared after a
@@ -132,19 +227,29 @@ pub enum Outcome {
     /// A confirmed change that the guard refused, because this gateway
     /// already restarted for that same binary. Reported once.
     Throttled,
-    /// A confirmed change into a new binary: end, and let the supervisor
-    /// start it.
+    /// A confirmed change into a file that does not run, carrying the
+    /// reason it does not. Reported once per such change: the stamp is
+    /// recorded as seen, so the same broken file is not run every tick, and
+    /// the next change is verified afresh.
+    Unrunnable(String),
+    /// A confirmed change into a new binary that runs: end, and let the
+    /// supervisor start it.
     Replaced(UpgradeRestart),
 }
 
 /// Watches one path for the binary under it being replaced.
 ///
-/// The stat is a parameter rather than a call so the debounce, the "gone"
-/// state and the guard can be tested as the state machine they are, without
-/// a filesystem fast enough to reproduce a half-written binary on demand.
-pub struct Watcher<S> {
+/// The stat and the verification are parameters rather than calls, so the
+/// debounce, the "gone" state, the guard and the refusal to restart into a
+/// file that does not run can be tested as the state machine they are —
+/// without a filesystem fast enough to reproduce a half-written binary on
+/// demand, and without a build of a broken one.
+pub struct Watcher<S, V = fn(&Path) -> Result<(), String>> {
     path: PathBuf,
     stat: S,
+    /// Asked once per confirmed change, and only for a change that would
+    /// otherwise end the process.
+    verify: V,
     /// The stamp this watcher is content with. Set at construction, so a
     /// binary replaced before the watcher started is not read as an upgrade
     /// the moment it starts.
@@ -158,17 +263,36 @@ pub struct Watcher<S> {
 }
 
 impl<S: Fn(&Path) -> Stamp> Watcher<S> {
-    /// Watches `path`, stat-ing it with `stat`.
+    /// Watches `path`, stat-ing it with `stat` and verifying a replacement
+    /// by running it.
     pub fn new(path: PathBuf, stat: S) -> Self {
         let seen = stat(&path);
         Self {
             path,
             stat,
+            verify: verify_runs,
             seen,
             candidate: None,
             gone: false,
             throttled: false,
             guard: None,
+        }
+    }
+}
+
+impl<S: Fn(&Path) -> Stamp, V: Fn(&Path) -> Result<(), String>> Watcher<S, V> {
+    /// Checks a replacement with `verify` instead of running it.
+    #[must_use]
+    pub fn with_verify<W: Fn(&Path) -> Result<(), String>>(self, verify: W) -> Watcher<S, W> {
+        Watcher {
+            path: self.path,
+            stat: self.stat,
+            verify,
+            seen: self.seen,
+            candidate: self.candidate,
+            gone: self.gone,
+            throttled: self.throttled,
+            guard: self.guard,
         }
     }
 
@@ -228,6 +352,11 @@ impl<S: Fn(&Path) -> Stamp> Watcher<S> {
                 Outcome::Throttled
             };
         }
+        // After the guard, because a change this gateway is not going to
+        // restart into anyway is not worth a fork.
+        if let Err(reason) = (self.verify)(&self.path) {
+            return Outcome::Unrunnable(reason);
+        }
         Outcome::Replaced(restart)
     }
 
@@ -250,33 +379,54 @@ impl<S: Fn(&Path) -> Stamp> Watcher<S> {
     /// [`Some`] means this gateway should stand aside for the binary the
     /// restart names; [`None`] means the gateway is shutting down anyway.
     pub async fn watch(
-        mut self,
+        self,
         interval: Duration,
         shutdown: impl Future<Output = ()>,
-    ) -> Option<UpgradeRestart> {
+    ) -> Option<UpgradeRestart>
+    where
+        S: Send + 'static,
+        V: Send + 'static,
+    {
         let mut shutdown = std::pin::pin!(shutdown);
+        let mut watcher = self;
         loop {
             tokio::select! {
                 () = &mut shutdown => return None,
                 () = tokio::time::sleep(interval) => {}
             }
-            match self.tick(now()) {
+            // Off the runtime and back again: a tick stats the path, and
+            // once per change it also forks the replacement and waits for
+            // it. Neither of those belongs on a thread that is answering
+            // requests.
+            let ticked = tokio::task::spawn_blocking(move || {
+                let outcome = watcher.tick(now());
+                (watcher, outcome)
+            })
+            .await;
+            let Ok((ticked, outcome)) = ticked else {
+                return None;
+            };
+            watcher = ticked;
+            let path = watcher.path.display();
+            match outcome {
                 Outcome::Unchanged => {}
                 Outcome::Gone => eprintln!(
-                    "warning: the mcpgw binary at {} is gone; staying up on the running one \
-                     — a service cannot be restarted from a path with nothing at it",
-                    self.path.display()
+                    "warning: the mcpgw binary at {path} is gone; staying up on the running one \
+                     — a service cannot be restarted from a path with nothing at it"
                 ),
                 Outcome::Throttled => eprintln!(
-                    "warning: the mcpgw binary at {} changed back to one this gateway already \
-                     restarted for; staying up rather than restarting in a loop",
-                    self.path.display()
+                    "warning: the mcpgw binary at {path} changed back to one this gateway already \
+                     restarted for; staying up rather than restarting in a loop"
+                ),
+                Outcome::Unrunnable(reason) => eprintln!(
+                    "warning: the mcpgw binary at {path} changed but does not run ({reason}); \
+                     staying on the current build — replace it with a fresh file (rename into \
+                     place), not an in-place overwrite"
                 ),
                 Outcome::Replaced(restart) => {
                     eprintln!(
-                        "the mcpgw binary at {} changed; restarting so the service runs it \
-                         (see mcpgw daemon logs)",
-                        self.path.display()
+                        "the mcpgw binary at {path} changed; restarting so the service runs it \
+                         (see mcpgw daemon logs)"
                     );
                     return Some(restart);
                 }
@@ -323,11 +473,114 @@ mod tests {
     const NOW: u64 = 1_700_000_000;
 
     /// A stat that answers from a cell the test moves, so a "binary" can be
-    /// replaced between two ticks without a filesystem in the way.
-    fn watcher(reported: &Cell<Option<u64>>) -> Watcher<impl Fn(&std::path::Path) -> Stamp + '_> {
+    /// replaced between two ticks without a filesystem in the way. The
+    /// replacement always runs; the tests that care say otherwise with
+    /// [`verifying`].
+    fn watcher(
+        reported: &Cell<Option<u64>>,
+    ) -> Watcher<
+        impl Fn(&std::path::Path) -> Stamp + '_,
+        impl Fn(&std::path::Path) -> Result<(), String>,
+    > {
         Watcher::new("/usr/local/bin/mcpgw".into(), |_: &std::path::Path| {
             reported.get().map(|len| (None, len))
         })
+        .with_verify(|_: &std::path::Path| Ok(()))
+    }
+
+    /// The same watcher, with a verification the test can fail at will and
+    /// count.
+    fn verifying<'a>(
+        reported: &'a Cell<Option<u64>>,
+        runs: &'a Cell<bool>,
+        checked: &'a Cell<u32>,
+    ) -> Watcher<
+        impl Fn(&std::path::Path) -> Stamp + 'a,
+        impl Fn(&std::path::Path) -> Result<(), String> + 'a,
+    > {
+        Watcher::new("/usr/local/bin/mcpgw".into(), |_: &std::path::Path| {
+            reported.get().map(|len| (None, len))
+        })
+        .with_verify(move |_: &std::path::Path| {
+            checked.set(checked.get() + 1);
+            if runs.get() {
+                Ok(())
+            } else {
+                Err("signal: 9 (SIGKILL)".to_owned())
+            }
+        })
+    }
+
+    /// The one-way door: a confirmed change is run before this gateway ends
+    /// for it, because the file an in-place overwrite leaves behind is one
+    /// macOS will not execute at all.
+    #[test]
+    fn a_replacement_that_does_not_run_is_never_restarted_into() {
+        let reported = Cell::new(Some(100));
+        let runs = Cell::new(false);
+        let checked = Cell::new(0);
+        let mut watcher = verifying(&reported, &runs, &checked);
+
+        reported.set(Some(200));
+        assert_eq!(watcher.tick(NOW), Outcome::Unchanged);
+        assert_eq!(
+            watcher.tick(NOW),
+            Outcome::Unrunnable("signal: 9 (SIGKILL)".to_owned())
+        );
+        assert_eq!(checked.get(), 1);
+
+        // The broken file was taken as seen, so it is not forked every two
+        // seconds for the rest of the gateway's life.
+        for _ in 0..5 {
+            assert_eq!(watcher.tick(NOW), Outcome::Unchanged);
+        }
+        assert_eq!(checked.get(), 1);
+    }
+
+    /// Recording the broken file is not giving up on the path: the next
+    /// thing that lands there is a change like any other, and gets its own
+    /// verification.
+    #[test]
+    fn the_replacement_after_a_broken_one_is_verified_again_and_fires() {
+        let reported = Cell::new(Some(100));
+        let runs = Cell::new(false);
+        let checked = Cell::new(0);
+        let mut watcher = verifying(&reported, &runs, &checked);
+
+        reported.set(Some(200));
+        assert_eq!(watcher.tick(NOW), Outcome::Unchanged);
+        assert!(matches!(watcher.tick(NOW), Outcome::Unrunnable(_)));
+
+        runs.set(true);
+        reported.set(Some(300));
+        assert_eq!(watcher.tick(NOW + 2), Outcome::Unchanged);
+        assert!(matches!(watcher.tick(NOW + 4), Outcome::Replaced(_)));
+        assert_eq!(checked.get(), 2);
+    }
+
+    /// The debounce comes first: a file still being written is not forked
+    /// once per tick to find out that it is half a binary.
+    #[test]
+    fn a_binary_still_being_written_is_never_run() {
+        let reported = Cell::new(Some(100));
+        let runs = Cell::new(true);
+        let checked = Cell::new(0);
+        let mut watcher = verifying(&reported, &runs, &checked);
+
+        for len in [1, 90, 300, 512, 900] {
+            reported.set(Some(len));
+            assert_eq!(watcher.tick(NOW), Outcome::Unchanged, "{len}");
+        }
+        assert_eq!(checked.get(), 0);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_program_does_not_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcpgw");
+        std::fs::write(&path, b"not a bin\n").unwrap();
+
+        assert!(super::verify_runs(&path).is_err());
     }
 
     #[test]
@@ -361,17 +614,6 @@ mod tests {
             }
         );
         assert_eq!(restart.at, NOW);
-    }
-
-    #[test]
-    fn a_binary_still_being_written_never_fires() {
-        let reported = Cell::new(Some(100));
-        let mut watcher = watcher(&reported);
-
-        for len in [1, 90, 300, 512, 900] {
-            reported.set(Some(len));
-            assert_eq!(watcher.tick(NOW), Outcome::Unchanged, "{len}");
-        }
     }
 
     /// A cargo install is a rename over the path: the file is briefly
