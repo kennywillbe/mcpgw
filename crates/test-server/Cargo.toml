@@ -21,7 +21,7 @@ serde.workspace = true
 oauth2.workspace = true
 
 [dev-dependencies]
-mcpgw-core = { version = "0.4.1", path = "../core" }
+mcpgw-core = { version = "0.5.0", path = "../core" }
 rmcp-client-http.workspace = true
 tempfile.workspace = true
 # The "browser" in the OAuth tests: one blocking GET that follows the
