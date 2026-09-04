@@ -1736,18 +1736,18 @@ async fn every_upstream_capability_is_forwarded_except_what_the_pipe_cannot_hono
         capabilities["extensions"]["com.example/thing"]["deep"], true,
         "{capabilities}"
     );
-    // Dropped: notifications that stop at the gateway, and the methods it
-    // does not forward. A client that believed these would wait forever.
+    // `listChanged` is forwarded now that the pipe carries the notification
+    // (issue #140), on both the families this fixture declares it for.
+    assert_eq!(capabilities["tools"]["listChanged"], true, "{capabilities}");
+    assert_eq!(
+        capabilities["resources"]["listChanged"], true,
+        "{capabilities}"
+    );
+    // Dropped: the promises that still stop at the gateway. Per-resource
+    // updates need a subscription the pipe does not hold, and a client that
+    // believed `subscribe` would wait forever.
     assert!(
         capabilities["resources"].get("subscribe").is_none(),
-        "{capabilities}"
-    );
-    assert!(
-        capabilities["resources"].get("listChanged").is_none(),
-        "{capabilities}"
-    );
-    assert!(
-        capabilities["tools"].get("listChanged").is_none(),
         "{capabilities}"
     );
     assert!(capabilities.get("logging").is_none(), "{capabilities}");
@@ -2085,4 +2085,294 @@ async fn two_stateless_clients_are_attributed_to_themselves() {
         attributed["cursor/0.48"].contains("from two"),
         "{records:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #140: an upstream that changes its lists can reach a connected client
+// ---------------------------------------------------------------------------
+
+/// A downstream client that records the list-changed notifications it is
+/// sent. The default handler (`()`) decodes them and drops them, which is
+/// indistinguishable from never having been told.
+#[derive(Clone)]
+struct Listening(tokio::sync::mpsc::UnboundedSender<&'static str>);
+
+impl rmcp_client_http::ClientHandler for Listening {
+    async fn on_tool_list_changed(
+        &self,
+        _context: rmcp_client_http::service::NotificationContext<rmcp_client_http::RoleClient>,
+    ) {
+        let _ = self.0.send("tools");
+    }
+
+    async fn on_resource_list_changed(
+        &self,
+        _context: rmcp_client_http::service::NotificationContext<rmcp_client_http::RoleClient>,
+    ) {
+        let _ = self.0.send("resources");
+    }
+
+    async fn on_prompt_list_changed(
+        &self,
+        _context: rmcp_client_http::service::NotificationContext<rmcp_client_http::RoleClient>,
+    ) {
+        let _ = self.0.send("prompts");
+    }
+}
+
+type Listener = rmcp_client_http::service::RunningService<rmcp_client_http::RoleClient, Listening>;
+
+/// A 2025-11-25 session that keeps what it was told, plus the queue it keeps
+/// it in.
+async fn listening_at(
+    addr: std::net::SocketAddr,
+    path: &str,
+) -> (Listener, tokio::sync::mpsc::UnboundedReceiver<&'static str>) {
+    let (heard, queue) = tokio::sync::mpsc::unbounded_channel();
+    let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}{path}"));
+    (Listening(heard).serve(transport).await.unwrap(), queue)
+}
+
+/// An endpoint advertises what it last heard from the server behind it, so a
+/// session opened before the gateway has ever reached it is promised nothing.
+/// One request through the endpoint settles that; every test below wants a
+/// session that was promised something.
+async fn warmed(addr: std::net::SocketAddr, name: &str) {
+    let warm = client_at(addr, &endpoint_path(name)).await;
+    warm.list_all_tools().await.unwrap();
+    warm.cancel().await.unwrap();
+}
+
+/// The bug in issue #140: an upstream announcing a new tool had nowhere to
+/// announce it to, so a client kept calling the list it read at connect time
+/// until someone restarted it.
+#[tokio::test]
+async fn a_session_hears_when_the_upstream_changes_its_tool_list() {
+    let (addr, manager) = serve_both(&[("fx", "bump")], None).await;
+    warmed(addr, "fx").await;
+
+    let (client, mut heard) = listening_at(addr, &endpoint_path("fx")).await;
+    // The promise first: a client only listens for what it was offered.
+    let capabilities = client.peer_info().unwrap().capabilities.clone();
+    assert_eq!(
+        capabilities.tools.as_ref().unwrap().list_changed,
+        Some(true),
+        "{capabilities:?}"
+    );
+
+    client.call_tool(call("bump", "")).await.unwrap();
+
+    let what = tokio::time::timeout(Duration::from_secs(10), heard.recv())
+        .await
+        .expect("no list-changed reached the client")
+        .unwrap();
+    assert_eq!(what, "tools");
+    // And the news is true: the list really did change behind it.
+    let tools = client.list_all_tools().await.unwrap();
+    assert!(tool_names(&tools).contains(&"bumped"), "{tools:?}");
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// Only the family the upstream declared: the `bump` fixture announces tools
+/// and nothing else, and a pipe that turned one promise into three would have
+/// clients re-reading lists that never move.
+#[tokio::test]
+async fn only_the_families_the_upstream_announces_are_advertised() {
+    let (addr, manager) = serve_both(&[("fx", "bump")], None).await;
+    warmed(addr, "fx").await;
+
+    let (client, _heard) = listening_at(addr, &endpoint_path("fx")).await;
+    let capabilities = client.peer_info().unwrap().capabilities.clone();
+
+    assert_eq!(
+        capabilities.tools.as_ref().unwrap().list_changed,
+        Some(true),
+        "{capabilities:?}"
+    );
+    assert_eq!(
+        capabilities.resources.as_ref().unwrap().list_changed,
+        None,
+        "{capabilities:?}"
+    );
+    assert_eq!(
+        capabilities.prompts.as_ref().unwrap().list_changed,
+        None,
+        "{capabilities:?}"
+    );
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// The other half: a server that announces nothing leaves the session exactly
+/// as it was. Nothing is promised, nothing is pushed, and the ordinary
+/// request families still work.
+#[tokio::test]
+async fn a_session_on_a_silent_server_is_promised_nothing_and_still_works() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    warmed(addr, "fx").await;
+
+    let (client, mut heard) = listening_at(addr, &endpoint_path("fx")).await;
+    let capabilities = client.peer_info().unwrap().capabilities.clone();
+    assert_eq!(
+        capabilities.tools.as_ref().unwrap().list_changed,
+        None,
+        "{capabilities:?}"
+    );
+
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tool_names(&tools), ["echo", "reverse"]);
+    let result = client.call_tool(call("reverse", "mcpgw")).await.unwrap();
+    assert!(format!("{result:?}").contains("wgpcm"));
+    assert!(heard.try_recv().is_err(), "nothing should have been pushed");
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// One `subscriptions/listen` stream, read as it arrives.
+///
+/// Every other raw helper here reads the response to the end, which a
+/// subscription never reaches: staying open is the whole point of it.
+struct ListenStream {
+    stream: tokio::net::TcpStream,
+    /// What has arrived and not yet been split into lines.
+    buffer: String,
+}
+
+impl ListenStream {
+    /// Opens a stream asking for `notifications`, in the 2026-07-28 shape:
+    /// no session, the revision and the client in `_meta`, the method in a
+    /// header (SEP-2243).
+    async fn open(
+        addr: std::net::SocketAddr,
+        path: &str,
+        notifications: serde_json::Value,
+    ) -> Self {
+        use tokio::io::AsyncWriteExt as _;
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen",
+            "params": {
+                "notifications": notifications,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": InlineSession::VERSION,
+                    "io.modelcontextprotocol/clientInfo": { "name": "listen", "version": "1" },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             MCP-Protocol-Version: {}\r\nMcp-Method: subscriptions/listen\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            InlineSession::VERSION,
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        Self {
+            stream,
+            buffer: String::new(),
+        }
+    }
+
+    /// The next JSON-RPC message on the stream, waiting for it to arrive.
+    async fn next(&mut self) -> serde_json::Value {
+        use tokio::io::AsyncReadExt as _;
+
+        loop {
+            while let Some(end) = self.buffer.find('\n') {
+                let line: String = self.buffer.drain(..=end).collect();
+                if let Some(payload) = line.trim_end().strip_prefix("data: ")
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
+                {
+                    return value;
+                }
+            }
+            let mut chunk = [0_u8; 4096];
+            let read = tokio::time::timeout(Duration::from_secs(10), self.stream.read(&mut chunk))
+                .await
+                .expect("nothing arrived on the subscription")
+                .unwrap();
+            assert!(read > 0, "the subscription stream closed");
+            self.buffer
+                .push_str(&String::from_utf8_lossy(&chunk[..read]));
+        }
+    }
+}
+
+/// 2026-07-28 has no session to hang a notification on, so the same events
+/// travel over `subscriptions/listen` instead (SEP-2568). Same upstream, same
+/// pipe, different downstream shape — which is the point of driving it off
+/// the revision the client is on rather than one hardcoded path.
+#[tokio::test]
+async fn a_2026_client_gets_list_changed_over_subscriptions_listen() {
+    let (addr, manager) = serve_both(&[("fx", "bump")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+    fx.request("tools/list", serde_json::json!({})).await;
+
+    let mut listen = ListenStream::open(
+        addr,
+        &endpoint_path("fx"),
+        // More than the server behind the endpoint announces, so the
+        // acknowledgment has something to narrow.
+        serde_json::json!({ "toolsListChanged": true, "promptsListChanged": true }),
+    )
+    .await;
+
+    let ack = listen.next().await;
+    assert_eq!(
+        ack["method"], "notifications/subscriptions/acknowledged",
+        "{ack}"
+    );
+    assert_eq!(
+        ack["params"]["notifications"]["toolsListChanged"], true,
+        "{ack}"
+    );
+    assert!(
+        ack["params"]["notifications"]
+            .get("promptsListChanged")
+            .is_none(),
+        "{ack}"
+    );
+
+    fx.request(
+        "tools/call",
+        serde_json::json!({ "name": "bump", "arguments": {} }),
+    )
+    .await;
+
+    let event = listen.next().await;
+    assert_eq!(
+        event["method"], "notifications/tools/list_changed",
+        "{event}"
+    );
+
+    let tools = fx.request("tools/list", serde_json::json!({})).await;
+    assert!(names_in(&tools).contains(&"bumped"), "{tools}");
+    manager.shutdown().await;
+}
+
+/// A pipe in front of a server that announces nothing has no subscription to
+/// offer, and says so rather than handing back a stream that would never
+/// carry anything.
+#[tokio::test]
+async fn subscriptions_listen_is_refused_when_the_server_announces_nothing() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+    fx.request("tools/list", serde_json::json!({})).await;
+
+    let message = fx
+        .attempt(
+            "subscriptions/listen",
+            serde_json::json!({ "notifications": { "toolsListChanged": true } }),
+        )
+        .await;
+
+    assert_eq!(message["error"]["code"], -32601, "{message}");
+    manager.shutdown().await;
 }

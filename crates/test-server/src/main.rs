@@ -17,7 +17,9 @@
 //! end, `legacy` (answers the way every server predating
 //! 2026-07-28 does: no `resultType`, no caching fields), `modern` (the other
 //! end of the matrix: 2026-07-28 only, no `initialize` at all, and one tool
-//! that needs an MRTR round trip), `pid` (one tool
+//! that needs an MRTR round trip), `bump` (a server whose tool list changes
+//! under a connected client: calling its `bump` tool adds a tool and
+//! announces it with `notifications/tools/list_changed`), `pid` (one tool
 //! that names this process, slowly — what config reload is checked with,
 //! since it has to prove both that an untouched server keeps the *same*
 //! child and that a call already in flight still lands on it).
@@ -95,6 +97,9 @@ fn park() {
 
 fn serve(mode: &str) {
     let die_on_tools = mode == "die-on-tools";
+    // The `bump` fixture's whole point is that its answer depends on what has
+    // been called already, so it is the one mode with state across requests.
+    let mut bumped = false;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -112,7 +117,12 @@ fn serve(mode: &str) {
         if method == "tools/list" && die_on_tools {
             std::process::exit(0);
         }
-        match reply(mode, method, &msg) {
+        let answer = if mode == "bump" {
+            bump(method, &msg, &mut bumped, &mut stdout)
+        } else {
+            reply(mode, method, &msg)
+        };
+        match answer {
             Some(Ok(result)) => respond(&mut stdout, &id, &result),
             Some(Err(failure)) => fail(&mut stdout, &id, &failure),
             // Methods this fixture does not implement get no answer at all,
@@ -170,6 +180,62 @@ fn reply(
         "prompts/list" | "prompts/get" => prompts(method, params),
         "completion/complete" => complete(params),
         _ => return None,
+    };
+    Some(Ok(result))
+}
+
+/// The `bump` fixture: a server whose tool list changes while a client is
+/// connected, which is the upstream half of what a pipe has to relay
+/// (issue #140). Calling `bump` adds a tool and announces it.
+///
+/// Only tools' `listChanged` is declared, and it is the only notification
+/// this fixture ever sends: a pipe in front of it must advertise exactly that
+/// much, and must not turn one announcement into three.
+fn bump(
+    method: &str,
+    msg: &serde_json::Value,
+    bumped: &mut bool,
+    out: &mut impl std::io::Write,
+) -> Option<Result<serde_json::Value, Failure>> {
+    let params = &msg["params"];
+    let result = match method {
+        "initialize" => {
+            let proto = params["protocolVersion"].as_str().unwrap_or("2025-06-18");
+            serde_json::json!({
+                "protocolVersion": proto,
+                "capabilities": {
+                    "tools": { "listChanged": true },
+                    "resources": {},
+                    "prompts": {},
+                    "completions": {}
+                },
+                "serverInfo": { "name": "mcpgw-test-server", "version": "9.9.9" }
+            })
+        }
+        "tools/list" => {
+            let mut tools = vec![
+                tool("echo", "echoes input"),
+                tool("bump", "adds a tool and announces it"),
+            ];
+            if *bumped {
+                tools.push(tool("bumped", "the tool the bump added"));
+            }
+            serde_json::json!({ "tools": tools })
+        }
+        "tools/call" if params["name"].as_str() == Some("bump") => {
+            *bumped = true;
+            // Announced before the answer, so that by the time the caller has
+            // its result the new tool is already there to be listed.
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/tools/list_changed"
+            });
+            writeln!(out, "{notification}").unwrap();
+            out.flush().unwrap();
+            serde_json::json!({ "content": [{ "type": "text", "text": "bumped" }] })
+        }
+        // Everything else this fixture answers the ordinary way, so a pipe in
+        // front of it is exercised on the families it forwards as well.
+        _ => return reply("healthy", method, msg),
     };
     Some(Ok(result))
 }

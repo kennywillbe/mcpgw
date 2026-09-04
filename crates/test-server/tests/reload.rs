@@ -483,3 +483,65 @@ async fn a_sighup_reloads_without_waiting_for_the_poll() {
     watcher.await.unwrap();
     manager.shutdown().await;
 }
+
+/// A downstream client that records the list-changed notifications it is
+/// sent — see the same helper in `gateway.rs`, kept per-suite because the
+/// two harnesses share no test crate.
+#[derive(Clone)]
+struct Listening(tokio::sync::mpsc::UnboundedSender<&'static str>);
+
+impl rmcp_client_http::ClientHandler for Listening {
+    async fn on_tool_list_changed(
+        &self,
+        _context: rmcp_client_http::service::NotificationContext<rmcp_client_http::RoleClient>,
+    ) {
+        let _ = self.0.send("tools");
+    }
+}
+
+/// A transport swap retires the child and dials a fresh one, so whatever the
+/// new command lists is a different list by definition. A client sitting on
+/// the endpoint has to be told, or the whole reason hot reload exists — not
+/// having to restart the editor — is lost one layer down (issue #140).
+#[tokio::test]
+async fn swapping_a_servers_transport_tells_the_connected_client() {
+    let gateway = Harness::start(&[("fx", "bump", true)]).await;
+    // The endpoint advertises what it last heard, so the capability the
+    // session listens on only exists once the server has been reached.
+    assert!(
+        gateway
+            .tools(&endpoint_path("fx"))
+            .await
+            .contains(&"bump".to_owned())
+    );
+
+    let (heard, mut queue) = tokio::sync::mpsc::unbounded_channel();
+    let url = format!("http://{}{}", gateway.addr, endpoint_path("fx"));
+    let client = Listening(heard)
+        .serve(StreamableHttpClientTransport::from_uri(url))
+        .await
+        .unwrap();
+
+    // The stream a session's notifications ride is a second connection the
+    // client opens on its own, after `initialize` returns, and it hands back
+    // nothing to await on. This is the pause that lets it get there, and it
+    // is a property of the test client rather than of the gateway.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // A different fixture mode is a different `args`, which is a transport
+    // change: the old child is retired and a new one takes its place.
+    let replaced = gateway.set(&[("fx", "healthy", true)]).await;
+    assert_eq!(replaced, ["fx"]);
+
+    let what = tokio::time::timeout(Duration::from_secs(10), queue.recv())
+        .await
+        .expect("the reload told nobody")
+        .unwrap();
+    assert_eq!(what, "tools");
+
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["echo", "reverse"]);
+
+    client.cancel().await.unwrap();
+    gateway.manager.shutdown().await;
+}

@@ -135,11 +135,38 @@ What each side gets:
 - **A server on an older revision** is reached exactly as before.
 
 What the gateway advertises for a server is what that server declared, minus
-what a pipe cannot deliver: `listChanged` and `resources.subscribe` (change
-notifications stop at the gateway — until it forwards `subscriptions/listen`,
-promising them would leave a client waiting forever), `logging`, and the tasks
-extension. Everything else is forwarded as-is, including capabilities newer
-than this version of mcpgw.
+what a pipe cannot deliver:
+
+| capability | forwarded? | why |
+| --- | --- | --- |
+| `tools.listChanged`, `resources.listChanged`, `prompts.listChanged` | yes | the notification crosses the gateway, both ways the two revisions define it |
+| `resources.subscribe` | no | per-resource `resources/updated` needs a subscription per URI upstream, which the gateway does not hold |
+| `logging` | no | `logging/setLevel` is not forwarded and `notifications/message` does not cross either; deprecated in 2026-07-28 anyway |
+| `io.modelcontextprotocol/tasks` | no | advertising it makes the SDK accept `tasks/get` and friends here, which the gateway answers "method not found" |
+| everything else | yes | including capabilities newer than this version of mcpgw |
+
+### Change notifications
+
+A server that adds a tool while a client is connected can now say so, and the
+client hears it: the gateway listens for `notifications/tools/list_changed`
+(and the resources and prompts ones) on every upstream connection and hands
+each one to the sessions that were promised it. How it reaches your client
+depends on the revision that client is on — a session on 2025-11-25 or older
+gets the notification on its own stream, and a client on 2026-07-28 asks for
+the same events with `subscriptions/listen` and gets them on that request's
+stream. Nothing has to be configured either way; the gateway follows whatever
+the client negotiated.
+
+A config reload that changes a server's transport counts as a change and is
+announced the same way. The gateway retires the old process and dials the new
+one, and whatever that new connection lists is a different list by definition,
+so a client sitting on `/s/<name>` re-reads it instead of holding the old one
+until it is restarted.
+
+The gateway only ever promises what the server behind it promised. A server
+that declares no `listChanged` is fronted by an endpoint that declares none
+either, and a client on such an endpoint is never sent one — nor, on
+2026-07-28, offered a `subscriptions/listen` stream at all.
 
 `tools/list` is merged. A server is allowed to hand its tools back a page at a
 time and expect the client to follow `nextCursor`, and several widely used
@@ -158,7 +185,9 @@ it reached that server. A client connecting to a freshly started gateway,
 before anything has talked to the server yet, is told "tools" — the
 conservative answer — because working it out for real would mean starting the
 server in the middle of a handshake. Anything that connects after the first
-request through the endpoint sees the full set. The name an endpoint reports at
+request through the endpoint sees the full set. Change notifications follow
+that rule too: a session opened in that window was promised none, so it is
+sent none until it reconnects. The name an endpoint reports at
 `initialize` follows the same rule: once the gateway has met the server it
 answers with that server's own name and version (`Context7 4.0.4`), which is
 what a client shows the user; before first contact, and on `/mcp`, it is
