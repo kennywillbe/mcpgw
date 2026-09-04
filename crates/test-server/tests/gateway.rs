@@ -6,7 +6,9 @@ use mcpgw_core::capture::{
     Bodies, CapturePolicy, CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER,
 };
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
-use mcpgw_core::gateway::{Gateway, MAX_TOOL_PAGES, NO_TOOLS_HERE, serve_http, serve_http_with};
+use mcpgw_core::gateway::{
+    Gateway, MAX_TOOL_PAGES, NO_TOOLS_HERE, not_allowed, serve_http, serve_http_with,
+};
 use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
 use rmcp_client_http::ServiceExt as _;
@@ -16,6 +18,7 @@ fn stdio_server(mode: &str) -> Server {
     Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Stdio {
             command: env!("CARGO_BIN_EXE_mcpgw-test-server").to_owned(),
             args: vec![mode.to_owned()],
@@ -171,6 +174,7 @@ async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<Up
     let remote = Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Http {
             url: format!("http://{addr}{}", endpoint_path("fx")),
             headers_command: Vec::new(),
@@ -1418,6 +1422,7 @@ fn remote_manager(addr: std::net::SocketAddr) -> Arc<UpstreamManager> {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Http {
             url: format!("http://{addr}{}", endpoint_path("fx")),
             headers_command: Vec::new(),
@@ -2374,5 +2379,153 @@ async fn subscriptions_listen_is_refused_when_the_server_announces_nothing() {
         .await;
 
     assert_eq!(message["error"]["code"], -32601, "{message}");
+    manager.shutdown().await;
+}
+
+/// A fixture server carrying a `[tools]` table.
+fn filtered_server(mode: &str, allow: &[&str], deny: &[&str]) -> Server {
+    let owned = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+    Server {
+        tools: Some(mcpgw_core::ToolRules {
+            allow: owned(allow),
+            deny: owned(deny),
+        }),
+        ..stdio_server(mode)
+    }
+}
+
+/// The tools a client sees through a pipe over a server with these lists.
+async fn visible_tools(allow: &[&str], deny: &[&str]) -> Vec<String> {
+    let manager = Arc::new(
+        UpstreamManager::new(
+            [("fx".to_owned(), filtered_server("healthy", allow, deny))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let client = connect("fx", Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let names = tools.iter().map(|t| t.name.to_string()).collect();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+    names
+}
+
+#[tokio::test]
+async fn an_allow_list_hides_everything_it_does_not_name() {
+    assert_eq!(visible_tools(&["echo"], &[]).await, ["echo"]);
+}
+
+#[tokio::test]
+async fn a_deny_list_hides_only_what_it_names() {
+    assert_eq!(visible_tools(&[], &["echo"]).await, ["reverse"]);
+}
+
+#[tokio::test]
+async fn allow_is_applied_first_and_deny_over_what_is_left() {
+    assert_eq!(
+        visible_tools(&["echo", "reverse"], &["reverse"]).await,
+        ["echo"]
+    );
+}
+
+#[tokio::test]
+async fn a_trailing_star_matches_a_prefix() {
+    assert_eq!(visible_tools(&["rev*"], &[]).await, ["reverse"]);
+    assert_eq!(visible_tools(&[], &["ech*"]).await, ["reverse"]);
+}
+
+/// The upgrade promise: a server with no table lists exactly what it listed
+/// before there was such a thing as a table.
+#[tokio::test]
+async fn no_table_leaves_the_list_alone() {
+    let (client, manager) = gateway_client("healthy").await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tool_names(&tools), ["echo", "reverse"]);
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn calling_a_filtered_out_tool_is_refused_and_captured_as_denied() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let manager = Arc::new(
+        UpstreamManager::new(
+            [("fx".to_owned(), filtered_server("healthy", &["echo"], &[]))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let gateway =
+        Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
+    let client = connect("fx", gateway).await;
+
+    let err = client
+        .call_tool(call("reverse", "mcpgw"))
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    // Compared against the one function that writes it, so the wording here
+    // cannot drift away from the wording a user reads.
+    assert!(text.contains(&not_allowed("reverse", "fx")), "{text}");
+    assert!(text.contains("mcpgw tools fx"), "{text}");
+    // The tool that survived the list still works, so the refusal is the
+    // filter and not a broken endpoint.
+    client.call_tool(call("echo", "hi")).await.unwrap();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    let shape: Vec<(Kind, Option<&str>, bool)> = records
+        .iter()
+        .map(|r| (r.kind, r.tool.as_deref(), r.ok))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (Kind::Denied, Some("reverse"), false),
+            (Kind::Call, Some("echo"), true)
+        ],
+        "{records:#?}"
+    );
+    // The line carries the reason, so `watch` shows why the call never left.
+    assert!(
+        records[0].error.as_deref().unwrap().contains("not allowed"),
+        "{records:#?}"
+    );
+    // On disk under its own name, not only in this build's enum.
+    let line = std::fs::read_to_string(
+        std::fs::read_dir(writer.dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(line.contains(r#""kind":"denied""#), "{line}");
+}
+
+/// A denied call must not be the thing that starts a server: the refusal is
+/// about an endpoint that does not offer that tool, and spawning the process
+/// first would make the filter a delay rather than a boundary.
+#[tokio::test]
+async fn a_denied_call_never_reaches_the_upstream() {
+    let manager = Arc::new(
+        UpstreamManager::new(
+            // `exit` dies the moment it is spawned, so anything that reached
+            // it would fail with the upstream's own error instead.
+            [("fx".to_owned(), filtered_server("exit", &["echo"], &[]))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let client = connect("fx", Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
+    let err = client.call_tool(call("reverse", "x")).await.unwrap_err();
+    assert!(err.to_string().contains("is not allowed"), "{err}");
+    assert_eq!(manager.status("fx").await, Some(UpstreamStatus::Idle));
     manager.shutdown().await;
 }

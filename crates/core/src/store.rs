@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::config::{Config, Server, Transport, validate_name};
+use crate::config::{Config, Server, ToolRules, Transport, validate_name};
 use crate::error::Error;
 
 const TEMPLATE: &str = "\
@@ -112,7 +112,24 @@ impl ConfigStore {
             });
         }
         let mut doc = self.doc.clone();
-        ensure_servers_table(&mut doc).insert(name, Item::Table(server_table(server)));
+        let mut table = server_table(server);
+        // An overwrite redefines the transport, not the allowlist: a
+        // re-import or `add --force` that dropped `[tools]` would silently
+        // widen what every client can reach through that server, which is the
+        // one edit nobody would think to check for afterwards. An incoming
+        // entry that carries rules of its own still wins.
+        if server.tools.is_none()
+            && let Some(existing) = self
+                .doc
+                .get("servers")
+                .and_then(Item::as_table_like)
+                .and_then(|servers| servers.get(name))
+                .and_then(Item::as_table_like)
+                .and_then(|entry| entry.get("tools"))
+        {
+            table.insert("tools", existing.clone());
+        }
+        ensure_servers_table(&mut doc).insert(name, Item::Table(table));
         self.commit(doc)?;
         Ok(exists)
     }
@@ -140,6 +157,33 @@ impl ConfigStore {
         self.ensure_known(name)?;
         let mut doc = self.doc.clone();
         doc["servers"][name]["enabled"] = value(enabled);
+        self.commit(doc)
+    }
+
+    /// Replaces `name`'s `[tools]` table, or removes it when `rules` says
+    /// nothing at all — `mcpgw tools <server> clear`, and the shape every
+    /// other edit reduces to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownServer`] when no such entry exists.
+    pub fn set_tool_rules(&mut self, name: &str, rules: &ToolRules) -> Result<(), Error> {
+        self.ensure_known(name)?;
+        let mut doc = self.doc.clone();
+        let entry = &mut doc["servers"][name];
+        // A hand-written inline entry cannot hold a standard sub-table;
+        // normalized the same way `ensure_servers_table` normalizes its
+        // parent, and for the same reason.
+        if let Item::Value(toml_edit::Value::InlineTable(inline)) = entry {
+            *entry = Item::Table(std::mem::take(inline).into_table());
+        }
+        if let Some(entry) = entry.as_table_like_mut() {
+            if rules.is_empty() {
+                entry.remove("tools");
+            } else {
+                entry.insert("tools", Item::Table(tools_table(rules)));
+            }
+        }
         self.commit(doc)
     }
 
@@ -272,6 +316,27 @@ fn server_table(server: &Server) -> Table {
             }
             table["headers"] = value(string_map(headers));
         }
+    }
+    // Last, because it is a sub-table: TOML puts every value of a section
+    // ahead of the sections nested in it.
+    if let Some(rules) = &server.tools
+        && !rules.is_empty()
+    {
+        table["tools"] = Item::Table(tools_table(rules));
+    }
+    table
+}
+
+/// A `[servers.NAME.tools]` table, with each list written only when it has
+/// entries: an `allow = []` beside a populated `deny` reads as an allowlist
+/// that permits nothing, which is the opposite of what it means.
+fn tools_table(rules: &ToolRules) -> Table {
+    let mut table = Table::new();
+    if !rules.allow.is_empty() {
+        table["allow"] = value(string_array(&rules.allow));
+    }
+    if !rules.deny.is_empty() {
+        table["deny"] = value(string_array(&rules.deny));
     }
     table
 }

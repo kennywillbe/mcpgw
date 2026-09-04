@@ -483,6 +483,7 @@ fn only_the_two_clients_with_a_helper_field_are_written_one() {
     let server = mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Http {
             url: "https://mcp.corp.example/mcp".to_owned(),
             headers_command: ["corp-auth", "print-mcp-headers"]

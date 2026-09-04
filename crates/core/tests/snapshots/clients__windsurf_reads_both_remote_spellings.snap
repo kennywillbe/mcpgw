@@ -12,6 +12,7 @@ ClientRead {
                 headers_command: [],
                 headers: {},
             },
+            tools: None,
         },
         "github": Server {
             enabled: true,
@@ -26,6 +27,7 @@ ClientRead {
                     "GITHUB_TOKEN": "${env:GITHUB_TOKEN}",
                 },
             },
+            tools: None,
         },
         "linear": Server {
             enabled: true,
@@ -37,6 +39,7 @@ ClientRead {
                     "Authorization": "Bearer ${env:LINEAR_TOKEN}",
                 },
             },
+            tools: None,
         },
         "notes": Server {
             enabled: true,
@@ -46,6 +49,7 @@ ClientRead {
                 headers_command: [],
                 headers: {},
             },
+            tools: None,
         },
     },
     problems: [

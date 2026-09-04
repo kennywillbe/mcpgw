@@ -79,3 +79,21 @@ fn the_human_table_never_carried_secrets_to_begin_with() {
     assert!(!text.contains("ghp_realsecret"), "{text}");
     assert!(!text.contains("t0ken"), "{text}");
 }
+
+#[test]
+fn json_output_carries_the_tool_lists() {
+    let out = run_list(&fixture("tools.toml"), &["--json"]);
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        value["servers"]["github"]["tools"]["allow"],
+        serde_json::json!(["search_repositories"])
+    );
+    assert_eq!(
+        value["servers"]["github"]["tools"]["deny"],
+        serde_json::json!(["delete_*"])
+    );
+    // A server with no table has no key, rather than an empty one that would
+    // read as a list allowing nothing.
+    assert!(value["servers"]["linear"].get("tools").is_none());
+}

@@ -1,0 +1,13 @@
+version = 1
+
+[servers.github]
+type = "stdio"
+command = "npx"
+
+[servers.github.tools]
+allow = ["search_repositories"]
+deny = ["delete_*"]
+
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"

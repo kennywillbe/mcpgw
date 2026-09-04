@@ -274,6 +274,7 @@ fn entry_shapes_per_client() {
         &mcpgw_core::Server {
             enabled: true,
             tags: Vec::new(),
+            tools: None,
             transport: mcpgw_core::Transport::Http {
                 url: "https://h.example/mcp".to_owned(),
                 headers_command: Vec::new(),
@@ -392,6 +393,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
     servers.push(mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
             headers_command: Vec::new(),
@@ -407,6 +409,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
     servers.push(mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Stdio {
             command: "notes-mcp".to_owned(),
             args: Vec::new(),
@@ -746,6 +749,7 @@ fn zed_writes_source_on_stdio_entries_only() {
     let stdio = mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Stdio {
             command: "npx".to_owned(),
             args: vec!["server-github".to_owned()],
@@ -755,6 +759,7 @@ fn zed_writes_source_on_stdio_entries_only() {
     let remote = mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Http {
             url: "https://mcp.linear.app/mcp".to_owned(),
             headers_command: Vec::new(),

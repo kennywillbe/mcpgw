@@ -538,6 +538,7 @@ fn parse_mcp_servers(obj: &Map<String, Value>) -> Result<(Server, Option<String>
         Server {
             enabled,
             tags: Vec::new(),
+            tools: None,
             transport,
         },
         note,
@@ -651,6 +652,7 @@ fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), St
             // sibling root key and is applied after the whole file is read.
             enabled: true,
             tags: Vec::new(),
+            tools: None,
             transport,
         },
         note,
@@ -689,6 +691,7 @@ fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), Str
         Server {
             enabled: !matches!(obj.get("enabled"), Some(Value::Bool(false))),
             tags: Vec::new(),
+            tools: None,
             transport,
         },
         None,
@@ -752,6 +755,7 @@ fn parse_opencode(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
         Server {
             enabled: !matches!(obj.get("enabled"), Some(Value::Bool(false))),
             tags: Vec::new(),
+            tools: None,
             transport,
         },
         None,

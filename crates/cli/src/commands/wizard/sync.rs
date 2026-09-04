@@ -363,7 +363,7 @@ fn verify(cx: &Ctx) {
                 &format!(
                     "{label}  {} — {} tools",
                     ui::dim(&endpoint.url, cx.color),
-                    success.tool_count
+                    success.tool_count()
                 ),
                 cx.color,
             ),

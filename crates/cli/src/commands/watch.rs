@@ -318,8 +318,10 @@ impl<'a> Filters<'a> {
 /// client, error.
 fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
     let target = match (record.kind, record.tool.as_deref()) {
-        // A tool call is shown under the name a client would type for it.
-        (Kind::Call, tool) => format!(
+        // A tool call is shown under the name a client would type for it —
+        // including the one the allowlist refused, which is the row a reader
+        // is looking for when a client says a tool is missing.
+        (Kind::Call | Kind::Denied, tool) => format!(
             "{}{}{}",
             record.server,
             mcpgw_core::gateway::SEPARATOR,

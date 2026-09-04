@@ -545,3 +545,53 @@ async fn swapping_a_servers_transport_tells_the_connected_client() {
     client.cancel().await.unwrap();
     gateway.manager.shutdown().await;
 }
+
+/// A tool list edited under a running gateway takes effect on the next
+/// request — including on a session that was opened before the edit — and
+/// without the server behind it being restarted, which is what would make an
+/// allowlist change cost every client its connection.
+#[tokio::test]
+async fn a_new_tool_list_applies_without_reconnecting_anything() {
+    let harness = Harness::start(&[("fx", "healthy", true)]).await;
+    let path = endpoint_path("fx");
+    // Opened before the edit and kept across it: what the filter does to an
+    // already-connected client is the half a fresh client cannot show.
+    let client = harness.client(&path).await;
+    assert_eq!(harness.tools(&path).await, ["echo", "reverse"]);
+
+    let mut text = config(&[("fx", "healthy", true)]);
+    text.push_str("\n[servers.fx.tools]\nallow = [\"echo\"]\n");
+    write(&harness.path, &text);
+    let reloaded = harness.reloader.reload().await.unwrap();
+    // Nothing added, removed, replaced or stopped: the transport did not
+    // change, so the child process behind the endpoint is the same one.
+    assert!(reloaded.changes.is_empty(), "{:?}", reloaded.changes);
+    assert_eq!(reloaded.serving, ["fx"]);
+    assert_eq!(harness.tools(&path).await, ["echo"]);
+
+    // The session that predates the edit is filtered too. Asserted on a call
+    // rather than on a list: an MCP client is entitled to reuse the listing
+    // it already fetched, and this one does.
+    let err = client
+        .call_tool(rmcp_client_http::model::CallToolRequestParams::new(
+            "reverse".to_owned(),
+        ))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("is not allowed"), "{err}");
+
+    // And back again, with nothing restarted either way.
+    write(&harness.path, &config(&[("fx", "healthy", true)]));
+    let reloaded = harness.reloader.reload().await.unwrap();
+    assert!(reloaded.changes.is_empty(), "{:?}", reloaded.changes);
+    assert_eq!(harness.tools(&path).await, ["echo", "reverse"]);
+    client
+        .call_tool(rmcp_client_http::model::CallToolRequestParams::new(
+            "reverse".to_owned(),
+        ))
+        .await
+        .unwrap();
+
+    client.cancel().await.unwrap();
+    harness.manager.shutdown().await;
+}

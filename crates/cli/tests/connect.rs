@@ -24,6 +24,7 @@ async fn fixture_gateway() -> (String, Arc<UpstreamManager>) {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Stdio {
             command: fixture_binary().to_string_lossy().into_owned(),
             args: vec!["healthy".to_owned()],

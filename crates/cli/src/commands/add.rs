@@ -38,6 +38,7 @@ pub fn run(args: &AddArgs) -> anyhow::Result<()> {
     let server = Server {
         enabled: !args.disabled,
         tags: args.tags.clone(),
+        tools: None,
         transport: build_transport(args)?,
     };
     let path = super::canonical_config_path()?;

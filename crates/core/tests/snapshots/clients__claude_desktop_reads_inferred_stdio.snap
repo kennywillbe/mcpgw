@@ -16,6 +16,7 @@ ClientRead {
                 ],
                 env: {},
             },
+            tools: None,
         },
         "github": Server {
             enabled: true,
@@ -30,6 +31,7 @@ ClientRead {
                     "GITHUB_PERSONAL_ACCESS_TOKEN": "REDACTED",
                 },
             },
+            tools: None,
         },
     },
     problems: [],

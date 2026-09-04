@@ -21,6 +21,7 @@ fn stdio_server(command: &str, args: &[&str]) -> Server {
     Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Stdio {
             command: command.to_owned(),
             args: args.iter().map(|a| (*a).to_owned()).collect(),
@@ -43,7 +44,7 @@ async fn healthy_server_reports_identity_and_tools() {
     let success = probe_mode("healthy", GENEROUS).await.unwrap();
     assert_eq!(success.server_name, "mcpgw-test-server");
     assert_eq!(success.server_version, "9.9.9");
-    assert_eq!(success.tool_count, 2);
+    assert_eq!(success.tool_count(), 2);
 }
 
 #[tokio::test]
@@ -98,6 +99,7 @@ async fn http_server_reports_identity_and_tools() {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Http {
             url: format!("http://{addr}/s/fx"),
             headers_command: Vec::new(),
@@ -109,7 +111,7 @@ async fn http_server_reports_identity_and_tools() {
         .await
         .unwrap();
     assert_eq!(success.server_name, "mcpgw");
-    assert_eq!(success.tool_count, 2);
+    assert_eq!(success.tool_count(), 2);
     manager.shutdown().await;
 }
 
@@ -118,6 +120,7 @@ async fn unreachable_http_server_fails_the_handshake() {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Http {
             // Port 1 on loopback refuses connections instantly.
             url: "http://127.0.0.1:1/mcp".to_owned(),
@@ -170,7 +173,7 @@ async fn a_server_with_no_initialize_is_probed_over_discover() {
     let success = probe_mode("modern", GENEROUS).await.unwrap();
     assert_eq!(success.server_name, "mcpgw-test-server-modern");
     assert_eq!(success.server_version, "9.9.9");
-    assert_eq!(success.tool_count, 2);
+    assert_eq!(success.tool_count(), 2);
 }
 
 /// `doctor --probe` runs the command too, because what it proves is that the
@@ -181,6 +184,7 @@ async fn a_failing_headers_command_fails_the_probe_by_name() {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Http {
             url: "http://127.0.0.1:1/mcp".to_owned(),
             headers_command: vec![

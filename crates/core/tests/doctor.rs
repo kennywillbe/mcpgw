@@ -2,9 +2,9 @@ use std::path::Path;
 
 use mcpgw_core::doctor::{
     GatewayFault, GatewayPlan, NEEDS_OAUTH, Severity, check_server, classify_gateway_failure,
-    classify_problems, gateway_unreachable, needs_oauth, unserved_endpoint,
+    classify_problems, gateway_unreachable, needs_oauth, unmatched_tool_rules, unserved_endpoint,
 };
-use mcpgw_core::{ClientKind, Config};
+use mcpgw_core::{ClientKind, Config, Server, Transport};
 
 fn parse(text: &str) -> Config {
     Config::parse(text, Path::new("t.toml")).unwrap()
@@ -104,6 +104,7 @@ fn http(url: &str) -> mcpgw_core::Server {
     mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Http {
             url: url.to_owned(),
             headers_command: Vec::new(),
@@ -116,6 +117,7 @@ fn bridge(command: &str, args: &[&str]) -> mcpgw_core::Server {
     mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Stdio {
             command: command.to_owned(),
             args: args.iter().map(|a| (*a).to_owned()).collect(),
@@ -333,4 +335,37 @@ headers_command = ["present"]
     );
     assert!(message.contains("corp-auth print-mcp-headers"), "{message}");
     assert!(message.contains("absolute path"), "{message}");
+}
+
+#[test]
+fn a_tool_rule_matching_nothing_is_a_warning_naming_the_list() {
+    let server = Server {
+        enabled: true,
+        tags: Vec::new(),
+        tools: Some(mcpgw_core::ToolRules {
+            allow: vec!["echo".to_owned(), "gone".to_owned()],
+            deny: vec!["dead_*".to_owned()],
+        }),
+        transport: Transport::Stdio {
+            command: "x".to_owned(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+        },
+    };
+    let offered = vec!["echo".to_owned(), "reverse".to_owned()];
+    let findings = unmatched_tool_rules("fx", &server, &offered);
+    let messages: Vec<&str> = findings.iter().map(|f| f.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        [
+            "[servers.fx.tools] allow entry \"gone\" matches no tool fx offers",
+            "[servers.fx.tools] deny entry \"dead_*\" matches no tool fx offers"
+        ]
+    );
+    assert!(findings.iter().all(|f| f.severity == Severity::Warning));
+
+    // A server with no table has nothing to check.
+    let mut plain = server.clone();
+    plain.tools = None;
+    assert!(unmatched_tool_rules("fx", &plain, &offered).is_empty());
 }

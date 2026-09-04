@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use mcpgw_core::{Config, ConfigStore, Error, Server, Transport};
+use mcpgw_core::{Config, ConfigStore, Error, Server, ToolRules, Transport};
 
 const COMMENTED: &str = r#"# my precious header comment
 version = 1 # schema version
@@ -25,6 +25,7 @@ fn http_server(url: &str) -> Server {
     Server {
         enabled: true,
         tags: vec!["work".to_owned()],
+        tools: None,
         transport: Transport::Http {
             url: url.to_owned(),
             headers_command: Vec::new(),
@@ -209,4 +210,91 @@ fn a_generated_entry_writes_the_command_as_argv() {
         Config::load(&path).unwrap().servers["corp"].transport,
         corp.transport
     );
+}
+
+#[test]
+fn tool_rules_are_written_as_a_table_and_keep_the_comments_around_them() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store
+        .set_tool_rules(
+            "github",
+            &ToolRules {
+                allow: vec!["search_repositories".to_owned()],
+                deny: vec!["delete_*".to_owned()],
+            },
+        )
+        .unwrap();
+    store.save().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# my precious header comment"), "{text}");
+    assert!(
+        text.contains("# github powers the code review flow"),
+        "{text}"
+    );
+    insta::assert_snapshot!(text);
+
+    // And read back as rules, not as text that happens to look like them.
+    // The first handle goes first: the lock it holds is what a second
+    // reader in this process would block on forever.
+    drop(store);
+    let store = ConfigStore::edit(&path).unwrap();
+    let rules = store.config().servers["github"].tools.as_ref().unwrap();
+    assert_eq!(rules.allow, ["search_repositories"]);
+    assert_eq!(rules.deny, ["delete_*"]);
+}
+
+#[test]
+fn clearing_the_rules_removes_the_table() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store
+        .set_tool_rules(
+            "github",
+            &ToolRules {
+                allow: vec!["echo".to_owned()],
+                deny: Vec::new(),
+            },
+        )
+        .unwrap();
+    store
+        .set_tool_rules("github", &ToolRules::default())
+        .unwrap();
+    store.save().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("tools"), "{text}");
+    assert!(store.config().servers["github"].tools.is_none());
+}
+
+#[test]
+fn rules_on_an_unknown_server_are_refused() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    let err = store
+        .set_tool_rules("ghost", &ToolRules::default())
+        .unwrap_err();
+    assert!(matches!(err, Error::UnknownServer { .. }));
+}
+
+#[test]
+fn overwriting_an_entry_keeps_its_tool_rules() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store
+        .set_tool_rules(
+            "github",
+            &ToolRules {
+                allow: vec!["search_repositories".to_owned()],
+                deny: Vec::new(),
+            },
+        )
+        .unwrap();
+    // What `add --force` and a re-import do. The transport is redefined; the
+    // allowlist is not theirs to drop.
+    store
+        .upsert_server("github", &http_server("https://x"), true)
+        .unwrap();
+    store.save().unwrap();
+    let rules = store.config().servers["github"].tools.as_ref().unwrap();
+    assert_eq!(rules.allow, ["search_repositories"]);
 }

@@ -57,6 +57,16 @@ pub enum Kind {
     /// `completion/complete`, forwarded by a pipe; the argument name is in
     /// `tool`.
     Complete,
+    /// A `tools/call` the server's `[tools]` table refused, so it never left
+    /// the gateway; the tool the client asked for is in `tool`.
+    ///
+    /// Its own kind rather than a flag on [`Kind::Call`] because the two are
+    /// different events: a `call` line says a server was asked something,
+    /// and filing a refusal under it would put a row in the traffic log that
+    /// reads as the server having answered. `kind` is what `watch`, the TUI
+    /// and every `jq` filter select on, so it is where the distinction has
+    /// to live.
+    Denied,
 }
 
 impl Kind {
@@ -66,7 +76,9 @@ impl Kind {
     pub fn method(self) -> &'static str {
         match self {
             Kind::List => "tools/list",
-            Kind::Call => "tools/call",
+            // A refusal names the method the client called; what became of
+            // it is the kind, not the method.
+            Kind::Call | Kind::Denied => "tools/call",
             Kind::Resources => "resources/list",
             Kind::ResourceTemplates => "resources/templates/list",
             Kind::ResourceRead => "resources/read",

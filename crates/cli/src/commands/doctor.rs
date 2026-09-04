@@ -6,7 +6,7 @@ use mcpgw_core::doctor::project_unmanaged;
 use mcpgw_core::doctor::{
     Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
     classify_gateway_failure, classify_problems, endpoint_server, gateway_unreachable, needs_oauth,
-    unserved_endpoint,
+    unmatched_tool_rules, unserved_endpoint,
 };
 use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
 use mcpgw_core::projects::{ProjectConfig, Standing};
@@ -153,7 +153,11 @@ pub fn run(
             // One runtime for both passes: they ask the same machine the same
             // kind of question, and a second reactor would only add threads.
             let runtime = tokio::runtime::Runtime::new()?;
-            let direct = run_probes(&runtime, plan, timeout);
+            let mut direct = run_probes(&runtime, plan, timeout);
+            // Only under `--probe`: whether a rule matches anything can only
+            // be answered by the server, and asking it is what `--probe` is.
+            let stale = stale_tool_rules(&direct, &canonical_servers);
+            direct.findings.extend(stale);
             let gateway = (!gateway_plan.is_empty())
                 .then(|| run_gateway_probes(&runtime, gateway_plan, timeout));
             (Some(direct), gateway)
@@ -503,7 +507,7 @@ fn emit_json(
                         "servers": label, "ok": true,
                         "server_name": success.server_name,
                         "server_version": success.server_version,
-                        "tools": success.tool_count,
+                        "tools": success.tool_count(),
                     }),
                     Err(ProbeError::AuthRequired) => serde_json::json!({
                         "servers": label, "ok": false,
@@ -541,7 +545,7 @@ fn emit_json(
                         row["ok"] = serde_json::json!(true);
                         row["server_name"] = serde_json::json!(success.server_name);
                         row["server_version"] = serde_json::json!(success.server_version);
-                        row["tools"] = serde_json::json!(success.tool_count);
+                        row["tools"] = serde_json::json!(success.tool_count());
                     }
                     GatewayOutcome::Unserved(detail) => {
                         row["ok"] = serde_json::json!(false);
@@ -622,6 +626,26 @@ impl ProbeReport {
             )
         })
     }
+}
+
+/// The findings for every `[servers.NAME.tools]` entry that matched nothing
+/// the server just listed.
+///
+/// Read off the direct rows rather than the gateway ones: a rule is about
+/// what the server offers, and the gateway pass sees the filtered list — in
+/// which an over-narrow `allow` looks perfectly consistent with itself.
+fn stale_tool_rules(probes: &ProbeReport, canonical: &BTreeMap<String, Server>) -> Vec<Finding> {
+    probes
+        .results
+        .iter()
+        .filter_map(|(label, outcome)| {
+            let success = outcome.as_ref().ok()?;
+            let name = probes.name(label);
+            let server = canonical.get(name)?;
+            Some(unmatched_tool_rules(name, server, &success.tools))
+        })
+        .flatten()
+        .collect()
 }
 
 fn run_probes(
@@ -773,6 +797,7 @@ pub(super) async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutco
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: Transport::Http {
             url: url.to_owned(),
             headers_command: Vec::new(),
@@ -874,7 +899,9 @@ fn render_probes(probes: &ProbeReport, color: bool) {
             Ok(success) => {
                 let line = format!(
                     "{label}: {} {}, {} tools{helper}",
-                    success.server_name, success.server_version, success.tool_count,
+                    success.server_name,
+                    success.server_version,
+                    success.tool_count(),
                 );
                 ok_line(&line, color);
             }
@@ -889,6 +916,15 @@ fn render_probes(probes: &ProbeReport, color: bool) {
             }
             Err(err) => bad_line(&format!("{label}: {err}{helper}"), color),
         }
+    }
+    // The OAuth findings already have a row of their own above; what is left
+    // is the rules pass, which has none.
+    for finding in probes
+        .findings
+        .iter()
+        .filter(|finding| finding.code != Some(mcpgw_core::doctor::NEEDS_OAUTH))
+    {
+        print_finding(finding, color);
     }
 }
 
@@ -918,7 +954,9 @@ fn render_gateway(report: &GatewayReport, color: bool) {
             GatewayOutcome::Ok(success) => ok_line(
                 &format!(
                     "{where_}: {} {}, {} tools",
-                    success.server_name, success.server_version, success.tool_count
+                    success.server_name,
+                    success.server_version,
+                    success.tool_count()
                 ),
                 color,
             ),
@@ -1040,7 +1078,7 @@ mod tests {
                 Ok(ProbeSuccess {
                     server_name: "fixture".to_owned(),
                     server_version: "1".to_owned(),
-                    tool_count: 2,
+                    tools: vec!["echo".to_owned(), "reverse".to_owned()],
                 }),
             )
         });

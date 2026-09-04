@@ -73,6 +73,50 @@ Common to both transports:
 | `headers_command` | list of strings | `[]` | run per connect; its headers win over `headers` |
 | `headers` | table of strings | `{}` | sent on every request |
 
+#### `[servers.NAME.tools]`
+
+Which of a server's tools clients may reach through its endpoint. Optional,
+and absent from every entry until you add it:
+
+```toml
+[servers.github.tools]
+allow = ["search_repositories", "get_file_contents"]
+deny  = ["delete_*"]
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `allow` | list of patterns | `[]` | once it has an entry, nothing else is offered |
+| `deny` | list of patterns | `[]` | removed from whatever `allow` left |
+
+A pattern is a literal tool name or a prefix with a trailing `*`
+(`delete_*`) — that and nothing more, because a rule language you cannot
+predict is the wrong thing to put in front of "which tools can this agent
+call".
+
+The rules are read in that order: `allow` first, then `deny` over what is
+left, so a broad `allow` can be trimmed without listing every name that
+should stay. Deny-by-default starts the moment `allow` has an entry and not
+before: **a server with no table, or with two empty lists, offers everything
+it always did.**
+
+A filtered-out tool is not in `tools/list` and cannot be called: a
+`tools/call` naming it comes back as an error, and the traffic log records
+the attempt under kind `denied` — see [Gateway](./gateway.md#tool-allowlists).
+
+The lists are editable without opening the file, and `mcpgw tools NAME` shows
+them against the tools the server offers right now:
+
+```sh
+mcpgw tools github                                # every tool, allowed or denied
+mcpgw tools github allow search_repositories      # add to allow
+mcpgw tools github deny 'delete_*'                # add to deny
+mcpgw tools github clear                          # remove both lists
+```
+
+`mcpgw doctor --probe` reports an entry that matches no tool the server
+currently offers — a typo, or a tool that has been renamed since.
+
 #### `headers_command`
 
 A token you paste into `headers` lasts as long as the token does. Anything an
@@ -165,7 +209,7 @@ tags = ["work"]
 ```
 
 Values must come before sub-tables within a section — that's TOML, not mcpgw.
-`env` and `headers` are sub-tables, so they go last.
+`env`, `headers` and `tools` are sub-tables, so they go last.
 
 ## `[capture]`
 

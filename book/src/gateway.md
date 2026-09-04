@@ -74,6 +74,44 @@ One client, one server, one endpoint. Tool names are never rewritten, so
 adding a server cannot rename another server's tool, and a prompt that names
 one keeps working.
 
+### Tool allowlists
+
+An endpoint offers every tool its server has, unless the config says
+otherwise:
+
+```toml
+[servers.github.tools]
+allow = ["search_repositories", "get_file_contents"]
+deny  = ["delete_*"]
+```
+
+Both sides of the pipe are filtered. `tools/list` returns what survives, and
+a `tools/call` on anything else is refused before the request reaches the
+server — it never spawns a process and never spends a credential:
+
+```text
+tool "delete_repository" is not allowed on server "github" (see mcpgw tools github)
+```
+
+Refusals are captured under kind `denied`, so `mcpgw watch` shows what a
+client tried to reach and did not get, which is the difference between "the
+list works" and "the list is why my agent keeps apologising".
+
+```sh
+mcpgw tools github                          # every tool, with allowed/denied
+mcpgw tools github allow search_repositories
+mcpgw tools github deny 'delete_*'
+mcpgw tools github clear
+```
+
+The lists follow the config file like everything else — an edit is live
+within a couple of seconds, on sessions that are already open, and without
+the server behind the endpoint being restarted. A server with no table is
+unaffected in every way. The rules, the pattern syntax and what
+`doctor --probe` makes of an entry that matches nothing are in
+[`[servers.NAME.tools]`](./configuration.md#serversnametools); what the lists
+are and are not worth is in the [Trust model](./trust-model.md).
+
 ### The base endpoint
 
 `/mcp` is the gateway's own address rather than a way through it. It answers
@@ -232,7 +270,9 @@ An added server gets its endpoint and joins `/mcp`; a removed or disabled one
 loses both and its process is stopped. A server the edit didn't mention is left
 completely alone — same connection, same child process — so adding one server
 never interrupts the others. Only a change to a server's own transport (its
-command, args, env or URL) restarts that server.
+command, args, env or URL) restarts that server: editing a
+[`[tools]`](./configuration.md#serversnametools) list changes what the next
+request sees and nothing else.
 
 Nothing is torn down under a request in flight: a `tools/call` that was already
 running when the config changed still gets its answer from the process it

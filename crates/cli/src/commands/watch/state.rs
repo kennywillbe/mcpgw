@@ -47,8 +47,10 @@ impl Entry {
     /// the tool for a call, the method for everything else.
     fn target(&self) -> &str {
         match (self.record.kind, self.record.tool.as_deref()) {
-            (Kind::Call, Some(tool)) => tool,
-            (Kind::Call, None) => "?",
+            // A refused call is filed under the tool it named, so the TUI
+            // groups it with the calls that did get through.
+            (Kind::Call | Kind::Denied, Some(tool)) => tool,
+            (Kind::Call | Kind::Denied, None) => "?",
             (kind, _) => kind.method(),
         }
     }

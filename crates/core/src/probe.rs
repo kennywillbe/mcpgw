@@ -43,7 +43,17 @@ pub async fn gateway_listening(base: &str, timeout: Duration) -> bool {
 pub struct ProbeSuccess {
     pub server_name: String,
     pub server_version: String,
-    pub tool_count: usize,
+    /// Every tool the server offered, so a caller can check a
+    /// `[servers.NAME.tools]` entry against what is actually there rather
+    /// than only count what came back.
+    pub tools: Vec<String>,
+}
+
+impl ProbeSuccess {
+    #[must_use]
+    pub fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -253,7 +263,10 @@ async fn inspect(service: Service) -> Result<ProbeSuccess, ProbeError> {
     Ok(ProbeSuccess {
         server_name,
         server_version,
-        tool_count: tools.len(),
+        tools: tools
+            .into_iter()
+            .map(|tool| tool.name.into_owned())
+            .collect(),
     })
 }
 

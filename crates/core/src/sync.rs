@@ -346,6 +346,7 @@ pub fn per_server_gateway_server(
     Ok(Server {
         enabled: server.enabled,
         tags: server.tags.clone(),
+        tools: None,
         transport,
     })
 }

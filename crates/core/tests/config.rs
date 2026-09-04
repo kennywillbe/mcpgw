@@ -226,3 +226,45 @@ fn a_headers_command_round_trips_as_an_array() {
         config
     );
 }
+
+const WITH_TOOLS: &str = r#"
+version = 1
+
+[servers.github]
+type = "stdio"
+command = "npx"
+
+[servers.github.tools]
+allow = ["search_repositories", "get_*"]
+deny = ["get_secret"]
+
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+"#;
+
+#[test]
+fn a_tools_table_parses_and_only_where_it_is_written() {
+    let config = Config::parse(WITH_TOOLS, Path::new("tools.toml")).unwrap();
+    let rules = config.servers["github"].tools.as_ref().unwrap();
+    assert_eq!(rules.allow, ["search_repositories", "get_*"]);
+    assert_eq!(rules.deny, ["get_secret"]);
+    // The promise the wizard makes to everyone who upgrades: a server with
+    // no table has no rules, not empty ones.
+    assert!(config.servers["linear"].tools.is_none());
+    assert!(config.servers["linear"].allows_tool("anything"));
+    assert!(config.servers["github"].allows_tool("get_file_contents"));
+    assert!(!config.servers["github"].allows_tool("get_secret"));
+    assert!(!config.servers["github"].allows_tool("delete_repository"));
+}
+
+#[test]
+fn a_tools_table_round_trips_through_toml() {
+    let config = Config::parse(WITH_TOOLS, Path::new("tools.toml")).unwrap();
+    let text = config.to_toml_string().unwrap();
+    let reparsed = Config::parse(&text, Path::new("roundtrip.toml")).unwrap();
+    assert_eq!(config, reparsed);
+    // A server that had no table must not grow an empty one on the way out:
+    // `tools = {}` in a written config would be a rule nobody asked for.
+    assert!(!text.contains("linear.tools"));
+}

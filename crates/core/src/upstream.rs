@@ -525,6 +525,17 @@ impl UpstreamManager {
         })
     }
 
+    /// The config entry `name` is served under as of right now.
+    ///
+    /// Live rather than captured at startup: a reload that changes nothing
+    /// about a server's transport stores the new entry here in place, so a
+    /// caller reading a per-server setting through this sees the edited one
+    /// without anything reconnecting.
+    #[must_use]
+    pub fn server(&self, name: &str) -> Option<Arc<Server>> {
+        Some(self.get(name)?.server.load_full())
+    }
+
     /// What `name` reported at its last successful connect, or `None` if it
     /// has never been reached in this process.
     ///
