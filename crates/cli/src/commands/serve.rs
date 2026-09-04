@@ -240,6 +240,12 @@ pub(crate) fn build(
     if let Some(writer) = &capture {
         reloader = reloader.with_capture(Arc::clone(writer));
     }
+    // Independent of capture: the pin file is what `doctor` and
+    // `mcpgw tools NAME pin --show` read, and a gateway started with
+    // `--no-capture` still has to notice a server rewriting its tools.
+    if let Some(dir) = mcpgw_core::paths::state_dir() {
+        reloader = reloader.with_pins(Arc::new(mcpgw_core::pins::PinStore::under_state_dir(&dir)));
+    }
 
     Ok(Built {
         manager,

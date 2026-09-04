@@ -9,6 +9,7 @@ use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{
     Gateway, MAX_TOOL_PAGES, NO_TOOLS_HERE, not_allowed, serve_http, serve_http_with,
 };
+use mcpgw_core::pins::Change;
 use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
 use rmcp_client_http::ServiceExt as _;
@@ -2391,6 +2392,7 @@ fn filtered_server(mode: &str, allow: &[&str], deny: &[&str]) -> Server {
         tools: Some(mcpgw_core::ToolRules {
             allow: owned(allow),
             deny: owned(deny),
+            ..mcpgw_core::ToolRules::default()
         }),
         ..stdio_server(mode)
     }
@@ -2530,4 +2532,164 @@ async fn a_denied_call_never_reaches_the_upstream() {
     assert!(err.to_string().contains("is not allowed"), "{err}");
     assert_eq!(manager.status("fx").await, Some(UpstreamStatus::Idle));
     manager.shutdown().await;
+}
+
+/// A gateway over the `drift` fixture, with its own state directory: pins in
+/// `<state>/pins`, traffic in `<state>/traffic`.
+async fn drifting_gateway(
+    state: &std::path::Path,
+    drift: mcpgw_core::Drift,
+) -> (Client, Arc<UpstreamManager>, Arc<CaptureWriter>) {
+    let server = Server {
+        tools: Some(mcpgw_core::ToolRules {
+            drift,
+            ..mcpgw_core::ToolRules::default()
+        }),
+        ..stdio_server("drift")
+    };
+    let manager = Arc::new(
+        UpstreamManager::new([("fx".to_owned(), server)].into_iter().collect())
+            .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let writer = Arc::new(CaptureWriter::under_state_dir(state));
+    let gateway = Gateway::new(Arc::clone(&manager), "fx".to_owned())
+        .with_capture(Arc::clone(&writer))
+        .with_pins(Arc::new(mcpgw_core::pins::PinStore::under_state_dir(state)));
+    let client = connect("fx", gateway).await;
+    (client, manager, writer)
+}
+
+/// The rug pull, end to end: a list that pins, a `bump` that rewrites the
+/// server's tools, and a second list that has to say so — and keep serving.
+#[tokio::test]
+async fn a_server_that_rewrites_its_tools_is_reported_and_still_served() {
+    let state = tempfile::tempdir().unwrap();
+    let (client, manager, writer) = drifting_gateway(state.path(), mcpgw_core::Drift::Warn).await;
+    let store = mcpgw_core::pins::PinStore::under_state_dir(state.path());
+
+    // First sight: pinned, nothing reported.
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tool_names(&tools), ["echo", "reverse", "bump"]);
+    let pinned = store.read("fx").unwrap().unwrap();
+    assert_eq!(pinned.tools.len(), 3);
+    assert!(pinned.drift.is_empty());
+    assert!(captured(writer.dir()).iter().all(|r| r.kind != Kind::Drift));
+
+    client.call_tool(call("bump", "")).await.unwrap();
+
+    // Second sight: one tool rewritten, one gone, one new.
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tool_names(&tools), ["echo", "exfiltrate", "bump"]);
+    // A drifted tool is still callable: warn, never block.
+    let result = client.call_tool(call("echo", "still works")).await.unwrap();
+    assert!(format!("{result:?}").contains("still works"));
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let drift: Vec<CaptureRecord> = captured(writer.dir())
+        .into_iter()
+        .filter(|record| record.kind == Kind::Drift)
+        .collect();
+    let shape: Vec<(Option<&str>, Option<Change>)> = drift
+        .iter()
+        .map(|record| (record.tool.as_deref(), record.change))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (Some("echo"), Some(Change::Changed)),
+            (Some("exfiltrate"), Some(Change::Added)),
+            (Some("reverse"), Some(Change::Removed)),
+        ],
+        "{drift:#?}"
+    );
+    // Lengths either side of the change, and no description anywhere: the
+    // rewritten text is the payload of this attack and must not be copied
+    // into the log a reader (or a model) reads back.
+    assert_eq!(drift[0].desc_len_before, Some(12));
+    assert!(drift[0].desc_len_after.is_some_and(|len| len > 12));
+    assert_eq!(drift[1].desc_len_before, None);
+    assert_eq!(drift[2].desc_len_after, None);
+    let text = std::fs::read_to_string(
+        std::fs::read_dir(writer.dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(text.contains(r#""kind":"drift""#), "{text}");
+    assert!(text.contains(r#""change":"changed""#), "{text}");
+    assert!(!text.contains("id_rsa"), "{text}");
+
+    // And the same disagreement is on the pin file for `doctor` to read.
+    let after = store.read("fx").unwrap().unwrap();
+    assert_eq!(after.drift.len(), 3);
+    assert_eq!(
+        after.tools, pinned.tools,
+        "the pins are not silently updated"
+    );
+}
+
+/// `drift = "off"` writes nothing and reports nothing, on a server doing
+/// exactly what the other test catches.
+#[tokio::test]
+async fn drift_off_records_nothing_and_pins_nothing() {
+    let state = tempfile::tempdir().unwrap();
+    let (client, manager, writer) = drifting_gateway(state.path(), mcpgw_core::Drift::Off).await;
+    client.list_all_tools().await.unwrap();
+    client.call_tool(call("bump", "")).await.unwrap();
+    client.list_all_tools().await.unwrap();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let store = mcpgw_core::pins::PinStore::under_state_dir(state.path());
+    assert_eq!(store.read("fx").unwrap(), None);
+    assert!(
+        !store.dir().exists(),
+        "no pin file, and no directory either"
+    );
+    assert!(captured(writer.dir()).iter().all(|r| r.kind != Kind::Drift));
+}
+
+/// Accepting the current definitions ends the reporting: the next list
+/// agrees with the pins and writes no record.
+#[tokio::test]
+async fn a_re_pin_ends_the_drift() {
+    let state = tempfile::tempdir().unwrap();
+    let (client, manager, writer) = drifting_gateway(state.path(), mcpgw_core::Drift::Warn).await;
+    let store = mcpgw_core::pins::PinStore::under_state_dir(state.path());
+
+    client.list_all_tools().await.unwrap();
+    client.call_tool(call("bump", "")).await.unwrap();
+    let moved = client.list_all_tools().await.unwrap();
+    assert_eq!(
+        captured(writer.dir())
+            .iter()
+            .filter(|r| r.kind == Kind::Drift)
+            .count(),
+        3
+    );
+
+    // What `mcpgw tools fx pin` does, over the definitions the server is
+    // serving now.
+    let accepted: Vec<mcpgw_core::pins::ToolFingerprint> = moved
+        .iter()
+        .map(mcpgw_core::pins::ToolFingerprint::of)
+        .collect();
+    store.pin("fx", &accepted).unwrap();
+
+    client.list_all_tools().await.unwrap();
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+    assert_eq!(
+        captured(writer.dir())
+            .iter()
+            .filter(|r| r.kind == Kind::Drift)
+            .count(),
+        3,
+        "the accepted definitions must not report again"
+    );
+    assert!(store.read("fx").unwrap().unwrap().drift.is_empty());
 }

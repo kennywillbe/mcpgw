@@ -6,7 +6,7 @@ use mcpgw_core::doctor::project_unmanaged;
 use mcpgw_core::doctor::{
     Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
     classify_gateway_failure, classify_problems, endpoint_server, gateway_unreachable, needs_oauth,
-    unmatched_tool_rules, unserved_endpoint,
+    tool_drift, unmatched_tool_rules, unserved_endpoint,
 };
 use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
 use mcpgw_core::projects::{ProjectConfig, Standing};
@@ -133,6 +133,8 @@ pub fn run(
             "invalid".to_owned()
         }
     };
+
+    findings.extend(drifted_tool_definitions(&canonical_servers));
 
     let detections = scan_clients(
         &mut findings,
@@ -629,6 +631,44 @@ impl ProbeReport {
             )
         })
     }
+}
+
+/// The findings for every server whose tool definitions have moved since the
+/// gateway pinned them.
+///
+/// Read off the pin files rather than by dialing anything, so it costs
+/// nothing and works without `--probe`: the gateway already did the
+/// comparison, on the list a client actually received, and left the answer
+/// on disk. A server the state directory knows nothing about has never been
+/// listed through a gateway, and has nothing to say here.
+fn drifted_tool_definitions(canonical: &BTreeMap<String, Server>) -> Vec<Finding> {
+    let Some(dir) = mcpgw_core::paths::state_dir() else {
+        return Vec::new();
+    };
+    let store = mcpgw_core::pins::PinStore::under_state_dir(&dir);
+    canonical
+        .iter()
+        .filter_map(|(name, server)| {
+            let file = match store.read(name) {
+                Ok(file) => file?,
+                // An unreadable pin file is its own problem and says so; it
+                // must not read as "nothing has drifted".
+                Err(err) => {
+                    return Some(Finding {
+                        client: None,
+                        server: Some(name.clone()),
+                        severity: Severity::Warning,
+                        message: error_chain(&err),
+                        code: None,
+                    });
+                }
+            };
+            // A server whose watching was turned off after it drifted keeps
+            // a stale file; the config is what says whether to report it.
+            server.drift().is_watched().then_some(())?;
+            tool_drift(name, &file.drift)
+        })
+        .collect()
 }
 
 /// The findings for every `[servers.NAME.tools]` entry that matched nothing

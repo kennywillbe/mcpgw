@@ -112,6 +112,58 @@ unaffected in every way. The rules, the pattern syntax and what
 [`[servers.NAME.tools]`](./configuration.md#serversnametools); what the lists
 are and are not worth is in the [Trust model](./trust-model.md).
 
+### Tool definition drift
+
+A tool's description and its `inputSchema` are prompt material: the model
+reads them and does what they say. A server that rewrites either after you
+installed it changes what your agent does on a machine where nothing was
+reconfigured — benign at install, instructions added later. Nothing else in
+the pipe remembers what the server said last time.
+
+So the first time an endpoint lists a server, the gateway hashes each tool it
+is going to hand on — `name`, `description`, `inputSchema`, plus
+`outputSchema` and `annotations` where the tool has them — and writes the
+hashes to `<state>/pins/<name>.json` (mode `0600`, one file per server, not
+per client). Every later list is compared against them. A tool whose hash
+moved, a tool that has gone and a tool that has appeared are each a drift
+event, and each is reported four ways:
+
+```text
+⚠  [s/github] github tools/list create_issue   definition changed, 21 → 384 bytes
+```
+
+- a traffic record with `"kind": "drift"` — see [the record
+  format](./traffic.md#the-record-format);
+- that line in `mcpgw watch`, and its own mark and colour in the TUI;
+- a `mcpgw doctor` warning naming the server and the tools, which needs no
+  `--probe` because the gateway already did the comparison;
+- and a line on the gateway's own stderr.
+
+**Nothing is blocked.** The drifted tool stays in `tools/list` and a call to
+it still goes through. See [`drift`](./configuration.md#drift) for why, and
+for the `drift = "off"` that turns the whole thing off per server.
+
+What the records never carry is the description itself, only how many bytes
+it was before and after. The rewritten text is the payload of exactly this
+attack, and copying it into the traffic log would put those instructions into
+a second file — one that `mcpgw watch`'s detail pane reads back onto a
+screen, and that people paste into issues.
+
+Accepting the new definitions is a command:
+
+```sh
+mcpgw tools github                # the listing, with a pinned/changed/new column
+mcpgw tools github pin --show     # the pinned hashes and the drift since
+mcpgw tools github pin            # accept what the server serves now
+mcpgw tools github unpin          # forget them; the next list pins afresh
+```
+
+A paginated `tools/list` is not compared. This gateway forwards pagination
+rather than collapsing it, so one page is a fraction of the list, and every
+tool on the other pages would read as removed. Only a request with no cursor
+answered with no cursor is the whole list. The comparison is also made after
+the allowlist, on exactly the tools the endpoint hands on.
+
 ### The base endpoint
 
 `/mcp` is the gateway's own address rather than a way through it. It answers

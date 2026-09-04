@@ -67,6 +67,15 @@ pub enum Kind {
     /// and every `jq` filter select on, so it is where the distinction has
     /// to live.
     Denied,
+    /// One tool whose definition stopped matching the one this gateway
+    /// pinned for the server (see [`crate::pins`]). Written by the
+    /// `tools/list` that noticed, one record per tool that moved.
+    ///
+    /// Not a request: nothing was forwarded and nothing was refused. It is
+    /// in this file because the traffic log is the stream the calls that
+    /// follow a rewritten description arrive in, and a change nobody sees
+    /// next to that traffic is a change nobody sees.
+    Drift,
 }
 
 impl Kind {
@@ -75,7 +84,9 @@ impl Kind {
     #[must_use]
     pub fn method(self) -> &'static str {
         match self {
-            Kind::List => "tools/list",
+            // A drift line names the method that carried the definitions,
+            // which is the request it was written during.
+            Kind::List | Kind::Drift => "tools/list",
             // A refusal names the method the client called; what became of
             // it is the kind, not the method.
             Kind::Call | Kind::Denied => "tools/call",
@@ -584,6 +595,23 @@ pub struct CaptureRecord {
     /// meaning instead of silently claiming to be safe.
     #[serde(default, skip_serializing_if = "is_full")]
     pub bodies: Bodies,
+    /// For a [`Kind::Drift`] line, what happened to the tool in `tool`.
+    /// Absent on every other kind, and on every line written before drift
+    /// detection existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<crate::pins::Change>,
+    /// Byte length of the tool's pinned description, and of the one the
+    /// server serves now. Absent respectively for a tool that was added and
+    /// one that was removed — and on every kind but [`Kind::Drift`].
+    ///
+    /// Lengths, never the text. A rewritten description is the payload of
+    /// exactly this attack, and copying it into the traffic log would put
+    /// the injected instructions into the second file a model gets shown —
+    /// `mcpgw watch`'s detail pane reads these lines back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc_len_before: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc_len_after: Option<usize>,
 }
 
 impl CaptureRecord {
@@ -604,7 +632,20 @@ impl CaptureRecord {
             args: None,
             response: None,
             bodies: Bodies::Full,
+            change: None,
+            desc_len_before: None,
+            desc_len_after: None,
         }
+    }
+
+    /// Fills in what one drifted tool did, for a [`Kind::Drift`] line.
+    #[must_use]
+    pub fn with_drift(mut self, event: &crate::pins::DriftEvent) -> Self {
+        self.tool = Some(event.tool.clone());
+        self.change = Some(event.change);
+        self.desc_len_before = event.desc_len_before;
+        self.desc_len_after = event.desc_len_after;
+        self
     }
 
     /// Attributes the record to the gateway face that took the request, e.g.

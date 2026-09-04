@@ -366,6 +366,12 @@ fn tools_table(rules: &ToolRules) -> Table {
     if !rules.deny.is_empty() {
         table["deny"] = value(string_array(&rules.deny));
     }
+    // Written back like the lists, or a `tools allow` on a server whose
+    // drift is off would quietly turn it back on: this rewrites the whole
+    // table from the parsed rules.
+    if !rules.drift.is_default() {
+        table["drift"] = value(rules.drift.as_str());
+    }
     table
 }
 

@@ -98,6 +98,17 @@ pub enum Error {
         #[source]
         source: Box<serde_json::Error>,
     },
+
+    // Its own variant because the fix is a command rather than a deletion:
+    // deleting the pins silently turns drift detection back to first sight,
+    // which is the one outcome an unreadable pin file must not produce by
+    // accident.
+    #[error("invalid tool pin file {path} (re-pin the server with `mcpgw tools NAME pin`)")]
+    PinParse {
+        path: PathBuf,
+        #[source]
+        source: Box<serde_json::Error>,
+    },
 }
 
 fn known(available: &[String]) -> String {

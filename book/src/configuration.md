@@ -112,6 +112,7 @@ deny  = ["delete_*"]
 | --- | --- | --- | --- |
 | `allow` | list of patterns | `[]` | once it has an entry, nothing else is offered |
 | `deny` | list of patterns | `[]` | removed from whatever `allow` left |
+| `drift` | `"warn"` or `"off"` | `"warn"` | whether changed tool definitions are reported |
 
 A pattern is a literal tool name or a prefix with a trailing `*`
 (`delete_*`) — that and nothing more, because a rule language you cannot
@@ -140,6 +141,32 @@ mcpgw tools github clear                          # remove both lists
 
 `mcpgw doctor --probe` reports an entry that matches no tool the server
 currently offers — a typo, or a tool that has been renamed since.
+
+##### `drift`
+
+The gateway hashes each tool's definition the first time it lists a server
+and reports it when it stops matching:
+
+```toml
+[servers.github.tools]
+drift = "off"    # this server versions its tools constantly; stop telling me
+```
+
+`"warn"` — the default, and what every server without the key gets — writes a
+`drift` record to the traffic log, a line in `mcpgw watch` and a `mcpgw
+doctor` warning, and keeps serving. `"off"` pins nothing and compares
+nothing: no pin file is written for that server, and nothing is reported.
+
+There is deliberately **no `"deny"`**. A gateway that refuses calls because a
+description changed refuses them the day a server ships a legitimate new
+version, and a check that breaks a working setup is a check people turn off —
+which is how MCPProxy's quarantine came to over-report. The value here is
+that the change is visible at the moment it happens, in the same stream as
+the traffic that follows it. Blocking, if it is ever offered, will be a
+separate opt-in and not a default.
+
+The pins live in `<state>/pins/<name>.json`, one file per server, mode
+`0600`. See [Tool definition drift](./gateway.md#tool-definition-drift).
 
 #### `headers_command`
 

@@ -11,6 +11,7 @@
 mod state;
 mod tui;
 
+use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -341,12 +342,21 @@ fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
         Some(endpoint) => format!("[{endpoint}] {target}"),
         None => target,
     };
-    let mark = if record.ok { "✓" } else { "✗" };
+    // Drift gets its own mark before the outcome is even looked at: the list
+    // it was noticed during succeeded, so a `✓` is true and useless — what
+    // the reader has to see is that the server changed what it says its
+    // tools do, on the line above the calls that follow it.
+    let drift = record.kind == Kind::Drift;
+    let mark = match (drift, record.ok) {
+        (true, _) => "⚠",
+        (false, true) => "✓",
+        (false, false) => "✗",
+    };
     let mark = if color {
-        if record.ok {
-            mark.green().to_string()
-        } else {
-            mark.red().to_string()
+        match (drift, record.ok) {
+            (true, _) => mark.yellow().to_string(),
+            (false, true) => mark.green().to_string(),
+            (false, false) => mark.red().to_string(),
         }
     } else {
         mark.to_owned()
@@ -381,11 +391,27 @@ fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
             line.push_str(&client);
         }
     }
+    if let Some(change) = record.change {
+        // Spelled out rather than left to the `drift` kind alone: the line
+        // has to say what moved and by how much without anyone going to the
+        // JSON for it. Lengths, never the description — see `capture`.
+        let _ = write!(line, "  definition {change}{}", sizes(record));
+    }
     if let Some(error) = &record.error {
         line.push_str("  ");
         line.push_str(&clip(error, ERROR_CHARS));
     }
     line
+}
+
+/// `, 12 → 384 bytes` for a drift line that has both lengths.
+pub(super) fn sizes(record: &CaptureRecord) -> String {
+    match (record.desc_len_before, record.desc_len_after) {
+        (Some(before), Some(after)) => format!(", {before} → {after} bytes"),
+        (None, Some(after)) => format!(", {after} bytes"),
+        (Some(before), None) => format!(", was {before} bytes"),
+        (None, None) => String::new(),
+    }
 }
 
 /// Coarse relative age — a live stream only needs to say "just now" or
@@ -431,6 +457,31 @@ mod tests {
         let mut record = CaptureRecord::new("s3ss", "linear", Kind::List, Duration::from_millis(4));
         record.ts = NOW - 7_200_000;
         record
+    }
+
+    fn drift() -> CaptureRecord {
+        let mut record = CaptureRecord::new("s3ss", "github", Kind::Drift, Duration::ZERO)
+            .with_drift(&mcpgw_core::pins::DriftEvent {
+                tool: "create_issue".to_owned(),
+                change: mcpgw_core::pins::Change::Changed,
+                at: NOW,
+                desc_len_before: Some(21),
+                desc_len_after: Some(384),
+            });
+        record.ts = NOW - 1000;
+        record
+    }
+
+    #[test]
+    fn renders_a_drift_line_with_its_own_mark_and_no_description() {
+        let line = render_line(&drift(), NOW, false);
+        assert!(line.contains('⚠'), "{line}");
+        assert!(!line.contains('✓'), "{line}");
+        assert!(line.contains("github tools/list"), "{line}");
+        assert!(
+            line.contains("definition changed, 21 → 384 bytes"),
+            "{line}"
+        );
     }
 
     #[test]

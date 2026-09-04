@@ -333,6 +333,33 @@ pub struct ResourceInfo {
     pub mime_type: Option<String>,
 }
 
+/// Connects to `server` and fingerprints every tool it offers, in list
+/// order.
+///
+/// Separate from [`inspect_server`] because a fingerprint needs the whole
+/// definition — schemas and annotations included — and [`Inspection`] is a
+/// display model that keeps the name and the description. This is what
+/// `mcpgw tools NAME pin` writes and what its drift column is read against,
+/// so it has to hash exactly what the gateway hashes.
+///
+/// # Errors
+///
+/// Returns [`ProbeError`] for spawn failures, handshake/protocol errors and
+/// timeouts, exactly like [`probe_server`].
+pub async fn fingerprint_tools(
+    name: &str,
+    server: &Server,
+    state_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<Vec<crate::pins::ToolFingerprint>, ProbeError> {
+    connected(name, server, state_dir, timeout, |service| async move {
+        let tools = service.list_all_tools().await.map_err(handshake)?;
+        let _ = service.cancel().await;
+        Ok(tools.iter().map(crate::pins::ToolFingerprint::of).collect())
+    })
+    .await
+}
+
 /// Connects to `server` and lists everything it offers: identity, tools and
 /// (where supported) resources.
 ///

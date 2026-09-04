@@ -359,6 +359,7 @@ fn a_tool_rule_matching_nothing_is_a_warning_naming_the_list() {
         tools: Some(mcpgw_core::ToolRules {
             allow: vec!["echo".to_owned(), "gone".to_owned()],
             deny: vec!["dead_*".to_owned()],
+            ..mcpgw_core::ToolRules::default()
         }),
         transport: Transport::Stdio {
             command: "x".to_owned(),

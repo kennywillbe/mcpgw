@@ -159,9 +159,31 @@ so and points at the stream rather than writing escape sequences into a pipe.
   | `prompts` | `prompts/list` |
   | `prompt_get` | `prompts/get` |
   | `complete` | `completion/complete` |
+  | `denied` | `tools/call`, refused by the server's `[tools]` table |
+  | `drift` | `tools/list`, whose definitions no longer match the pins |
 
   Everything below `call` was added when endpoints grew past tools; older
   lines carry only `list` and `call`.
+- `change` / `desc_len_before` / `desc_len_after` — on a `drift` line only.
+  `change` is `changed`, `added` or `removed`, `tool` names the tool it
+  happened to, and the two lengths are the size in bytes of the description
+  either side of it:
+
+  ```json
+  {"ts":1756742400123,"session":"b1e4c07a","endpoint":"s/github",
+   "server":"github","tool":"create_issue","kind":"drift","duration_ms":0,
+   "ok":true,"change":"changed","desc_len_before":21,"desc_len_after":384}
+  ```
+
+  Lengths and never the text. A rewritten description is the payload of a
+  tool-poisoning attack, and copying it here would put those instructions in
+  front of the next reader — human or model — of the traffic log. `ok` is
+  `true` because nothing failed: the list succeeded, and the drift is a fact
+  about the answer rather than a request that went wrong. One record per
+  tool that moved, written once per change rather than once per list, so a
+  client polling `tools/list` does not fill the file with the same
+  unaccepted change. See [Tool definition
+  drift](./gateway.md#tool-definition-drift).
 - `tool` — what the request named: the tool, the prompt, the resource URI or
   the argument being completed. Absent on the list kinds, which name nothing.
 - `ok` / `error` — `error` carries the full text; `watch`'s one-line view
