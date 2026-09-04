@@ -1113,40 +1113,12 @@ impl UpstreamManager {
         };
         match &server.transport {
             Transport::Stdio { command, args, env } => {
-                // Rebuilt per attempt: a handshake that failed leaves a child
-                // holding the pipes, and the second lifecycle needs its own.
-                let spawn = || {
-                    let mut cmd = Command::new(command);
-                    cmd.args(args);
-                    for (key, value) in env {
-                        cmd.env(key, value);
-                    }
-                    cmd.stderr(std::process::Stdio::null());
-                    // Orphan prevention (learned the hard way in the probe milestone).
-                    cmd.kill_on_drop(true);
-                    TokioChildProcess::new(cmd)
-                        .map_err(|err| failed(format!("spawn failed: {err}")))
-                };
-                match dial(
-                    spawn()?,
-                    Lifecycle::Legacy,
-                    Some(self.connect_timeout),
-                    client.clone(),
-                )
-                .await
-                {
-                    Err(err) if err.refused_initialize => {
-                        dial(
-                            spawn()?,
-                            Lifecycle::Modern,
-                            Some(self.connect_timeout),
-                            client,
-                        )
-                        .await
-                    }
-                    other => other,
-                }
-                .map_err(|err| failed(err.message))
+                stdio_ladder(command, args, env, Some(self.connect_timeout), client)
+                    .await
+                    .map_err(|err| match err {
+                        LadderError::Transport(err) => failed(format!("spawn failed: {err}")),
+                        LadderError::Dial(err) => failed(err.message),
+                    })
             }
             Transport::Http {
                 url,
@@ -1204,73 +1176,7 @@ impl UpstreamManager {
         // Nothing is dialed until the handshake, so an unreachable host
         // surfaces here as a normal connect failure and feeds the same backoff
         // ladder as a stdio spawn failure.
-        //
-        // The two ladders are spelled out rather than shared behind a trait
-        // object: rmcp's transport is generic over its client, and the
-        // authorized one is a different type, not a configured one.
-        let outcome = if let Some(auth) = credentials {
-            let auth = ForwardsParams(auth);
-            let transport = || {
-                rmcp::transport::StreamableHttpClientTransport::with_client(
-                    auth.clone(),
-                    config.clone(),
-                )
-            };
-            match dial(
-                transport(),
-                Lifecycle::Legacy,
-                Some(self.connect_timeout),
-                client.clone(),
-            )
-            .await
-            {
-                Err(err) if err.refused_initialize => {
-                    dial(
-                        transport(),
-                        Lifecycle::Modern,
-                        Some(self.connect_timeout),
-                        client,
-                    )
-                    .await
-                }
-                other => other,
-            }
-        } else {
-            // `from_config` would build rmcp's own reqwest client and give no
-            // way to wrap it, so the client is built here — see
-            // [`plain_http_client`] for the settings that have to be kept in
-            // step with it.
-            let plain = ForwardsParams(plain_http_client());
-            let transport = || {
-                rmcp::transport::StreamableHttpClientTransport::with_client(
-                    plain.clone(),
-                    config.clone(),
-                )
-            };
-            match dial(
-                transport(),
-                Lifecycle::Legacy,
-                Some(self.connect_timeout),
-                client.clone(),
-            )
-            .await
-            {
-                // A 401 is not "this server has no `initialize`": it is a
-                // server that will not answer anything without a credential,
-                // so asking it again over the other lifecycle only spends a
-                // second round trip on the same refusal.
-                Err(err) if err.refused_initialize => {
-                    dial(
-                        transport(),
-                        Lifecycle::Modern,
-                        Some(self.connect_timeout),
-                        client,
-                    )
-                    .await
-                }
-                other => other,
-            }
-        };
+        let outcome = http_ladder(&config, credentials, Some(self.connect_timeout), client).await;
         outcome.map_err(|err| {
             if err.auth_required {
                 // The token file is deliberately left alone. A 401 that
@@ -1413,6 +1319,142 @@ where
             challenge: None,
         }),
     }
+}
+
+/// A ladder that ended before a handshake did, kept apart from one that
+/// ended in a refusal: a transport that could not be built at all is a
+/// failure on this machine, and every caller words it differently.
+pub(crate) enum LadderError<T> {
+    /// The transport could never be built — a stdio child that would not
+    /// spawn.
+    Transport(T),
+    /// A handshake was attempted and failed.
+    Dial(DialError),
+}
+
+impl LadderError<std::convert::Infallible> {
+    /// The dial half, for a ladder whose transport factory cannot fail.
+    fn into_dial(self) -> DialError {
+        match self {
+            Self::Transport(never) => match never {},
+            Self::Dial(err) => err,
+        }
+    }
+}
+
+/// The connect ladder: one handshake on the legacy lifecycle, and a second
+/// on the modern one only if the server answered the first with an error.
+///
+/// `transport` is called once per rung rather than handed in built, because
+/// a rung consumes what it dials: a stdio child that failed the handshake
+/// still owns its pipes, and an http transport keeps the session id the
+/// first attempt was given.
+///
+/// This is the single ladder both the gateway's upstream manager and
+/// `doctor --probe` climb. `--probe`'s contract is that a server answers
+/// *the way mcpgw would reach it*, which only holds while there is one
+/// ladder to change.
+async fn dial_ladder<T, E, A, X>(
+    mut transport: impl FnMut() -> Result<T, X>,
+    timeout: Option<Duration>,
+    client: UpstreamClient,
+) -> Result<UpstreamService, LadderError<X>>
+where
+    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let first = transport().map_err(LadderError::Transport)?;
+    match dial(first, Lifecycle::Legacy, timeout, client.clone()).await {
+        // A 401 is not "this server has no `initialize`": it is a server that
+        // will not answer anything without a credential, so asking it again
+        // over the other lifecycle only spends a second round trip on the
+        // same refusal. `refused_initialize` is false for it for that reason.
+        Err(err) if err.refused_initialize => {
+            let second = transport().map_err(LadderError::Transport)?;
+            dial(second, Lifecycle::Modern, timeout, client).await
+        }
+        other => other,
+    }
+    .map_err(LadderError::Dial)
+}
+
+/// The stdio rung of the ladder: spawn `command` and hand its pipes to a
+/// handshake, once per lifecycle.
+pub(crate) async fn stdio_ladder(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    timeout: Option<Duration>,
+    client: UpstreamClient,
+) -> Result<UpstreamService, LadderError<std::io::Error>> {
+    dial_ladder(
+        || {
+            let mut cmd = Command::new(command);
+            cmd.args(args);
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+            // Server logs on stderr are noise to both callers: the gateway
+            // reports status, doctor reports outcomes.
+            cmd.stderr(std::process::Stdio::null());
+            // Orphan prevention (learned the hard way in the probe
+            // milestone): a dropped ladder must take its child with it.
+            cmd.kill_on_drop(true);
+            TokioChildProcess::new(cmd)
+        },
+        timeout,
+        client,
+    )
+    .await
+}
+
+/// The http rung of the ladder, dialed with `credentials` when the caller
+/// has a stored login for the server and bare otherwise.
+///
+/// The two branches are spelled out rather than shared behind a trait
+/// object: rmcp's transport is generic over its client, and the authorized
+/// one is a different type, not a configured one.
+pub(crate) async fn http_ladder(
+    config: &StreamableHttpClientTransportConfig,
+    credentials: Option<rmcp::transport::auth::AuthClient<reqwest::Client>>,
+    timeout: Option<Duration>,
+    client: UpstreamClient,
+) -> Result<UpstreamService, DialError> {
+    if let Some(auth) = credentials {
+        let auth = ForwardsParams(auth);
+        dial_ladder(
+            || {
+                Ok::<_, std::convert::Infallible>(
+                    rmcp::transport::StreamableHttpClientTransport::with_client(
+                        auth.clone(),
+                        config.clone(),
+                    ),
+                )
+            },
+            timeout,
+            client,
+        )
+        .await
+    } else {
+        // `from_config` would build rmcp's own reqwest client and give no way
+        // to wrap it, so the client is built here — see [`http_client`] for
+        // the settings that have to be kept in step with it.
+        let plain = ForwardsParams(http_client());
+        dial_ladder(
+            || {
+                Ok::<_, std::convert::Infallible>(
+                    rmcp::transport::StreamableHttpClientTransport::with_client(
+                        plain.clone(),
+                        config.clone(),
+                    ),
+                )
+            },
+            timeout,
+            client,
+        )
+        .await
+    }
+    .map_err(LadderError::into_dial)
 }
 
 /// Builds the streamable-http client config for `url`, passing the canonical
@@ -1637,14 +1679,15 @@ where
     }
 }
 
-/// The client the unauthenticated http path dials through.
+/// The client every unauthenticated http dial goes through — the gateway's
+/// and `doctor --probe`'s alike.
 ///
 /// A copy of rmcp's own default, which is private: idle pooling off (a reused
 /// connection whose previous body was not drained stalls ~40ms on Linux's
 /// delayed ACK) and redirects off (so custom headers cannot be replayed to a
 /// redirect target). Both are behaviour, not taste — if rmcp changes them,
-/// this has to follow.
-fn plain_http_client() -> reqwest::Client {
+/// this has to follow, and this is the one place that has to be changed.
+pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .redirect(reqwest::redirect::Policy::none())

@@ -5,11 +5,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use rmcp::transport::TokioChildProcess;
-use tokio::process::Command;
-
 use crate::config::{Server, Transport};
-use crate::upstream::{DialError, Lifecycle};
+use crate::upstream::{DialError, LadderError};
 
 /// Appended to the stdio timeout message; the first `npx`/`uvx` run of a
 /// package spends its budget downloading, which looks like a hang.
@@ -159,32 +156,20 @@ async fn connect_stdio(
     args: &[String],
     env: &BTreeMap<String, String>,
 ) -> Result<Service, ProbeError> {
-    // Rebuilt per attempt: the first child owns the pipes it was handed, so a
-    // second lifecycle needs a second process.
-    let spawn = || {
-        let mut cmd = Command::new(command);
-        cmd.args(args);
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-        // Server logs on stderr are noise here; doctor reports outcomes only.
-        cmd.stderr(std::process::Stdio::null());
-        // A timed-out probe drops its future mid-handshake; without this the
-        // spawned server would outlive us as an orphan.
-        cmd.kill_on_drop(true);
-        TokioChildProcess::new(cmd).map_err(|source| ProbeError::Spawn {
-            command: command.to_owned(),
-            source,
+    // The gateway's own ladder, which is the point of `--probe`: it runs both
+    // lifecycles because a 2026-07-28 server has no `initialize` to answer,
+    // and reporting it as unreachable would be doctor lying about a healthy
+    // server. No deadline of its own: `connected` already races the whole
+    // probe against the caller's timeout.
+    crate::upstream::stdio_ladder(command, args, env, None, detached())
+        .await
+        .map_err(|err| match err {
+            LadderError::Transport(source) => ProbeError::Spawn {
+                command: command.to_owned(),
+                source,
+            },
+            LadderError::Dial(err) => failure(err),
         })
-    };
-    // The probe runs both lifecycles for the same reason the gateway does:
-    // a 2026-07-28 server has no `initialize` to answer, and reporting it as
-    // unreachable would be doctor lying about a healthy server.
-    match dial(spawn()?, Lifecycle::Legacy).await {
-        Err(err) if err.refused_initialize => dial(spawn()?, Lifecycle::Modern).await,
-        other => other,
-    }
-    .map_err(failure)
 }
 
 async fn connect_http(
@@ -230,45 +215,16 @@ async fn connect_http(
     // there is no separate "spawn" step for a remote server. The 401 is the
     // exception, and rmcp answers for it rather than the message being
     // matched: see `upstream::dial`.
-    if let Some(client) = credentials {
-        let transport = || {
-            rmcp::transport::StreamableHttpClientTransport::with_client(
-                client.clone(),
-                config.clone(),
-            )
-        };
-        match dial(transport(), Lifecycle::Legacy).await {
-            Err(err) if err.refused_initialize => dial(transport(), Lifecycle::Modern).await,
-            other => other,
-        }
-    } else {
-        let transport =
-            || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
-        match dial(transport(), Lifecycle::Legacy).await {
-            Err(err) if err.refused_initialize => dial(transport(), Lifecycle::Modern).await,
-            other => other,
-        }
-    }
-    .map_err(failure)
+    crate::upstream::http_ladder(&config, credentials, None, detached())
+        .await
+        .map_err(failure)
 }
 
-/// One handshake, with no deadline of its own: [`connected`] already races
-/// the whole probe against the caller's timeout, and a second one inside it
-/// would only decide the same thing twice.
-async fn dial<T, E, A>(transport: T, lifecycle: Lifecycle) -> Result<Service, DialError>
-where
-    T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    // Detached: the probe asks one connection what it can do and drops it,
-    // so a list-changed notification arriving on it has nobody to reach.
-    crate::upstream::dial(
-        transport,
-        lifecycle,
-        None,
-        crate::upstream::UpstreamClient::detached(),
-    )
-    .await
+/// The handler a probe dials with: detached, because it asks one connection
+/// what it can do and drops it, so a list-changed notification arriving on
+/// it has nobody to reach.
+fn detached() -> crate::upstream::UpstreamClient {
+    crate::upstream::UpstreamClient::detached()
 }
 
 /// What a failed handshake means for the report: a server that will not talk
