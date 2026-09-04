@@ -5,6 +5,8 @@ use assert_cmd::Command;
 
 mod util;
 use util::fixture_binary;
+#[cfg(unix)]
+use util::install_fixture_service;
 
 /// Runs doctor in a fully sandboxed home: every env key any adapter looks at
 /// points into the temp dir, so the real machine never leaks into the test.
@@ -73,6 +75,43 @@ fn unresolvable_command_is_an_error_exit() {
     let out = run_doctor(dir.path(), Some(BROKEN_COMMAND), &[]);
     assert!(!out.status.success());
     assert!(stdout(&out).contains("not found in PATH"));
+}
+
+/// The state the daemon PATH goes stale in: `cargo` is on the shell's PATH
+/// (it is what runs this test) and the installed service was baked with one
+/// that has nothing on it, so the entry works everywhere except under the
+/// service — which is the one place nothing used to say.
+#[cfg(unix)]
+#[test]
+fn a_command_the_daemons_path_cannot_resolve_is_a_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty = dir.path().join("empty-bin");
+    std::fs::create_dir(&empty).unwrap();
+    install_fixture_service(dir.path(), &empty.display().to_string());
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &[]);
+    let text = stdout(&out);
+    // A warning and not an error: the entry is spelled right, and a
+    // foreground gateway starts it perfectly.
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("resolves in your shell"), "{text}");
+    assert!(text.contains("`mcpgw daemon install`"), "{text}");
+    assert!(text.contains("1 warnings"), "{text}");
+}
+
+/// The same machine with a service installed from this very shell: the
+/// command resolves for the daemon too, so there is nothing to say.
+#[cfg(unix)]
+#[test]
+fn a_service_installed_with_your_own_path_says_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    install_fixture_service(dir.path(), &std::env::var("PATH").unwrap());
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &[]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(!text.contains("resolves in your shell"), "{text}");
+    assert!(text.contains("0 warnings"), "{text}");
 }
 
 #[test]

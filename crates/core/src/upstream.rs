@@ -1116,7 +1116,7 @@ impl UpstreamManager {
                 stdio_ladder(command, args, env, Some(self.connect_timeout), client)
                     .await
                     .map_err(|err| match err {
-                        LadderError::Transport(err) => failed(format!("spawn failed: {err}")),
+                        LadderError::Transport(err) => failed(spawn_failure(command, env, &err)),
                         LadderError::Dial(err) => failed(err.message),
                     })
             }
@@ -1695,12 +1695,78 @@ pub(crate) fn http_client() -> reqwest::Client {
         .expect("failed to build the default http client")
 }
 
+/// What a stdio server that could not be started says, naming the `PATH` the
+/// lookup was made on.
+///
+/// A supervised gateway runs with the `PATH` frozen into its service
+/// definition, not with the one the user has in a terminal, so "No such file
+/// or directory" on its own sends people to check a command they can run
+/// perfectly well by hand. Printing the `PATH` that was actually searched —
+/// the server's own `env` entry when it has one, since that is what the child
+/// would look on, otherwise this process's — is the whole diagnosis.
+///
+/// Only for a bare name that was not found: any other failure (a permission
+/// bit, a bad interpreter) is about the file, and `PATH` already found it.
+fn spawn_failure(command: &str, env: &BTreeMap<String, String>, err: &std::io::Error) -> String {
+    let spelled_as_path = std::path::Path::new(command)
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if err.kind() != std::io::ErrorKind::NotFound || spelled_as_path {
+        return format!("spawn failed: {err}");
+    }
+    match env
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+    {
+        Some(path) => format!(
+            "spawn failed: {command:?} is not on the PATH this gateway searched ({path}) — a \
+             service runs with the PATH it was installed with, so re-run `mcpgw daemon install` \
+             from a shell where {command:?} resolves, or give the absolute path"
+        ),
+        None => format!(
+            "spawn failed: {command:?} was not found, and this gateway is running with no PATH \
+             at all"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
-    use super::{Budget, http_config};
+    use super::{Budget, http_config, spawn_failure};
+
+    /// The failure a stale daemon PATH produces, which is only ever read in
+    /// the daemon log or in a probe row — so the PATH that was searched has
+    /// to be in the sentence itself.
+    #[test]
+    fn a_command_that_is_not_on_the_path_says_which_path() {
+        let not_found = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let none = BTreeMap::new();
+
+        let message = spawn_failure("npx", &none, &not_found());
+        let searched = std::env::var("PATH").unwrap();
+        assert!(message.contains("\"npx\""), "{message}");
+        assert!(message.contains(&searched), "{message}");
+        assert!(message.contains("`mcpgw daemon install`"), "{message}");
+
+        // A server carrying its own PATH is looked up on that one, so that is
+        // the one worth printing back.
+        let own: BTreeMap<String, String> = [("PATH".to_owned(), "/only/here".to_owned())]
+            .into_iter()
+            .collect();
+        let message = spawn_failure("npx", &own, &not_found());
+        assert!(message.contains("/only/here"), "{message}");
+
+        // Anything else is about the file, which PATH already found.
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let message = spawn_failure("npx", &none, &denied);
+        assert!(!message.contains(&searched), "{message}");
+        let message = spawn_failure("/opt/node/bin/npx", &none, &not_found());
+        assert!(!message.contains(&searched), "{message}");
+    }
 
     /// A burst of `limit` gets through and the next call does not, and the
     /// wait it is told to take is exactly one emission interval.

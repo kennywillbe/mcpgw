@@ -77,7 +77,34 @@ pub fn run(args: &AddArgs) -> anyhow::Result<()> {
         if replaced { "updated" } else { "added" },
         args.name
     );
+    warn_unreachable_by_daemon(&server.transport);
     Ok(())
+}
+
+/// Says so when the command just stored resolves for the caller but not for
+/// the installed gateway service.
+///
+/// After the entry is written rather than instead of writing it: the entry is
+/// exactly what was asked for and is right for a foreground `mcpgw serve`, so
+/// this is a warning about where it will *not* work, not a refusal. On stderr
+/// so the success line above stays the only thing a script reads.
+///
+/// A server carrying its own `PATH` is left alone: `--env` reaches the child
+/// whatever the daemon's own environment is, which is the whole reason it is
+/// one of the fixes offered here.
+fn warn_unreachable_by_daemon(transport: &Transport) {
+    let Transport::Stdio { command, env, .. } = transport else {
+        return;
+    };
+    if env.contains_key("PATH") {
+        return;
+    }
+    let service_path = mcpgw_core::daemon_check::service_path();
+    let reach = mcpgw_core::daemon_check::stdio_command_reach(command, service_path.as_deref());
+    if let Some(advice) = reach.advice() {
+        eprintln!("warning: {advice}");
+        eprintln!("         (or re-add it with --env PATH=... to give this server its own PATH)");
+    }
 }
 
 fn build_transport(args: &AddArgs) -> anyhow::Result<Transport> {

@@ -136,6 +136,7 @@ pub fn run(
         &managed,
         &command_exists,
     );
+    findings.extend(daemon_path_gaps(&canonical_servers));
     findings.extend(stale_service_exe());
     findings.extend(stale_service_version());
     findings.extend(unauthenticated_bind());
@@ -389,6 +390,32 @@ fn unauthenticated_bind() -> Vec<Finding> {
     binds
         .filter(|bind| seen.insert(bind.clone()))
         .filter_map(|(bind, _)| mcpgw_core::doctor::unauthenticated_bind(&bind, require))
+        .collect()
+}
+
+/// The warnings for stdio servers this shell can start and the daemon cannot.
+///
+/// Only the canonical config: these are the entries the installed service
+/// spawns, and a client's own entry is started by that client with that
+/// client's environment, so the daemon's `PATH` says nothing about it.
+///
+/// Silent on a machine with no service definition — there is no second `PATH`
+/// to disagree with — and silent for an entry carrying its own `PATH` in
+/// `env`, which reaches the child whatever the service was installed with.
+fn daemon_path_gaps(servers: &BTreeMap<String, Server>) -> Vec<Finding> {
+    let Some(service_path) = mcpgw_core::daemon_check::service_path() else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .filter_map(|(name, server)| match &server.transport {
+            Transport::Stdio { command, env, .. } if !env.contains_key("PATH") => {
+                mcpgw_core::daemon_check::stdio_command_reach(command, Some(&service_path))
+                    .finding(name)
+            }
+            Transport::Stdio { .. } | Transport::Http { .. } => None,
+        })
         .collect()
 }
 

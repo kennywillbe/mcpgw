@@ -15,6 +15,14 @@
 //! running gateway publishes ([`crate::runtime`]) rather than the service
 //! definition, and is only ever believed together with a live probe.
 //!
+//! The third fact it answers is about the service's *environment* rather than
+//! its binary: an installed service runs with the `PATH` that was captured
+//! when it was installed (see [`crate::daemon::launchd::inherited_path`] and
+//! its systemd twin), so a command that a version manager put on your shell's
+//! `PATH` afterwards resolves for you and not for the daemon. That state is
+//! silent in exactly the same way — `which npx` succeeds, the config looks
+//! right, and the child dies before the MCP handshake.
+//!
 //! Lives outside [`crate::daemon`] because that module is final by contract,
 //! and outside [`crate::doctor`] because this reads the filesystem — doctor's
 //! rules are pure by design and take their environment injected. It is one
@@ -252,6 +260,189 @@ pub fn url_host(url: &str) -> Option<String> {
     Some(parsed.host_str()?.trim_matches(['[', ']']).to_owned())
 }
 
+/// How a stdio server's bare command resolves for the shell that typed it
+/// versus for the `PATH` the installed service runs with.
+///
+/// Deliberately only two answers. A command that resolves nowhere is already
+/// an error [`crate::doctor::check_server`] reports, and one that resolves
+/// for both is a machine with nothing wrong with it — the single case worth a
+/// new sentence is the one nobody can currently see, where the shell says yes
+/// and the daemon says no.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandReach {
+    /// Nothing to say: no service is installed, the command is spelled as a
+    /// path (so no `PATH` decides it), or both sides resolve it.
+    Fine,
+    /// It resolves in the caller's `PATH` and not in the service's, so the
+    /// gateway works in the foreground and the daemon cannot spawn it.
+    ShellOnly {
+        /// The command as the config spells it.
+        command: String,
+        /// What the caller's own `PATH` resolves it to, which is also the
+        /// absolute path that would fix the entry.
+        resolved: PathBuf,
+    },
+}
+
+impl CommandReach {
+    /// The one sentence every command says about a command the daemon cannot
+    /// resolve, or `None` when there is nothing to say.
+    ///
+    /// Names both fixes because they are for different situations: re-running
+    /// the install is right when your shell's `PATH` is the one you want the
+    /// daemon to have, and the absolute path is right when it is not (a
+    /// `PATH` full of version-manager shims that move on every upgrade).
+    #[must_use]
+    pub fn advice(&self) -> Option<String> {
+        match self {
+            CommandReach::Fine => None,
+            CommandReach::ShellOnly { command, resolved } => Some(format!(
+                "{command:?} resolves in your shell ({}) but not on the PATH the gateway service \
+                 was installed with, so the daemon cannot start it — re-run `mcpgw daemon \
+                 install` from this shell to refresh that PATH, or use the absolute path {}",
+                resolved.display(),
+                resolved.display()
+            )),
+        }
+    }
+
+    /// The same fact as a doctor finding about `server`.
+    ///
+    /// A warning rather than an error: the entry is spelled correctly and
+    /// works everywhere except under the service, and a machine that runs the
+    /// gateway in the foreground is not broken at all.
+    #[must_use]
+    pub fn finding(&self, server: &str) -> Option<Finding> {
+        self.advice().map(|advice| Finding {
+            client: None,
+            server: Some(server.to_owned()),
+            severity: Severity::Warning,
+            message: advice,
+            code: None,
+        })
+    }
+}
+
+/// Resolves a bare command name against one `PATH` value, without consulting
+/// the environment this process happens to have.
+///
+/// Both sides of [`command_reach`] go through it, so "resolves for you" and
+/// "resolves for the daemon" cannot be two different questions — and a `PATH`
+/// being a plain string is what makes the whole check testable without one.
+#[must_use]
+pub fn resolve_in(command: &str, path_env: &str) -> Option<PathBuf> {
+    if !is_bare(command) {
+        return None;
+    }
+    // Only consulted for a command spelled with a separator, which `is_bare`
+    // has just ruled out; an empty cwd keeps the lookup off the filesystem
+    // around whoever happens to be asking.
+    which::which_in(command, Some(path_env), "").ok()
+}
+
+/// Whether `command` is a name `PATH` decides, rather than a path.
+fn is_bare(command: &str) -> bool {
+    // Windows spells a path with either slash, and a drive letter with a
+    // colon; on unix all three are legal in a filename.
+    let separators: &[char] = if cfg!(windows) {
+        &['/', '\\', ':']
+    } else {
+        &['/']
+    };
+    !command.is_empty() && !command.contains(separators)
+}
+
+/// How `command` resolves for a caller holding `shell_path` against a service
+/// installed with `service_path`.
+///
+/// Both `PATH`s are optional and a missing one is [`CommandReach::Fine`]: no
+/// recorded service definition means there is no daemon to disagree with, and
+/// a caller with no `PATH` at all has nothing to compare from. Silence is the
+/// right answer for both — this check exists to explain a failure, and
+/// guessing at one from half the evidence is how a warning becomes noise.
+#[must_use]
+pub fn command_reach(
+    command: &str,
+    shell_path: Option<&str>,
+    service_path: Option<&str>,
+) -> CommandReach {
+    let (Some(shell_path), Some(service_path)) = (shell_path, service_path) else {
+        return CommandReach::Fine;
+    };
+    let Some(resolved) = resolve_in(command, shell_path) else {
+        return CommandReach::Fine;
+    };
+    if resolve_in(command, service_path).is_some() {
+        return CommandReach::Fine;
+    }
+    CommandReach::ShellOnly {
+        command: command.to_owned(),
+        resolved,
+    }
+}
+
+/// [`command_reach`] against this process's `PATH` and the installed
+/// service's, which is what every caller outside a test actually asks.
+#[must_use]
+pub fn stdio_command_reach(command: &str, service_path: Option<&str>) -> CommandReach {
+    let shell_path = std::env::var("PATH").ok();
+    command_reach(command, shell_path.as_deref(), service_path)
+}
+
+/// The `PATH` the installed service definition on this machine runs with, or
+/// `None` when nothing is installed — or when the platform's service does not
+/// record one, which is the Windows case: its service takes the machine
+/// environment and there is nothing frozen to go stale.
+///
+/// Read out of the definition the supervisor actually reads, rather than out
+/// of `daemon.json`: the plist or unit is what decides the daemon's `PATH`,
+/// so it is the only file that cannot be right about it.
+#[must_use]
+pub fn service_path() -> Option<String> {
+    read_service_path(&definition_path()?)
+}
+
+/// [`service_path`] for a definition file named by the caller, which is what
+/// makes the check testable against a fixture.
+#[must_use]
+pub fn read_service_path(definition: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(definition).ok()?;
+    definition_path_env(&text)
+}
+
+/// Where this platform's supervisor keeps the definition [`service_path`]
+/// reads.
+#[cfg(target_os = "macos")]
+fn definition_path() -> Option<PathBuf> {
+    crate::daemon::launchd::plist_path().ok()
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn definition_path() -> Option<PathBuf> {
+    crate::daemon::systemd::unit_path().ok()
+}
+
+#[cfg(windows)]
+fn definition_path() -> Option<PathBuf> {
+    None
+}
+
+/// The `PATH` out of that definition, in the format this platform writes.
+#[cfg(target_os = "macos")]
+fn definition_path_env(text: &str) -> Option<String> {
+    crate::daemon::launchd::plist_path_env(text)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn definition_path_env(text: &str) -> Option<String> {
+    crate::daemon::systemd::unit_path_env(text)
+}
+
+#[cfg(windows)]
+fn definition_path_env(_text: &str) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +467,153 @@ mod tests {
 
     fn write_binary(path: &Path) {
         std::fs::write(path, b"not really a binary").unwrap();
+    }
+
+    /// Puts something `which` resolves as runnable in `dir`, and answers with
+    /// the bare name a config would spell it with — `.exe` on Windows, where
+    /// PATHEXT rather than a mode bit decides what is executable.
+    fn write_tool(dir: &Path, name: &str) -> String {
+        #[cfg(windows)]
+        {
+            std::fs::write(dir.join(format!("{name}.exe")), b"").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = dir.join(name);
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        name.to_owned()
+    }
+
+    /// A PATH with those directories on it, spelled the way this platform's
+    /// environment spells one.
+    fn path_env(dirs: &[&Path]) -> String {
+        let joined = std::env::join_paths(dirs).unwrap();
+        joined.into_string().unwrap()
+    }
+
+    #[test]
+    fn a_command_both_paths_resolve_is_not_worth_a_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim");
+        std::fs::create_dir(&shim).unwrap();
+        let npx = write_tool(&shim, "npx");
+        let path = path_env(&[&shim]);
+
+        let reach = command_reach(&npx, Some(&path), Some(&path));
+        assert_eq!(reach, CommandReach::Fine);
+        assert_eq!(reach.advice(), None);
+        assert_eq!(reach.finding("playwright"), None);
+    }
+
+    #[test]
+    fn a_command_only_your_shell_resolves_names_the_two_fixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("nvm-bin");
+        let system = dir.path().join("usr-bin");
+        std::fs::create_dir(&shim).unwrap();
+        std::fs::create_dir(&system).unwrap();
+        let npx = write_tool(&shim, "npx");
+
+        let reach = command_reach(&npx, Some(&path_env(&[&shim])), Some(&path_env(&[&system])));
+        let CommandReach::ShellOnly { command, resolved } = &reach else {
+            panic!("expected a shell-only command, got {reach:?}");
+        };
+        assert_eq!(command, &npx);
+        assert!(resolved.starts_with(&shim), "{}", resolved.display());
+
+        let advice = reach.advice().unwrap();
+        assert!(advice.contains("resolves in your shell"), "{advice}");
+        assert!(advice.contains("`mcpgw daemon install`"), "{advice}");
+        assert!(
+            advice.contains(&resolved.display().to_string()),
+            "the absolute path is the other fix: {advice}"
+        );
+
+        let finding = reach.finding("playwright").unwrap();
+        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(finding.server.as_deref(), Some("playwright"));
+        assert_eq!(finding.message, advice);
+    }
+
+    /// The plain "command not found" case belongs to `doctor::check_server`,
+    /// which already reports it as an error; saying it twice in two voices
+    /// would be worse than saying it once.
+    #[test]
+    fn a_command_neither_path_resolves_is_left_to_the_existing_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = path_env(&[dir.path()]);
+        assert_eq!(
+            command_reach("npx", Some(&empty), Some(&empty)),
+            CommandReach::Fine
+        );
+    }
+
+    #[test]
+    fn a_command_spelled_as_a_path_is_decided_by_no_path_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("nvm-bin");
+        std::fs::create_dir(&shim).unwrap();
+        let npx = write_tool(&shim, "npx");
+        let absolute = shim.join(&npx).display().to_string();
+
+        assert_eq!(resolve_in(&absolute, &path_env(&[&shim])), None);
+        assert_eq!(
+            command_reach(&absolute, Some(&path_env(&[&shim])), Some("")),
+            CommandReach::Fine
+        );
+    }
+
+    /// A machine with no service installed has no second PATH to disagree
+    /// with, and a caller with no PATH has nothing to compare from.
+    #[test]
+    fn a_missing_path_on_either_side_says_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("nvm-bin");
+        std::fs::create_dir(&shim).unwrap();
+        let npx = write_tool(&shim, "npx");
+        let path = path_env(&[&shim]);
+
+        assert_eq!(command_reach(&npx, Some(&path), None), CommandReach::Fine);
+        assert_eq!(command_reach(&npx, None, Some("")), CommandReach::Fine);
+    }
+
+    /// The whole read path, from a service definition on disk to the PATH the
+    /// supervisor would run with — in this platform's own format.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_service_path_is_read_out_of_the_installed_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let spec = DaemonSpec {
+            exe: PathBuf::from("/usr/local/bin/mcpgw"),
+            config_path: dir.path().join("config.toml"),
+            logs: crate::daemon::LogPaths::under_state_dir(&state),
+            state_dir: state,
+            bind: "127.0.0.1".to_owned(),
+            port: 8137,
+        };
+        let baked = "/opt/homebrew/bin:/usr/bin:/bin";
+        #[cfg(target_os = "macos")]
+        let definition = crate::daemon::launchd::render_plist(&spec, Some(baked));
+        #[cfg(not(target_os = "macos"))]
+        let definition = crate::daemon::systemd::render_unit(&spec, Some(baked));
+
+        let file = dir.path().join("service-definition");
+        std::fs::write(&file, definition).unwrap();
+        assert_eq!(read_service_path(&file).as_deref(), Some(baked));
+
+        // A definition from a build that baked no PATH, and a file that is
+        // not one at all, both read as "nothing recorded".
+        #[cfg(target_os = "macos")]
+        let without = crate::daemon::launchd::render_plist(&spec, None);
+        #[cfg(not(target_os = "macos"))]
+        let without = crate::daemon::systemd::render_unit(&spec, None);
+        std::fs::write(&file, without).unwrap();
+        assert_eq!(read_service_path(&file), None);
+        assert_eq!(read_service_path(&dir.path().join("nothing-here")), None);
     }
 
     #[test]

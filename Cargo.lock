@@ -1428,6 +1428,7 @@ dependencies = [
  "toml_edit",
  "tower-service",
  "url",
+ "which",
  "windows-service",
  "windows-sys 0.61.2",
 ]

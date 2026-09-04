@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use mcpgw_core::daemon::systemd::{
     Linger, Ran, install_with, linger, linger_note, query_with, render_unit, start_with, stop_with,
-    uninstall_with, unit_path_with,
+    uninstall_with, unit_path_env, unit_path_with,
 };
 use mcpgw_core::daemon::{DaemonError, DaemonSpec, LogPaths};
 
@@ -162,6 +162,38 @@ fn a_space_is_quoted_and_a_percent_is_doubled_for_the_unit_parser() {
         unit.contains("StandardOutput=append:/home/100%% sure/state/logs/daemon.out.log\n"),
         "{unit}"
     );
+}
+
+/// The read half of the same file: what a later `doctor` or `add` learns
+/// about the PATH the service actually runs with, including the quoting and
+/// the doubled percent the writer put in.
+#[test]
+fn the_baked_path_is_read_back_out_of_the_unit() {
+    let plain = render_unit(
+        &spec(Path::new("/home/u/state")),
+        Some("/home/u/.local/bin:/usr/bin"),
+    );
+    assert_eq!(
+        unit_path_env(&plain).as_deref(),
+        Some("/home/u/.local/bin:/usr/bin")
+    );
+
+    let awkward = render_unit(
+        &spec(Path::new("/home/u/state")),
+        Some("/home/100% sure/bin"),
+    );
+    assert_eq!(
+        unit_path_env(&awkward).as_deref(),
+        Some("/home/100% sure/bin")
+    );
+
+    // Nothing baked, and something that is not a unit at all.
+    assert_eq!(
+        unit_path_env(&render_unit(&spec(Path::new("/home/u/state")), None)),
+        None
+    );
+    assert_eq!(unit_path_env("Environment=PATH=\n"), None);
+    assert_eq!(unit_path_env("hello"), None);
 }
 
 #[test]

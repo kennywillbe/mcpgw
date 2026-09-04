@@ -496,3 +496,37 @@ pub async fn rewrite_record_version(home: &Path, url: &str, version: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// Writes the service definition this platform's supervisor reads, with
+/// `path_env` baked into it the way `mcpgw daemon install` bakes the
+/// installing shell's `PATH`.
+///
+/// Rendered by the same writers the install uses rather than hand-typed, so a
+/// change to either format cannot leave a fixture behind claiming a `PATH`
+/// mcpgw would no longer read. Unix only: the Windows service records no
+/// `PATH` of its own, so there is nothing there for a test to stale.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub fn install_fixture_service(home: &Path, path_env: &str) {
+    let state_dir = home.join("state");
+    let spec = mcpgw_core::daemon::DaemonSpec {
+        exe: home.join("bin/mcpgw"),
+        config_path: home.join("config.toml"),
+        logs: mcpgw_core::daemon::LogPaths::under_state_dir(&state_dir),
+        state_dir,
+        bind: "127.0.0.1".to_owned(),
+        port: 8137,
+    };
+    #[cfg(target_os = "macos")]
+    let (path, text) = (
+        home.join("Library/LaunchAgents/io.mcpgw.gateway.plist"),
+        mcpgw_core::daemon::launchd::render_plist(&spec, Some(path_env)),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (path, text) = (
+        home.join(".config/systemd/user/mcpgw.service"),
+        mcpgw_core::daemon::systemd::render_unit(&spec, Some(path_env)),
+    );
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
