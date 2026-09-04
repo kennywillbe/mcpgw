@@ -269,8 +269,11 @@ clients send no `Origin` at all and are unaffected.
   gateway token — is `0600`. Those backups are copies of files that hold tokens, which is why
   they get the same treatment as the traffic log.
 - The canonical config holds your `env` values and headers in plaintext, the
-  same way every client config already does. `mcpgw list --json` masks them;
-  `--show-secrets` prints them.
+  same way every client config already does. `mcpgw list` masks them, on both
+  the table and `--json`, and it runs the same redaction over the target — a
+  `?token=` in a URL, an `--api-key=` in an argument — because a credential
+  put there is just as readable in scrollback. `--show-secrets` prints all of
+  it.
 - `mcpgw eject` puts the original definitions back into every client, so the
   state above is not a lock-in — see [Backing out](./eject.md).
 

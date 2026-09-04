@@ -97,3 +97,63 @@ fn json_output_carries_the_tool_lists() {
     // read as a list allowing nothing.
     assert!(value["servers"]["linear"].get("tools").is_none());
 }
+
+/// The secret material here is in `args` and in a query string, which is
+/// where the `env`/`headers` masking never reached.
+#[test]
+fn the_table_redacts_secrets_in_args_and_urls() {
+    let out = run_list(&fixture("target-secrets.toml"), &[]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("notarealkeyjustashape"), "{text}");
+    assert!(!text.contains("notarealtokenjustashape"), "{text}");
+    // What is left is still a readable target: the command, the host, and
+    // the name of the parameter that carried the credential.
+    assert!(text.contains("npx -y server-github"), "{text}");
+    assert!(text.contains("https://mcp.linear.app/mcp?token="), "{text}");
+}
+
+#[test]
+fn the_table_shows_args_and_url_secrets_when_asked() {
+    let out = run_list(&fixture("target-secrets.toml"), &["--show-secrets"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("--api-key=sk-notarealkeyjustashape"),
+        "{text}"
+    );
+    assert!(text.contains("?token=notarealtokenjustashape"), "{text}");
+}
+
+#[test]
+fn json_output_redacts_secrets_in_args_and_urls() {
+    let out = run_list(&fixture("target-secrets.toml"), &["--json"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("notarealkeyjustashape"), "{text}");
+    assert!(!text.contains("notarealtokenjustashape"), "{text}");
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        value["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp?token=[redacted]"
+    );
+    assert_eq!(value["servers"]["github"]["args"][1], "server-github");
+}
+
+#[test]
+fn json_output_shows_args_and_url_secrets_when_asked() {
+    let out = run_list(
+        &fixture("target-secrets.toml"),
+        &["--json", "--show-secrets"],
+    );
+    assert!(out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        value["servers"]["linear"]["url"],
+        "https://mcp.linear.app/mcp?token=notarealtokenjustashape"
+    );
+    assert_eq!(
+        value["servers"]["github"]["args"][2],
+        "--api-key=sk-notarealkeyjustashape"
+    );
+}

@@ -28,7 +28,8 @@ enum Command {
         /// Machine-readable output
         #[arg(long)]
         json: bool,
-        /// Print env and header values instead of masking them
+        /// Print env values, header values and target URLs and
+        /// arguments in full instead of masking them
         #[arg(long)]
         show_secrets: bool,
     },

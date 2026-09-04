@@ -1,4 +1,5 @@
 use anyhow::Context as _;
+use mcpgw_core::capture::{RedactionRules, redact_text};
 use mcpgw_core::{Config, Error, Transport, paths};
 
 /// What a masked `env` / `headers` value renders as. The key survives —
@@ -15,31 +16,74 @@ pub fn run(json: bool, show_secrets: bool, color: bool) -> anyhow::Result<()> {
         Err(Error::NotFound { .. }) => Config::empty(),
         Err(err) => return Err(err).with_context(|| format!("cannot load {}", path.display())),
     };
+    // The site's own `[capture] redact` patterns count here too: they name
+    // the credential shapes only this user knows about, and a config already
+    // rejected them at parse time if any of them were unusable.
+    let rules = if show_secrets {
+        None
+    } else {
+        Some(
+            RedactionRules::compile(&config.capture.redact).with_context(|| {
+                format!("cannot compile the redaction rules in {}", path.display())
+            })?,
+        )
+    };
 
     if json {
-        let config = if show_secrets { config } else { masked(config) };
+        let config = match &rules {
+            Some(rules) => masked(config, rules),
+            None => config,
+        };
         println!("{}", serde_json::to_string_pretty(&config)?);
     } else if config.servers.is_empty() {
         println!("no servers configured (config: {})", path.display());
     } else {
-        // The table renders names, transports and tags only, so there is
-        // nothing to mask on this path.
-        print!("{}", crate::render::server_table(&config, color));
+        // TARGET can carry a credential in an argument or in a URL's query
+        // string, so it goes through `redact_text` like every other string
+        // this crate prints.
+        print!(
+            "{}",
+            crate::render::server_table(&config, color, rules.as_ref())
+        );
     }
     Ok(())
 }
 
-/// Replaces every stdio `env` value and every HTTP header value with
-/// [`MASK`]. Both are where API keys and `Authorization: Bearer …` live, and
-/// `--json` output is routinely piped somewhere it outlives the terminal.
-fn masked(mut config: Config) -> Config {
+/// Masks everything in `config` that a reader does not need: every stdio
+/// `env` value and every HTTP header value becomes [`MASK`], and the strings
+/// that are still worth reading — `url`, `args`, `headers_command` — keep
+/// their shape but lose any credential inside them.
+///
+/// `env` and `headers` are where API keys and `Authorization: Bearer …`
+/// live, and `--json` output is routinely piped somewhere it outlives the
+/// terminal. The rest is a `?token=` in a URL or an `--api-key=` in an
+/// argument, which [`redact_text`] takes out while leaving the command line
+/// legible.
+fn masked(mut config: Config, rules: &RedactionRules) -> Config {
     for server in config.servers.values_mut() {
-        let values = match &mut server.transport {
-            Transport::Stdio { env, .. } => env,
-            Transport::Http { headers, .. } => headers,
-        };
-        for value in values.values_mut() {
-            MASK.clone_into(value);
+        match &mut server.transport {
+            Transport::Stdio { args, env, .. } => {
+                for arg in args.iter_mut() {
+                    *arg = redact_text(arg, rules);
+                }
+                for value in env.values_mut() {
+                    MASK.clone_into(value);
+                }
+            }
+            Transport::Http {
+                url,
+                headers_command,
+                headers,
+                ..
+            } => {
+                *url = redact_text(url, rules);
+                for arg in headers_command.iter_mut() {
+                    *arg = redact_text(arg, rules);
+                }
+                for value in headers.values_mut() {
+                    MASK.clone_into(value);
+                }
+            }
         }
     }
     config
@@ -73,7 +117,7 @@ headers = { Authorization = "Bearer t0ken" }
 
     #[test]
     fn masking_keeps_the_keys_and_drops_every_value() {
-        let json = serde_json::to_string(&masked(sample())).unwrap();
+        let json = serde_json::to_string(&masked(sample(), &RedactionRules::builtin())).unwrap();
         assert!(json.contains("GITHUB_TOKEN"), "{json}");
         assert!(json.contains("Authorization"), "{json}");
         assert!(!json.contains("ghp_realsecret"), "{json}");
