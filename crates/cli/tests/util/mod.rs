@@ -216,6 +216,17 @@ pub fn binary_copy(dir: &Path) -> PathBuf {
 pub fn replace_binary(path: &Path) {
     let mut bytes = std::fs::read(path).unwrap();
     bytes.extend_from_slice(b"an upgrade");
+    publish_binary(path, &bytes);
+}
+
+/// [`replace_binary`], with the caller saying what the new file holds.
+///
+/// The tests that publish something which is *not* a working binary need
+/// the same rename-into-place, so that what is under test is the gateway
+/// running the replacement rather than the gateway catching a half-written
+/// file mid-copy.
+#[allow(dead_code)]
+pub fn publish_binary(path: &Path, bytes: &[u8]) {
     let published = path.with_extension("new");
     std::fs::write(&published, bytes).unwrap();
     // Carried over so the replacement is a plausible binary rather than a
