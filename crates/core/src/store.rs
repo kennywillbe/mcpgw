@@ -278,11 +278,16 @@ impl ConfigStore {
             move |source| Error::Io { path, source }
         };
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+        crate::private::create_dir_all(parent).map_err(io_err(parent))?;
         let mut tmp = tempfile::Builder::new()
             .prefix(".config.toml.")
             .tempfile_in(parent)
             .map_err(io_err(parent))?;
+        // The published config holds `env` values and literal `Authorization`
+        // headers, so it gets the owner-only treatment every other writer in
+        // the crate applies rather than leaning on `tempfile`'s unix default,
+        // which has no equivalent off unix.
+        crate::private::harden_file(tmp.path()).map_err(io_err(&self.path))?;
         tmp.write_all(self.doc.to_string().as_bytes())
             .map_err(io_err(&self.path))?;
         // fsync before rename: a crash must yield the old file, never a

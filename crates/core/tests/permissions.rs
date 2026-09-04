@@ -82,3 +82,53 @@ fn the_gateway_record_is_owner_only_under_an_owner_only_dir() {
     assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
     assert_eq!(mode(&state), 0o700, "{:o}", mode(&state));
 }
+
+/// `config.toml` carries `Authorization` headers and `env` values verbatim,
+/// so it and the directory it lands in follow the same rule as everything
+/// under the state dir.
+#[test]
+fn the_config_and_the_dir_holding_it_are_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("config");
+    let path = home.join("config.toml");
+
+    let mut store = mcpgw_core::ConfigStore::edit_or_create(&path).unwrap();
+    let server = mcpgw_core::Server {
+        enabled: true,
+        tags: Vec::new(),
+        calls_per_minute: 0,
+        tools: None,
+        transport: mcpgw_core::Transport::Http {
+            url: "https://example.test/mcp".to_owned(),
+            headers_command: Vec::new(),
+            headers: std::collections::BTreeMap::from([(
+                "Authorization".to_owned(),
+                "Bearer t0ken".to_owned(),
+            )]),
+            auth: None,
+        },
+    };
+    store.upsert_server("x", &server, false).unwrap();
+    store.save().unwrap();
+
+    assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
+    assert_eq!(mode(&home), 0o700, "{:o}", mode(&home));
+}
+
+/// `save` is the one writer that can be asked to recreate the config
+/// directory: the lock it holds survives the directory going away, so which
+/// of the two functions creates that directory — and with which mode —
+/// depends on what happened between opening the store and saving it.
+#[test]
+fn save_recreates_a_vanished_config_dir_owner_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("config");
+    let path = home.join("config.toml");
+
+    let store = mcpgw_core::ConfigStore::edit_or_create(&path).unwrap();
+    std::fs::remove_dir_all(&home).unwrap();
+    store.save().unwrap();
+
+    assert_eq!(mode(&path), 0o600, "{:o}", mode(&path));
+    assert_eq!(mode(&home), 0o700, "{:o}", mode(&home));
+}
