@@ -26,6 +26,11 @@
         },
         {
           "type": "toml",
+          "path": "/crates/cli/Cargo.toml",
+          "jsonpath": "$['dev-dependencies']['mcpgw-core'].version"
+        },
+        {
+          "type": "toml",
           "path": "/crates/test-server/Cargo.toml",
           "jsonpath": "$['dev-dependencies']['mcpgw-core'].version"
         },
