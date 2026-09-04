@@ -193,7 +193,8 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         if let Some(served) = served {
             served?;
         }
-        // Ctrl-C fell through the graceful shutdown: kill the children too.
+        // The shutdown signal fell through the graceful drain: kill the
+        // children too.
         manager.shutdown().await;
         Ok(())
     })
@@ -516,9 +517,9 @@ async fn drain_for_an_upgrade(mut decided: tokio::sync::watch::Receiver<Option<U
     tokio::time::sleep(UPGRADE_DRAIN).await;
 }
 
-/// What the HTTP server drains on: Ctrl-C, or the exe watcher deciding this
-/// gateway must stand aside for the binary that replaced it. Either way both
-/// watchers are stopped on the way out.
+/// What the HTTP server drains on: Ctrl-C, the stop a supervisor sends, or
+/// the exe watcher deciding this gateway must stand aside for the binary that
+/// replaced it. Either way both watchers are stopped on the way out.
 async fn shutdown_signal(
     stop: Arc<tokio::sync::Notify>,
     stop_upgrades: Arc<tokio::sync::Notify>,
@@ -526,12 +527,41 @@ async fn shutdown_signal(
 ) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("\nshutting down"),
+        // The stop every supervisor sends. Its default disposition would end
+        // the process where it stands, which is the crash path: no drain, no
+        // children killed, and a runtime record left claiming this gateway is
+        // still up.
+        () = terminated() => println!("shutting down"),
         // Announced by the watcher already, which is the only party that
         // can say which binary changed.
         () = upgrade_decided(&mut decided) => {}
     }
     stop.notify_one();
     stop_upgrades.notify_one();
+}
+
+/// Resolves on SIGTERM.
+///
+/// Never resolves off Unix, where there is no such signal to catch: Windows
+/// stops a service by other means, and the arm being unreachable there is
+/// what keeps the `select!` above free of a platform split.
+async fn terminated() {
+    #[cfg(unix)]
+    {
+        // A handler that cannot be installed is not worth ending the gateway
+        // over; the arm simply never fires, which is where it started.
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(err) => {
+                eprintln!("warning: this gateway cannot be stopped gracefully: {err:#}");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
 }
 
 /// Resolves once the exe watcher has decided this gateway must stand aside.
