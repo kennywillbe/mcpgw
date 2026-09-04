@@ -7,8 +7,8 @@ use mcpgw_core::doctor::project_unmanaged;
 use mcpgw_core::doctor::{
     ClientBudget, Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
     classify_gateway_failure, classify_problems, client_budget, endpoint_server,
-    gateway_unreachable, needs_oauth, over_tool_cap, tool_cap, tool_drift, unknown_scoped_servers,
-    unmatched_tool_rules, unserved_endpoint,
+    gateway_unreachable, needs_oauth, over_tool_cap, tool_cap, tool_drift, unknown_config_keys,
+    unknown_scoped_servers, unmatched_tool_rules, unserved_endpoint,
 };
 use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
 use mcpgw_core::projects::{ProjectConfig, Standing};
@@ -236,8 +236,9 @@ fn load_canonical(
     plan: &mut ProbePlan,
     command_exists: &dyn Fn(&str) -> bool,
 ) -> Canonical {
-    match Config::load(path) {
-        Ok(config) => {
+    match Config::load_reporting(path) {
+        Ok((config, unknown)) => {
+            findings.extend(unknown_config_keys(&unknown));
             for (name, server) in &config.servers {
                 findings.extend(check_server(None, name, server, command_exists));
                 plan.collect("canonical", name, server);

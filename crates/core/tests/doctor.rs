@@ -601,3 +601,46 @@ command = "npx"
     assert_eq!(findings[0].severity, Severity::Warning);
     assert!(findings[0].message.contains("gone"), "{findings:?}");
 }
+
+/// The unknown-key warnings doctor prints, with the server they belong to
+/// attached so a `--json` reader can group them.
+#[test]
+fn unknown_config_keys_become_warnings_naming_the_path() {
+    use mcpgw_core::config::unknown_keys;
+    use mcpgw_core::doctor::{UNKNOWN_CONFIG_KEY, unknown_config_keys};
+
+    let findings = unknown_config_keys(&unknown_keys(
+        r#"
+version = 1
+[servers.context7]
+type = "stdio"
+command = "npx"
+calls_per_minutes = 10
+[clients.cursor]
+server = ["context7"]
+"#,
+    ));
+    assert_eq!(findings.len(), 2);
+    assert!(findings.iter().all(|f| f.severity == Severity::Warning));
+    assert!(
+        findings.iter().all(|f| f.code == Some(UNKNOWN_CONFIG_KEY)),
+        "{findings:?}"
+    );
+
+    let scoped = &findings[0];
+    assert_eq!(scoped.server, None);
+    assert!(
+        scoped.message.contains("clients.cursor.server") && scoped.message.contains("\"servers\""),
+        "{scoped:?}"
+    );
+
+    let server = &findings[1];
+    assert_eq!(server.server.as_deref(), Some("context7"));
+    assert!(
+        server
+            .message
+            .contains("servers.context7.calls_per_minutes")
+            && server.message.contains("\"calls_per_minute\""),
+        "{server:?}"
+    );
+}

@@ -43,6 +43,34 @@ Required, currently `1`. It's read before anything else, so a config from a
 future mcpgw fails with "unsupported version" instead of a confusing
 field-level parse error.
 
+### Unknown keys
+
+A key mcpgw doesn't recognize is reported, not enforced. The file still loads,
+the key is still ignored, and every place that reads the config says so: the
+gateway prints a warning on start and on each reload that reads one, and
+`mcpgw doctor` reports one warning per key, naming the table path and the
+nearest key it could be a typo of.
+
+```text
+warning: unknown key servers.context7.calls_per_minutes in config.toml —
+did you mean "calls_per_minute"? It is ignored as written
+```
+
+It's worth a warning because a typo in `deny`, `calls_per_minute` or a
+client's `servers` costs you the restriction you wrote, silently: the gateway
+serves everything and nothing looks wrong.
+
+It is deliberately not a parse error. A key this build doesn't know is also
+what a config written by a *newer* mcpgw looks like, and one machine's config
+is routinely read by more than one version — an older CLI alongside an
+upgraded gateway, or the other way round during a staged rollout or a
+downgrade. Refusing to load those would break mixed versions for the sake of
+catching typos, so **a config stays loadable across versions**, and unknown
+keys are diagnostics only.
+
+Two places are not scanned, because their keys are yours: server and client
+names, and the contents of `env` and `headers`.
+
 ### `[servers.NAME]`
 
 `NAME` must match `[a-z0-9-_]`, and may not contain `__` — the name is a URL

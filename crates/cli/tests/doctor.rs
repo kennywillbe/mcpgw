@@ -1034,3 +1034,36 @@ args = ["healthy"]
     // Nothing here is a problem, so nothing here fails the run.
     assert!(out.status.success(), "{text}");
 }
+
+/// A typo in a restriction is a warning that names the key, and the run
+/// still succeeds: the config loads, it just does less than it was meant to.
+#[test]
+fn unknown_config_keys_are_warned_about_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_doctor(
+        dir.path(),
+        Some(
+            r#"
+version = 1
+[servers.build]
+type = "stdio"
+command = "cargo"
+calls_per_minutes = 10
+
+[servers.build.tools]
+deney = ["delete_*"]
+"#,
+        ),
+        &[],
+    );
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("servers.build.calls_per_minutes") && text.contains("\"calls_per_minute\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("servers.build.tools.deney") && text.contains("\"deny\""),
+        "{text}"
+    );
+}

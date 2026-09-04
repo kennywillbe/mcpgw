@@ -1,0 +1,48 @@
+# Every key every config type has, so a new field that nobody taught the
+# unknown-key scan about shows up as a test failure rather than as a warning
+# in a user's doctor output.
+version = 1
+
+[capture]
+redact = ["ticket-[0-9]+"]
+
+[gateway]
+require_token = true
+
+[clients.cursor]
+servers = ["stdio-entry"]
+max_tools = 40
+
+[clients.cursor.tools]
+allow = ["search_*"]
+deny = ["delete_*"]
+drift = "off"
+
+[servers.stdio-entry]
+type = "stdio"
+command = "cargo"
+args = ["run"]
+env = { TOKEN = "x" }
+enabled = true
+tags = ["work"]
+calls_per_minute = 10
+
+[servers.stdio-entry.tools]
+allow = ["search_*"]
+deny = ["delete_*"]
+drift = "off"
+
+[servers.http-entry]
+type = "http"
+url = "https://example.invalid/mcp"
+headers = { X-Api-Version = "1" }
+
+[servers.http-entry.auth]
+client_id = "abc"
+client_secret_env = "EXAMPLE_SECRET"
+scopes = ["read"]
+
+[servers.http-headers-command]
+type = "http"
+url = "https://example.invalid/mcp"
+headers_command = ["printf", "{}"]
