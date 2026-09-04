@@ -239,6 +239,29 @@ pub fn inherited_path() -> Option<String> {
     std::env::var("PATH").ok().filter(|path| !path.is_empty())
 }
 
+/// The `PATH` an installed plist runs the gateway with, read back out of the
+/// file [`render_plist`] wrote.
+///
+/// The counterpart to [`inherited_path`]: the value baked in at install time
+/// is the only record of what the service can actually resolve, and reading
+/// it is what lets `doctor` and `add` tell "that command does not exist" from
+/// "that command exists, but not for the daemon". Line-oriented rather than a
+/// plist parser, because the shape it looks for is the one this file emits;
+/// `None` for a definition written by hand in some other shape is the honest
+/// answer, and every caller already has to handle the no-service case.
+#[must_use]
+pub fn plist_path_env(plist: &str) -> Option<String> {
+    let mut lines = plist.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line == "<key>PATH</key>" {
+            let value = lines.next()?.trim();
+            let value = value.strip_prefix("<string>")?.strip_suffix("</string>")?;
+            return Some(unescape(value)).filter(|path| !path.is_empty());
+        }
+    }
+    None
+}
+
 /// Where the launch agent's plist belongs for the user running mcpgw.
 ///
 /// # Errors
@@ -430,4 +453,13 @@ fn escape(value: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// The inverse of [`escape`], for a value read back out of a plist. `&amp;`
+/// is undone last so an escaped `&amp;lt;` does not come back as `<`.
+fn unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }

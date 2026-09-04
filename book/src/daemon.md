@@ -62,7 +62,9 @@ Two things in it are decisions rather than defaults:
   `/usr/bin:/bin:/usr/sbin:/sbin`, and almost every stdio MCP server is an
   `npx`, `uvx` or `bunx` living somewhere else — so the gateway would come up
   with every stdio server failing to spawn. The cost is that the `PATH` is
-  frozen: change it, or move your config, and re-run `install`.
+  frozen: change it, or move your config, and re-run `install`. `mcpgw add`
+  and `mcpgw doctor` say so when a command stops resolving under it — see
+  [After your PATH moves](#after-your-path-moves).
 
 One thing to avoid: a launch agent cannot read through `~/Desktop`,
 `~/Documents` or `~/Downloads` unless it has been granted Full Disk Access,
@@ -153,7 +155,9 @@ Four of those lines are decisions rather than defaults:
   `npx`, `uvx` or `bunx` living under `~/.local/bin` or a version manager's
   shim directory — so the gateway would come up with every stdio server
   failing to spawn. The cost is that the `PATH` is frozen: change it, or move
-  your config, and re-run `install`.
+  your config, and re-run `install`. `mcpgw add` and `mcpgw doctor` say so
+  when a command stops resolving under it — see
+  [After your PATH moves](#after-your-path-moves).
 
 `stop` and `start` are `systemctl --user stop` / `start` on that unit, and
 `uninstall` disables it, deletes the file and reloads. Uninstalling something
@@ -355,6 +359,61 @@ service   runs mcpgw 0.4.0; you are running 0.4.1 — run `mcpgw daemon install`
 That one is only ever said about a gateway that answered the probe: the
 running gateway writes down what it is, and a file left behind by a crash is
 not a version anybody is serving.
+
+## After your PATH moves
+
+The `PATH` in the plist or the unit is the one the shell you installed from
+had, and nothing re-reads it afterwards. That is deliberate — it is what makes
+an `npx` or `uvx` server work under a supervisor at all — but it means the
+service keeps looking on yesterday's `PATH`. Install a new node with `nvm`,
+`asdf`, `volta` or `mise`, or install the daemon from a login shell that had
+not sourced the version manager yet, and you get a server that starts when you
+run it by hand and dies before the MCP handshake under the daemon:
+
+```text
+connection closed: initialize response
+```
+
+`mcpgw add` and `mcpgw doctor` now tell that apart from a command that is
+simply not installed. Both resolve a bare stdio command twice — once on your
+own `PATH`, once on the one the installed service definition records — and say
+so when only the first one finds it:
+
+```text
+playwright  "npx" resolves in your shell (/Users/you/.nvm/versions/node/v22.23.1/bin/npx) but not
+            on the PATH the gateway service was installed with, so the daemon cannot start it —
+            re-run `mcpgw daemon install` from this shell to refresh that PATH, or use the
+            absolute path /Users/you/.nvm/versions/node/v22.23.1/bin/npx
+```
+
+There are three ways out, and which one is right depends on why the two
+disagree:
+
+- **`mcpgw daemon install`, from a shell where the command works.** The
+  install re-bakes that shell's `PATH`, so this is the fix when your shell's
+  `PATH` is the one you want the daemon to have.
+- **Spell the command as an absolute path.** No `PATH` decides it, so nothing
+  about it can go stale — at the cost of pinning a version manager's directory,
+  which moves on the next node upgrade.
+- **Give that one server its own `PATH`.** `mcpgw add <name> --force --env
+  PATH=... -- <command>` reaches the child whatever the daemon's own
+  environment is, which is what to reach for when only one server needs a
+  toolchain the rest of the machine does not have.
+
+In `doctor` this is a warning rather than an error: the entry is spelled
+correctly and a foreground `mcpgw serve` starts it perfectly — what is broken
+is only the daemon's ability to find it. A server carrying its own `PATH` in
+`env`, a command already spelled as a path, and a machine with no service
+installed are all silent, since none of them has two `PATH`s to disagree.
+
+If a spawn does fail anyway, the gateway's own log says which `PATH` it looked
+on rather than only that the file was not found:
+
+```text
+spawn failed: "npx" is not on the PATH this gateway searched (/usr/bin:/bin:/usr/sbin:/sbin) —
+a service runs with the PATH it was installed with, so re-run `mcpgw daemon install` from a
+shell where "npx" resolves, or give the absolute path
+```
 
 ## Status
 

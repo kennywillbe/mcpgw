@@ -412,6 +412,44 @@ pub fn render_unit(spec: &DaemonSpec, path_env: Option<&str>) -> String {
     )
 }
 
+/// The `PATH` an installed unit runs the gateway with, read back out of the
+/// file [`render_unit`] wrote.
+///
+/// The counterpart to `inherited_path`: the value baked in at install time is
+/// the only record of what the service can actually resolve, and reading it
+/// is what lets `doctor` and `add` tell "that command does not exist" from
+/// "that command exists, but not for the daemon". Line-oriented rather than a
+/// unit parser, because the shape it looks for is the one this file emits;
+/// `None` for a definition written by hand in some other shape is the honest
+/// answer, and every caller already has to handle the no-service case.
+#[must_use]
+pub fn unit_path_env(unit: &str) -> Option<String> {
+    unit.lines()
+        .filter_map(|line| line.trim().strip_prefix("Environment="))
+        .filter_map(|value| {
+            unquoted(value.trim())
+                .strip_prefix("PATH=")
+                .map(str::to_owned)
+        })
+        .find(|path| !path.is_empty())
+}
+
+/// The inverse of [`quoted`], for a value read back out of a unit: drops the
+/// surrounding quotes an install added around a value with spaces in it, and
+/// undoes both escapes it applied inside them.
+fn unquoted(value: &str) -> String {
+    let inner = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .map_or_else(
+            || value.to_owned(),
+            |quoted| quoted.replace("\\\"", "\"").replace("\\\\", "\\"),
+        );
+    // systemd expands `%x` in unit values, so a literal percent was written
+    // doubled and has to be halved on the way back.
+    inner.replace("%%", "%")
+}
+
 /// The `PATH` an install should bake into the unit: the one it was run with.
 ///
 /// A user unit otherwise inherits the manager's own minimal `PATH`, and

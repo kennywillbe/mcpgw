@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use mcpgw_core::daemon::launchd::{LABEL, Launchd, plist_path, render_plist};
+use mcpgw_core::daemon::launchd::{LABEL, Launchd, plist_path, plist_path_env, render_plist};
 use mcpgw_core::daemon::{DaemonSpec, LogPaths, ServiceManager as _, ServiceStatus};
 
 fn spec() -> DaemonSpec {
@@ -149,6 +149,28 @@ fn the_agent_goes_where_launchd_looks_for_per_user_agents() {
         path.display()
     );
     assert!(path.is_absolute(), "{}", path.display());
+}
+
+/// The read half of the same file: what a later `doctor` or `add` learns
+/// about the PATH the service actually runs with, XML escapes undone.
+#[test]
+fn the_baked_path_is_read_back_out_of_the_plist() {
+    let plain = render_plist(&spec(), Some("/opt/homebrew/bin:/usr/bin"));
+    assert_eq!(
+        plist_path_env(&plain).as_deref(),
+        Some("/opt/homebrew/bin:/usr/bin")
+    );
+
+    let awkward = render_plist(&spec(), Some("/Users/u/Ben & Co/bin:/usr/bin"));
+    assert_eq!(
+        plist_path_env(&awkward).as_deref(),
+        Some("/Users/u/Ben & Co/bin:/usr/bin")
+    );
+
+    // Nothing baked, and something that is not a plist at all.
+    assert_eq!(plist_path_env(&render_plist(&spec(), None)), None);
+    assert_eq!(plist_path_env("<key>PATH</key>\n<string></string>"), None);
+    assert_eq!(plist_path_env("hello"), None);
 }
 
 /// Read-only, so it is safe on a developer's machine whether or not they have

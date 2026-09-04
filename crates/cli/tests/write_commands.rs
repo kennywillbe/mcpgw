@@ -3,6 +3,8 @@ use std::process::Output;
 
 use assert_cmd::Command;
 
+mod util;
+
 fn mcpgw(config: &Path, args: &[&str]) -> Output {
     Command::cargo_bin("mcpgw")
         .unwrap()
@@ -70,6 +72,71 @@ fn add_creates_config_from_template() {
 
     let unmasked = list_json_with(&config, &["--show-secrets"]);
     assert_eq!(unmasked["servers"]["github"]["env"]["TOKEN"], "t");
+}
+
+/// The warning that turns "the daemon says connection closed" into a
+/// sentence: the command runs here, and the PATH the service was installed
+/// with cannot find it.
+#[cfg(unix)]
+#[test]
+fn add_warns_when_the_daemon_could_not_start_the_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let empty = dir.path().join("empty-bin");
+    std::fs::create_dir(&empty).unwrap();
+    util::install_fixture_service(dir.path(), &empty.display().to_string());
+
+    let out = add_in_home(dir.path(), &config, &["add", "build", "--", "cargo", "mcp"]);
+    let said = stderr(&out);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("resolves in your shell"), "{said}");
+    assert!(said.contains("`mcpgw daemon install`"), "{said}");
+    assert!(said.contains("--env PATH="), "{said}");
+
+    // The entry is still written exactly as it was asked for: the daemon's
+    // PATH is a fact about this machine, not a reason to refuse a command.
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("command = \"cargo\""), "{text}");
+    assert!(text.contains("args = [\"mcp\"]"), "{text}");
+
+    // A server carrying its own PATH reaches the child whatever the service
+    // was installed with, so there is nothing to warn about.
+    let out = add_in_home(
+        dir.path(),
+        &config,
+        &[
+            "add",
+            "build",
+            "--force",
+            "--env",
+            "PATH=/whatever",
+            "--",
+            "cargo",
+            "mcp",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("resolves in your shell"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// `add` in a home of the test's own, which is where the service definition
+/// it reads has to live.
+#[cfg(unix)]
+fn add_in_home(home: &Path, config: &Path, args: &[&str]) -> Output {
+    Command::cargo_bin("mcpgw")
+        .unwrap()
+        .env("MCPGW_NO_UPDATE_CHECK", "1")
+        .args(args)
+        .env("MCPGW_CONFIG", config)
+        .env("HOME", home)
+        .env("MCPGW_STATE_DIR", home.join("state"))
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap()
 }
 
 #[test]

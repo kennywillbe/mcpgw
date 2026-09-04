@@ -35,6 +35,11 @@ arc-swap.workspace = true
 tower-service.workspace = true
 regex.workspace = true
 sha2.workspace = true
+# PATH resolution, for the two questions `daemon_check` asks about one stdio
+# command: does your shell find it, and does the PATH the installed service
+# was baked with find it. The CLI already resolves commands through this
+# crate, so both halves of the workspace answer "is it on PATH" the same way.
+which.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
