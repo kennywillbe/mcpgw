@@ -80,7 +80,11 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
         Ok(policy) => policy,
         Err(err) => return Ok(no_service(cx, &format!("{err:#}"))),
     };
-    if let Err(err) = mcpgw_core::daemon::preflight(&spec, policy) {
+    if let Err(err) = mcpgw_core::daemon::preflight(
+        &spec,
+        policy,
+        crate::commands::token::bind_policy(&spec.state_dir),
+    ) {
         return match err {
             DaemonError::PortInUse { .. } => port_taken(cx, &service, &spec),
             other => Ok(no_service(cx, &other.to_string())),
@@ -197,7 +201,11 @@ fn install(
         Ok(policy) => policy,
         Err(err) => return Ok(no_service(cx, &format!("{err:#}"))),
     };
-    if let Err(err) = mcpgw_core::daemon::preflight(&spec, policy) {
+    if let Err(err) = mcpgw_core::daemon::preflight(
+        &spec,
+        policy,
+        crate::commands::token::bind_policy(&spec.state_dir),
+    ) {
         return Ok(no_service(cx, &err.to_string()));
     }
     if policy == mcpgw_core::daemon::PortPolicy::OwnServiceReinstall {

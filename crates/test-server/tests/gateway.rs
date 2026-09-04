@@ -7,8 +7,10 @@ use mcpgw_core::capture::{
 };
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{
-    Gateway, MAX_TOOL_PAGES, NO_TOOLS_HERE, not_allowed, over_budget, serve_http, serve_http_with,
+    Gateway, GatewayAuth, MAX_TOOL_PAGES, NO_TOOLS_HERE, not_allowed, over_budget, serve_http,
+    serve_http_with,
 };
+use mcpgw_core::gateway_token::GatewayToken;
 use mcpgw_core::pins::Change;
 use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
@@ -485,7 +487,12 @@ async fn serve_both(
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_http_with(endpoints, listener, std::future::pending()));
+    tokio::spawn(serve_http_with(
+        endpoints,
+        GatewayAuth::open(),
+        listener,
+        std::future::pending(),
+    ));
     (addr, manager)
 }
 
@@ -3058,5 +3065,143 @@ async fn a_throttled_call_never_reaches_the_upstream() {
     assert!(!first.to_string().contains("over its budget"), "{first}");
     let second = client.call_tool(call("echo", "x")).await.unwrap_err();
     assert!(second.to_string().contains("over its budget"), "{second}");
+    manager.shutdown().await;
+}
+
+/// Serves one pipe endpoint holding `token`, with the grace period on or off,
+/// and returns the address.
+async fn serve_authenticated(
+    token: &str,
+    require: bool,
+) -> (std::net::SocketAddr, Arc<UpstreamManager>) {
+    let manager = manager(&[("fx", "healthy")]);
+    let endpoints = Endpoints::new(EndpointTable::new([(
+        "fx".to_owned(),
+        Gateway::new(Arc::clone(&manager), "fx".to_owned()),
+    )]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(serve_http_with(
+        endpoints,
+        GatewayAuth::new(GatewayToken::from_secret(token), require),
+        listener,
+        std::future::pending(),
+    ));
+    (addr, manager)
+}
+
+/// One raw `GET` of `path`, which is what `daemon status` and `doctor` do to
+/// ask whether anything is listening.
+async fn raw_get(addr: std::net::SocketAddr, path: &str) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = vec![0u8; 256];
+    let read = stream.read(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response[..read]).into_owned()
+}
+
+#[tokio::test]
+async fn the_right_token_reaches_the_endpoint() {
+    let (addr, manager) = serve_authenticated("t0ken", true).await;
+    let response = raw_post_body(
+        addr,
+        &endpoint_path("fx"),
+        None,
+        &[("Authorization", "Bearer t0ken")],
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+    )
+    .await;
+    assert!(response.contains("200"), "{response}");
+    assert!(!response.contains("401"), "{response}");
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn during_the_grace_period_a_loopback_client_without_the_token_still_passes() {
+    let (addr, manager) = serve_authenticated("t0ken", false).await;
+    // Wrong token and no token alike: this release answers a loopback client
+    // whatever it presents, and says so once on stderr.
+    for header in [&[][..], &[("Authorization", "Bearer wrong")][..]] {
+        let response = raw_post_body(
+            addr,
+            &endpoint_path("fx"),
+            None,
+            header,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        )
+        .await;
+        assert!(!response.contains("401"), "{header:?} -> {response}");
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn require_token_refuses_the_wrong_token_with_a_bearer_challenge() {
+    let (addr, manager) = serve_authenticated("t0ken", true).await;
+    for header in [&[][..], &[("Authorization", "Bearer wrong")][..]] {
+        let response = raw_post_body(
+            addr,
+            &endpoint_path("fx"),
+            None,
+            header,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+        )
+        .await;
+        assert!(response.contains("401"), "{header:?} -> {response}");
+        // Bare `Bearer`, with no `realm` and no `resource_metadata`: this is
+        // a static token and there is no authorization server for a client
+        // to go and discover.
+        assert!(
+            response
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("www-authenticate: Bearer")),
+            "{response}"
+        );
+        assert!(response.contains("mcpgw sync"), "{response}");
+    }
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_liveness_probe_stays_open_and_the_endpoints_do_not() {
+    let (addr, manager) = serve_authenticated("t0ken", true).await;
+    // What `daemon status` asks. It reaches no server and carries none of the
+    // user's data, and a status that cannot answer is worth more than the
+    // nothing it would protect.
+    let probe = raw_get(addr, "/mcp").await;
+    assert!(!probe.contains("401"), "{probe}");
+
+    // Everything else on the same gateway is closed, `/mcp` included the
+    // moment it stops being the bare probe.
+    let endpoint = raw_get(addr, &endpoint_path("fx")).await;
+    assert!(endpoint.contains("401"), "{endpoint}");
+    let post = raw_post_to(addr, "/mcp", None).await;
+    assert!(post.contains("401"), "{post}");
+    manager.shutdown().await;
+}
+
+/// A bind past loopback is only allowed under `require_token`, which is the
+/// same rule the daemon preflight enforces — so what a remote client meets
+/// there is what a loopback client meets here with the grace period spent.
+/// Simulated rather than bound: a second loopback address needs an interface
+/// alias on macOS, and the rule under test is the one the flag decides.
+#[tokio::test]
+async fn a_gateway_that_requires_the_token_refuses_every_client_without_it() {
+    let (addr, manager) = serve_authenticated("t0ken", true).await;
+    let refused = raw_post_body(
+        addr,
+        &endpoint_path("fx"),
+        None,
+        &[],
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    )
+    .await;
+    assert!(refused.contains("401"), "{refused}");
     manager.shutdown().await;
 }

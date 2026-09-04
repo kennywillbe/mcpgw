@@ -464,6 +464,83 @@ pub fn gateway_unreachable(base: &str) -> Finding {
     }
 }
 
+/// The code on the finding for a managed entry with no gateway token in it.
+pub const MISSING_TOKEN: &str = "missing_gateway_token";
+
+/// The code on the finding for a gateway listening past loopback with nothing
+/// to authenticate its clients.
+pub const UNAUTHENTICATED_BIND: &str = "unauthenticated_bind";
+
+/// The warning for a managed gateway entry that carries no install token.
+///
+/// A warning rather than an error because the gateway still answers it: this
+/// release lets an unauthenticated loopback request through and logs once.
+/// The next one will not, which is what makes saying it now worth a line.
+///
+/// [`None`] for a client whose entries cannot carry the token at all — Zed,
+/// whose remote entry holds no headers, and Claude Desktop, whose entry is an
+/// `mcpgw connect` bridge that reads the token off the disk. Neither is
+/// missing anything, and a permanent warning naming a fix that does not exist
+/// is how a report stops being read.
+#[must_use]
+pub fn missing_gateway_token(
+    client: &str,
+    entry: &str,
+    server: &Server,
+    carries_token: bool,
+) -> Option<Finding> {
+    if !carries_token {
+        return None;
+    }
+    let Transport::Http { headers, .. } = &server.transport else {
+        return None;
+    };
+    if headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"))
+    {
+        return None;
+    }
+    Some(Finding {
+        client: Some(client.to_owned()),
+        server: Some(entry.to_owned()),
+        severity: Severity::Warning,
+        message: "reaches the gateway without its install token — run `mcpgw sync` \
+                  (the next release stops answering entries without one)"
+            .to_owned(),
+        code: Some(MISSING_TOKEN),
+    })
+}
+
+/// The error for a gateway bound past loopback that requires no token.
+///
+/// The one finding in this file about the *gateway's* configuration rather
+/// than a client's, and an error rather than a warning: an address other
+/// machines can reach, answering without a credential, hands every server —
+/// and the OAuth logins behind them — to anything that can route to it.
+///
+/// `require_token` is `[gateway] require_token`. A token that exists but is
+/// not yet required is not a boundary: the grace period still admits an
+/// unauthenticated loopback request, and a remote one is refused only because
+/// it is remote, which is a rule this bind has just removed the point of.
+#[must_use]
+pub fn unauthenticated_bind(bind: &str, require_token: bool) -> Option<Finding> {
+    if crate::daemon::is_loopback(bind) || require_token {
+        return None;
+    }
+    Some(Finding {
+        client: None,
+        server: None,
+        severity: Severity::Error,
+        message: format!(
+            "the gateway is bound to {bind}, which is not loopback, and does not require its \
+             install token — set `[gateway] require_token = true` and `mcpgw sync`, or bind \
+             127.0.0.1"
+        ),
+        code: Some(UNAUTHENTICATED_BIND),
+    })
+}
+
 /// Findings for an endpoint the running gateway does not serve: one per
 /// entry, because each one is a separate client file somebody has to fix.
 #[must_use]

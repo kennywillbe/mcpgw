@@ -144,6 +144,22 @@ impl ClientKind {
         !matches!(self, Self::ClaudeDesktop)
     }
 
+    /// Whether a gateway entry written for this client can carry the install
+    /// token.
+    ///
+    /// Two clients cannot, for two different reasons, and both fall back to
+    /// the same place. Claude Desktop has no remote entry shape at all, so
+    /// its entry is an `mcpgw connect` bridge — which reads the token out of
+    /// the state directory rather than out of the config file, and is the
+    /// better half of the deal. Zed has one but it holds no headers; see
+    /// [`EntrySchema::carries_headers`].
+    ///
+    /// [`EntrySchema::carries_headers`]: crate::clients::codec::EntrySchema::carries_headers
+    #[must_use]
+    pub fn carries_gateway_token(self) -> bool {
+        self.supports_http_entries() && self.codec().entries.carries_headers()
+    }
+
     /// How this client's config is stored, addressed and shaped.
     ///
     /// Most clients here are plain-JSON `mcpServers` maps. VS Code renames

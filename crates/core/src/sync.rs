@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::clients::codec::{self, ClientDocument};
 use crate::clients::{self, ClientKind};
 use crate::config::{Server, Transport};
+use crate::gateway_token::GatewayToken;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncPlan {
@@ -311,6 +312,12 @@ pub fn apply_plan(
 /// same canonical server, reached differently, and [`plan_sync`] stays the one
 /// place that decides a disabled server is not mirrored.
 ///
+/// `token` is the install's gateway token, and lands in the entry as
+/// `Authorization: Bearer …` for every client whose entries carry headers.
+/// The bridge shape gets none: `mcpgw connect` reads the token off the state
+/// directory itself, which keeps the secret out of a config file that did not
+/// need to hold one.
+///
 /// # Errors
 ///
 /// Returns the parse error when `base_url` is not an absolute URL.
@@ -320,12 +327,13 @@ pub fn per_server_gateway_server(
     server: &Server,
     base_url: &str,
     bridge_command: &str,
+    token: Option<&GatewayToken>,
 ) -> Result<Server, url::ParseError> {
     let transport = if kind.supports_http_entries() {
         Transport::Http {
             url: crate::endpoints::per_server_url(base_url, name)?,
             headers_command: Vec::new(),
-            headers: BTreeMap::new(),
+            headers: gateway_headers(kind, token),
             // The client entry points at the gateway, and the gateway is the
             // one holding the upstream's credential — a client that carried
             // the server's `[auth]` would be a client mcpgw had told to log
@@ -373,15 +381,36 @@ pub fn per_server_gateway_servers(
     canonical: &BTreeMap<String, Server>,
     base_url: &str,
     bridge_command: &str,
+    token: Option<&GatewayToken>,
 ) -> Result<BTreeMap<String, Server>, url::ParseError> {
     canonical
         .iter()
         .map(|(name, server)| {
-            let entry = per_server_gateway_server(kind, name, server, base_url, bridge_command)?;
+            let entry =
+                per_server_gateway_server(kind, name, server, base_url, bridge_command, token)?;
             Ok((name.clone(), entry))
         })
         .collect()
 }
+
+/// The headers a gateway entry for `kind` carries: the install token, or
+/// nothing at all.
+///
+/// Nothing is written for a client that cannot send it. An entry holding a
+/// header its client drops is worse than one holding none — it reads as
+/// authenticated in every listing and in `doctor`, and fails at the first
+/// call.
+fn gateway_headers(kind: ClientKind, token: Option<&GatewayToken>) -> BTreeMap<String, String> {
+    match token.filter(|_| kind.carries_gateway_token()) {
+        Some(token) => BTreeMap::from([(GATEWAY_AUTH_HEADER.to_owned(), token.header_value())]),
+        None => BTreeMap::new(),
+    }
+}
+
+/// The header name the token travels under, in the casing every client file
+/// on this machine will be written with. One spelling, because `eject` and
+/// `doctor` both look the entry up by it.
+pub const GATEWAY_AUTH_HEADER: &str = "Authorization";
 
 /// The client-shaped value for one canonical server, as its codec spells it.
 #[must_use]

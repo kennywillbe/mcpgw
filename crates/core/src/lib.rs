@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod endpoints;
 pub mod error;
 pub mod gateway;
+pub mod gateway_token;
 pub mod headers;
 pub mod import;
 pub mod paths;
@@ -25,7 +26,9 @@ pub mod upgrade;
 pub mod upstream;
 
 pub use clients::{ClientKind, ClientRead, Detection, Problem};
-pub use config::{Capture, Config, Drift, SUPPORTED_VERSION, Server, ToolRules, Transport};
+pub use config::{
+    Capture, Config, Drift, GatewaySettings, SUPPORTED_VERSION, Server, ToolRules, Transport,
+};
 pub use doctor::{Finding, Severity};
 pub use error::Error;
 pub use store::ConfigStore;

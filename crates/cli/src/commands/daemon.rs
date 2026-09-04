@@ -128,8 +128,9 @@ pub struct AddressArgs {
     /// to the port the service was installed with]
     #[arg(long)]
     pub port: Option<u16>,
-    /// Address the service should bind. Loopback only — see `mcpgw daemon
-    /// install --help` output on refusal [default: 127.0.0.1]
+    /// Address the service should bind. Loopback only, unless `[gateway]
+    /// require_token = true` and this install has a token [default:
+    /// 127.0.0.1]
     #[arg(long)]
     pub bind: Option<String>,
 }
@@ -161,7 +162,11 @@ fn install(address: &AddressArgs) -> anyhow::Result<()> {
     // not refused as if a stranger held the port. A supervisor that cannot
     // be queried at all decides nothing, and the refusal stands.
     let policy = port_policy(service.query().ok().as_ref(), &spec)?;
-    mcpgw_core::daemon::preflight(&spec, policy)?;
+    // Minted here if this install has never served: the token has to exist
+    // before the bind is judged against it, and before `sync` can write it
+    // into a client entry that will dial the service being installed.
+    let (token, minted) = super::token::ensure(&spec.state_dir)?;
+    preflight(&spec, policy)?;
     if policy == PortPolicy::OwnServiceReinstall {
         println!("{}", reinstall_notice(&spec.state_dir));
     }
@@ -185,6 +190,12 @@ fn install(address: &AddressArgs) -> anyhow::Result<()> {
         println!("  {note}");
     }
     println!("it will answer on {}", spec.url());
+    if minted {
+        println!(
+            "issued this install's gateway token ({}) — `mcpgw sync` writes it into your clients",
+            token.masked()
+        );
+    }
     Ok(())
 }
 
@@ -216,6 +227,26 @@ fn run_service(args: &SpecArgs) -> anyhow::Result<u8> {
     std::process::exit(0);
 }
 
+/// The shared preflight, with the one thing the refusal itself cannot say.
+///
+/// [`mcpgw_core::daemon::preflight`] is the single place the rules live and
+/// the message is one sentence for all three supervisors; what it has no way
+/// to know is whether *this* install could make the bind allowed. That is a
+/// question about the token, so it is answered here.
+fn preflight(spec: &DaemonSpec, policy: PortPolicy) -> anyhow::Result<()> {
+    let result =
+        mcpgw_core::daemon::preflight(spec, policy, super::token::bind_policy(&spec.state_dir));
+    if matches!(result, Err(DaemonError::NonLoopbackBind { .. })) {
+        eprintln!("hint: {BIND_HINT}");
+    }
+    Ok(result?)
+}
+
+/// How to make a bind past loopback allowed rather than refused.
+const BIND_HINT: &str = "a gateway whose clients authenticate may bind anywhere — set \
+     `[gateway] require_token = true` in your config, run `mcpgw sync` so every client \
+     carries this install's token, then install again";
+
 fn uninstall() -> anyhow::Result<()> {
     let service = mcpgw_core::daemon::platform_service();
     service.uninstall()?;
@@ -238,7 +269,7 @@ fn start(address: &AddressArgs) -> anyhow::Result<()> {
     // An address the user did not name comes from the record, so a service
     // installed on 18137 comes back on 18137.
     let spec = spec(address, installed.as_ref())?;
-    mcpgw_core::daemon::preflight(&spec, PortPolicy::MustBeFree)?;
+    preflight(&spec, PortPolicy::MustBeFree)?;
     let service = mcpgw_core::daemon::platform_service();
     service.start(&spec)?;
     println!("started the mcpgw gateway service on {}", spec.url());

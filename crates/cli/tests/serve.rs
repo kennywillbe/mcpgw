@@ -471,3 +471,38 @@ async fn serve_capturing(home: &Path, args: &[&str]) -> (tokio::process::Child, 
     write_config(&home.join("config.toml"), &fixture_config(&["fx1"]));
     util::serve_with(home, &[], args).await
 }
+
+/// The grace period, end to end: a gateway holds a token, a client arrives
+/// without one, and the gateway answers it and says so exactly once. The line
+/// is the whole of the warning anybody gets before the next release stops
+/// answering, so it is worth a test that watches a real gateway print it.
+#[tokio::test]
+async fn a_client_without_the_token_is_answered_and_named_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_config(&home.join("config.toml"), &fixture_config(&["fx1"]));
+    let (mut child, addr, _endpoints, errors) =
+        util::serve_binary(&assert_cmd::cargo::cargo_bin("mcpgw"), home, &[]).await;
+
+    // The gateway minted its token at startup and holds it in memory. Taking
+    // the file away is how a bridge in the same sandbox becomes a client that
+    // has not been re-synced.
+    let state = home.join("state");
+    std::fs::remove_file(mcpgw_core::gateway_token::GatewayToken::path(&state)).unwrap();
+
+    assert_eq!(
+        tool_names(&format!("http://{addr}/s/fx1")).await,
+        ["echo", "reverse"]
+    );
+    wait_for_stderr(&errors, "run mcpgw sync").await;
+
+    // Once per process: a second client says nothing further.
+    let before = errors.lock().unwrap().matches("run mcpgw sync").count();
+    let _ = tool_names(&format!("http://{addr}/s/fx1")).await;
+    assert_eq!(
+        errors.lock().unwrap().matches("run mcpgw sync").count(),
+        before
+    );
+
+    child.kill().await.unwrap();
+}

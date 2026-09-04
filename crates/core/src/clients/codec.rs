@@ -255,6 +255,29 @@ impl EntrySchema {
         }
     }
 
+    /// Whether a remote entry in this shape carries an `Authorization` header
+    /// the client is known to send.
+    ///
+    /// Every schema here has somewhere to *put* one — the key differs
+    /// (`http_headers` in Codex, `headers` everywhere else) and
+    /// [`emit`](Self::emit) writes it — but Zed's `context_servers` entries
+    /// are documented as a URL and nothing else, and no run in the matrix has
+    /// confirmed that a header written into one reaches the request. So it is
+    /// left out, because the failure is silent in the worst direction: an
+    /// entry holding a header its client drops reads as authenticated in the
+    /// file, in `mcpgw list` and in `doctor`, and fails at the first call with
+    /// nothing anywhere saying why. An entry that plainly carries none is at
+    /// least true.
+    ///
+    /// What that costs Zed is the gateway token, not the gateway: its entries
+    /// stay loopback-only, which is what every entry was before this existed,
+    /// and a Zed that has to reach a gateway past loopback goes through the
+    /// `mcpgw connect` bridge, which reads the token off the disk itself.
+    #[must_use]
+    pub fn carries_headers(self) -> bool {
+        !matches!(self, Self::Zed)
+    }
+
     /// Fields on an entry that belong to the client, not to mcpgw.
     ///
     /// [`EntrySchema::emit`] builds an entry from the canonical server alone,

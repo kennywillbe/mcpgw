@@ -20,6 +20,12 @@ those; it only changed what your *clients* were pointed at. Eject
 writes the originals back under the same names, so a gateway entry is a plain
 update over the entry it already occupies, not a remove and an add.
 
+The gateway token goes with them. `sync` wrote it into each entry as an
+`Authorization: Bearer` header, and eject writes the original definition back
+over that entry — headers and all — so nothing is left holding a credential
+for a gateway the client no longer talks to. Nothing hunts for it: it was
+never part of your server definition, so restoring the definition removes it.
+
 Everything else in the file is left alone: entries mcpgw never wrote, other
 settings, comments, formatting.
 
@@ -72,7 +78,8 @@ dimmed line and no question.
 ## What eject does not delete
 
 Your data is yours. Eject rewrites client configs and stops there — the
-canonical config, the state directory and the binary all stay, and the closing
+canonical config, the state directory (gateway token, OAuth logins, backups
+and traffic log included) and the binary all stay, and the closing
 screen names them so a full uninstall is three deletions you make yourself:
 
 ```text

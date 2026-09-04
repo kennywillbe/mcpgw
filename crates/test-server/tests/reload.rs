@@ -72,7 +72,12 @@ impl Harness {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_http_with(endpoints, listener, std::future::pending()));
+        tokio::spawn(serve_http_with(
+            endpoints,
+            mcpgw_core::gateway::GatewayAuth::open(),
+            listener,
+            std::future::pending(),
+        ));
         Self {
             addr,
             path,

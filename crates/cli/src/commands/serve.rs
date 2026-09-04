@@ -4,7 +4,7 @@ use anyhow::{Context as _, bail};
 use mcpgw_core::Config;
 use mcpgw_core::capture::{Bodies, CapturePolicy, CaptureWriter, RedactionRules};
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
-use mcpgw_core::gateway::serve_http_with;
+use mcpgw_core::gateway::{GatewayAuth, serve_http_with};
 use mcpgw_core::reload::{POLL_INTERVAL, Reloader};
 use mcpgw_core::runtime::GatewayRecord;
 use mcpgw_core::upgrade::{self, UpgradeRestart};
@@ -96,7 +96,11 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 
     let selected = select(args, &config, &config_path)?;
 
-    warn_if_reachable(&args.bind);
+    // Before the listener, because a token that cannot be written is a
+    // gateway nobody can be synced to, and finding that out after the banner
+    // would be finding it out in a log.
+    let auth = gateway_auth(&config)?;
+    warn_if_reachable(&args.bind, &auth);
     let Built {
         manager,
         endpoints,
@@ -120,7 +124,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         // the port the kernel actually handed out rather than the zero it
         // asked for.
         let (state_dir, record) = publish_record(&args.bind, addr.port(), args.supervised).unzip();
-        print_banner(addr, &serving, &capture_note);
+        print_banner(addr, &serving, &capture_note, &auth.note);
 
         // `notify_one` rather than `notify_waiters`: it leaves a permit
         // behind, so the watcher is stopped even if Ctrl-C lands while it is
@@ -158,7 +162,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             Arc::clone(&stop_upgrades),
             decided.clone(),
         );
-        let mut served = std::pin::pin!(serve_http_with(endpoints, listener, shutdown));
+        let mut served = std::pin::pin!(serve_http_with(endpoints, auth.auth, listener, shutdown));
         // Only the upgrade path is ever cut short: the drain cannot resolve
         // before the watcher has decided, and a Ctrl-C shutdown is allowed
         // to take as long as its clients need.
@@ -255,18 +259,71 @@ pub(crate) fn build(
     })
 }
 
-/// Says once, loudly, that this gateway is reachable by other people.
+/// The gateway's own credential, plus the banner line describing it.
+struct Auth {
+    auth: GatewayAuth,
+    note: String,
+}
+
+/// Reads this install's token, minting one on the first `serve`, and decides
+/// whether the grace period still applies.
 ///
-/// The same classification `mcpgw daemon` refuses to install past, so a bind
-/// that only warns here can never quietly become one that passes there.
-fn warn_if_reachable(bind: &str) {
-    if !mcpgw_core::daemon::is_loopback(bind) {
-        eprintln!(
-            "warning: binding to {bind} without any authentication — anyone who can reach \
-             this address can call your MCP servers; keep it behind a trusted network \
-             or reverse proxy until the auth milestone lands"
-        );
+/// A state directory that cannot be written costs the gateway its token
+/// rather than its life: an mcpgw with nowhere to put one has nowhere to put
+/// the OAuth credentials the token exists to protect either, so there is
+/// nothing here worth refusing to serve over. It is said out loud.
+fn gateway_auth(config: &Config) -> anyhow::Result<Auth> {
+    let Some(state_dir) = mcpgw_core::paths::state_dir() else {
+        return Ok(Auth {
+            auth: GatewayAuth::open(),
+            note: "no state directory: serving without a token".to_owned(),
+        });
+    };
+    let (token, minted) = super::token::ensure(&state_dir)?;
+    let require = config.gateway.require_token;
+    let note = match (minted, require) {
+        (true, _) => format!(
+            "issued this install's gateway token ({}) — `mcpgw sync` writes it into your clients",
+            token.masked()
+        ),
+        (false, true) => {
+            "requiring the gateway token on every request ([gateway] require_token)".to_owned()
+        }
+        (false, false) => format!(
+            "gateway token {} required; loopback clients without one still pass this release",
+            token.masked()
+        ),
+    };
+    Ok(Auth {
+        auth: GatewayAuth::new(token, require),
+        note,
+    })
+}
+
+/// Says once, loudly, that this gateway is reachable by other people and
+/// nothing stops them.
+///
+/// Still only a warning, and still only for a foreground `serve`: a person is
+/// reading this terminal and can decide. What `mcpgw daemon` refuses to
+/// install past is the same address with the same reasoning — see
+/// [`BindPolicy`](mcpgw_core::gateway_token::BindPolicy) — so a bind that
+/// warns here can never quietly become one that passes there.
+fn warn_if_reachable(bind: &str, auth: &Auth) {
+    if mcpgw_core::daemon::is_loopback(bind) {
+        return;
     }
+    if auth.auth.requires_token() {
+        eprintln!(
+            "warning: binding to {bind} — anyone who can reach this address and holds \
+             this install's gateway token can call your MCP servers"
+        );
+        return;
+    }
+    eprintln!(
+        "warning: binding to {bind} without any authentication — anyone who can reach \
+         this address can call your MCP servers; set `[gateway] require_token = true` \
+         and `mcpgw sync` your clients, or keep it behind a trusted network"
+    );
 }
 
 /// What a gateway captures under, or [`None`] for no traffic log at all.
@@ -311,8 +368,13 @@ fn capture_writer(
     Ok((Some(Arc::new(writer)), note))
 }
 
-/// The three lines a gateway prints once it is listening.
-fn print_banner(addr: std::net::SocketAddr, serving: &[String], capture_note: &str) {
+/// The four lines a gateway prints once it is listening.
+fn print_banner(
+    addr: std::net::SocketAddr,
+    serving: &[String],
+    capture_note: &str,
+    auth_note: &str,
+) {
     println!(
         "mcpgw gateway listening on http://{addr}/mcp — serving {} server(s): {}",
         serving.len(),
@@ -324,6 +386,7 @@ fn print_banner(addr: std::net::SocketAddr, serving: &[String], capture_note: &s
         .collect();
     println!("per-server endpoints: {}", urls.join(", "));
     println!("{capture_note}");
+    println!("{auth_note}");
 }
 
 /// Starts the watcher that ends this gateway when the binary underneath it

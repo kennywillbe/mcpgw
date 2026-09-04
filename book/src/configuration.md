@@ -322,6 +322,33 @@ config error naming the pattern, so a rule can never quietly match nothing.
 Read once at gateway startup, so an edit needs a restart. See
 [Watching traffic](./traffic.md) for what is redacted without it.
 
+## `[gateway]`
+
+Optional, and absent from a config that never mentions it. One key today:
+
+```toml
+version = 1
+
+[gateway]
+require_token = true
+
+[servers.github]
+type = "stdio"
+command = "npx"
+```
+
+`require_token` ends the one-release grace period on the gateway's install
+token. With it off — the default — the gateway checks the token on every
+request but still answers a **loopback** client that carries none, logging one
+line per process so the state is noticed before the next release stops
+answering it. With it on, the token is required everywhere, and a supervised
+gateway may then bind past loopback (`mcpgw daemon install --bind`), which is
+refused without it.
+
+Read at gateway startup, so an edit needs a restart. The token itself lives in
+the state directory, not here — see
+[`mcpgw token`](./trust-model.md#the-token-is-the-authentication-boundary).
+
 ## Project-level client files
 
 Several clients read a second MCP config from inside the repository, next to
@@ -402,6 +429,7 @@ the repo root.
 ```text
 ~/.local/share/mcpgw/
 ├── managed.json          which server names mcpgw wrote into which file
+├── gateway.token         this install's gateway token, mode 0600
 ├── auth/
 │   └── linear.json       OAuth tokens for one server, mode 0600
 ├── backups/
@@ -423,6 +451,12 @@ re-adopt them with `import`.
 
 **`backups/`** is written before every client file is rewritten. The five most
 recent per client are kept; `mcpgw sync --rollback` restores the newest.
+
+**`gateway.token`** is what clients present to the gateway, written into their
+entries by `sync`. Deleting it costs you nothing permanent: the next `serve`
+mints a new one, and `mcpgw sync` writes that one into the clients. `mcpgw
+token rotate` does both in one command. See
+[Trust model](./trust-model.md#the-token-is-the-authentication-boundary).
 
 **`auth/`** holds one file per logged-in server — see
 [Servers that need OAuth](./auth.md). Deleting one is a logout.

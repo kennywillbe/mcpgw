@@ -14,8 +14,35 @@ pub struct Config {
     // written before the next section starts, and both of these are tables.
     #[serde(default, skip_serializing_if = "Capture::is_default")]
     pub capture: Capture,
+    #[serde(default, skip_serializing_if = "GatewaySettings::is_default")]
+    pub gateway: GatewaySettings,
     #[serde(default)]
     pub servers: BTreeMap<String, Server>,
+}
+
+/// The `[gateway]` table: how the gateway treats the clients that dial it.
+///
+/// Absent from a config that never mentions it, and skipped on the way out,
+/// for the same reason `[capture]` is.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewaySettings {
+    /// Ends the one-release grace period early.
+    ///
+    /// The gateway ships holding the install token against every request but
+    /// letting a *loopback* request without one through, so an install whose
+    /// clients have not been re-synced yet keeps working and says so in the
+    /// log. Turning this on makes the token mandatory everywhere, which is
+    /// also what allows a supervised gateway to bind past loopback — see
+    /// [`crate::gateway_token::BindPolicy`].
+    #[serde(default)]
+    pub require_token: bool,
+}
+
+impl GatewaySettings {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        !self.require_token
+    }
 }
 
 /// The `[capture]` table: what the gateway's traffic log is allowed to keep.
@@ -378,6 +405,7 @@ impl Config {
         Self {
             version: SUPPORTED_VERSION,
             capture: Capture::default(),
+            gateway: GatewaySettings::default(),
             servers: BTreeMap::new(),
         }
     }

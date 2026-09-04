@@ -351,3 +351,74 @@ async fn two_bridges_starting_at_once_end_up_on_one_gateway() {
     ends(one, one_child).await;
     ends(two, two_child).await;
 }
+
+/// The bridge is how the two clients whose entries cannot carry a header
+/// reach an authenticated gateway, so it has to present the token itself —
+/// read off the state directory, which is the only place it was ever written.
+#[tokio::test]
+async fn the_bridge_presents_the_install_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let state = home.join("state");
+    let token = mcpgw_core::gateway_token::GatewayToken::generate();
+    token.save(&state).unwrap();
+
+    let server = Server {
+        enabled: true,
+        tags: Vec::new(),
+        calls_per_minute: 0,
+        tools: None,
+        transport: Transport::Stdio {
+            command: fixture_binary().to_string_lossy().into_owned(),
+            args: vec!["healthy".to_owned()],
+            env: BTreeMap::new(),
+        },
+    };
+    let manager = Arc::new(UpstreamManager::new(BTreeMap::from([(
+        "fx".to_owned(),
+        server,
+    )])));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(mcpgw_core::gateway::serve_http_with(
+        mcpgw_core::endpoints::Endpoints::new(mcpgw_core::endpoints::EndpointTable::new([(
+            "fx".to_owned(),
+            Gateway::new(Arc::clone(&manager), "fx".to_owned()),
+        )])),
+        // No grace: the gateway answers the token and nothing else, so a
+        // bridge that sent none would fail here rather than pass by default.
+        mcpgw_core::gateway::GatewayAuth::new(token, true),
+        listener,
+        std::future::pending(),
+    ));
+
+    let url = format!("http://{addr}/s/fx");
+    let mut command = tokio::process::Command::from(mcpgw(home));
+    command.args(["connect", "--url", &url]);
+    let (transport, _stderr) = TokioChildProcess::builder(command)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = ().serve(transport).await.unwrap();
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(
+        tools.iter().map(|t| t.name.as_ref()).collect::<Vec<_>>(),
+        ["echo", "reverse"]
+    );
+    client.cancel().await.unwrap();
+
+    // And the control: the same bridge with no token file finds the door
+    // shut, rather than being let through by something other than the token.
+    std::fs::remove_file(mcpgw_core::gateway_token::GatewayToken::path(&state)).unwrap();
+    let mut command = tokio::process::Command::from(mcpgw(home));
+    command.args(["connect", "--url", &url, "--no-auto-start"]);
+    let (transport, _stderr) = TokioChildProcess::builder(command)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = ().serve(transport).await.unwrap();
+    assert!(client.list_all_tools().await.is_err());
+    client.cancel().await.unwrap();
+
+    manager.shutdown().await;
+}

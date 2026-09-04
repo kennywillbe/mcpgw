@@ -64,6 +64,9 @@ enum Command {
     Daemon(commands::daemon::DaemonArgs),
     /// Show what one server offers: identity, tools and resources
     Inspect(commands::inspect::InspectArgs),
+    /// Show or rotate the token clients present to the gateway
+    #[command(subcommand_help_heading = "Token commands")]
+    Token(commands::token::TokenArgs),
     /// Show which of a server's tools clients may reach, and change it
     Tools(commands::tools::ToolsArgs),
     /// Follow the gateway's captured traffic live
@@ -190,6 +193,7 @@ fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
         Command::Connect(args) => commands::connect::run(&args).map(|()| 0),
         Command::Daemon(args) => commands::daemon::run(&args),
         Command::Inspect(args) => commands::inspect::run(&args, color).map(|()| 0),
+        Command::Token(args) => commands::token::run(&args, color),
         Command::Tools(args) => commands::tools::run(&args, color).map(|()| 0),
         Command::Watch(args) => commands::watch::run(&args, color).map(|()| 0),
         Command::Doctor {

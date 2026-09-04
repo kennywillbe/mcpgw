@@ -7,6 +7,9 @@ Config {
     capture: Capture {
         redact: [],
     },
+    gateway: GatewaySettings {
+        require_token: false,
+    },
     servers: {
         "fs": Server {
             enabled: true,
