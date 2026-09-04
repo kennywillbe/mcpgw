@@ -127,9 +127,17 @@ fn list(args: &ToolsArgs, color: bool) -> anyhow::Result<()> {
             available: config.servers.keys().cloned().collect(),
         })?;
 
+    let state_dir = mcpgw_core::paths::state_dir();
     let runtime = tokio::runtime::Runtime::new()?;
     let inspection = runtime
-        .block_on(inspect_server(server, Duration::from_secs(args.timeout)))
+        .block_on(inspect_server(
+            name,
+            server,
+            // The listing has to say what *this* gateway can reach, and for
+            // an OAuth server that means connecting with the login it holds.
+            state_dir.as_deref(),
+            Duration::from_secs(args.timeout),
+        ))
         .with_context(|| format!("cannot inspect server {name:?}"))?;
 
     let rows: Vec<(String, bool)> = inspection

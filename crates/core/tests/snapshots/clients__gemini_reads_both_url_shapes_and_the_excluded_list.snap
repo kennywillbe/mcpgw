@@ -11,6 +11,7 @@ ClientRead {
                 url: "https://both.example.com/mcp",
                 headers_command: [],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },
@@ -36,6 +37,7 @@ ClientRead {
                 url: "https://sse.example.com/sse",
                 headers_command: [],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },
@@ -48,6 +50,7 @@ ClientRead {
                 headers: {
                     "Authorization": "Bearer ${LINEAR_TOKEN}",
                 },
+                auth: None,
             },
             tools: None,
         },

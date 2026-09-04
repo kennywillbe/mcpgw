@@ -28,6 +28,7 @@ ClientRead {
                 headers: {
                     "Authorization": "Bearer token",
                 },
+                auth: None,
             },
             tools: None,
         },

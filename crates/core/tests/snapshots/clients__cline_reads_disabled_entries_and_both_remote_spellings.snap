@@ -39,6 +39,7 @@ ClientRead {
                 url: "https://legacy.example/sse",
                 headers_command: [],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },
@@ -51,6 +52,7 @@ ClientRead {
                 headers: {
                     "Authorization": "Bearer token",
                 },
+                auth: None,
             },
             tools: None,
         },
@@ -61,6 +63,7 @@ ClientRead {
                 url: "https://notes.example/sse",
                 headers_command: [],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },

@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod backup;
 pub mod capture;
 pub mod clients;

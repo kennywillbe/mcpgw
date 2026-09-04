@@ -252,7 +252,7 @@ they're indistinguishable. With one exception: a remote server that answers
 `401` is not retried at all. Its endpoint reports `needs OAuth`, `mcpgw doctor
 --probe` says the same thing as a warning rather than a failure, and calls
 through it fail naming the login rather than a server that is down — see
-[Remote servers and OAuth](./trust-model.md#remote-servers-and-oauth).
+[Servers that need OAuth](./auth.md).
 
 ## Config reload
 

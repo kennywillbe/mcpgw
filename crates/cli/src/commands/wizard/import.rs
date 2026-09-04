@@ -465,6 +465,7 @@ fn summarize(server: &Server) -> String {
             url,
             headers_command,
             headers,
+            ..
         } => {
             // The command line, not what it prints: the summary is read out
             // loud in a terminal, and everything else on this line is

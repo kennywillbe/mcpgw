@@ -68,6 +68,7 @@ impl ProbePlan {
                 url,
                 headers_command,
                 headers,
+                ..
             } => TargetKey::Http(url.clone(), headers_command.clone(), headers.clone()),
         };
         self.targets
@@ -555,7 +556,8 @@ fn emit_json(
                     GatewayOutcome::NeedsOAuth(name) => {
                         row["ok"] = serde_json::json!(false);
                         row["code"] = serde_json::json!(mcpgw_core::doctor::NEEDS_OAUTH);
-                        row["error"] = serde_json::json!(needs_oauth(None, name).message);
+                        row["error"] =
+                            serde_json::json!(needs_oauth(None, name, token_state(name)).message);
                     }
                     GatewayOutcome::Failed(err) => {
                         row["ok"] = serde_json::json!(false);
@@ -609,7 +611,8 @@ impl ProbeReport {
     /// `--json` entry say what the finding says rather than a second wording
     /// of it.
     fn oauth_message(&self, label: &str) -> String {
-        needs_oauth(None, self.name(label)).message
+        let name = self.name(label);
+        needs_oauth(None, name, token_state(name)).message
     }
 
     fn name<'a>(&'a self, label: &'a str) -> &'a str {
@@ -655,11 +658,17 @@ fn run_probes(
 ) -> ProbeReport {
     let mut names: BTreeMap<String, String> = BTreeMap::new();
     let mut helpers: BTreeMap<String, String> = BTreeMap::new();
+    // Read once for the whole pass rather than per target: it is the same
+    // directory for every one of them, and a probe that dialed with a token
+    // for one server and without for the next would be reporting on two
+    // different gateways.
+    let state_dir = mcpgw_core::paths::state_dir();
     let mut results = runtime.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         let mut labels: BTreeMap<tokio::task::Id, String> = BTreeMap::new();
         for target in plan.targets.into_values() {
             let label = target.labels.join(", ");
+            let probe_name = target.name.clone();
             names.insert(label.clone(), target.name);
             if let Some(helper) = target.helper {
                 helpers.insert(label.clone(), helper);
@@ -667,7 +676,14 @@ fn run_probes(
             let server = target.server;
             let handle = set.spawn({
                 let label = label.clone();
-                async move { (label, probe_server(&server, timeout).await) }
+                let name = probe_name.clone();
+                let state_dir = state_dir.clone();
+                async move {
+                    (
+                        label,
+                        probe_server(&name, &server, state_dir.as_deref(), timeout).await,
+                    )
+                }
             });
             labels.insert(handle.id(), label);
         }
@@ -678,10 +694,8 @@ fn run_probes(
         .iter()
         .filter(|(_, outcome)| matches!(outcome, Err(ProbeError::AuthRequired)))
         .map(|(label, _)| {
-            needs_oauth(
-                None,
-                names.get(label).map_or(label.as_str(), String::as_str),
-            )
+            let name = names.get(label).map_or(label.as_str(), String::as_str);
+            needs_oauth(None, name, token_state(name))
         })
         .collect();
     ProbeReport {
@@ -781,11 +795,29 @@ fn run_gateway_probes(
             GatewayOutcome::Unserved(detail) => {
                 report.findings.extend(unserved_endpoint(target, detail));
             }
-            GatewayOutcome::NeedsOAuth(name) => report.findings.push(needs_oauth(None, name)),
+            GatewayOutcome::NeedsOAuth(name) => {
+                report
+                    .findings
+                    .push(needs_oauth(None, name, token_state(name)));
+            }
             GatewayOutcome::Ok(_) | GatewayOutcome::Failed(_) => {}
         }
     }
     report
+}
+
+/// What `mcpgw auth login` has stored for `name`, if anything.
+///
+/// Read from disk at each call rather than carried: every caller is on a
+/// reporting path that already touches the filesystem several times, and a
+/// snapshot taken at the top of a probe pass would be a snapshot from before
+/// the pass refreshed a token.
+fn token_state(name: &str) -> Option<mcpgw_core::auth::TokenState> {
+    let state_dir = mcpgw_core::paths::state_dir()?;
+    mcpgw_core::auth::Tokens::load(&state_dir, name)
+        .ok()
+        .flatten()
+        .map(|tokens| tokens.state())
 }
 
 /// Runs the full client handshake against one gateway endpoint.
@@ -802,9 +834,13 @@ pub(super) async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutco
             url: url.to_owned(),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
+            auth: None,
         },
     };
-    match probe_server(&server, timeout).await {
+    // No name and no state directory: the token a server was logged in for
+    // belongs to that server, and the gateway endpoint in front of it is not
+    // the resource server it was minted for.
+    match probe_server("", &server, None, timeout).await {
         Ok(success) => GatewayOutcome::Ok(success),
         Err(err) => match classify_gateway_failure(&err.to_string()) {
             GatewayFault::Unserved(detail) => GatewayOutcome::Unserved(detail),
@@ -973,7 +1009,10 @@ fn render_gateway(report: &GatewayReport, color: bool) {
             }
             GatewayOutcome::NeedsOAuth(name) => {
                 warn_line(
-                    &format!("{where_}: {}", needs_oauth(None, name).message),
+                    &format!(
+                        "{where_}: {}",
+                        needs_oauth(None, name, token_state(name)).message
+                    ),
                     color,
                 );
             }

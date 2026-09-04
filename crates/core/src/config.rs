@@ -172,6 +172,19 @@ pub enum Transport {
         headers_command: Vec<String>,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        /// The `[servers.<name>.auth]` table: what identity `mcpgw auth
+        /// login` presents to this server's authorization server.
+        ///
+        /// Absent from every entry that never needed one, which is the
+        /// common case — with no table at all the broker picks its own
+        /// identity (a Client ID Metadata Document, or Dynamic Client
+        /// Registration where the server still offers it). The table exists
+        /// for the hosts that accept neither and issue client ids by hand.
+        ///
+        /// Last of the http fields because it is a table and TOML wants
+        /// every value of a section written before its tables.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth: Option<ServerAuth>,
     },
 }
 
@@ -182,6 +195,35 @@ impl Server {
     pub fn allows_tool(&self, tool: &str) -> bool {
         self.tools.as_ref().is_none_or(|rules| rules.allows(tool))
     }
+}
+
+/// The identity half of one server's OAuth, as the config spells it.
+///
+/// Only the parts a user has to *choose* live here. Everything the flow
+/// discovers — the authorization server, its endpoints, the scopes it
+/// grants — is read off the server at login time and kept with the tokens,
+/// not written back into the config: a config that pinned a discovered
+/// endpoint would go stale the first time the provider moved one.
+///
+/// No secret is stored here either. `client_secret_env` names an
+/// environment variable; the secret itself never reaches the file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerAuth {
+    /// A client id issued out of band, for the providers that register
+    /// clients by hand (Atlassian, GitHub) and accept nothing else.
+    /// Persisted by `mcpgw auth login --client-id`, so the next login and
+    /// every refresh present the same identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The environment variable holding the secret paired with
+    /// [`client_id`](Self::client_id), for the rare confidential client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_env: Option<String>,
+    /// Scopes to ask for, when the ones the server advertises are not the
+    /// ones wanted. Empty means "let the server's own metadata decide",
+    /// which is what almost every provider expects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
 }
 
 /// Reads a `headers_command` as argv, from either spelling.
@@ -261,8 +303,9 @@ impl Config {
             });
         }
         let config: Self = toml::from_str(text).map_err(parse_err)?;
-        for name in config.servers.keys() {
+        for (name, server) in &config.servers {
             validate_name(name)?;
+            validate_auth(name, server)?;
         }
         // Compiled and thrown away: the gateway builds its own rules later,
         // and the point here is that `mcpgw serve` never starts believing it
@@ -307,6 +350,36 @@ impl Config {
             source: Box::new(source),
         })
     }
+}
+
+/// Refuses an entry that carries both an `[auth]` table and a
+/// `headers_command`.
+///
+/// The two are two answers to one question — what goes in the
+/// `Authorization` header — and an entry with both would have the command's
+/// output silently win over a token a user just logged in for, or the other
+/// way round depending on which layer ran last. Neither is a behaviour worth
+/// documenting, and a config that asks for both is a mistake worth naming at
+/// parse time rather than at the next connect.
+///
+/// # Errors
+///
+/// Returns [`Error::AuthConflict`] when both are set.
+fn validate_auth(name: &str, server: &Server) -> Result<(), Error> {
+    let Transport::Http {
+        headers_command,
+        auth: Some(_),
+        ..
+    } = &server.transport
+    else {
+        return Ok(());
+    };
+    if headers_command.is_empty() {
+        return Ok(());
+    }
+    Err(Error::AuthConflict {
+        name: name.to_owned(),
+    })
 }
 
 /// Validates a server name against `[a-z0-9-_]+`, minus `__`.

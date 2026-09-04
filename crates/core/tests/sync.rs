@@ -281,6 +281,7 @@ fn entry_shapes_per_client() {
                 headers: [("Authorization".to_owned(), "Bearer t".to_owned())]
                     .into_iter()
                     .collect(),
+                auth: None,
             },
         },
     );
@@ -403,6 +404,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
             )]
             .into_iter()
             .collect(),
+            auth: None,
         },
     });
     // A bare command with no arguments: the array must not collapse.
@@ -766,6 +768,7 @@ fn zed_writes_source_on_stdio_entries_only() {
             headers: [("Authorization".to_owned(), "Bearer t".to_owned())]
                 .into_iter()
                 .collect(),
+            auth: None,
         },
     };
 

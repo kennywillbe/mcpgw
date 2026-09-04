@@ -45,6 +45,14 @@ pub enum Error {
     #[error("server {name:?} already exists")]
     DuplicateName { name: String },
 
+    // Both fill the same header, so an entry with both has no defined
+    // behaviour to document — see `config::validate_auth`.
+    #[error(
+        "server {name:?} sets both headers_command and [auth]; \
+         a server's credential comes from one of them, not both"
+    )]
+    AuthConflict { name: String },
+
     #[error("no server named {name:?}{}", known(available))]
     UnknownServer {
         name: String,

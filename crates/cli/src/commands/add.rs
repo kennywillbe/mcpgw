@@ -91,6 +91,10 @@ fn build_transport(args: &AddArgs) -> anyhow::Result<Transport> {
                 url: url.clone(),
                 headers_command: headers_command(args.headers_command.as_deref())?,
                 headers: parse_pairs(&args.headers, "--header")?,
+                // `mcpgw auth login` writes this table when it is told a
+                // client id; `add` has no business guessing one, and a server
+                // that needs no OAuth must not grow an empty table for it.
+                auth: None,
             })
         }
         (None, Some((command, rest))) => {

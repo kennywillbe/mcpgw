@@ -57,6 +57,7 @@ Piece by piece, if you'd rather:
 mcpgw import                                              # adopt what your clients already have
 mcpgw add github -- npx -y @modelcontextprotocol/server-github
 mcpgw add linear --url https://mcp.linear.app/mcp
+mcpgw auth login linear                                   # if it wants OAuth
 mcpgw list
 mcpgw daemon install                                      # keep the gateway running
 mcpgw sync                                                # point every client at it
@@ -195,6 +196,11 @@ version of what that does and does not protect. The short one:
 - Requests carrying an `Origin` header that isn't a loopback page are refused
   with 403, so a website cannot drive your gateway by rebinding its own domain
   to `127.0.0.1`. MCP clients send no `Origin` and are unaffected.
+- A remote server behind OAuth is logged into once, with `mcpgw auth login
+  <name>`: the gateway runs the flow and holds the refresh token, because
+  relaying the server's challenge would have your client send that server's
+  token back through the gateway — the token passthrough the MCP spec forbids.
+  The tokens live in the state directory at mode 0600 and are never printed.
 - Your state directory is mode 0700 and everything mcpgw writes into it —
   backups of client configs, the managed-state file, traffic logs — is 0600.
 - `mcpgw list --json` masks `env` and header values; pass `--show-secrets` when

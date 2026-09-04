@@ -31,6 +31,7 @@ fn http_server(url: &str, headers: &[(&str, &str)]) -> Server {
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect(),
+            auth: None,
         },
     }
 }
@@ -484,6 +485,7 @@ fn helper_server(url: &str, mode: &str, arg: Option<&std::path::Path>) -> Server
             url: url.to_owned(),
             headers_command: argv,
             headers: BTreeMap::new(),
+            auth: None,
         },
     }
 }

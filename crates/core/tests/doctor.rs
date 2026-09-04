@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use mcpgw_core::auth::TokenState;
 use mcpgw_core::doctor::{
     GatewayFault, GatewayPlan, NEEDS_OAUTH, Severity, check_server, classify_gateway_failure,
     classify_problems, gateway_unreachable, needs_oauth, unmatched_tool_rules, unserved_endpoint,
@@ -109,6 +110,7 @@ fn http(url: &str) -> mcpgw_core::Server {
             url: url.to_owned(),
             headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
+            auth: None,
         },
     }
 }
@@ -264,7 +266,7 @@ fn a_404_is_the_only_failure_that_means_wrong_address() {
 /// act on it without matching prose.
 #[test]
 fn a_server_needing_oauth_is_a_tagged_warning_naming_the_login() {
-    let finding = needs_oauth(None, "linear");
+    let finding = needs_oauth(None, "linear", None);
     assert_eq!(finding.severity, Severity::Warning);
     assert_eq!(finding.server.as_deref(), Some("linear"));
     assert_eq!(
@@ -273,6 +275,18 @@ fn a_server_needing_oauth_is_a_tagged_warning_naming_the_login() {
          run mcpgw auth login linear"
     );
     assert_eq!(finding.code, Some(NEEDS_OAUTH));
+
+    // The same diagnosis and the same command, and a different middle clause
+    // for each of the two things a reader is telling apart: a login that has
+    // never happened, and one that has and stopped working.
+    assert_eq!(
+        needs_oauth(None, "linear", Some(TokenState::Expired)).message,
+        "linear needs OAuth — the stored login expired; run mcpgw auth login linear"
+    );
+    assert_eq!(
+        needs_oauth(None, "linear", Some(TokenState::Valid)).message,
+        "linear needs OAuth — the stored login was refused; run mcpgw auth login linear"
+    );
 
     let json = serde_json::to_value(&finding).unwrap();
     assert_eq!(json["code"], "needs_oauth");

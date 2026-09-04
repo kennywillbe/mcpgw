@@ -14,6 +14,7 @@ ClientRead {
                     "print-mcp-headers",
                 ],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },
@@ -24,6 +25,7 @@ ClientRead {
                 url: "https://mcp.figma.com/mcp",
                 headers_command: [],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },
@@ -51,6 +53,7 @@ ClientRead {
                 headers: {
                     "Authorization": "Bearer ${LINEAR_TOKEN}",
                 },
+                auth: None,
             },
             tools: None,
         },

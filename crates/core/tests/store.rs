@@ -30,6 +30,7 @@ fn http_server(url: &str) -> Server {
             url: url.to_owned(),
             headers_command: Vec::new(),
             headers: std::collections::BTreeMap::new(),
+            auth: None,
         },
     }
 }
@@ -297,4 +298,57 @@ fn overwriting_an_entry_keeps_its_tool_rules() {
     store.save().unwrap();
     let rules = store.config().servers["github"].tools.as_ref().unwrap();
     assert_eq!(rules.allow, ["search_repositories"]);
+}
+
+/// `mcpgw auth login --client-id` has to leave the identity behind: a refresh
+/// runs in the daemon, where nobody can pass a flag. The rest of the file —
+/// comments, ordering, the entry's own hand-written shape — is untouched.
+#[test]
+fn set_auth_records_the_identity_without_rewriting_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "# hand-written\nversion = 1\n\n[servers.jira]\n# the corporate one\n\
+         type = \"http\"\nurl = \"https://mcp.atlassian.com/mcp\"\n",
+    )
+    .unwrap();
+
+    let mut store = mcpgw_core::ConfigStore::edit(&path).unwrap();
+    store
+        .set_auth(
+            "jira",
+            &mcpgw_core::config::ServerAuth {
+                client_id: Some("abc123".to_owned()),
+                client_secret_env: None,
+                scopes: Vec::new(),
+            },
+        )
+        .unwrap();
+    store.save().unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# hand-written"), "{text}");
+    assert!(text.contains("# the corporate one"), "{text}");
+    assert!(text.contains("auth = { client_id = \"abc123\" }"), "{text}");
+
+    let reread = mcpgw_core::Config::load(&path).unwrap();
+    let mcpgw_core::Transport::Http { auth, .. } = &reread.servers["jira"].transport else {
+        panic!("expected an http server");
+    };
+    assert_eq!(auth.as_ref().unwrap().client_id.as_deref(), Some("abc123"));
+
+    // The first store still holds the file lock, and a second `edit` would
+    // wait on it forever inside this one process.
+    drop(store);
+
+    // And it is refused on the entry where it would have no meaning.
+    let err = mcpgw_core::ConfigStore::edit(&path)
+        .unwrap()
+        .set_auth("nope", &mcpgw_core::config::ServerAuth::default())
+        .unwrap_err();
+    assert!(
+        matches!(err, mcpgw_core::Error::UnknownServer { .. }),
+        "{err}"
+    );
 }

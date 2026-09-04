@@ -23,6 +23,7 @@ ClientRead {
                 url: "https://mcp.linear.app/sse",
                 headers_command: [],
                 headers: {},
+                auth: None,
             },
             tools: None,
         },
@@ -49,6 +50,7 @@ ClientRead {
                 headers: {
                     "Authorization": "token ${SRC_ACCESS_TOKEN}",
                 },
+                auth: None,
             },
             tools: None,
         },

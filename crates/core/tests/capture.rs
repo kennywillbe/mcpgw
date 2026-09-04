@@ -288,3 +288,29 @@ fn a_line_without_the_bodies_field_reads_as_full() {
     assert_eq!(record.bodies, Bodies::Full);
     assert!(record.bodies.is_full());
 }
+
+/// The credential half of the OAuth broker meets the capture log here: the
+/// token file's own shape, and the header the gateway builds from it, both
+/// come out of the writer with nothing usable in them.
+///
+/// Pinned as its own test rather than left to the general rules because these
+/// are the two exact spellings a stored login can take, and a rule that
+/// stopped covering either would be a bearer token in a file the user is
+/// invited to read and paste into a bug report.
+#[test]
+fn a_stored_oauth_login_never_reaches_the_capture_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path());
+    let record = CaptureRecord::new(writer.session(), "linear", Kind::Call, Duration::ZERO)
+        .with_args(r#"{"headers":{"Authorization":"Bearer lin_oat_9f2e1c5d7b3a0e64"}}"#.to_owned())
+        .with_response(
+            r#"{"access_token":"lin_oat_9f2e1c5d7b3a0e64","refresh_token":"lin_ort_0badc0ffee"}"#
+                .to_owned(),
+        );
+    writer.append(&record).unwrap();
+
+    let text = std::fs::read_to_string(daily_path(writer.dir(), record.ts)).unwrap();
+    assert!(!text.contains("lin_oat_9f2e1c5d7b3a0e64"), "{text}");
+    assert!(!text.contains("lin_ort_0badc0ffee"), "{text}");
+    assert!(text.contains("[redacted]"), "{text}");
+}

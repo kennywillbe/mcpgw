@@ -318,6 +318,7 @@ impl EntrySchema {
                 url,
                 headers_command,
                 headers,
+                ..
             } => {
                 let headers_key = match self {
                     Self::Gemini => {
@@ -532,6 +533,7 @@ fn parse_mcp_servers(obj: &Map<String, Value>) -> Result<(Server, Option<String>
             url: string_field(obj, "url")?.ok_or("missing `url`")?,
             headers_command: Vec::new(),
             headers: string_object(obj, "headers")?,
+            auth: None,
         }
     };
     Ok((
@@ -626,6 +628,7 @@ fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), St
                 url: http_url,
                 headers_command: Vec::new(),
                 headers: string_object(obj, "headers")?,
+                auth: None,
             }
         }
         (None, Some(sse_url)) => {
@@ -636,6 +639,7 @@ fn parse_gemini(obj: &Map<String, Value>) -> Result<(Server, Option<String>), St
                 url: sse_url,
                 headers_command: Vec::new(),
                 headers: string_object(obj, "headers")?,
+                auth: None,
             }
         }
         (None, None) => Transport::Stdio {
@@ -682,6 +686,7 @@ fn parse_codex(obj: &Map<String, Value>) -> Result<(Server, Option<String>), Str
             url,
             headers_command: Vec::new(),
             headers: string_object(obj, "http_headers")?,
+            auth: None,
         },
         (Some(_), Some(_)) => return Err("has both `command` and `url`".to_owned()),
         (None, None) => return Err("has neither `command` nor `url`".to_owned()),
@@ -748,6 +753,7 @@ fn parse_opencode(obj: &Map<String, Value>) -> Result<(Server, Option<String>), 
             url: string_field(obj, "url")?.ok_or("missing `url`")?,
             headers_command: Vec::new(),
             headers: string_object(obj, "headers")?,
+            auth: None,
         }
     };
 

@@ -25,6 +25,7 @@ ClientRead {
                 headers: {
                     "Authorization": "Bearer ${input:api-key}",
                 },
+                auth: None,
             },
             tools: None,
         },
