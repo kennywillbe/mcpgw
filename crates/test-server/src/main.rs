@@ -10,8 +10,11 @@
 //! `garbage` (non-JSON output), `exit` (dies immediately), `die-on-tools`
 //! (handshakes fine, then dies on the first tools/list — exercises
 //! died-after-ready reconnection), `paged` (serves its tools over two
-//! cursored pages — exercises a pipe forwarding pagination rather than
-//! collapsing it), `legacy` (answers the way every server predating
+//! cursored pages, each page claiming a different caching policy —
+//! exercises a pipe merging the pages and keeping page one's answer),
+//! `paged-loop` (hands back the same cursor forever) and `paged-endless`
+//! (hands back a fresh cursor forever) — the two shapes of a list with no
+//! end, `legacy` (answers the way every server predating
 //! 2026-07-28 does: no `resultType`, no caching fields), `modern` (the other
 //! end of the matrix: 2026-07-28 only, no `initialize` at all, and one tool
 //! that needs an MRTR round trip), `pid` (one tool
@@ -206,6 +209,12 @@ fn tools(mode: &str, method: &str, params: &serde_json::Value) -> serde_json::Va
         if mode == "paged" {
             return paged_tools(params);
         }
+        if mode == "paged-loop" {
+            return looping_tools();
+        }
+        if mode == "paged-endless" {
+            return endless_tools(params);
+        }
         // What every server written before 2026-07-28 sends: the tools, and
         // nothing the newer revision made mandatory. A pipe with a client on
         // the newer revision has to answer for this server without inventing
@@ -248,15 +257,24 @@ fn tools(mode: &str, method: &str, params: &serde_json::Value) -> serde_json::Va
 
 /// tools/list over two pages. Only the exact cursor from the first page
 /// yields the second, so a pipe that invented its own pagination — or that
-/// dropped the cursor the client sent — answers the wrong page here.
+/// mangled the cursor on the way out — answers the wrong page here.
+///
+/// The two pages disagree about caching on purpose: one merged answer can
+/// only make one claim, and page one's is the one the client asked for.
 fn paged_tools(params: &serde_json::Value) -> serde_json::Value {
     match params["cursor"].as_str() {
         None => serde_json::json!({
             "tools": [tool("echo", "echoes input")],
-            "nextCursor": PAGE_TWO
+            "nextCursor": PAGE_TWO,
+            "ttlMs": 4242,
+            "cacheScope": "public",
+            "_meta": { "io.mcpgw.test/page": "one" }
         }),
         Some(PAGE_TWO) => serde_json::json!({
-            "tools": [tool("reverse", "reverses input")]
+            "tools": [tool("reverse", "reverses input")],
+            "ttlMs": 1,
+            "cacheScope": "private",
+            "_meta": { "io.mcpgw.test/page": "two" }
         }),
         // Reported rather than answered: a wrong cursor means the pipe
         // mangled it, and the test should see which one arrived.
@@ -265,6 +283,38 @@ fn paged_tools(params: &serde_json::Value) -> serde_json::Value {
             "_meta": { "io.mcpgw.test/unexpectedCursor": other }
         }),
     }
+}
+
+/// The cursor `paged-loop` hands back on every page, including the pages that
+/// cursor itself fetched.
+const FOREVER: &str = "fixture-cursor-forever";
+
+/// tools/list that never ends: the same cursor on every page, which is a
+/// server a pipe must not follow to the end because there is no end. Broken
+/// rather than malicious is the common case — an off-by-one in a server's own
+/// paging is enough.
+fn looping_tools() -> serde_json::Value {
+    serde_json::json!({
+        "tools": [tool("loop", "one page of a list that never ends")],
+        "nextCursor": FOREVER
+    })
+}
+
+/// The prefix on `paged-endless`'s cursors; the page number follows.
+const ENDLESS: &str = "fixture-cursor-endless-";
+
+/// tools/list that never ends the other way: every cursor is new, so nothing
+/// short of a page ceiling stops a walk through it.
+fn endless_tools(params: &serde_json::Value) -> serde_json::Value {
+    let page: u32 = params["cursor"]
+        .as_str()
+        .and_then(|cursor| cursor.strip_prefix(ENDLESS))
+        .and_then(|page| page.parse().ok())
+        .unwrap_or(0);
+    serde_json::json!({
+        "tools": [tool(&format!("page-{page}"), "one of endlessly many")],
+        "nextCursor": format!("{ENDLESS}{}", page + 1)
+    })
 }
 
 /// The opaque state the `ask` tool hands out with its `input_required`
@@ -412,7 +462,12 @@ fn resources(method: &str, params: &serde_json::Value) -> Result<serde_json::Val
         "resources/list" => Ok(serde_json::json!({
             "resources": [
                 { "uri": RESOURCE_URI, "name": "greeting", "mimeType": "text/plain" }
-            ]
+            ],
+            // Echoed because resources, unlike tools, are still paged through
+            // the pipe: this is how a test sees that the client's own cursor
+            // reached the server rather than being answered out of a list the
+            // gateway had collected for itself.
+            "_meta": { "io.mcpgw.test/cursor": params["cursor"].clone() }
         })),
         "resources/templates/list" => Ok(serde_json::json!({
             "resourceTemplates": [

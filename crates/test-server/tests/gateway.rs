@@ -6,7 +6,7 @@ use mcpgw_core::capture::{
     Bodies, CapturePolicy, CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER,
 };
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
-use mcpgw_core::gateway::{Gateway, NO_TOOLS_HERE, serve_http, serve_http_with};
+use mcpgw_core::gateway::{Gateway, MAX_TOOL_PAGES, NO_TOOLS_HERE, serve_http, serve_http_with};
 use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
 use rmcp_client_http::ServiceExt as _;
@@ -978,29 +978,119 @@ async fn a_pipe_hands_back_the_upstreams_own_call_result_fields() {
     manager.shutdown().await;
 }
 
-/// Pagination is the upstream's to run: the pipe carries the cursor out and
-/// the next cursor back, and never collapses the pages into one answer of
-/// its own. Collapsing is what hid the upstream's own result fields, and it
-/// also left a client with no way to ask for page two.
+/// Issue #137: Cursor and Codex both ignore `nextCursor` on `tools/list`, so
+/// a client of either sees page one and never learns the rest exists. The
+/// pipe walks the pages itself and answers with all of them.
+///
+/// The merged answer is still page one's — its `ttlMs`, `cacheScope` and
+/// `_meta`, which is what issue #62 was about — with only the tools grown.
+/// The fixture's second page claims a different policy precisely so a pipe
+/// that let the last page win would fail here.
 #[tokio::test]
-async fn a_pipe_forwards_pagination_cursors_verbatim() {
+async fn a_pipe_merges_every_page_of_tools_list_into_one_answer() {
     let (addr, manager) = serve_both(&[("fx", "paged")], None).await;
     let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
 
-    let first = fx.request("tools/list", serde_json::json!({})).await;
-    assert_eq!(names_in(&first), ["echo"], "{first}");
-    let cursor = first["nextCursor"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no cursor to page with: {first}"))
-        .to_owned();
+    let result = fx.request("tools/list", serde_json::json!({})).await;
 
-    let second = fx
-        .request("tools/list", serde_json::json!({ "cursor": cursor }))
+    assert_eq!(names_in(&result), ["echo", "reverse"], "{result}");
+    // Nothing left to page for, so nothing offering to.
+    assert!(result.get("nextCursor").is_none(), "{result}");
+    assert_eq!(result["ttlMs"], 4242, "{result}");
+    assert_eq!(result["cacheScope"], "public", "{result}");
+    assert_eq!(result["_meta"]["io.mcpgw.test/page"], "one", "{result}");
+    manager.shutdown().await;
+}
+
+/// The same for a client on the newer revision, which is where the two
+/// changes could collide: the merge picks the result the bridge then fills
+/// in, and page one already had a caching policy of its own to keep.
+#[tokio::test]
+async fn a_newer_client_gets_the_merged_list_too() {
+    let (addr, manager) = serve_both(&[("fx", "paged")], None).await;
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx"));
+
+    let result = fx.request("tools/list", serde_json::json!({})).await;
+
+    assert_eq!(names_in(&result), ["echo", "reverse"], "{result}");
+    assert!(result.get("nextCursor").is_none(), "{result}");
+    assert_eq!(result["resultType"], "complete", "{result}");
+    assert_eq!(result["ttlMs"], 4242, "{result}");
+    assert_eq!(result["cacheScope"], "public", "{result}");
+    manager.shutdown().await;
+}
+
+/// A client that does paginate asks for page two of a list that is now one
+/// page. That request is not an error — the client obeyed the protocol — so
+/// it gets the empty list that ends its loop.
+#[tokio::test]
+async fn a_client_supplied_cursor_gets_an_empty_page_rather_than_an_error() {
+    let (addr, manager) = serve_both(&[("fx", "paged")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    let message = fx
+        .attempt(
+            "tools/list",
+            serde_json::json!({ "cursor": "fixture-cursor-page-2" }),
+        )
         .await;
-    // The fixture answers page two only for its own cursor, and says so when
-    // a different one arrives.
-    assert_eq!(names_in(&second), ["reverse"], "{second}");
-    assert!(second.get("nextCursor").is_none(), "{second}");
+
+    assert!(message.get("error").is_none(), "{message}");
+    let result = &message["result"];
+    assert_eq!(names_in(result), Vec::<&str>::new(), "{result}");
+    assert!(result.get("nextCursor").is_none(), "{result}");
+    manager.shutdown().await;
+}
+
+/// A server whose `tools/list` never ends must not be able to hold a client's
+/// request open for as long as it keeps issuing cursors. Both shapes stop:
+/// the cursor handed out twice, and the cursor that is always new.
+#[tokio::test]
+async fn a_list_that_never_ends_stops_at_the_guard() {
+    let (addr, manager) = serve_both(
+        &[("loop", "paged-loop"), ("endless", "paged-endless")],
+        None,
+    )
+    .await;
+
+    // The repeat is caught on the page that returns it, so the walk stops
+    // having fetched two pages rather than the ceiling's worth.
+    let mut looping = RawSession::open(addr, &endpoint_path("loop")).await;
+    let result = looping.request("tools/list", serde_json::json!({})).await;
+    assert_eq!(names_in(&result), ["loop", "loop"], "{result}");
+    assert!(result.get("nextCursor").is_none(), "{result}");
+
+    // Every cursor new, so only the page ceiling ends this one.
+    let mut endless = RawSession::open(addr, &endpoint_path("endless")).await;
+    let result = endless.request("tools/list", serde_json::json!({})).await;
+    let names = names_in(&result);
+    assert_eq!(names.len(), MAX_TOOL_PAGES, "{result}");
+    assert_eq!(names.first(), Some(&"page-0"), "{result}");
+    assert!(result.get("nextCursor").is_none(), "{result}");
+    manager.shutdown().await;
+}
+
+/// Resources are not merged. The issue is that clients lose *tools*, and a
+/// resource list can run to thousands of entries — so the cursor still
+/// crosses the pipe in both directions there.
+#[tokio::test]
+async fn resources_still_paginate_through_the_pipe() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut fx = RawSession::open(addr, &endpoint_path("fx")).await;
+
+    // The fixture echoes the cursor it was given, which is how a client's own
+    // pagination being carried through rather than answered out of a list the
+    // pipe collected for itself is visible from here.
+    let result = fx
+        .request(
+            "resources/list",
+            serde_json::json!({ "cursor": "some-server-cursor" }),
+        )
+        .await;
+    assert_eq!(
+        result["_meta"]["io.mcpgw.test/cursor"], "some-server-cursor",
+        "{result}"
+    );
     manager.shutdown().await;
 }
 
