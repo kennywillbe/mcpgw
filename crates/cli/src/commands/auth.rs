@@ -13,6 +13,7 @@ use anyhow::Context as _;
 use mcpgw_core::auth::{self, Tokens};
 use mcpgw_core::config::ServerAuth;
 use mcpgw_core::probe::ProbeError;
+use mcpgw_core::probe_state::{AuthObservation, ProbeState};
 use mcpgw_core::{Config, ConfigStore, Error, Server, Transport};
 use owo_colors::OwoColorize as _;
 
@@ -148,6 +149,44 @@ fn credential(server: &Server, logged_in: bool) -> Credential {
         } if !headers_command.is_empty() => Credential::Command,
         Transport::Http { headers, .. } if !headers.is_empty() => Credential::Header,
         _ => Credential::None,
+    }
+}
+
+/// What the last probe said about a server nothing in the config
+/// authenticates — the difference between a server that has never needed a
+/// login and one that has never been asked.
+///
+/// From the config alone the two look identical, and printing the login hint
+/// for both is what sent people to `auth login` for servers that answer
+/// happily with no credential at all. The answer comes from
+/// [`mcpgw_core::probe_state`], which `doctor --probe` and `auth login` fill
+/// in when they dial.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Observed {
+    /// A probe reached the server while presenting nothing.
+    NoAuthNeeded,
+    /// A probe was answered 401 with OAuth discovery metadata.
+    LoginRequired,
+    /// Nothing has probed this server yet, so there is genuinely nothing to
+    /// go on — which is a thing to say, not a reason to guess.
+    NotChecked,
+}
+
+impl Observed {
+    fn of(name: &str, state: &ProbeState) -> Self {
+        match state.get(name).map(|seen| seen.auth) {
+            Some(AuthObservation::NoAuthNeeded) => Self::NoAuthNeeded,
+            Some(AuthObservation::LoginRequired) => Self::LoginRequired,
+            None => Self::NotChecked,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NoAuthNeeded => "no_auth_needed",
+            Self::LoginRequired => "login_required",
+            Self::NotChecked => "not_checked",
+        }
     }
 }
 
@@ -333,23 +372,57 @@ fn persist_identity(
 }
 
 /// The enabled http servers that answer 401 right now.
+///
+/// What it sees is also written down: this is a probe pass like
+/// `doctor --probe`, and a later `auth status` — which opens no socket — can
+/// only tell "never needed a login" from "never asked" by reading back what
+/// a pass like this one saw.
 async fn needing_login(config: &Config, state_dir: &std::path::Path) -> Vec<String> {
     let timeout = Duration::from_secs(10);
     let mut found = Vec::new();
+    let mut observed = Vec::new();
     for (name, server) in &config.servers {
         if !server.enabled || !matches!(server.transport, Transport::Http { .. }) {
             continue;
         }
         // With the stored login attached, so a server that is already logged
         // in is not offered again.
-        if matches!(
-            mcpgw_core::probe::probe_server(name, server, Some(state_dir), timeout).await,
-            Err(ProbeError::AuthRequired)
-        ) {
-            found.push(name.clone());
+        let outcome = mcpgw_core::probe::probe_server(name, server, Some(state_dir), timeout).await;
+        // A handshake that presented a credential proves nothing about a
+        // server that would take a caller without one, so only a probe that
+        // carried nothing records a clean bill.
+        let bare = matches!(
+            credential(server, token_exists(state_dir, name)),
+            Credential::None
+        );
+        match &outcome {
+            Ok(_) if bare => observed.push((name.clone(), AuthObservation::NoAuthNeeded)),
+            Err(ProbeError::AuthRequired) => {
+                observed.push((name.clone(), AuthObservation::LoginRequired));
+                found.push(name.clone());
+            }
+            _ => {}
         }
     }
+    // Best effort: a state directory that will not take a write costs a
+    // sharper `auth status` line later and nothing about this login.
+    drop(ProbeState::record(state_dir, observed));
     found
+}
+
+fn token_exists(state_dir: &std::path::Path, name: &str) -> bool {
+    Tokens::load(state_dir, name).ok().flatten().is_some()
+}
+
+/// One line of `auth status`, gathered before anything is printed so the
+/// table can be padded to its widest name.
+struct Row {
+    name: String,
+    /// The client id the config names, for the identity line.
+    configured: Option<String>,
+    tokens: Option<Tokens>,
+    credential: Credential,
+    observed: Observed,
 }
 
 fn run_status(args: &StatusArgs, color: bool) -> anyhow::Result<u8> {
@@ -367,6 +440,8 @@ fn run_status(args: &StatusArgs, color: bool) -> anyhow::Result<u8> {
             .collect(),
     };
 
+    // Read once for the whole table: it is the same file for every row.
+    let probed = ProbeState::load(&state_dir);
     let mut rows = Vec::new();
     for name in names {
         let server = config.servers.get(&name);
@@ -375,28 +450,40 @@ fn run_status(args: &StatusArgs, color: bool) -> anyhow::Result<u8> {
         let credential = server.map_or(Credential::None, |server| {
             credential(server, tokens.is_some())
         });
-        rows.push((name, configured.map(str::to_owned), tokens, credential));
+        let observed = Observed::of(&name, &probed);
+        rows.push(Row {
+            name,
+            configured: configured.map(str::to_owned),
+            tokens,
+            credential,
+            observed,
+        });
     }
 
     if args.json {
+        // `observed_auth` is added beside the fields that were always here,
+        // never in place of one: a reader keyed on `logged_in` or
+        // `credential` keeps reading exactly what it read before.
         let entries: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, configured, tokens, credential)| match tokens {
+            .map(|row| match &row.tokens {
                 None => serde_json::json!({
-                    "server": name,
+                    "server": row.name,
                     "logged_in": false,
-                    "credential": credential.label(),
+                    "credential": row.credential.label(),
+                    "observed_auth": row.observed.label(),
                 }),
                 Some(tokens) => serde_json::json!({
-                    "server": name,
+                    "server": row.name,
                     "logged_in": true,
-                    "credential": credential.label(),
+                    "credential": row.credential.label(),
+                    "observed_auth": row.observed.label(),
                     "state": tokens.state().label(),
                     "expires_at": tokens.expires_at(),
                     "renewable": tokens.renewable(),
                     "issuer": tokens.issuer(),
                     "client_id": tokens.client_id(),
-                    "identity": tokens.identity(configured.as_deref()).to_string(),
+                    "identity": tokens.identity(row.configured.as_deref()).to_string(),
                     "scopes": tokens.scopes(),
                 }),
             })
@@ -416,43 +503,70 @@ fn run_status(args: &StatusArgs, color: bool) -> anyhow::Result<u8> {
     // escapes skew `format!` widths.
     let width = rows
         .iter()
-        .map(|(name, _, _, _)| name.chars().count())
+        .map(|row| row.name.chars().count())
         .max()
         .unwrap_or(0);
-    for (name, configured, tokens, credential) in &rows {
-        let pad = " ".repeat(width - name.chars().count());
-        let detail = match tokens {
-            // Not a login prompt for a server that already holds a
-            // credential: it is a report of the one it holds.
-            None => match credential {
-                Credential::Command => crate::ui::dim("headers from command", color),
-                Credential::Header => crate::ui::dim("static header", color),
-                Credential::Oauth | Credential::None => {
-                    format!("no login yet — run mcpgw auth login {name}")
-                }
-            },
-            Some(tokens) => {
-                let identity = tokens.identity(configured.as_deref()).to_string();
-                let issuer = tokens.issuer().unwrap_or("unnamed issuer");
-                // The one state a user has to act on gets the command. Every
-                // other line is a report, and a report does not tell people
-                // to run things they do not have to.
-                let suffix = if tokens.state() == mcpgw_core::auth::TokenState::Expired {
-                    format!(" — run mcpgw auth login {name}")
-                } else {
-                    String::new()
-                };
-                format!(
-                    "{}{}  {issuer}  {}{suffix}",
-                    tokens.state().label(),
-                    remaining(tokens),
-                    crate::ui::dim(&identity, color),
-                )
-            }
-        };
-        println!("  {name}{pad}  {detail}");
+    for row in &rows {
+        let pad = " ".repeat(width - row.name.chars().count());
+        println!("  {}{pad}  {}", row.name, detail(row, color));
     }
     Ok(0)
+}
+
+/// The right-hand side of one `auth status` line: a report of the credential
+/// this server holds, and a command to run only where there is one to run.
+fn detail(row: &Row, color: bool) -> String {
+    let Row {
+        name,
+        configured,
+        tokens,
+        credential,
+        observed,
+    } = row;
+    match tokens {
+        // Not a login prompt for a server that already holds a
+        // credential: it is a report of the one it holds.
+        None => match credential {
+            Credential::Command => crate::ui::dim("headers from command", color),
+            Credential::Header => crate::ui::dim("static header", color),
+            // An `[auth]` table is the config saying this server does
+            // OAuth, which is evidence enough on its own.
+            Credential::Oauth => format!("no login yet — run mcpgw auth login {name}"),
+            // Nothing in the config authenticates this one, so the only
+            // evidence is what a probe saw — and the login hint goes to
+            // the server that actually asked for a login.
+            Credential::None => match observed {
+                Observed::LoginRequired => {
+                    format!("no login yet — run mcpgw auth login {name}")
+                }
+                Observed::NoAuthNeeded => crate::ui::dim(
+                    "no auth needed (last probe succeeded without credentials)",
+                    color,
+                ),
+                Observed::NotChecked => {
+                    crate::ui::dim("not checked yet — run mcpgw doctor --probe", color)
+                }
+            },
+        },
+        Some(tokens) => {
+            let identity = tokens.identity(configured.as_deref()).to_string();
+            let issuer = tokens.issuer().unwrap_or("unnamed issuer");
+            // The one state a user has to act on gets the command. Every
+            // other line is a report, and a report does not tell people
+            // to run things they do not have to.
+            let suffix = if tokens.state() == mcpgw_core::auth::TokenState::Expired {
+                format!(" — run mcpgw auth login {name}")
+            } else {
+                String::new()
+            };
+            format!(
+                "{}{}  {issuer}  {}{suffix}",
+                tokens.state().label(),
+                remaining(tokens),
+                crate::ui::dim(&identity, color),
+            )
+        }
+    }
 }
 
 /// `" (42m left)"` for a token with a clock on it, nothing for one without.

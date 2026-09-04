@@ -16,6 +16,7 @@ pub mod paths;
 pub mod pins;
 pub mod private;
 pub mod probe;
+pub mod probe_state;
 pub mod projects;
 pub mod reload;
 pub mod runtime;

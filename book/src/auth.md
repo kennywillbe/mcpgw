@@ -97,6 +97,8 @@ $ mcpgw auth status
   linear     valid (47m left)  https://auth.linear.app  client id metadata document
   notion     expired  https://api.notion.com  dynamic client registration — run mcpgw auth login notion
   sentry     no login yet — run mcpgw auth login sentry
+  deepwiki   no auth needed (last probe succeeded without credentials)
+  mslearn    not checked yet — run mcpgw doctor --probe
   context7   static header
 ```
 
@@ -105,6 +107,23 @@ A server that authenticates with a `headers` entry of its own reads as
 they already carry a credential, so there is nothing to log in to and no
 login hint. With no http server to say anything about, the whole listing is
 one line — `no server needs a login`.
+
+For a server the config authenticates in no way at all, the line comes from
+what a probe last saw rather than from the config, because the config cannot
+tell "never needed a login" apart from "never asked":
+
+| Line | What was observed |
+| --- | --- |
+| `no login yet — run mcpgw auth login NAME` | the server answered `401` with OAuth metadata |
+| `no auth needed (last probe succeeded without credentials)` | the handshake went through while presenting nothing |
+| `not checked yet — run mcpgw doctor --probe` | nothing has dialed this server yet |
+
+`mcpgw doctor --probe` and `mcpgw auth login` (with no server named) write
+what they saw to `~/.local/share/mcpgw/probes.json`, and `auth status` reads
+it back — `auth status` itself opens no socket. Deleting that file only
+returns every server to `not checked yet`. A server with an
+[`[auth]`](#serversnameauth) table is the config saying it does OAuth, so it
+asks for a login without waiting to be probed.
 
 Three states, and only one of them is a problem:
 
@@ -115,8 +134,9 @@ Three states, and only one of them is a problem:
 | `expired` | it has, and there is nothing to renew it with |
 
 `--json` gives the same rows as objects, each with a `credential` of
-`oauth`, `header`, `command` or `none`, and a logged-in one also with
-`expires_at`, `issuer`, `client_id`, `identity` and `scopes`.
+`oauth`, `header`, `command` or `none`, an `observed_auth` of
+`login_required`, `no_auth_needed` or `not_checked`, and a logged-in one also
+with `expires_at`, `issuer`, `client_id`, `identity` and `scopes`.
 
 ## `mcpgw auth logout`
 

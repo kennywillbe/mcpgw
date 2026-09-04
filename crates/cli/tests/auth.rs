@@ -194,8 +194,10 @@ fn a_preregistered_client_id_is_presented_and_kept_in_the_config() {
     assert_eq!(value["servers"][0]["identity"], "pre-registered client id");
 }
 
+/// A server nothing has dialed yet is a server nothing is known about, and
+/// saying so beats guessing at a login it may never want.
 #[test]
-fn status_says_which_servers_have_never_been_logged_into() {
+fn status_says_when_a_server_has_not_been_checked_yet() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("config.toml"),
@@ -210,9 +212,94 @@ fn status_says_which_servers_have_never_been_logged_into() {
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
+        text.contains("linear  not checked yet — run mcpgw doctor --probe"),
+        "{text}"
+    );
+    assert!(!text.contains("auth login"), "{text}");
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status", "--json"])
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["servers"][0]["observed_auth"], "not_checked");
+    // The fields that were always there still are, under their own names.
+    assert_eq!(value["servers"][0]["logged_in"], false);
+    assert_eq!(value["servers"][0]["credential"], "none");
+}
+
+/// A server that answered a credential-less handshake has nothing to log in
+/// to, and the report says that rather than sending its owner to a login.
+#[test]
+fn status_reports_no_auth_needed_after_a_probe_got_through_without_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "version = 1\n\n[servers.deepwiki]\ntype = \"http\"\nurl = \"https://mcp.deepwiki.com/mcp\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.path().join("state")).unwrap();
+    std::fs::write(
+        home.path().join("state/probes.json"),
+        r#"{"servers":{"deepwiki":{"auth":"no_auth_needed","at":1}}}"#,
+    )
+    .unwrap();
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("deepwiki  no auth needed (last probe succeeded without credentials)"),
+        "{text}"
+    );
+    assert!(!text.contains("auth login"), "{text}");
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status", "--json"])
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["servers"][0]["observed_auth"], "no_auth_needed");
+}
+
+/// The whole round trip: a server that answers 401 with OAuth metadata is
+/// probed by `doctor --probe`, and the `auth status` that follows — which
+/// opens no socket — asks for the login on that evidence.
+#[test]
+fn status_asks_for_a_login_once_a_probe_has_been_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let provider = Provider::start(oauth::Config::default());
+    std::fs::write(home.path().join("config.toml"), provider.config()).unwrap();
+
+    // Not asserted on: doctor's own exit code is about the whole report, and
+    // this test is about what the probe left behind.
+    let out = mcpgw(home.path())
+        .args(["doctor", "--probe"])
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("needs OAuth"), "{report}");
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
         text.contains("linear  no login yet — run mcpgw auth login linear"),
         "{text}"
     );
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status", "--json"])
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["servers"][0]["observed_auth"], "login_required");
 }
 
 /// A server that authenticates with a header of its own has nothing to log
