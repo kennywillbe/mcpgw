@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use http::{HeaderName, HeaderValue};
 use rmcp::ServiceExt as _;
@@ -163,6 +163,79 @@ fn headers_command(server: &Server) -> Option<&[String]> {
     }
 }
 
+/// One minute, the window every `calls_per_minute` is a count over.
+const WINDOW: Duration = Duration::from_secs(60);
+
+/// What a refused charge tells the caller: the ceiling that refused it, and
+/// how long until the next call would be let through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverBudget {
+    pub limit: u32,
+    pub retry_in: Duration,
+}
+
+/// One server's `calls_per_minute` token bucket.
+///
+/// Held as the theoretical arrival time of the next call rather than as a
+/// token count and a refill timestamp, which is the same bucket written
+/// down differently (GCRA). It is the form that needs no floating point and
+/// accumulates no rounding: a count has to be refilled by `elapsed × rate`
+/// on every charge, and a burst of sub-millisecond calls then credits zero
+/// each time and starves the bucket, while a deadline only ever moves
+/// forward by whole emission intervals.
+///
+/// `None` is a bucket nothing has been charged against yet, which is a full
+/// one — a fresh server owes nobody a wait. That is also why the state lives
+/// on [`Upstream`] and not on the gateway pipe: a reload that only edits an
+/// entry's metadata keeps the same `Upstream` and so keeps the bucket, and a
+/// transport change installs a new one and so starts a new bucket, which is
+/// the same rule the live connection underneath follows.
+#[derive(Default)]
+struct Budget(std::sync::Mutex<Option<Instant>>);
+
+impl Budget {
+    /// Charges one call at `now`, returning what stopped it if the bucket
+    /// had nothing left.
+    ///
+    /// `limit` is passed in on every charge rather than stored, so an edit
+    /// to `calls_per_minute` applies to the next call rather than to the
+    /// next reconnect. A `limit` of 0 is no budget at all and never touches
+    /// the state, so turning a budget off and on again does not hand a
+    /// client a fresh burst.
+    ///
+    /// `now` is a parameter for the same reason it is a monotonic
+    /// [`Instant`]: the suite has to be able to advance it, and a wall clock
+    /// that steps backwards over an NTP correction would hand out a free
+    /// burst.
+    fn charge(&self, limit: u32, now: Instant) -> Option<OverBudget> {
+        if limit == 0 {
+            return None;
+        }
+        // The gap one call is worth, and how far ahead of `now` the deadline
+        // may run before the bucket is empty. `limit - 1` because the call
+        // being charged is itself the last of the burst.
+        let interval = WINDOW / limit;
+        let burst = interval.saturating_mul(limit - 1);
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A deadline already in the past is a bucket that sat idle long
+        // enough to refill; clamping it to `now` is what stops an hour of
+        // quiet from buying back more than the one burst it is worth.
+        let deadline = state.unwrap_or(now).max(now);
+        let ahead = deadline.duration_since(now);
+        if ahead > burst {
+            return Some(OverBudget {
+                limit,
+                retry_in: ahead.saturating_sub(burst),
+            });
+        }
+        *state = Some(deadline + interval);
+        None
+    }
+}
+
 /// Consecutive connect attempts before latching into `Failed`.
 pub const ATTEMPTS: u32 = 3;
 
@@ -298,6 +371,10 @@ struct Upstream {
     /// the replacement entry — see [`UpstreamManager::apply`] — so a client
     /// that subscribed before a reload is still listening after it.
     changes: tokio::sync::broadcast::Sender<ListChanged>,
+    /// This server's call budget, metered across every downstream session:
+    /// the thing being protected is the upstream, and it cannot tell which
+    /// client's loop is hammering it.
+    budget: Budget,
 }
 
 impl Upstream {
@@ -458,6 +535,7 @@ fn upstream_publishing(
         settled: Notify::new(),
         info: arc_swap::ArcSwapOption::empty(),
         changes,
+        budget: Budget::default(),
     })
 }
 
@@ -552,6 +630,21 @@ impl UpstreamManager {
     #[must_use]
     pub fn server(&self, name: &str) -> Option<Arc<Server>> {
         Some(self.get(name)?.server.load_full())
+    }
+
+    /// Charges one `tools/call` against `name`'s budget, returning what
+    /// refused it when the server is over.
+    ///
+    /// The limit is read here rather than by the caller, and read on every
+    /// charge, so a reload that raises or lowers `calls_per_minute` applies
+    /// to the next call without anything reconnecting — the same liveness
+    /// [`server`](Self::server) gives the tool rules. An unknown name is
+    /// unmetered: whatever refuses it, it is not this.
+    #[must_use]
+    pub fn charge(&self, name: &str) -> Option<OverBudget> {
+        let upstream = self.get(name)?;
+        let limit = upstream.server.load().calls_per_minute;
+        upstream.budget.charge(limit, Instant::now())
     }
 
     /// What `name` reported at its last successful connect, or `None` if it
@@ -1562,8 +1655,87 @@ fn plain_http_client() -> reqwest::Client {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::{Duration, Instant};
 
-    use super::http_config;
+    use super::{Budget, http_config};
+
+    /// A burst of `limit` gets through and the next call does not, and the
+    /// wait it is told to take is exactly one emission interval.
+    #[test]
+    fn a_burst_of_the_limit_passes_and_the_next_one_does_not() {
+        let budget = Budget::default();
+        let now = Instant::now();
+        for call in 0..2 {
+            assert!(budget.charge(2, now).is_none(), "call {call} was refused");
+        }
+        let over = budget.charge(2, now).expect("the third call is over");
+        assert_eq!(over.limit, 2);
+        assert_eq!(over.retry_in, Duration::from_secs(30));
+    }
+
+    /// One call's worth of room comes back after 60/N seconds, and not
+    /// before.
+    #[test]
+    fn a_refused_call_is_let_through_once_the_bucket_refills() {
+        let budget = Budget::default();
+        let now = Instant::now();
+        for _ in 0..2 {
+            assert!(budget.charge(2, now).is_none());
+        }
+        assert!(budget.charge(2, now + Duration::from_secs(29)).is_some());
+        assert!(budget.charge(2, now + Duration::from_secs(30)).is_none());
+        // And only one call's worth: the window did not reopen wholesale.
+        assert!(budget.charge(2, now + Duration::from_secs(30)).is_some());
+    }
+
+    /// An idle server refills to a full burst and no further, however long
+    /// it sat there.
+    #[test]
+    fn a_long_idle_period_buys_back_one_burst_and_no_more() {
+        let budget = Budget::default();
+        let now = Instant::now();
+        assert!(budget.charge(2, now).is_none());
+        let later = now + Duration::from_secs(3600);
+        assert!(budget.charge(2, later).is_none());
+        assert!(budget.charge(2, later).is_none());
+        assert!(budget.charge(2, later).is_some());
+    }
+
+    /// The limit is the caller's on every charge, so a reload that raises it
+    /// is felt on the very next call: the same emptied bucket now refills
+    /// sixty times faster, and the wait shrinks to match.
+    #[test]
+    fn a_raised_limit_applies_to_the_next_call() {
+        let budget = Budget::default();
+        let now = Instant::now();
+        for _ in 0..2 {
+            assert!(budget.charge(2, now).is_none());
+        }
+        assert_eq!(
+            budget.charge(2, now).map(|over| over.retry_in),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            budget.charge(60, now).map(|over| over.retry_in),
+            Some(Duration::from_secs(1))
+        );
+        assert!(budget.charge(60, now + Duration::from_secs(1)).is_none());
+    }
+
+    /// No budget means no metering, and it does not spend the bucket either:
+    /// turning one off and back on is not a way to buy a fresh burst.
+    #[test]
+    fn a_limit_of_zero_meters_nothing_and_spends_nothing() {
+        let budget = Budget::default();
+        let now = Instant::now();
+        for _ in 0..50 {
+            assert!(budget.charge(0, now).is_none());
+        }
+        for _ in 0..2 {
+            assert!(budget.charge(2, now).is_none());
+        }
+        assert!(budget.charge(2, now).is_some());
+    }
 
     #[test]
     fn headers_land_in_the_transport_config() {

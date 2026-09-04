@@ -198,3 +198,60 @@ fn drift_off_is_written_into_the_table_and_survives_a_list_edit() {
     let listed = stdout(&tools(dir.path(), &["fx", "--timeout", "60"]));
     assert!(listed.contains(r#"drift = "off""#), "{listed}");
 }
+
+#[test]
+fn budget_writes_the_key_and_off_removes_it() {
+    let dir = home();
+    let out = tools(dir.path(), &["fx", "budget", "120"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout(&out).contains("120 calls per minute"), "{out:?}");
+    assert!(config_text(dir.path()).contains("calls_per_minute = 120"));
+
+    let out = tools(dir.path(), &["fx", "budget", "off"]);
+    assert!(out.status.success());
+    assert!(stdout(&out).contains("unmetered again"), "{out:?}");
+    assert!(!config_text(dir.path()).contains("calls_per_minute"));
+}
+
+#[test]
+fn the_listing_names_the_budget_and_says_when_there_is_none() {
+    let dir = home();
+    let text = stdout(&tools(dir.path(), &["fx", "--timeout", "60"]));
+    assert!(text.contains("no budget — calls are unmetered"), "{text}");
+
+    tools(dir.path(), &["fx", "budget", "120"]);
+    let text = stdout(&tools(dir.path(), &["fx", "--timeout", "60"]));
+    assert!(text.contains("budget = 120 calls/min"), "{text}");
+}
+
+/// A budget the config cannot mean is a config error, and `doctor` is where
+/// it is reported — the CLI never writes one, but a hand-edited file can.
+#[test]
+fn a_budget_of_zero_in_the_file_is_a_config_error() {
+    let dir = home();
+    let path = dir.path().join("config.toml");
+    let text = std::fs::read_to_string(&path).unwrap() + "calls_per_minute = 0\n";
+    std::fs::write(&path, text).unwrap();
+    let out = tools(dir.path(), &["fx", "--timeout", "60"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("calls_per_minute"), "{stderr}");
+}
+
+#[test]
+fn a_budget_that_is_not_a_number_is_refused_before_anything_is_written() {
+    let dir = home();
+    let before = config_text(dir.path());
+    let out = tools(dir.path(), &["fx", "budget", "lots"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("whole number of calls per minute"),
+        "{stderr}"
+    );
+    assert_eq!(config_text(dir.path()), before);
+}

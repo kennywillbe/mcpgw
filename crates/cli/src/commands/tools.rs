@@ -52,6 +52,12 @@ pub enum ToolsCommand {
     },
     /// Forget the pinned definitions; the next list pins afresh
     Unpin,
+    /// Set the server's calls-per-minute ceiling, or `off` to remove it
+    Budget {
+        /// A whole number of calls per minute, or `off`
+        #[arg(value_name = "N|off")]
+        limit: String,
+    },
 }
 
 pub fn run(args: &ToolsArgs, color: bool) -> anyhow::Result<()> {
@@ -62,6 +68,7 @@ pub fn run(args: &ToolsArgs, color: bool) -> anyhow::Result<()> {
         Some(ToolsCommand::Pin { show: true }) => show_pins(&args.name),
         Some(ToolsCommand::Pin { show: false }) => pin(args),
         Some(ToolsCommand::Unpin) => unpin(&args.name),
+        Some(ToolsCommand::Budget { limit }) => budget(&args.name, limit),
         None => list(args, color),
     }
 }
@@ -120,6 +127,31 @@ fn clear(name: &str) -> anyhow::Result<()> {
     store.set_tool_rules(name, &rules)?;
     store.save()?;
     println!("cleared the tool lists on {name:?}: every tool is allowed again");
+    Ok(())
+}
+
+/// Sets or removes the server's `calls_per_minute`.
+///
+/// `off` and not `0`: zero is the one number the config rejects, because it
+/// reads equally well as "no budget" and "refuse everything", and a word
+/// cannot be misread that way. `0` is accepted here anyway and means `off`,
+/// since it is what someone will type.
+fn budget(name: &str, limit: &str) -> anyhow::Result<()> {
+    let calls = match limit.trim() {
+        "off" | "none" | "0" => 0,
+        other => other.parse::<u32>().with_context(|| {
+            format!("{other:?} is not a whole number of calls per minute (or `off`)")
+        })?,
+    };
+    let path = super::canonical_config_path()?;
+    let mut store = ConfigStore::edit(&path)?;
+    store.set_call_budget(name, calls)?;
+    store.save()?;
+    if calls == 0 {
+        println!("no call budget on {name:?}: calls are unmetered again");
+    } else {
+        println!("call budget on {name:?}: {calls} calls per minute");
+    }
     Ok(())
 }
 
@@ -343,7 +375,16 @@ fn list(args: &ToolsArgs, color: bool) -> anyhow::Result<()> {
             }
         })
         .collect();
-    print!("{}", render(name, server.tools.as_ref(), &rows, color));
+    print!(
+        "{}",
+        render(
+            name,
+            server.tools.as_ref(),
+            server.calls_per_minute,
+            &rows,
+            color
+        )
+    );
     Ok(())
 }
 
@@ -369,9 +410,16 @@ fn state(
     }
 }
 
-/// The listing: every tool the server offers, with what the lists and the
-/// pins make of it, under a header saying which of both are in force.
-fn render(name: &str, rules: Option<&ToolRules>, rows: &[Row], color: bool) -> String {
+/// The listing: every tool the server offers, with what the lists, the pins
+/// and the budget make of it, under a header saying which of them are in
+/// force.
+fn render(
+    name: &str,
+    rules: Option<&ToolRules>,
+    calls_per_minute: u32,
+    rows: &[Row],
+    color: bool,
+) -> String {
     let mut out = String::new();
     let heading = if color {
         format!("{name} — {} tool(s)", rows.len())
@@ -398,6 +446,14 @@ fn render(name: &str, rules: Option<&ToolRules>, rows: &[Row], color: bool) -> S
         // states look identical in the table and mean different things the
         // moment a tool is added to the server.
         None => out.push_str("  no lists — every tool is allowed\n"),
+    }
+    // Under the lists, because it is the other thing the header answers:
+    // between them they are the whole of what this gateway will let a client
+    // do with this server.
+    if calls_per_minute > 0 {
+        let _ = writeln!(out, "  budget = {calls_per_minute} calls/min");
+    } else {
+        out.push_str("  no budget — calls are unmetered\n");
     }
     out.push('\n');
     if rows.is_empty() {
@@ -464,13 +520,29 @@ mod tests {
             allow: vec!["echo".to_owned()],
             ..ToolRules::default()
         };
-        insta::assert_snapshot!(render("fx", Some(&rules), &rows(), false));
+        insta::assert_snapshot!(render("fx", Some(&rules), 0, &rows(), false));
     }
 
     #[test]
     fn a_server_with_no_lists_says_so() {
-        let rendered = render("fx", None, &[row("echo", true, Pinned::Unpinned)], false);
+        let rendered = render("fx", None, 0, &[row("echo", true, Pinned::Unpinned)], false);
         assert!(rendered.contains("every tool is allowed"), "{rendered}");
+        assert!(
+            rendered.contains("no budget — calls are unmetered"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_budget_is_named_in_the_header() {
+        let rendered = render(
+            "fx",
+            None,
+            120,
+            &[row("echo", true, Pinned::Unpinned)],
+            false,
+        );
+        assert!(rendered.contains("budget = 120 calls/min"), "{rendered}");
     }
 
     #[test]
@@ -478,6 +550,7 @@ mod tests {
         let rendered = render(
             "fx",
             None,
+            0,
             &[
                 row("echo", true, Pinned::Changed),
                 row("exfiltrate", true, Pinned::New),
@@ -495,7 +568,7 @@ mod tests {
     /// A server whose definitions all match must not be told to do anything.
     #[test]
     fn an_unchanged_server_gets_no_footer() {
-        let rendered = render("fx", None, &rows(), false);
+        let rendered = render("fx", None, 0, &rows(), false);
         assert!(!rendered.contains("pin`"), "{rendered}");
     }
 

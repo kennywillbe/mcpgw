@@ -113,21 +113,28 @@ impl ConfigStore {
         }
         let mut doc = self.doc.clone();
         let mut table = server_table(server);
-        // An overwrite redefines the transport, not the allowlist: a
+        // An overwrite redefines the transport, not the limits around it: a
         // re-import or `add --force` that dropped `[tools]` would silently
-        // widen what every client can reach through that server, which is the
-        // one edit nobody would think to check for afterwards. An incoming
-        // entry that carries rules of its own still wins.
-        if server.tools.is_none()
-            && let Some(existing) = self
-                .doc
-                .get("servers")
-                .and_then(Item::as_table_like)
-                .and_then(|servers| servers.get(name))
-                .and_then(Item::as_table_like)
-                .and_then(|entry| entry.get("tools"))
-        {
-            table.insert("tools", existing.clone());
+        // widen what every client can reach through that server, and one
+        // that dropped `calls_per_minute` would silently take the brake off
+        // it. Both are the edit nobody would think to check for afterwards.
+        // An incoming entry that carries a value of its own still wins.
+        let existing = self
+            .doc
+            .get("servers")
+            .and_then(Item::as_table_like)
+            .and_then(|servers| servers.get(name))
+            .and_then(Item::as_table_like);
+        for (key, incoming) in [
+            ("tools", server.tools.is_some()),
+            ("calls_per_minute", server.calls_per_minute > 0),
+        ] {
+            if incoming {
+                continue;
+            }
+            if let Some(kept) = existing.and_then(|entry| entry.get(key)) {
+                table.insert(key, kept.clone());
+            }
         }
         ensure_servers_table(&mut doc).insert(name, Item::Table(table));
         self.commit(doc)?;
@@ -204,6 +211,30 @@ impl ConfigStore {
         self.ensure_known(name)?;
         let mut doc = self.doc.clone();
         doc["servers"][name]["auth"] = value(auth_table(auth));
+        self.commit(doc)
+    }
+
+    /// Sets `name`'s `calls_per_minute`, or removes the key when `calls` is
+    /// 0 — `mcpgw tools <server> budget off`.
+    ///
+    /// Removed rather than written as `calls_per_minute = 0`, because a zero
+    /// in the file is a config error: see
+    /// [`Server::calls_per_minute`](crate::Server::calls_per_minute).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownServer`] when no such entry exists.
+    pub fn set_call_budget(&mut self, name: &str, calls: u32) -> Result<(), Error> {
+        self.ensure_known(name)?;
+        let mut doc = self.doc.clone();
+        let entry = &mut doc["servers"][name];
+        if calls == 0 {
+            if let Some(entry) = entry.as_table_like_mut() {
+                entry.remove("calls_per_minute");
+            }
+        } else {
+            entry["calls_per_minute"] = value(i64::from(calls));
+        }
         self.commit(doc)
     }
 
@@ -344,6 +375,11 @@ fn server_table(server: &Server) -> Table {
                 table["auth"] = value(auth_table(auth));
             }
         }
+    }
+    // Omitted when there is no budget: a generated `calls_per_minute = 0`
+    // would be a file this build refuses to load again.
+    if server.calls_per_minute > 0 {
+        table["calls_per_minute"] = value(i64::from(server.calls_per_minute));
     }
     // Last, because it is a sub-table: TOML puts every value of a section
     // ahead of the sections nested in it.

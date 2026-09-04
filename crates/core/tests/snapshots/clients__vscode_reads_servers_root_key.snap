@@ -7,6 +7,7 @@ ClientRead {
         "fetch": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "uvx",
                 args: [
@@ -19,6 +20,7 @@ ClientRead {
         "remote": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://example.com/mcp",
                 headers_command: [],

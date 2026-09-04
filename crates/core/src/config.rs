@@ -48,6 +48,16 @@ pub struct Server {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// The `calls_per_minute` ceiling this server's `tools/call` traffic is
+    /// metered against, or 0 for an entry that has none — which is every
+    /// entry until someone opts in, and the reason an upgrade changes
+    /// nothing about how fast a client may call.
+    #[serde(
+        default,
+        skip_serializing_if = "unlimited",
+        deserialize_with = "calls_per_minute"
+    )]
+    pub calls_per_minute: u32,
     // Flattened before `tools` so plain values serialize before any table;
     // TOML requires values ahead of tables within one section, and both the
     // env/headers tables and `[tools]` are tables.
@@ -282,6 +292,40 @@ pub struct ServerAuth {
     /// which is what almost every provider expects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
+}
+
+/// Reads `calls_per_minute`, rejecting the values that cannot mean anything.
+///
+/// # Errors
+///
+/// A budget of zero is a config error rather than a silent "no budget": the
+/// two readings of `calls_per_minute = 0` — refuse everything, or meter
+/// nothing — are opposites, and a file that has to be guessed at is the
+/// wrong thing to put in front of a circuit breaker. Negative and
+/// fractional values fail here too, out of `u32` itself; the way to say "no
+/// budget" is to have no key, which is what `mcpgw tools <server> budget
+/// off` writes.
+fn calls_per_minute<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let calls = u32::deserialize(deserializer)?;
+    if calls == 0 {
+        return Err(serde::de::Error::custom(
+            "calls_per_minute must be at least 1; drop the key for no budget",
+        ));
+    }
+    Ok(calls)
+}
+
+// Taken by reference because that is the shape `skip_serializing_if` calls
+// with.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde calls `skip_serializing_if` with a reference to the field"
+)]
+fn unlimited(calls: &u32) -> bool {
+    *calls == 0
 }
 
 /// Reads a `headers_command` as argv, from either spelling.

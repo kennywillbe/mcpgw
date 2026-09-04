@@ -7,6 +7,7 @@ ClientRead {
         "context7": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://mcp.context7.com/mcp",
                 headers_command: [],
@@ -20,6 +21,7 @@ ClientRead {
         "corp": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://mcp.corp.example/mcp",
                 headers_command: [
@@ -34,6 +36,7 @@ ClientRead {
         "sqlite": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "uvx",
                 args: [

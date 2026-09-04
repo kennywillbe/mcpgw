@@ -869,6 +869,7 @@ pub(super) async fn probe_endpoint(url: &str, timeout: Duration) -> GatewayOutco
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: url.to_owned(),

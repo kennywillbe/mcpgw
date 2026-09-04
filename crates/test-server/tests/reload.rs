@@ -595,3 +595,54 @@ async fn a_new_tool_list_applies_without_reconnecting_anything() {
     client.cancel().await.unwrap();
     harness.manager.shutdown().await;
 }
+
+/// A `calls_per_minute` raised under a running gateway applies to the next
+/// call — on the session that was already open, and without the server
+/// behind the endpoint restarting, which is what would make raising a
+/// ceiling cost every client its connection.
+#[tokio::test]
+async fn a_raised_call_budget_applies_without_reconnecting_anything() {
+    let harness = Harness::start(&[("fx", "healthy", true)]).await;
+    let path = endpoint_path("fx");
+    let budgeted = |calls: u32| {
+        use std::fmt::Write as _;
+        let mut text = config(&[("fx", "healthy", true)]);
+        let _ = writeln!(text, "calls_per_minute = {calls}");
+        text
+    };
+    write(&harness.path, &budgeted(2));
+    assert!(harness.reloader.reload().await.unwrap().changes.is_empty());
+
+    // Opened before every edit below and kept across all of them.
+    let client = harness.client(&path).await;
+    let echo = || rmcp_client_http::model::CallToolRequestParams::new("echo".to_owned());
+    for n in 0..2 {
+        client
+            .call_tool(echo())
+            .await
+            .unwrap_or_else(|err| panic!("call {n} was refused: {err}"));
+    }
+    let err = client.call_tool(echo()).await.unwrap_err().to_string();
+    assert!(err.contains("budget of 2 calls per minute"), "{err}");
+    assert!(err.contains("retry in ~30 s"), "{err}");
+
+    write(&harness.path, &budgeted(4));
+    let reloaded = harness.reloader.reload().await.unwrap();
+    // Nothing added, removed, replaced or stopped: the transport did not
+    // change, so the child process behind the endpoint is the same one — and
+    // so is the bucket. A reload that had handed out a fresh one would have
+    // let this call straight through instead of halving the wait.
+    assert!(reloaded.changes.is_empty(), "{:?}", reloaded.changes);
+    let err = client.call_tool(echo()).await.unwrap_err().to_string();
+    assert!(err.contains("budget of 4 calls per minute"), "{err}");
+    assert!(err.contains("retry in ~15 s"), "{err}");
+
+    // And a ceiling generous enough to have refilled by now lets the same
+    // session call again, with nothing reconnected at any point.
+    write(&harness.path, &budgeted(6000));
+    assert!(harness.reloader.reload().await.unwrap().changes.is_empty());
+    // 6000/min refills a call's worth every 10ms; this is that wait, taken.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client.call_tool(echo()).await.unwrap();
+    client.cancel().await.unwrap();
+}

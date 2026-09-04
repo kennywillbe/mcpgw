@@ -7,6 +7,7 @@ ClientRead {
         "browser": Server {
             enabled: false,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "npx",
                 args: [
@@ -20,6 +21,7 @@ ClientRead {
         "github": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "npx",
                 args: [
@@ -35,6 +37,7 @@ ClientRead {
         "inherited": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://inherited.example/mcp",
                 headers_command: [],
@@ -46,6 +49,7 @@ ClientRead {
         "legacy": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://legacy.example/sse",
                 headers_command: [],
@@ -57,6 +61,7 @@ ClientRead {
         "linear": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://mcp.linear.app/mcp",
                 headers_command: [],
@@ -70,6 +75,7 @@ ClientRead {
         "untyped": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://notes.example/sse",
                 headers_command: [],

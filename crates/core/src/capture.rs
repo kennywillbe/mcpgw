@@ -76,6 +76,14 @@ pub enum Kind {
     /// follow a rewritten description arrive in, and a change nobody sees
     /// next to that traffic is a change nobody sees.
     Drift,
+    /// A `tools/call` the server's `calls_per_minute` budget refused, so it
+    /// never left the gateway; the tool the client asked for is in `tool`.
+    ///
+    /// Kept apart from [`Kind::Denied`] for the reason that one is kept
+    /// apart from [`Kind::Call`]: a denied call would never have been
+    /// allowed and a throttled one would have been a second earlier, so the
+    /// two say completely different things about the client that made them.
+    Throttled,
 }
 
 impl Kind {
@@ -89,13 +97,31 @@ impl Kind {
             Kind::List | Kind::Drift => "tools/list",
             // A refusal names the method the client called; what became of
             // it is the kind, not the method.
-            Kind::Call | Kind::Denied => "tools/call",
+            Kind::Call | Kind::Denied | Kind::Throttled => "tools/call",
             Kind::Resources => "resources/list",
             Kind::ResourceTemplates => "resources/templates/list",
             Kind::ResourceRead => "resources/read",
             Kind::Prompts => "prompts/list",
             Kind::PromptGet => "prompts/get",
             Kind::Complete => "completion/complete",
+        }
+    }
+
+    /// The word a traffic reader files the record under, which is the method
+    /// for everything the gateway forwarded and what became of the request
+    /// for a `tools/call` it metered.
+    ///
+    /// Its own accessor rather than a change to [`method`](Self::method),
+    /// which answers a different question and is what the detail pane and
+    /// every method filter want. A throttled call needs the distinction in
+    /// the column a reader scans: a runaway loop is a column of identical
+    /// rows, and `tools/call` on all of them hides the one fact that
+    /// explains the screen.
+    #[must_use]
+    pub fn status(self) -> &'static str {
+        match self {
+            Kind::Throttled => "tools/call throttled",
+            kind => kind.method(),
         }
     }
 }

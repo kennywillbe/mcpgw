@@ -7,6 +7,7 @@ ClientRead {
         "browser": Server {
             enabled: false,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "browser-mcp",
                 args: [],
@@ -19,6 +20,7 @@ ClientRead {
         "linear": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://mcp.linear.app/sse",
                 headers_command: [],
@@ -30,6 +32,7 @@ ClientRead {
         "playwright": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "npx",
                 args: [
@@ -44,6 +47,7 @@ ClientRead {
         "sourcegraph": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "${SRC_ENDPOINT}/.api/mcp/v1",
                 headers_command: [],

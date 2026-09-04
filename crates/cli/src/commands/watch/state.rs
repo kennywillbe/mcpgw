@@ -52,8 +52,8 @@ impl Entry {
             // A drift line is filed under its tool like a call is: the
             // whole point is seeing the change next to the traffic that came
             // after it.
-            (Kind::Call | Kind::Denied | Kind::Drift, Some(tool)) => tool,
-            (Kind::Call | Kind::Denied, None) => "?",
+            (Kind::Call | Kind::Denied | Kind::Throttled | Kind::Drift, Some(tool)) => tool,
+            (Kind::Call | Kind::Denied | Kind::Throttled, None) => "?",
             (kind, _) => kind.method(),
         }
     }
@@ -512,7 +512,10 @@ impl State {
                 age: age(now_ms, entry.record.ts),
                 server: entry.record.server.clone(),
                 target: entry.target().to_owned(),
-                kind: entry.record.kind.method(),
+                // `status`, not `method`: a throttled call gets a column
+                // that says so, which is what makes a runaway loop legible
+                // as a block of rows rather than as ordinary traffic.
+                kind: entry.record.kind.status(),
                 // An em dash rather than an empty cell: "this gateway does
                 // not attribute clients" and "this call had no client" look
                 // the same on screen, and both are the absence of an answer.
