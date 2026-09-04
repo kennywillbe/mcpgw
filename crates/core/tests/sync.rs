@@ -676,12 +676,15 @@ fn per_server_gateway_sync_unexcludes_its_own_names_in_gemini() {
     );
 }
 
+/// The loop runs with no delay on purpose: several of these backups land in
+/// the same millisecond, which is exactly the case that used to leave a
+/// pruned-out name free for a later write to reclaim and sort first.
 #[test]
 fn backups_prune_to_keep_and_latest_wins() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("state");
     let file = dir.path().join("mcp.json");
-    for i in 0..8 {
+    for i in 0..12 {
         std::fs::write(&file, format!("{{\"gen\": {i}}}")).unwrap();
         backup::backup_file(&state_dir, "cursor", &file).unwrap();
     }
@@ -692,7 +695,7 @@ fn backups_prune_to_keep_and_latest_wins() {
     let latest = backup::latest_backup(&state_dir, "cursor")
         .unwrap()
         .unwrap();
-    assert_eq!(std::fs::read_to_string(latest).unwrap(), "{\"gen\": 7}");
+    assert_eq!(std::fs::read_to_string(latest).unwrap(), "{\"gen\": 11}");
     assert!(
         backup::latest_backup(&state_dir, "vscode")
             .unwrap()
