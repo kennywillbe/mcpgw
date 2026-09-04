@@ -6,7 +6,7 @@ use mcpgw_core::capture::{
     Bodies, CapturePolicy, CaptureRecord, CaptureWriter, Kind, MAX_BODY_BYTES, TRUNCATION_MARKER,
 };
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
-use mcpgw_core::gateway::{Gateway, resolve, serve_http, serve_http_with};
+use mcpgw_core::gateway::{Gateway, NO_TOOLS_HERE, serve_http, serve_http_with};
 use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
 use mcpgw_core::{Server, Transport};
 use rmcp_client_http::ServiceExt as _;
@@ -38,18 +38,25 @@ fn manager(upstreams: &[(&str, &str)]) -> Arc<UpstreamManager> {
     )
 }
 
-/// Serves `gateway` on an ephemeral port and returns the bound address.
-async fn serve(gateway: Gateway) -> std::net::SocketAddr {
+/// Serves `gateway` as `name`'s endpoint on an ephemeral port and returns
+/// the bound address.
+async fn serve(name: &str, gateway: Gateway) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_http(gateway, listener, std::future::pending()));
+    tokio::spawn(serve_http(
+        name.to_owned(),
+        gateway,
+        listener,
+        std::future::pending(),
+    ));
     addr
 }
 
-/// Serves `gateway` on an ephemeral port and connects a client to it.
-async fn connect(gateway: Gateway) -> Client {
-    let addr = serve(gateway).await;
-    let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp"));
+/// The same, with a client connected to that endpoint.
+async fn connect(name: &str, gateway: Gateway) -> Client {
+    let addr = serve(name, gateway).await;
+    let transport =
+        StreamableHttpClientTransport::from_uri(format!("http://{addr}{}", endpoint_path(name)));
     ().serve(transport).await.unwrap()
 }
 
@@ -57,15 +64,7 @@ async fn connect(gateway: Gateway) -> Client {
 /// connected MCP client plus the manager for shutdown.
 async fn gateway_client(mode: &str) -> (Client, Arc<UpstreamManager>) {
     let manager = manager(&[("fx", mode)]);
-    let client = connect(Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
-    (client, manager)
-}
-
-/// Same, but aggregating the given `(name, mode)` upstreams.
-async fn aggregate_client(upstreams: &[(&str, &str)]) -> (Client, Arc<UpstreamManager>) {
-    let manager = manager(upstreams);
-    let names = upstreams.iter().map(|(n, _)| (*n).to_owned()).collect();
-    let client = connect(Gateway::aggregate(Arc::clone(&manager), names)).await;
+    let client = connect("fx", Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
     (client, manager)
 }
 
@@ -130,7 +129,7 @@ async fn a_hung_upstream_fails_the_request_on_the_deadline() {
     );
     let gateway = Gateway::new(Arc::clone(&manager), "fx".to_owned())
         .with_request_timeout(Duration::from_millis(300));
-    let client = connect(gateway).await;
+    let client = connect("fx", gateway).await;
 
     let started = std::time::Instant::now();
     let err = client.call_tool(call("echo", "hi")).await.unwrap_err();
@@ -154,57 +153,6 @@ async fn a_hung_upstream_fails_the_request_on_the_deadline() {
     manager.shutdown().await;
 }
 
-#[tokio::test]
-async fn aggregate_merges_prefixed_tools_from_every_upstream() {
-    let (client, manager) = aggregate_client(&[("fx1", "healthy"), ("fx2", "healthy")]).await;
-    let tools = client.list_all_tools().await.unwrap();
-    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(
-        names,
-        ["fx1__echo", "fx1__reverse", "fx2__echo", "fx2__reverse"]
-    );
-    manager.shutdown().await;
-}
-
-#[tokio::test]
-async fn aggregate_routes_calls_to_the_named_upstream() {
-    let (client, manager) = aggregate_client(&[("fx1", "healthy"), ("fx2", "healthy")]).await;
-
-    let reversed = client.call_tool(call("fx2__reverse", "abc")).await.unwrap();
-    let text = format!("{reversed:?}");
-    assert!(text.contains("cba"), "{text}");
-
-    let echoed = client.call_tool(call("fx1__echo", "abc")).await.unwrap();
-    let text = format!("{echoed:?}");
-    assert!(text.contains("abc"), "{text}");
-    manager.shutdown().await;
-}
-
-#[tokio::test]
-async fn unknown_prefix_errors_and_names_the_known_servers() {
-    let (client, manager) = aggregate_client(&[("fx1", "healthy"), ("fx2", "healthy")]).await;
-    let err = client.call_tool(call("nope__echo", "x")).await.unwrap_err();
-    let text = err.to_string();
-    assert!(text.contains("fx1") && text.contains("fx2"), "{text}");
-    manager.shutdown().await;
-}
-
-#[tokio::test]
-async fn one_broken_upstream_never_hides_the_healthy_ones() {
-    let (client, manager) = aggregate_client(&[("fx1", "healthy"), ("fx2", "exit")]).await;
-    let tools = client.list_all_tools().await.unwrap();
-    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(names, ["fx1__echo", "fx1__reverse"]);
-
-    // The surviving upstream stays fully usable.
-    let echoed = client
-        .call_tool(call("fx1__echo", "still here"))
-        .await
-        .unwrap();
-    assert!(format!("{echoed:?}").contains("still here"));
-    manager.shutdown().await;
-}
-
 /// Chains a second gateway on top of `gateway`: gw1 is served over http and
 /// becomes gw2's upstream, so requests travel client → gw2 → http → gw1 →
 /// stdio fixture.
@@ -213,13 +161,18 @@ async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<Up
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let gw1 = Gateway::new(Arc::clone(&inner), "fx".to_owned());
-    tokio::spawn(serve_http(gw1, listener, std::future::pending()));
+    tokio::spawn(serve_http(
+        "fx".to_owned(),
+        gw1,
+        listener,
+        std::future::pending(),
+    ));
 
     let remote = Server {
         enabled: true,
         tags: Vec::new(),
         transport: Transport::Http {
-            url: format!("http://{addr}/mcp"),
+            url: format!("http://{addr}{}", endpoint_path("fx")),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
@@ -229,10 +182,10 @@ async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<Up
             .with_connect_timeout(Duration::from_secs(30))
             .with_backoff_base(Duration::from_millis(20)),
     );
-    let client = connect(Gateway::aggregate(
-        Arc::clone(&outer),
-        vec![upstream.to_owned()],
-    ))
+    let client = connect(
+        upstream,
+        Gateway::new(Arc::clone(&outer), upstream.to_owned()),
+    )
     .await;
     (client, outer, inner)
 }
@@ -242,7 +195,7 @@ async fn http_upstream_lists_tools_through_the_chain() {
     let (client, outer, inner) = chained_client("remote").await;
     let tools = client.list_all_tools().await.unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(names, ["remote__echo", "remote__reverse"]);
+    assert_eq!(names, ["echo", "reverse"]);
     outer.shutdown().await;
     inner.shutdown().await;
 }
@@ -250,31 +203,11 @@ async fn http_upstream_lists_tools_through_the_chain() {
 #[tokio::test]
 async fn http_upstream_round_trips_a_tool_call() {
     let (client, outer, inner) = chained_client("remote").await;
-    let result = client
-        .call_tool(call("remote__reverse", "mcpgw"))
-        .await
-        .unwrap();
+    let result = client.call_tool(call("reverse", "mcpgw")).await.unwrap();
     let text = format!("{result:?}");
     assert!(text.contains("wgpcm"), "{text}");
     outer.shutdown().await;
     inner.shutdown().await;
-}
-
-#[test]
-fn resolve_prefers_the_longest_known_server_name() {
-    let servers = ["a".to_owned(), "a_b".to_owned()];
-    // "a_b__t" also parses as server "a" + tool "b__t" only if a separator
-    // followed "a" — it does not, so the longer server wins outright.
-    assert_eq!(resolve("a_b__t", &servers), Some(("a_b", "t")));
-
-    // `__` inside a tool name stays legal: only the first known-server
-    // boundary is consumed.
-    let servers = ["a".to_owned()];
-    assert_eq!(resolve("a__b__t", &servers), Some(("a", "b__t")));
-
-    assert_eq!(resolve("nope__t", &servers), None);
-    // A bare name without the separator belongs to no server.
-    assert_eq!(resolve("a", &servers), None);
 }
 
 /// Every JSONL line written into `dir`, sorted so the parallel tools/list
@@ -297,20 +230,19 @@ fn captured(dir: &std::path::Path) -> Vec<CaptureRecord> {
 async fn capture_records_every_upstream_list_and_call() {
     let state = tempfile::tempdir().unwrap();
     let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
-    let manager = manager(&[("fx1", "healthy"), ("fx2", "exit")]);
-    let gateway = Gateway::aggregate(
-        Arc::clone(&manager),
-        vec!["fx1".to_owned(), "fx2".to_owned()],
-    )
-    .with_capture(Arc::clone(&writer));
-    let client = connect(gateway).await;
+    let (addr, manager) = serve_both(&[("fx1", "healthy"), ("fx2", "exit")], Some(&writer)).await;
+    let one = client_at(addr, &endpoint_path("fx1")).await;
+    let two = client_at(addr, &endpoint_path("fx2")).await;
 
-    // One list (two upstream attempts, one of which cannot start), one good
-    // call and one call into the dead upstream.
-    client.list_all_tools().await.unwrap();
-    client.call_tool(call("fx1__echo", "hi")).await.unwrap();
-    client.call_tool(call("fx2__echo", "hi")).await.unwrap_err();
-    client.cancel().await.unwrap();
+    // Two lists, one of them against an upstream that cannot start, one good
+    // call and one call into that dead upstream.
+    one.list_all_tools().await.unwrap();
+    two.list_all_tools().await.unwrap_err();
+    one.call_tool(call("echo", "hi")).await.unwrap();
+    two.call_tool(call("echo", "hi")).await.unwrap_err();
+    for client in [one, two] {
+        client.cancel().await.unwrap();
+    }
     manager.shutdown().await;
 
     let records = captured(writer.dir());
@@ -329,11 +261,12 @@ async fn capture_records_every_upstream_list_and_call() {
         "{records:#?}"
     );
 
-    // One client means one downstream session: every record carries the same
-    // id, and it is the client's, not the gateway process's fallback.
-    let session = records[0].session.clone();
-    assert!(records.iter().all(|r| r.session == session), "{records:#?}");
-    assert_ne!(session, writer.session());
+    // Both records of one client carry that client's own session id, and
+    // neither client is filed under the gateway process's fallback.
+    assert_eq!(records[0].session, records[2].session, "{records:#?}");
+    assert_eq!(records[1].session, records[3].session, "{records:#?}");
+    assert_ne!(records[0].session, records[1].session, "{records:#?}");
+    assert_ne!(records[0].session, writer.session());
 
     // Calls carry both sides of the exchange.
     let good_call = &records[2];
@@ -353,7 +286,7 @@ async fn capture_truncates_oversized_bodies() {
     let manager = manager(&[("fx", "healthy")]);
     let gateway =
         Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
-    let client = connect(gateway).await;
+    let client = connect("fx", gateway).await;
 
     // Multibyte payload well past the cap, echoed back just as long.
     let message = "é".repeat(MAX_BODY_BYTES);
@@ -382,7 +315,7 @@ async fn a_credential_in_a_tool_argument_never_reaches_the_file() {
     let manager = manager(&[("fx", "healthy")]);
     let gateway =
         Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
-    let client = connect(gateway).await;
+    let client = connect("fx", gateway).await;
 
     client.call_tool(call("echo", FAKE_TOKEN)).await.unwrap();
     client.cancel().await.unwrap();
@@ -412,7 +345,7 @@ async fn capture_bodies_full_keeps_the_credential() {
     let manager = manager(&[("fx", "healthy")]);
     let gateway =
         Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
-    let client = connect(gateway).await;
+    let client = connect("fx", gateway).await;
 
     client.call_tool(call("echo", FAKE_TOKEN)).await.unwrap();
     client.cancel().await.unwrap();
@@ -501,7 +434,7 @@ async fn raw_post_body(
 #[tokio::test]
 async fn a_hostile_origin_is_refused_before_it_reaches_the_gateway() {
     let manager = manager(&[("fx", "healthy")]);
-    let addr = serve(Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
+    let addr = serve("fx", Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
 
     // DNS rebinding: the page's own domain resolves to loopback, so only the
     // Origin header tells the two apart.
@@ -519,8 +452,8 @@ async fn a_hostile_origin_is_refused_before_it_reaches_the_gateway() {
     manager.shutdown().await;
 }
 
-/// Serves `gateway` at `/mcp` and one pipe endpoint per upstream at
-/// `/s/<name>`, all over the one shared manager, and returns the address.
+/// Serves one pipe endpoint per upstream at `/s/<name>`, next to the base
+/// endpoint, all over the one shared manager, and returns the address.
 async fn serve_both(
     upstreams: &[(&str, &str)],
     capture: Option<&Arc<CaptureWriter>>,
@@ -541,16 +474,10 @@ async fn serve_both(
         })
         .collect();
     let endpoints = Endpoints::new(EndpointTable::new(pipes));
-    let aggregate = with_capture(Gateway::aggregate(Arc::clone(&manager), names));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_http_with(
-        aggregate,
-        Some(endpoints),
-        listener,
-        std::future::pending(),
-    ));
+    tokio::spawn(serve_http_with(endpoints, listener, std::future::pending()));
     (addr, manager)
 }
 
@@ -564,27 +491,18 @@ fn tool_names(tools: &[rmcp_client_http::model::Tool]) -> Vec<&str> {
     tools.iter().map(|t| t.name.as_ref()).collect()
 }
 
-/// The point of the endpoint table: three simultaneous views of the same
-/// upstreams — one aggregate and one per server — sharing a single
-/// `UpstreamManager`, so no view costs an extra process.
+/// The point of the endpoint table: two simultaneous views of the same
+/// upstreams, one per server, sharing a single `UpstreamManager`, so no view
+/// costs an extra process.
 #[tokio::test]
-async fn per_server_endpoints_serve_their_own_tools_next_to_the_aggregate() {
+async fn per_server_endpoints_serve_their_own_tools() {
     let (addr, manager) = serve_both(&[("fx1", "healthy"), ("fx2", "healthy")], None).await;
 
-    let aggregate = client_at(addr, "/mcp").await;
     let fx1 = client_at(addr, &endpoint_path("fx1")).await;
     let fx2 = client_at(addr, &endpoint_path("fx2")).await;
 
-    let (agg_tools, fx1_tools, fx2_tools) = tokio::join!(
-        aggregate.list_all_tools(),
-        fx1.list_all_tools(),
-        fx2.list_all_tools(),
-    );
-    // The aggregate keeps prefixing; each endpoint hands out bare names.
-    assert_eq!(
-        tool_names(&agg_tools.unwrap()),
-        ["fx1__echo", "fx1__reverse", "fx2__echo", "fx2__reverse"]
-    );
+    let (fx1_tools, fx2_tools) = tokio::join!(fx1.list_all_tools(), fx2.list_all_tools());
+    // Every endpoint hands out its own server's tools, under their own names.
     assert_eq!(tool_names(&fx1_tools.unwrap()), ["echo", "reverse"]);
     assert_eq!(tool_names(&fx2_tools.unwrap()), ["echo", "reverse"]);
 
@@ -596,7 +514,7 @@ async fn per_server_endpoints_serve_their_own_tools_next_to_the_aggregate() {
     assert!(format!("{:?}", one.unwrap()).contains("from fx1"));
     assert!(format!("{:?}", two.unwrap()).contains("dcba"));
 
-    for client in [aggregate, fx1, fx2] {
+    for client in [fx1, fx2] {
         client.cancel().await.unwrap();
     }
     manager.shutdown().await;
@@ -726,36 +644,6 @@ async fn a_pipe_advertises_what_its_upstream_can_do() {
     manager.shutdown().await;
 }
 
-/// Pinned, because it is a decision rather than an oversight: resource URIs
-/// and prompt names cannot be namespaced the way `server__tool` can, so the
-/// aggregate serves none of them and `/s/<name>` is where they live.
-#[tokio::test]
-async fn the_aggregate_serves_no_resources_or_prompts() {
-    let (client, manager) = aggregate_client(&[("fx1", "healthy"), ("fx2", "healthy")]).await;
-
-    assert!(client.list_all_resources().await.unwrap().is_empty());
-    assert!(
-        client
-            .list_all_resource_templates()
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(client.list_all_prompts().await.unwrap().is_empty());
-
-    // Reading or getting one is a plain "not here", not a made-up empty body.
-    assert!(client.read_resource(read(RESOURCE_URI)).await.is_err());
-    assert!(client.get_prompt(prompt("summarize", "x")).await.is_err());
-
-    // And the aggregate advertises exactly what it merges.
-    let capabilities = client.peer_info().unwrap().capabilities.clone();
-    assert!(capabilities.tools.is_some());
-    assert!(capabilities.resources.is_none() && capabilities.prompts.is_none());
-
-    client.cancel().await.unwrap();
-    manager.shutdown().await;
-}
-
 /// The forwarded families ride the same request deadline as `tools/call`;
 /// none of them can leave a client waiting on a server that never answers.
 #[tokio::test]
@@ -770,7 +658,7 @@ async fn a_hung_upstream_fails_a_forwarded_request_on_the_deadline() {
     );
     let gateway = Gateway::new(Arc::clone(&manager), "fx".to_owned())
         .with_request_timeout(Duration::from_millis(300));
-    let client = connect(gateway).await;
+    let client = connect("fx", gateway).await;
 
     let started = std::time::Instant::now();
     let err = client.list_all_prompts().await.unwrap_err();
@@ -883,16 +771,13 @@ async fn concurrent_clients_are_attributed_to_their_own_sessions_and_endpoints()
 
     let one = client_at(addr, &endpoint_path("fx1")).await;
     let two = client_at(addr, &endpoint_path("fx2")).await;
-    let aggregate = client_at(addr, "/mcp").await;
-    let (first, second, third) = tokio::join!(
+    let (first, second) = tokio::join!(
         one.call_tool(call("echo", "from one")),
         two.call_tool(call("echo", "from two")),
-        aggregate.call_tool(call("fx1__echo", "from the aggregate")),
     );
     first.unwrap();
     second.unwrap();
-    third.unwrap();
-    for client in [one, two, aggregate] {
+    for client in [one, two] {
         client.cancel().await.unwrap();
     }
     manager.shutdown().await;
@@ -904,20 +789,17 @@ async fn concurrent_clients_are_attributed_to_their_own_sessions_and_endpoints()
         .collect();
     assert_eq!(
         by_endpoint.keys().copied().collect::<Vec<_>>(),
-        ["mcp", "s/fx1", "s/fx2"],
+        ["s/fx1", "s/fx2"],
         "{records:#?}"
     );
-    // The aggregate still resolves the prefix to the real upstream, so the
-    // endpoint and the server are independent facts about one call.
-    assert_eq!(by_endpoint["mcp"].server, "fx1");
     assert_eq!(by_endpoint["s/fx1"].server, "fx1");
     assert_eq!(by_endpoint["s/fx2"].server, "fx2");
 
-    // Three connections, three distinct sessions, none of them the
+    // Two connections, two distinct sessions, neither of them the
     // per-process fallback.
     let sessions: std::collections::BTreeSet<&str> =
         records.iter().map(|r| r.session.as_str()).collect();
-    assert_eq!(sessions.len(), 3, "{records:#?}");
+    assert_eq!(sessions.len(), 2, "{records:#?}");
     assert!(!sessions.contains(writer.session()), "{records:#?}");
 }
 
@@ -1122,22 +1004,6 @@ async fn a_pipe_forwards_pagination_cursors_verbatim() {
     manager.shutdown().await;
 }
 
-/// The aggregate is allowed to be lossy, and pinning that keeps the two
-/// modes honest: it exists to merge N servers under `server__tool` names, so
-/// it collapses pagination and answers with a result of its own making.
-#[tokio::test]
-async fn the_aggregate_keeps_its_collapsed_prefixed_answer() {
-    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
-    let mut aggregate = RawSession::open(addr, "/mcp").await;
-
-    let result = aggregate.request("tools/list", serde_json::json!({})).await;
-
-    assert_eq!(names_in(&result), ["fx__echo", "fx__reverse"], "{result}");
-    assert!(result.get("ttlMs").is_none(), "{result}");
-    assert!(result.get("cacheScope").is_none(), "{result}");
-    manager.shutdown().await;
-}
-
 /// How far transparency reaches, pinned as a fact rather than assumed.
 ///
 /// Both hops go through rmcp's models — the upstream's answer is decoded
@@ -1181,12 +1047,12 @@ async fn a_pipe_names_its_upstream_once_it_has_met_it() {
     assert_eq!(identity.name, "mcpgw-test-server", "{identity:?}");
     assert_eq!(identity.version, "9.9.9", "{identity:?}");
 
-    // The aggregate is nobody's proxy in particular: it stays mcpgw.
-    let aggregate = client_at(addr, "/mcp").await;
-    let identity = aggregate.peer_info().unwrap().server_info.clone().unwrap();
+    // The base endpoint is nobody's proxy: it stays mcpgw.
+    let base = client_at(addr, "/mcp").await;
+    let identity = base.peer_info().unwrap().server_info.clone().unwrap();
     assert_eq!(identity.name, "mcpgw", "{identity:?}");
 
-    for client in [early, later, aggregate] {
+    for client in [early, later, base] {
         client.cancel().await.unwrap();
     }
     manager.shutdown().await;
@@ -1218,6 +1084,14 @@ impl InlineSession {
 
     /// Sends one request and returns its `result` object verbatim.
     async fn request(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+        let message = self.attempt(method, params).await;
+        assert!(message.get("error").is_none(), "{method} failed: {message}");
+        message["result"].clone()
+    }
+
+    /// The same, handing back the whole JSON-RPC message so a test can assert
+    /// on a failure the gateway is right to produce.
+    async fn attempt(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
         self.id += 1;
         let mut params = params;
         params["_meta"] = serde_json::json!({
@@ -1244,7 +1118,7 @@ impl InlineSession {
             headers.push(("Mcp-Name", subject));
         }
         let response = raw_post_body(self.addr, &self.path, None, &headers, &body).await;
-        let message = response
+        response
             .lines()
             .filter_map(|line| line.strip_prefix("data: "))
             .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
@@ -1253,9 +1127,7 @@ impl InlineSession {
                 let body = response.split("\r\n\r\n").nth(1)?;
                 serde_json::from_str::<serde_json::Value>(body).ok()
             })
-            .unwrap_or_else(|| panic!("no JSON-RPC answer in: {response}"));
-        assert!(message.get("error").is_none(), "{method} failed: {message}");
-        message["result"].clone()
+            .unwrap_or_else(|| panic!("no JSON-RPC answer in: {response}"))
     }
 }
 
@@ -1323,22 +1195,6 @@ async fn an_older_client_is_not_handed_fields_from_a_revision_it_did_not_ask_for
     assert!(result.get("resultType").is_none(), "{result}");
     assert!(result.get("ttlMs").is_none(), "{result}");
     assert!(result.get("cacheScope").is_none(), "{result}");
-    manager.shutdown().await;
-}
-
-/// The aggregate answers a newer client too, and it builds its merged result
-/// itself — so it needs the same fields, from the same rule.
-#[tokio::test]
-async fn the_aggregate_answers_a_newer_client_in_its_own_revision() {
-    let (addr, manager) = serve_both(&[("fx", "legacy")], None).await;
-    let mut aggregate = InlineSession::new(addr, "/mcp");
-
-    let result = aggregate.request("tools/list", serde_json::json!({})).await;
-
-    assert_eq!(names_in(&result), ["fx__echo", "fx__reverse"], "{result}");
-    assert_eq!(result["resultType"], "complete", "{result}");
-    assert_eq!(result["ttlMs"], 0, "{result}");
-    assert_eq!(result["cacheScope"], "private", "{result}");
     manager.shutdown().await;
 }
 
@@ -1413,9 +1269,19 @@ impl Remote {
             }
         };
         let addr = listener.local_addr().unwrap();
-        let inner = manager(&[("fx", "healthy")]);
-        let gateway = Gateway::aggregate(Arc::clone(&inner), vec!["fx".to_owned()]);
-        let task = tokio::spawn(serve_http(gateway, listener, std::future::pending()));
+        // `legacy` rather than `healthy`: the healthy fixture marks its
+        // tools/list cacheable for four seconds and the pipe forwards that
+        // faithfully, so a client would answer the second list out of its own
+        // cache — which says nothing about the connection these tests are
+        // entirely about.
+        let inner = manager(&[("fx", "legacy")]);
+        let gateway = Gateway::new(Arc::clone(&inner), "fx".to_owned());
+        let task = tokio::spawn(serve_http(
+            "fx".to_owned(),
+            gateway,
+            listener,
+            std::future::pending(),
+        ));
         Self { addr, task, inner }
     }
 
@@ -1433,7 +1299,7 @@ fn remote_manager(addr: std::net::SocketAddr) -> Arc<UpstreamManager> {
         enabled: true,
         tags: Vec::new(),
         transport: Transport::Http {
-            url: format!("http://{addr}/mcp"),
+            url: format!("http://{addr}{}", endpoint_path("fx")),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
@@ -1502,7 +1368,7 @@ async fn a_restarted_http_upstream_is_reconnected_on_the_next_demand() {
 
     let remote = Remote::start(addr.port()).await;
     let tools = list_through(&outer).await.unwrap();
-    assert_eq!(tool_names(&tools), ["fx__echo", "fx__reverse"]);
+    assert_eq!(tool_names(&tools), ["echo", "reverse"]);
     assert_eq!(outer.status("remote").await, Some(UpstreamStatus::Ready));
     outer.shutdown().await;
     remote.stop().await;
@@ -1517,9 +1383,11 @@ async fn a_json_rpc_error_from_a_live_http_upstream_keeps_the_slot_ready() {
     let outer = remote_manager(remote.addr);
     list_through(&outer).await.unwrap();
 
+    // A resource that is not there: the fixture answers it with a JSON-RPC
+    // error, which is a server saying no rather than a server going away.
     let err = outer
         .call("remote", |service| async move {
-            service.call_tool(call("nope", "x")).await
+            service.read_resource(read("mem:///nope.txt")).await
         })
         .await
         .unwrap_err();
@@ -1553,7 +1421,7 @@ async fn a_session_expired_by_a_restart_is_reinitialized_under_the_call() {
     assert_eq!(outer.status("remote").await, Some(UpstreamStatus::Ready));
 
     let tools = list_through(&outer).await.unwrap();
-    assert_eq!(tool_names(&tools), ["fx__echo", "fx__reverse"]);
+    assert_eq!(tool_names(&tools), ["echo", "reverse"]);
     outer.shutdown().await;
     remote.stop().await;
 }
@@ -1588,7 +1456,11 @@ fn unauthorized_server() -> std::net::SocketAddr {
 #[tokio::test]
 async fn an_oauth_upstream_names_the_login_rather_than_relaying_the_challenge() {
     let manager = remote_manager(unauthorized_server());
-    let client = connect(Gateway::new(Arc::clone(&manager), "remote".to_owned())).await;
+    let client = connect(
+        "remote",
+        Gateway::new(Arc::clone(&manager), "remote".to_owned()),
+    )
+    .await;
 
     let text = client.list_all_tools().await.unwrap_err().to_string();
     assert!(
@@ -1647,22 +1519,78 @@ async fn a_pipe_answers_discover_for_the_server_behind_it() {
     manager.shutdown().await;
 }
 
-/// The aggregate answers it too, as itself: it is nobody's proxy in
-/// particular, and it serves tools only.
+/// The base endpoint answers it as itself. It fronts no server, so the
+/// identity is the gateway's own and the tool list is empty — which is a
+/// different thing from an endpoint that is not there, and the difference is
+/// what a client dialing the base is entitled to learn.
 #[tokio::test]
-async fn the_aggregate_discovers_as_mcpgw() {
+async fn the_base_endpoint_discovers_as_mcpgw_and_serves_no_tools() {
     let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
-    let mut aggregate = InlineSession::new(addr, "/mcp");
+    let mut base = InlineSession::new(addr, "/mcp");
 
-    let result = aggregate
-        .request("server/discover", serde_json::json!({}))
+    let discovered = base.request("server/discover", serde_json::json!({})).await;
+    assert_eq!(
+        discovered["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "mcpgw",
+        "{discovered}"
+    );
+    assert!(
+        discovered["capabilities"]["tools"].is_object(),
+        "{discovered}"
+    );
+    // Nothing is forwarded from here, so nothing else may be advertised.
+    assert!(
+        discovered["capabilities"].get("resources").is_none(),
+        "{discovered}"
+    );
+    assert!(
+        discovered["capabilities"].get("prompts").is_none(),
+        "{discovered}"
+    );
+
+    // An empty list, still shaped the way the revision requires — an empty
+    // answer a strict client rejects is no better than no answer.
+    let listed = base.request("tools/list", serde_json::json!({})).await;
+    assert_eq!(names_in(&listed), Vec::<&str>::new(), "{listed}");
+    assert_eq!(listed["resultType"], "complete", "{listed}");
+    assert_eq!(listed["ttlMs"], 0, "{listed}");
+    assert_eq!(listed["cacheScope"], "private", "{listed}");
+
+    manager.shutdown().await;
+}
+
+/// A call that arrives here comes from a client config pointing one path too
+/// high — the shape 0.3 and 0.4 wrote. The answer says where to point it.
+#[tokio::test]
+async fn the_base_endpoint_refuses_a_tool_call_and_says_where_to_go() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+    let mut base = InlineSession::new(addr, "/mcp");
+
+    let message = base
+        .attempt(
+            "tools/call",
+            serde_json::json!({ "name": "echo", "arguments": { "message": "hi" } }),
+        )
         .await;
 
-    assert_eq!(
-        result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "mcpgw",
-        "{result}"
-    );
-    assert!(result["capabilities"]["tools"].is_object(), "{result}");
+    // -32601: JSON-RPC's own method-not-found, which means the same thing to
+    // a client of either revision.
+    assert_eq!(message["error"]["code"], -32601, "{message}");
+    assert_eq!(message["error"]["message"], NO_TOOLS_HERE, "{message}");
+    manager.shutdown().await;
+}
+
+/// `doctor` and `daemon status` ask the port whether a gateway is there with
+/// a plain GET and take any HTTP answer for a yes. The base endpoint is what
+/// they land on, and it has to keep answering one.
+#[tokio::test]
+async fn the_base_endpoint_answers_the_daemon_probe() {
+    let (addr, manager) = serve_both(&[("fx", "healthy")], None).await;
+
+    let reach =
+        mcpgw_core::daemon::probe_gateway(&format!("http://{addr}/mcp"), Duration::from_secs(5))
+            .await;
+
+    assert!(reach.is_up(), "{reach:?}");
     manager.shutdown().await;
 }
 

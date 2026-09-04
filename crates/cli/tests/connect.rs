@@ -19,7 +19,7 @@ mod util;
 use util::{fixture_binary, fixture_config, free_port, mcpgw};
 
 /// Serves a gateway piping the healthy fixture on an ephemeral port and
-/// returns its `/mcp` URL plus the manager (for shutdown).
+/// returns the fixture's own endpoint URL plus the manager (for shutdown).
 async fn fixture_gateway() -> (String, Arc<UpstreamManager>) {
     let server = Server {
         enabled: true,
@@ -39,8 +39,13 @@ async fn fixture_gateway() -> (String, Arc<UpstreamManager>) {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_http(gateway, listener, std::future::pending()));
-    (format!("http://{addr}/mcp"), manager)
+    tokio::spawn(serve_http(
+        "fx".to_owned(),
+        gateway,
+        listener,
+        std::future::pending(),
+    ));
+    (format!("http://{addr}/s/fx"), manager)
 }
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;

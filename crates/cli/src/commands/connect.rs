@@ -268,10 +268,9 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
     let config_path = super::canonical_config_path()?;
     let config = Config::load(&config_path)?;
     let selected = super::serve::enabled_servers(&config, &config_path)?;
-    // No selection: the aggregate on `/mcp` and a face per server under
-    // `/s/<name>`, exactly as a plain `mcpgw serve` would. Capture is on for
-    // the same reason it is there — a session nobody logged is a session
-    // `mcpgw watch` cannot explain.
+    // No selection: a face per server under `/s/<name>`, exactly as a plain
+    // `mcpgw serve` would. Capture is on for the same reason it is there — a
+    // session nobody logged is a session `mcpgw watch` cannot explain.
     //
     // Redacted, with no flag to say otherwise. A `--capture-bodies` on the
     // bridge would do nothing at all in the usual case, where a gateway is
@@ -291,12 +290,9 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
     let stop_watching = Arc::new(tokio::sync::Notify::new());
     let server = tokio::spawn({
         let stop = Arc::clone(&stop_serving);
-        mcpgw_core::gateway::serve_http_with(
-            built.gateway,
-            Some(built.endpoints),
-            listener,
-            async move { stop.notified().await },
-        )
+        mcpgw_core::gateway::serve_http_with(built.endpoints, listener, async move {
+            stop.notified().await;
+        })
     });
     let watcher = tokio::spawn({
         let stop = Arc::clone(&stop_watching);

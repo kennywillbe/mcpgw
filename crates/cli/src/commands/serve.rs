@@ -4,7 +4,7 @@ use anyhow::{Context as _, bail};
 use mcpgw_core::Config;
 use mcpgw_core::capture::{Bodies, CapturePolicy, CaptureWriter, RedactionRules};
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
-use mcpgw_core::gateway::{Gateway, ServerList, serve_http_with};
+use mcpgw_core::gateway::serve_http_with;
 use mcpgw_core::reload::{POLL_INTERVAL, Reloader};
 use mcpgw_core::runtime::GatewayRecord;
 use mcpgw_core::upgrade::{self, UpgradeRestart};
@@ -68,7 +68,7 @@ pub struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1")]
     pub bind: String,
     /// Serve only these servers (repeatable; default: every enabled
-    /// server). Exactly one turns the gateway into an unprefixed pipe.
+    /// server).
     #[arg(long, value_name = "NAME")]
     pub server: Vec<String>,
     /// Accepted and ignored: per-server endpoints are always served. Kept
@@ -101,8 +101,6 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         manager,
         endpoints,
         reloader,
-        gateway,
-        pipe,
         capture_note,
     } = build(
         config_path,
@@ -122,7 +120,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         // the port the kernel actually handed out rather than the zero it
         // asked for.
         let (state_dir, record) = publish_record(&args.bind, addr.port(), args.supervised).unzip();
-        print_banner(addr, pipe, &serving, &capture_note);
+        print_banner(addr, &serving, &capture_note);
 
         // `notify_one` rather than `notify_waiters`: it leaves a permit
         // behind, so the watcher is stopped even if Ctrl-C lands while it is
@@ -160,12 +158,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
             Arc::clone(&stop_upgrades),
             decided.clone(),
         );
-        let mut served = std::pin::pin!(serve_http_with(
-            gateway,
-            Some(endpoints),
-            listener,
-            shutdown
-        ));
+        let mut served = std::pin::pin!(serve_http_with(endpoints, listener, shutdown));
         // Only the upgrade path is ever cut short: the drain cannot resolve
         // before the watcher has decided, and a Ctrl-C shutdown is allowed
         // to take as long as its clients need.
@@ -212,10 +205,6 @@ pub(crate) struct Built {
     pub(crate) manager: Arc<UpstreamManager>,
     pub(crate) endpoints: Endpoints,
     pub(crate) reloader: Reloader,
-    pub(crate) gateway: Gateway,
-    /// Whether `/mcp` is one server's unprefixed pipe rather than the
-    /// aggregate. Only the banner cares.
-    pub(crate) pipe: bool,
     pub(crate) capture_note: String,
 }
 
@@ -244,35 +233,10 @@ pub(crate) fn build(
         reloader = reloader.with_capture(Arc::clone(writer));
     }
 
-    // One explicit --server keeps the M9 shape: a pure pipe with untouched
-    // tool names. Everything else aggregates under `server__tool`.
-    let (gateway, pipe) = match selected {
-        [single] if !selection.is_empty() => {
-            (Gateway::new(Arc::clone(&manager), single.clone()), true)
-        }
-        _ => {
-            // The aggregate's list is shared with the reloader rather than
-            // fixed here: a server added later has to appear on `/mcp` too,
-            // and the `/mcp` service is built once, for the whole process.
-            let servers = ServerList::new(Vec::new());
-            reloader = reloader.with_aggregate(servers.clone());
-            (
-                Gateway::aggregate_shared(Arc::clone(&manager), servers),
-                false,
-            )
-        }
-    };
-    let gateway = match &capture {
-        Some(writer) => gateway.with_capture(Arc::clone(writer)),
-        None => gateway,
-    };
-
     Ok(Built {
         manager,
         endpoints,
         reloader,
-        gateway,
-        pipe,
         capture_note,
     })
 }
@@ -334,17 +298,12 @@ fn capture_writer(
 }
 
 /// The three lines a gateway prints once it is listening.
-fn print_banner(addr: std::net::SocketAddr, pipe: bool, serving: &[String], capture_note: &str) {
-    let shape = if pipe {
-        format!("piping {:?}", serving.join(", "))
-    } else {
-        format!(
-            "aggregating {} server(s): {}",
-            serving.len(),
-            serving.join(", ")
-        )
-    };
-    println!("mcpgw gateway listening on http://{addr}/mcp — {shape}");
+fn print_banner(addr: std::net::SocketAddr, serving: &[String], capture_note: &str) {
+    println!(
+        "mcpgw gateway listening on http://{addr}/mcp — serving {} server(s): {}",
+        serving.len(),
+        serving.join(", ")
+    );
     let urls: Vec<String> = serving
         .iter()
         .map(|name| format!("http://{addr}{}", endpoint_path(name)))

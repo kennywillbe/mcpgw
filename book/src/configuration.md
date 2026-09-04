@@ -45,8 +45,9 @@ field-level parse error.
 
 ### `[servers.NAME]`
 
-`NAME` must match `[a-z0-9-_]`, and may not contain `__` — that sequence is
-reserved as the gateway's `server__tool` separator.
+`NAME` must match `[a-z0-9-_]`, and may not contain `__` — the name is a URL
+path segment (`/s/NAME`) and the half before `__` in what `mcpgw watch` prints
+for a call, and `__` inside one would make that unreadable.
 
 Common to both transports:
 

@@ -37,9 +37,9 @@ pub const TRUNCATION_MARKER: &str = "…[truncated]";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    /// `tools/list` against one upstream (in aggregate mode: one per upstream).
+    /// `tools/list` against one upstream.
     List,
-    /// `tools/call` against the resolved upstream.
+    /// `tools/call` against one upstream.
     Call,
     /// `resources/list`, forwarded by a pipe.
     Resources,
@@ -522,9 +522,11 @@ pub struct CaptureRecord {
     /// transport session when there is one, otherwise the gateway process's
     /// own id. See [`CaptureWriter::session`] for what each means.
     pub session: String,
-    /// Which face of the gateway took the request: `s/<server>` for a
-    /// per-server endpoint, `mcp` for the aggregate. Absent on lines written
-    /// before this field existed and on the stdio face, which has no path.
+    /// Which face of the gateway took the request: `s/<server>`, which is
+    /// the only face that reaches a server. Absent on lines written before
+    /// this field existed and on the stdio face, which has no path — and
+    /// `mcp` on lines a 0.4 gateway wrote, when the base endpoint still
+    /// served an aggregate of its own.
     ///
     /// Additive and optional on purpose: every JSONL line already on disk has
     /// to keep parsing, and a `jq` filter written against the old shape has to

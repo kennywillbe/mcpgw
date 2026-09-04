@@ -504,9 +504,13 @@ impl Guarded {
             StreamableHttpServerConfig, StreamableHttpService,
         };
 
-        let inner = Arc::new(manager(&[("fx", stdio_server("healthy"))]));
-        let gateway =
-            mcpgw_core::gateway::Gateway::aggregate(Arc::clone(&inner), vec!["fx".to_owned()]);
+        // `legacy` rather than `healthy`: the healthy fixture marks its
+        // tools/list cacheable for four seconds and the pipe in front of it
+        // forwards that faithfully, so a second list would be answered out of
+        // the client's own cache — without the request whose credential these
+        // tests are about.
+        let inner = Arc::new(manager(&[("fx", stdio_server("legacy"))]));
+        let gateway = mcpgw_core::gateway::Gateway::new(Arc::clone(&inner), "fx".to_owned());
         let service = StreamableHttpService::new(
             move || Ok(gateway.clone()),
             LocalSessionManager::default().into(),

@@ -222,9 +222,10 @@ impl Config {
 
 /// Validates a server name against `[a-z0-9-_]+`, minus `__`.
 ///
-/// Names end up in the gateway's `server__tool` namespace, so anything
-/// outside this set would break tool-name parsing there, and `__` inside a
-/// name would make the server/tool split ambiguous.
+/// A name is a URL path segment (`/s/<name>`) and a column in `mcpgw watch`,
+/// which joins a captured call as `server__tool`: outside this set a name
+/// would have to be escaped in the first, and `__` inside one makes the
+/// second ambiguous to read.
 ///
 /// # Errors
 ///
@@ -245,7 +246,7 @@ pub fn validate_name(name: &str) -> Result<(), Error> {
         return invalid("only lowercase letters, digits, '-' and '_' are allowed");
     }
     if name.contains(crate::gateway::SEPARATOR) {
-        return invalid("'__' is reserved as the gateway's server__tool separator");
+        return invalid("'__' is reserved and cannot appear in a server name");
     }
     Ok(())
 }

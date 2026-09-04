@@ -159,7 +159,8 @@ fn the_stdio_bridge_resolves_the_url_connect_would_dial() {
             &["connect", "--server", "github", "--url", BASE],
         ),
     ));
-    // Aggregate mode, and the bare form that defaults to the serve port.
+    // The legacy entry a 0.3.x sync wrote, in the bare form that defaults
+    // to the serve port: still ours, and still to be migrated.
     assert!(plan.collect("Codex CLI", "mcpgw", &bridge("mcpgw", &["connect"])));
     // Some other command called `connect` is not our bridge.
     assert!(!plan.collect("Zed", "x", &bridge("socat", &["connect"])));
@@ -173,7 +174,8 @@ fn the_stdio_bridge_resolves_the_url_connect_would_dial() {
             "http://127.0.0.1:8137/s/github"
         ]
     );
-    // The aggregate face belongs to no single server.
+    // The base endpoint belongs to no single server, which is what marks
+    // that entry as one to migrate rather than one that is served.
     assert_eq!(targets[0].server, None);
     assert_eq!(targets[1].server.as_deref(), Some("github"));
 }

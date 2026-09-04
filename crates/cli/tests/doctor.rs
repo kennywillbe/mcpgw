@@ -281,7 +281,7 @@ fn probe_json_carries_results() {
 }
 
 /// Serves `names` — each one the healthy fixture — on an ephemeral port, one
-/// endpoint per name, exactly as `mcpgw serve --per-server` would.
+/// endpoint per name, exactly as `mcpgw serve` would.
 ///
 /// The runtime comes back with the URL because it owns the server task: drop
 /// it and the gateway goes away mid-test.
@@ -300,10 +300,6 @@ fn fixture_gateway(names: &[&str]) -> (tokio::runtime::Runtime, String) {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let url = runtime.block_on(async {
         let manager = Arc::new(UpstreamManager::new(servers));
-        let aggregate = Gateway::aggregate(
-            Arc::clone(&manager),
-            names.iter().map(|n| (*n).to_owned()).collect(),
-        );
         let pipes: Vec<_> = names
             .iter()
             .map(|name| {
@@ -316,12 +312,7 @@ fn fixture_gateway(names: &[&str]) -> (tokio::runtime::Runtime, String) {
         let endpoints = Endpoints::new(EndpointTable::new(pipes));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_http_with(
-            aggregate,
-            Some(endpoints),
-            listener,
-            std::future::pending(),
-        ));
+        tokio::spawn(serve_http_with(endpoints, listener, std::future::pending()));
         format!("http://{addr}/mcp")
     });
     (runtime, url)

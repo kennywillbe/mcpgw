@@ -182,7 +182,7 @@ async fn an_already_finished_machine_gets_the_status_card() {
     assert!(stdout.contains("everything is set up"), "{stdout}");
     assert!(!stdout.contains("let's get your MCP servers"), "{stdout}");
     assert!(stdout.contains("1 configured, 1 enabled"), "{stdout}");
-    // One per-server endpoint plus the aggregate.
+    // One per-server endpoint plus the gateway's own.
     assert!(stdout.contains("2 endpoints"), "{stdout}");
     assert!(stdout.contains("Cursor"), "{stdout}");
     assert!(stdout.contains("which is gone"), "{stdout}");

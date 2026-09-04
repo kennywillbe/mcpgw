@@ -23,9 +23,9 @@ mcpgw watch
 
 ```text
 watching /Users/you/.local/share/mcpgw/traffic (Ctrl-C to stop)
-  now  ✓  [mcp] github__create_issue         87ms
-  12s  ✓  [s/linear] linear tools/list        4ms
-  30s  ✗  [mcp] github__search_code         210ms  upstream "github" failed after 3 attempt(s)
+  now  ✓  [s/github] github__create_issue      87ms
+  12s  ✓  [s/linear] linear tools/list          4ms
+  30s  ✗  [s/github] github__search_code       210ms  upstream "github" failed after 3 attempt(s)
 ```
 
 Age, outcome, the endpoint it arrived on, what was called, how long it took,
@@ -99,7 +99,7 @@ so and points at the stream rather than writing escape sequences into a pipe.
 {
   "ts": 1756742400123,
   "session": "b1e4c07a",
-  "endpoint": "mcp",
+  "endpoint": "s/github",
   "server": "github",
   "tool": "create_issue",
   "kind": "call",
@@ -126,10 +126,11 @@ so and points at the stream rather than writing escape sequences into a pipe.
   not. Failing both, it falls back to an id for the gateway *process*, which
   cannot tell any two clients apart. Same field either way, and the ids never
   collide; just a coarser answer.
-- `endpoint` — which face of the gateway took the request: `mcp` for the
-  gateway's own endpoint, `s/<server>` for a per-server one. Absent on stdio
-  traffic
-  and on lines written before this field existed.
+- `endpoint` — which face of the gateway took the request. It is
+  `s/<server>`: a server is reached through its own endpoint and nowhere
+  else. Absent on stdio traffic and on lines written before this field
+  existed. `mcp` appears on lines a 0.4 gateway wrote, when the base endpoint
+  still served every server's tools at once, and on nothing written since.
 - `kind` — which request family the record describes:
 
   | `kind` | method |
@@ -143,8 +144,8 @@ so and points at the stream rather than writing escape sequences into a pipe.
   | `prompt_get` | `prompts/get` |
   | `complete` | `completion/complete` |
 
-  Everything below `call` is written only by a per-server endpoint, which is
-  the shape that forwards those families.
+  Everything below `call` was added when endpoints grew past tools; older
+  lines carry only `list` and `call`.
 - `tool` — what the request named: the tool, the prompt, the resource URI or
   the argument being completed. Absent on the list kinds, which name nothing.
 - `ok` / `error` — `error` carries the full text; `watch`'s one-line view
