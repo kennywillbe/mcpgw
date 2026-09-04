@@ -290,7 +290,7 @@ fn fixture_gateway(names: &[&str]) -> (tokio::runtime::Runtime, String) {
     use std::sync::Arc;
 
     use mcpgw_core::endpoints::{EndpointTable, Endpoints};
-    use mcpgw_core::gateway::{Gateway, serve_http_with};
+    use mcpgw_core::gateway::{Gateway, GatewayAuth, serve_http_with};
     use mcpgw_core::upstream::UpstreamManager;
 
     let servers: BTreeMap<String, mcpgw_core::Server> = names
@@ -312,7 +312,12 @@ fn fixture_gateway(names: &[&str]) -> (tokio::runtime::Runtime, String) {
         let endpoints = Endpoints::new(EndpointTable::new(pipes));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_http_with(endpoints, listener, std::future::pending()));
+        tokio::spawn(serve_http_with(
+            endpoints,
+            GatewayAuth::open(),
+            listener,
+            std::future::pending(),
+        ));
         format!("http://{addr}/mcp")
     });
     (runtime, url)
@@ -479,14 +484,15 @@ fn a_down_gateway_is_reported_once_however_many_entries_point_at_it() {
     // Three entries, three endpoints, one sentence.
     assert_eq!(value["errors"], 1);
     let findings = value["findings"].as_array().unwrap();
-    assert_eq!(findings.len(), 1);
-    assert!(
-        findings[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("mcpgw serve"),
-        "{findings:?}"
-    );
+    let down: Vec<&serde_json::Value> = findings
+        .iter()
+        .filter(|finding| finding["message"].as_str().unwrap().contains("mcpgw serve"))
+        .collect();
+    assert_eq!(down.len(), 1, "{findings:?}");
+    // The missing-token warning is the other half of the report and is
+    // deliberately per entry: unlike the gateway being down, each one is a
+    // separate line in a separate client file.
+    assert_eq!(value["warnings"], 3, "{findings:?}");
 }
 
 #[test]

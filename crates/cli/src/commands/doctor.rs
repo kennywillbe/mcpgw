@@ -145,6 +145,7 @@ pub fn run(
     );
     findings.extend(stale_service_exe());
     findings.extend(stale_service_version());
+    findings.extend(unauthenticated_bind());
 
     // Reported from the working directory, not from the machine: a
     // repo-local file is only in front of the user when they are standing in
@@ -168,24 +169,20 @@ pub fn run(
         None => (None, None),
     };
 
-    let gateway_findings = gateway_report
-        .as_ref()
-        .map_or(&[][..], |report| &report.findings);
-    let probe_findings = probe_results
-        .as_ref()
-        .map_or(&[][..], |report| &report.findings);
-    let errors = count(&findings, Severity::Error)
-        + count(&projects.findings, Severity::Error)
-        + count(gateway_findings, Severity::Error)
-        + count(probe_findings, Severity::Error)
-        + probe_results.as_ref().map_or(0, ProbeReport::failures)
-        + gateway_report.as_ref().map_or(0, GatewayReport::failures);
-    let warnings = count(&findings, Severity::Warning)
-        + count(&projects.findings, Severity::Warning)
-        + count(gateway_findings, Severity::Warning)
-        + count(probe_findings, Severity::Warning);
+    let (errors, warnings) = tally(
+        &findings,
+        &projects,
+        probe_results.as_ref(),
+        gateway_report.as_ref(),
+    );
 
     if json {
+        let gateway_findings = gateway_report
+            .as_ref()
+            .map_or(&[][..], |report| &report.findings);
+        let probe_findings = probe_results
+            .as_ref()
+            .map_or(&[][..], |report| &report.findings);
         // Gateway findings join the same array: a consumer counting problems
         // should not have to know which pass produced them.
         let all: Vec<Finding> = findings
@@ -220,6 +217,29 @@ pub fn run(
     }
 
     Ok(u8::from(errors > 0))
+}
+
+/// Errors and warnings across every pass. Split out so that the exit code,
+/// the summary line and the JSON all count the same set the same way.
+fn tally(
+    findings: &[Finding],
+    projects: &ProjectReport,
+    probes: Option<&ProbeReport>,
+    gateway: Option<&GatewayReport>,
+) -> (usize, usize) {
+    let gateway_findings = gateway.map_or(&[][..], |report| &report.findings);
+    let probe_findings = probes.map_or(&[][..], |report| &report.findings);
+    let errors = count(findings, Severity::Error)
+        + count(&projects.findings, Severity::Error)
+        + count(gateway_findings, Severity::Error)
+        + count(probe_findings, Severity::Error)
+        + probes.map_or(0, ProbeReport::failures)
+        + gateway.map_or(0, GatewayReport::failures);
+    let warnings = count(findings, Severity::Warning)
+        + count(&projects.findings, Severity::Warning)
+        + count(gateway_findings, Severity::Warning)
+        + count(probe_findings, Severity::Warning);
+    (errors, warnings)
 }
 
 /// The static pass over every detected client: appends its findings, feeds
@@ -265,6 +285,17 @@ fn scan_clients(
                             // they meant it to reach.
                             let via_gateway = mine.is_some_and(|names| names.contains(server_name))
                                 && gateway_plan.collect(name, server_name, server);
+                            // Only for an entry mcpgw wrote and that does aim
+                            // at this gateway: an entry pointing somewhere
+                            // else has no reason to hold this token.
+                            if via_gateway {
+                                findings.extend(mcpgw_core::doctor::missing_gateway_token(
+                                    name,
+                                    server_name,
+                                    server,
+                                    kind.carries_gateway_token(),
+                                ));
+                            }
                             // An entry the gateway pass owns is not also a
                             // direct target: it is the same URL, so probing
                             // it twice reports one failure under two headings
@@ -286,6 +317,36 @@ fn scan_clients(
         }
     }
     detections
+}
+
+/// The error for a gateway on this machine listening where other machines can
+/// reach it with nothing to authenticate them.
+///
+/// Both the installed service and whatever is actually running are asked: a
+/// `daemon install --bind` that passed preflight under `require_token` and a
+/// config edit that has since turned the knob off are the same problem, and
+/// only the running gateway's own record says what a foreground `mcpgw serve
+/// --bind 0.0.0.0` did.
+fn unauthenticated_bind() -> Vec<Finding> {
+    let Some(state_dir) = mcpgw_core::paths::state_dir() else {
+        return Vec::new();
+    };
+    let require = super::token::require_token();
+    let installed = mcpgw_core::daemon::load_spec(&state_dir);
+    let binds = installed
+        .iter()
+        .map(|spec| (spec.bind.clone(), spec.port))
+        .chain(
+            installed
+                .iter()
+                .filter_map(|spec| mcpgw_core::runtime::read_record(&state_dir, spec.port).ok()?)
+                .map(|record| (record.bind, record.port)),
+        );
+    let mut seen = std::collections::BTreeSet::new();
+    binds
+        .filter(|bind| seen.insert(bind.clone()))
+        .filter_map(|(bind, _)| mcpgw_core::doctor::unauthenticated_bind(&bind, require))
+        .collect()
 }
 
 /// The warning for a login service pointed at an mcpgw that moved.

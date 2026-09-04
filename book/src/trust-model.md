@@ -6,24 +6,96 @@ goes through one process on your machine. That is worth being explicit about.
 This page is what mcpgw actually does and does not protect, with no marketing
 in it.
 
-## Loopback is the authentication boundary
+## The token is the authentication boundary
 
-The gateway has no authentication. It listens on `127.0.0.1:8137`, and
-anything that can open a socket there can call every server you have
-configured.
+Every mcpgw install has a gateway token: 32 bytes from the OS random source,
+base64url, written once to `~/.local/share/mcpgw/gateway.token` mode `0600`
+the first time `mcpgw serve` or `mcpgw daemon install` runs. `mcpgw sync`
+writes it into every client entry it manages as an `Authorization: Bearer`
+header, and the gateway checks it on every `/s/<server>` request.
 
-That sounds worse than it is, and the reason is worth stating plainly: a
-process running as you could already do all of it. Your MCP server
-credentials sit in `~/.cursor/mcp.json`, `~/.claude.json`, the Claude Desktop
-config and a dozen files like them, in plaintext, readable by anything with
-your uid. A process that wanted your Linear token did not need a gateway — it
-needed `cat`. mcpgw reaching those same servers over loopback is not a new
-door into your account; it is the same door, with a socket on it.
+```sh
+mcpgw token show                 # masked
+mcpgw token show --show-secrets  # in full
+mcpgw token rotate               # new token, then re-syncs every client
+```
 
-So the boundary mcpgw relies on is the user account. Loopback keeps the
-gateway inside it. That is the whole of the access control, and everything
-below is about the ways that boundary can be widened or the blast radius
-behind it can grow.
+Loopback is still the default and still does most of the work. `mcpgw serve`
+binds `127.0.0.1:8137` unless you say otherwise, and nothing about the token
+changes what a process running as you can do — it can read the token file
+just as it can read `~/.cursor/mcp.json`. What the token defends is the
+**port**: a bind past loopback, a container sharing the host's network, a
+second account on a multi-user box. Before it existed there was nothing to
+put in front of those, which is why `mcpgw daemon install --bind 0.0.0.0` was
+refused outright.
+
+The reason it exists now is [`mcpgw auth login`](./auth.md). Until the gateway
+held OAuth refresh tokens, it held nothing your client configs did not: your
+MCP server credentials sit in `~/.cursor/mcp.json`, `~/.claude.json`, the
+Claude Desktop config and a dozen files like them, in plaintext, readable by
+anything with your uid. A process that wanted your Linear token did not need a
+gateway — it needed `cat`. A refresh token minted through a browser flow is
+different: it lives in `~/.local/share/mcpgw/auth/` and nowhere else, so
+reaching the port became worth strictly more than reading every client config
+on the machine.
+
+**What the token does not protect.** A process running as you can read the
+token file, so it can present the token. So can anything that can read the
+client configs mcpgw wrote it into. The boundary is still your user account;
+the token is what extends that boundary across a socket instead of relying on
+the socket being unreachable.
+
+### One release of grace
+
+This release still answers a **loopback** request that carries no token, or
+the wrong one, and logs one line the first time it does:
+
+```text
+warning: clients without a token: run mcpgw sync (this release still answers
+them; the next will not)
+```
+
+A request from anywhere else without the token gets `401` with
+`WWW-Authenticate: Bearer` — bare, with no `realm` and no
+`resource_metadata`: this is a static string, not OAuth, and there is no
+authorization server for a client to go and discover. `mcpgw doctor` reports
+a managed entry with no token as a warning.
+
+To end the grace period now:
+
+```toml
+[gateway]
+require_token = true
+```
+
+Then the token is required on every request, loopback included.
+
+**The one thing that stays open** is a bare `GET /mcp` — the liveness probe
+`mcpgw daemon status`, `mcpgw doctor` and the `connect` bridge use to ask
+whether anything is listening. It reaches no server and returns nothing of
+yours, and a `status` that cannot answer on the machine whose token file is
+unreadable is a `status` that is useless exactly when it is needed. Every
+other request on `/mcp`, and every request under `/s/`, goes through the
+check.
+
+### The two clients that carry no header
+
+Eleven of the thirteen clients hold the token in the entry `sync` writes.
+Two do not:
+
+- **Zed.** Its `context_servers` remote entry is documented as a URL and
+  nothing else, and nothing has confirmed that a header written into one
+  reaches the request. An entry holding a header its client silently drops
+  reads as authenticated everywhere and fails at the first call, which is
+  worse than one that plainly carries none — so Zed entries stay
+  loopback-only, and `mcpgw doctor` does not warn about them, because there is
+  no fix to point at.
+- **Claude Desktop.** It has no remote entry shape at all, so `sync` writes an
+  `mcpgw connect` bridge — which reads the token off the state directory
+  itself. That is the better half of the deal: the secret stays in one `0600`
+  file instead of being copied into a config the client owns.
+
+A Zed that has to reach a gateway past loopback goes through the bridge too.
 
 ## What the flip actually changed
 
@@ -127,30 +199,44 @@ under `[capture] redact`.
 
 ## Binding anywhere else
 
+Loopback is still the default, and a bind past it is still something you have
+to ask for twice.
+
 ```sh
 mcpgw serve --bind 0.0.0.0     # warns loudly, then does it
 ```
 
-There is no authentication, so this hands your MCP servers — and the
-credentials behind them — to anything that can reach that address. The
-warning is real.
+A foreground `serve` warns and proceeds, as it always has. Without
+`require_token` the warning is the old one — the grace period means an
+unauthenticated request still gets through, and on `0.0.0.0` that is your MCP
+servers handed to anything that can reach the address. With `require_token`
+the warning says what it now is: reachable by anyone who can route to it *and*
+holds this install's token.
 
-A gateway under a service manager refuses the same address outright rather
-than warning:
+A gateway under a service manager is stricter, because a warning it prints
+goes into a log nobody reads and it then keeps answering for weeks. It
+refuses the address unless the clients actually authenticate:
 
 ```text
 $ mcpgw daemon install --bind 0.0.0.0
+hint: a gateway whose clients authenticate may bind anywhere — set
+`[gateway] require_token = true` in your config, run `mcpgw sync` so every
+client carries this install's token, then install again
 Error: refusing to run an unattended gateway on 0.0.0.0: it has no
-authentication, so anyone who can reach that address could call your MCP
-servers …
+authentication …
 ```
 
-The difference is deliberate. A warning works when a person is reading a
-terminal and can decide; an unattended service prints its warning into a log
-nobody reads and then keeps answering for weeks. Loopback there is
-`127.0.0.0/8`, `::1` and `localhost`. If the gateway genuinely has to be
-reachable from another machine, put something that authenticates in front of
-it.
+Both halves are required, and neither is enough alone. A token with the grace
+period still running is not a boundary — an unauthenticated loopback request
+still passes — and `require_token` on a machine with no token file is a rule
+with nothing to enforce. Loopback there is `127.0.0.0/8`, `::1` and
+`localhost`.
+
+`mcpgw doctor` reports a gateway bound past loopback that does not require its
+token as an **error**, whether the address came from `daemon install` or from
+a foreground `serve`. If the gateway is exposed to a network you do not
+control, a bearer token over plain HTTP is the floor, not the ceiling: put TLS
+and something that authenticates in front of it.
 
 ## The `Origin` check
 
@@ -167,8 +253,8 @@ clients send no `Origin` at all and are unaffected.
 ## What is on disk, and who can read it
 
 - The state directory is `0700`; everything mcpgw writes into it — backups of
-  your client configs, `managed.json`, the traffic logs, the daemon logs — is
-  `0600`. Those backups are copies of files that hold tokens, which is why
+  your client configs, `managed.json`, the traffic logs, the daemon logs, the
+  gateway token — is `0600`. Those backups are copies of files that hold tokens, which is why
   they get the same treatment as the traffic log.
 - The canonical config holds your `env` values and headers in plaintext, the
   same way every client config already does. `mcpgw list --json` masks them;
@@ -186,6 +272,8 @@ in `headers` and is forwarded as it always was.
 
 What that means for what mcpgw holds:
 
+- The refresh tokens are the reason the gateway authenticates its clients at
+  all — see [above](#the-token-is-the-authentication-boundary).
 - The tokens live in `~/.local/share/mcpgw/auth/<name>.json`, mode `0600`
   inside the `0700` state directory, one file per server. They are never
   logged, never captured — the traffic log has always redacted
@@ -227,8 +315,10 @@ because a helper that fails has to be fixable. mcpgw runs it with no shell.
 
 ## The short version
 
-- Anything running as you can use the gateway. That was already true of your
-  server credentials.
+- Anything running as you can use the gateway: it can read the token file. That
+  was already true of your server credentials.
+- The gateway token is what carries that boundary across a socket. Loopback is
+  still the default; the token is what makes anything else defensible.
 - `[servers.NAME.tools]` narrows what any of them can call on a server. It
   shrinks the blast radius; it does not authenticate anybody.
 - Tool definitions are pinned on first sight and a change is reported, not
@@ -238,6 +328,7 @@ because a helper that fails has to be fixable. mcpgw runs it with no shell.
 - One process now holds all of them, and one log now records every call.
 - The log redacts what looks like a credential; that is a filter, not a
   proof. `--capture-bodies off` and `--no-capture` are the stronger answers.
-- Do not `--bind` past loopback without putting authentication in front.
+- Do not `--bind` past loopback without `[gateway] require_token = true`, and
+  not over an untrusted network without TLS in front.
 - A short-lived credential belongs in `headers_command`, not in `headers`.
 - Nothing here is a substitute for not running MCP servers you do not trust.

@@ -399,12 +399,16 @@ The log directory is `0700` and the files `0600`, the same discipline the
 traffic log gets: everything mcpgw derives from your client configs can carry
 the tokens in them.
 
-## Binding: loopback only
+## Binding: loopback by default
 
-A daemon refuses to install or start on a non-loopback address:
+A daemon refuses to install or start on a non-loopback address, unless its
+clients authenticate:
 
 ```sh
 $ mcpgw daemon install --bind 0.0.0.0
+hint: a gateway whose clients authenticate may bind anywhere — set
+`[gateway] require_token = true` in your config, run `mcpgw sync` so every
+client carries this install's token, then install again
 Error: refusing to run an unattended gateway on 0.0.0.0: it has no
 authentication, so anyone who can reach that address could call your MCP
 servers …
@@ -414,9 +418,39 @@ servers …
 A warning works when a person is looking at a terminal and can decide. An
 unattended service prints its warning into a logfile nobody reads, so the
 same address that is a judgement call in the foreground is a machine on your
-network answering MCP calls with no authentication, for as long as it stays
-up. Loopback is `127.0.0.0/8`, `::1` and `localhost`; put a reverse proxy in
-front if the gateway has to be reachable from anywhere else.
+network answering MCP calls, for as long as it stays up. Loopback is
+`127.0.0.0/8`, `::1` and `localhost`.
+
+To open the bind:
+
+```toml
+# config.toml
+[gateway]
+require_token = true
+```
+
+```sh
+mcpgw sync                                   # every client carries the token
+mcpgw daemon install --bind 0.0.0.0          # now allowed
+```
+
+Both halves are required — a token that exists but is not yet required is not
+a boundary, since the one-release grace period still admits an
+unauthenticated loopback request — but `daemon install` mints the token if
+this install has none, so in practice the switch is the half you have to set.
+`daemon start` mints nothing, and refuses the address on a machine whose
+token file is gone. `mcpgw doctor` reports a service bound past loopback
+without the requirement as an error.
+
+Setting the switch does not sync your clients. Do that first, or every client
+on the machine stops being answered the moment the gateway comes up.
+
+A bearer token over plain HTTP is a floor, not a ceiling: on any network you
+do not control, put TLS and something that authenticates in front as well. See
+[Trust model](./trust-model.md#binding-anywhere-else).
+
+`mcpgw daemon status` keeps working either way — the liveness probe is a bare
+`GET /mcp` and is deliberately left open.
 
 Port conflicts are refused up front for the same reason — a service that
 cannot bind fails silently in the background:

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use mcpgw_core::gateway_token::GatewayToken;
 use mcpgw_core::state::ManagedState;
 use mcpgw_core::sync::{
     apply_plan, apply_plan_to, client_entry, per_server_gateway_server, per_server_gateway_servers,
@@ -485,7 +486,8 @@ fn per_server_gateway_entry_shapes_per_client() {
 
     for kind in ClientKind::ALL {
         let server =
-            per_server_gateway_server(kind, "github", &canonical["github"], base, "mcpgw").unwrap();
+            per_server_gateway_server(kind, "github", &canonical["github"], base, "mcpgw", None)
+                .unwrap();
         assert_eq!(client_entry(kind, &server), expected(kind), "{}", kind.id());
     }
 
@@ -496,6 +498,7 @@ fn per_server_gateway_entry_shapes_per_client() {
         &canonical["github"],
         "http://127.0.0.1:9000",
         "mcpgw",
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -508,7 +511,8 @@ fn per_server_gateway_entry_shapes_per_client() {
             "github",
             &canonical["github"],
             "not a url",
-            "mcpgw"
+            "mcpgw",
+            None
         )
         .is_err()
     );
@@ -539,7 +543,7 @@ fn flipping_to_per_server_gateway_mode_updates_the_same_names() {
         "users-own": { "command": "deno" },
     });
     let desired =
-        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw").unwrap();
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None).unwrap();
     let plan = plan_sync(
         ClientKind::Cursor,
         current.as_object().unwrap(),
@@ -586,7 +590,7 @@ fn migrating_off_the_aggregate_entry_removes_it() {
         "mcpgw": { "type": "http", "url": base },
     });
     let desired =
-        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw").unwrap();
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None).unwrap();
     let plan = plan_sync(
         ClientKind::Cursor,
         current.as_object().unwrap(),
@@ -610,7 +614,8 @@ fn per_server_gateway_entries_keep_the_fields_the_client_owns() {
     on_disk["autoApprove"] = serde_json::json!(["list_issues"]);
     let current = serde_json::json!({ "github": on_disk });
 
-    let desired = per_server_gateway_servers(ClientKind::Cline, &canonical, base, "mcpgw").unwrap();
+    let desired =
+        per_server_gateway_servers(ClientKind::Cline, &canonical, base, "mcpgw", None).unwrap();
     let plan = plan_sync(
         ClientKind::Cline,
         current.as_object().unwrap(),
@@ -643,7 +648,7 @@ fn per_server_gateway_sync_unexcludes_its_own_names_in_gemini() {
         }
     });
     let desired =
-        per_server_gateway_servers(ClientKind::Gemini, &canonical, base, "mcpgw").unwrap();
+        per_server_gateway_servers(ClientKind::Gemini, &canonical, base, "mcpgw", None).unwrap();
     let mut plan = plan_sync(
         ClientKind::Gemini,
         document["mcpServers"].as_object().unwrap(),
@@ -844,4 +849,112 @@ fn no_mapping_is_the_map_it_was_handed() {
     let names = under_client_names(canonical.clone(), &BTreeMap::new());
     assert_eq!(names.desired, canonical);
     assert!(names.displaced.is_empty());
+}
+
+/// Twelve of the thirteen clients get the install token written into the
+/// entry as a header. Zed does not, because its remote entry holds none, and
+/// Claude Desktop does not, because its entry is the bridge — which reads the
+/// token off the state directory instead.
+#[test]
+fn the_gateway_token_lands_on_every_entry_that_can_carry_it() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let token = GatewayToken::from_secret("t0ken");
+
+    let mut carried = 0;
+    for kind in ClientKind::ALL {
+        let server = per_server_gateway_server(
+            kind,
+            "github",
+            &canonical["github"],
+            base,
+            "mcpgw",
+            Some(&token),
+        )
+        .unwrap();
+        let entry = client_entry(kind, &server);
+        // Codex spells the map `http_headers`; everyone else spells it
+        // `headers`. Either way the value is the same one line.
+        let headers = entry
+            .get("headers")
+            .or_else(|| entry.get("http_headers"))
+            .and_then(|value| value.get("Authorization"))
+            .and_then(serde_json::Value::as_str);
+        if kind.carries_gateway_token() {
+            assert_eq!(headers, Some("Bearer t0ken"), "{}", kind.id());
+            carried += 1;
+        } else {
+            assert_eq!(headers, None, "{}", kind.id());
+        }
+    }
+    assert_eq!(carried, 11);
+
+    // The two that do not, and the two different reasons.
+    assert!(!ClientKind::Zed.carries_gateway_token());
+    assert!(ClientKind::Zed.supports_http_entries());
+    assert!(!ClientKind::ClaudeDesktop.carries_gateway_token());
+    assert!(!ClientKind::ClaudeDesktop.supports_http_entries());
+    // The bridge entry carries no secret at all — not the token, not an env
+    // var holding it. `mcpgw connect` reads the file itself.
+    let bridged = per_server_gateway_server(
+        ClientKind::ClaudeDesktop,
+        "github",
+        &canonical["github"],
+        base,
+        "mcpgw",
+        Some(&token),
+    )
+    .unwrap();
+    assert!(
+        !serde_json::to_string(&client_entry(ClientKind::ClaudeDesktop, &bridged))
+            .unwrap()
+            .contains("t0ken")
+    );
+}
+
+/// An install with no token yet writes the entries it always wrote. The first
+/// `serve` mints one and the next `sync` fills them in; a sync that refused
+/// in the meantime would be a sync that cannot run before the gateway does.
+#[test]
+fn without_a_token_the_entries_are_the_ones_they_always_were() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let with = per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None);
+    let entry = client_entry(ClientKind::Cursor, &with.unwrap()["github"]);
+    assert!(entry.get("headers").is_none(), "{entry}");
+}
+
+/// What `eject` does to the token: the restore's desired set is the canonical
+/// servers themselves, so the header goes with the gateway URL it belonged
+/// to. Nothing hunts for it — it was never the user's to keep.
+#[test]
+fn ejecting_takes_the_token_back_out_of_the_client() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let token = GatewayToken::from_secret("t0ken");
+    let synced =
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", Some(&token))
+            .unwrap();
+    let mut document = serde_json::json!({ "mcpServers": {} });
+    let managed: BTreeSet<String> = canonical.keys().cloned().collect();
+    let plan = plan_sync(
+        ClientKind::Cursor,
+        &serde_json::Map::new(),
+        &synced,
+        &BTreeSet::new(),
+    );
+    apply_plan(ClientKind::Cursor, &mut document, &plan).unwrap();
+    assert!(
+        serde_json::to_string(&document).unwrap().contains("t0ken"),
+        "{document}"
+    );
+
+    // Eject plans the canonical servers over exactly those managed names.
+    let current = document["mcpServers"].as_object().unwrap().clone();
+    let restore = plan_sync(ClientKind::Cursor, &current, &canonical, &managed);
+    apply_plan(ClientKind::Cursor, &mut document, &restore).unwrap();
+    assert!(
+        !serde_json::to_string(&document).unwrap().contains("t0ken"),
+        "{document}"
+    );
 }

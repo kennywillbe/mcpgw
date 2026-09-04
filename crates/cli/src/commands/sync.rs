@@ -56,7 +56,11 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         Err(err) => return Err(err.into()),
     };
 
-    let bridge = announce(args)?;
+    // Read once for the run: every client's entries carry the same token,
+    // and a rotate that landed halfway through would be worse than one that
+    // lands on the next run.
+    let token = super::token::current();
+    let bridge = announce(args, token.as_ref(), color)?;
 
     let state_path = state_dir.join("managed.json");
     // Held across the whole load→modify→save window: a second `mcpgw sync
@@ -77,7 +81,14 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     let mut notified = false;
     for kind in targets.iter().copied() {
         let scope = Scope::Home(kind);
-        let desired = gateway_entries(kind, args, &canonical, &bridge, &scope.resolved(&state))?;
+        let desired = gateway_entries(
+            kind,
+            args,
+            &canonical,
+            &bridge,
+            token.as_ref(),
+            &scope.resolved(&state),
+        )?;
         let planned = plan_client(kind, &desired.desired, &scope.managed(&state))?;
         run.one(&scope, planned, &desired, &mut state, &mut notified)?;
     }
@@ -93,8 +104,14 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
         for config in found {
             let kind = config.kind;
             let scope = config.scope();
-            let desired =
-                gateway_entries(kind, args, &canonical, &bridge, &scope.resolved(&state))?;
+            let desired = gateway_entries(
+                kind,
+                args,
+                &canonical,
+                &bridge,
+                token.as_ref(),
+                &scope.resolved(&state),
+            )?;
             let planned = plan_project(&config, &desired.desired, &scope.managed(&state))?;
             run.one(&scope, planned, &desired, &mut state, &mut notified)?;
         }
@@ -393,11 +410,16 @@ pub fn apply_client(
     Ok(Applied::Written)
 }
 
-/// Prints what this run is about to do and resolves the stdio bridge command.
+/// Prints what this run is about to do — the token included, masked — and
+/// resolves the stdio bridge command.
 ///
 /// The bridge is resolved once for the whole run: probing PATH per client
 /// would give the same answer.
-fn announce(args: &SyncArgs) -> anyhow::Result<String> {
+fn announce(
+    args: &SyncArgs,
+    token: Option<&mcpgw_core::gateway_token::GatewayToken>,
+    color: bool,
+) -> anyhow::Result<String> {
     // Checked before a single client is touched: a base URL that cannot take
     // an endpoint path is wrong for all of them, and failing halfway would
     // leave some clients rewritten and some not.
@@ -410,6 +432,28 @@ fn announce(args: &SyncArgs) -> anyhow::Result<String> {
          on the gateway at {} (serve it with `mcpgw serve`)",
         args.gateway_url
     );
+    // Masked, always. A dry run is the output people paste into an issue.
+    match token {
+        Some(token) => println!(
+            "  {}",
+            crate::ui::dim(
+                &format!(
+                    "each entry carries Authorization: Bearer {} — the gateway's install \
+                     token (`mcpgw token show`)",
+                    token.masked()
+                ),
+                color,
+            )
+        ),
+        None => println!(
+            "  {}",
+            crate::ui::dim(
+                "no gateway token on this machine yet, so the entries carry none — \
+                 `mcpgw serve` or `mcpgw daemon install` issues one",
+                color,
+            )
+        ),
+    }
     if args.project {
         println!("--project: the repo-local configs found from here are written too");
     }
@@ -433,9 +477,10 @@ fn gateway_entries(
     args: &SyncArgs,
     canonical: &BTreeMap<String, mcpgw_core::Server>,
     bridge: &str,
+    token: Option<&mcpgw_core::gateway_token::GatewayToken>,
     resolved: &BTreeMap<String, String>,
 ) -> anyhow::Result<mcpgw_core::sync::ClientNames> {
-    let desired = per_server_gateway_servers(kind, canonical, &args.gateway_url, bridge)?;
+    let desired = per_server_gateway_servers(kind, canonical, &args.gateway_url, bridge, token)?;
     Ok(mcpgw_core::sync::under_client_names(desired, resolved))
 }
 

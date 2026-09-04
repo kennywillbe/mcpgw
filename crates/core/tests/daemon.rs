@@ -8,6 +8,7 @@ use mcpgw_core::daemon::{
     DaemonError, DaemonSpec, GatewayReach, LogPaths, PROBE_TIMEOUT, PortPolicy, ServiceStatus,
     port_policy, preflight, prepare_logs, probe_gateway,
 };
+use mcpgw_core::gateway_token::BindPolicy;
 
 fn spec(bind: &str, port: u16, state_dir: &std::path::Path) -> DaemonSpec {
     DaemonSpec {
@@ -26,7 +27,12 @@ fn spec(bind: &str, port: u16, state_dir: &std::path::Path) -> DaemonSpec {
 fn a_non_loopback_bind_is_refused_with_the_reason_spelled_out() {
     let dir = tempfile::tempdir().unwrap();
     for bind in ["0.0.0.0", "192.168.1.10", "::", "gateway.internal"] {
-        let err = preflight(&spec(bind, 0, dir.path()), PortPolicy::MustBeFree).unwrap_err();
+        let err = preflight(
+            &spec(bind, 0, dir.path()),
+            PortPolicy::MustBeFree,
+            BindPolicy::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(&err, DaemonError::NonLoopbackBind { bind: got } if got == bind),
             "{bind}: {err}"
@@ -43,7 +49,12 @@ fn every_loopback_spelling_passes_the_bind_check() {
     // Port 0 never conflicts, so only the bind check can fail here.
     for bind in ["127.0.0.1", "127.0.0.53", "::1", "localhost"] {
         assert!(
-            preflight(&spec(bind, 0, dir.path()), PortPolicy::MustBeFree).is_ok(),
+            preflight(
+                &spec(bind, 0, dir.path()),
+                PortPolicy::MustBeFree,
+                BindPolicy::default()
+            )
+            .is_ok(),
             "{bind}"
         );
     }
@@ -57,7 +68,12 @@ fn a_taken_port_is_refused_by_name_and_points_at_status() {
     let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = held.local_addr().unwrap().port();
 
-    let err = preflight(&spec("127.0.0.1", port, dir.path()), PortPolicy::MustBeFree).unwrap_err();
+    let err = preflight(
+        &spec("127.0.0.1", port, dir.path()),
+        PortPolicy::MustBeFree,
+        BindPolicy::default(),
+    )
+    .unwrap_err();
     let text = err.to_string();
     assert!(matches!(err, DaemonError::PortInUse { .. }), "{text}");
     assert!(text.contains(&format!("127.0.0.1:{port}")), "{text}");
@@ -320,13 +336,18 @@ async fn our_own_running_service_is_reinstalled_over_rather_than_refused() {
 
     let policy = port_policy(Some(&service(true, true)), &ours).await;
     assert_eq!(policy, PortPolicy::OwnServiceReinstall);
-    assert!(preflight(&ours, policy).is_ok());
+    assert!(preflight(&ours, policy, BindPolicy::default()).is_ok());
     // The bind refusal is not part of the bargain: a reinstall onto an
     // address the network can reach is still an unattended, unauthenticated
     // gateway.
     let exposed = spec("0.0.0.0", port, dir.path());
     assert!(matches!(
-        preflight(&exposed, PortPolicy::OwnServiceReinstall).unwrap_err(),
+        preflight(
+            &exposed,
+            PortPolicy::OwnServiceReinstall,
+            BindPolicy::default()
+        )
+        .unwrap_err(),
         DaemonError::NonLoopbackBind { .. }
     ));
 
@@ -352,7 +373,7 @@ async fn a_port_that_is_not_our_running_service_is_still_refused() {
         assert_eq!(policy, PortPolicy::MustBeFree, "{queried:?}");
         assert!(
             matches!(
-                preflight(&answering, policy).unwrap_err(),
+                preflight(&answering, policy, BindPolicy::default()).unwrap_err(),
                 DaemonError::PortInUse { .. }
             ),
             "{queried:?}"
@@ -376,8 +397,39 @@ async fn a_port_that_is_not_our_running_service_is_still_refused() {
     let policy = port_policy(Some(&service(true, true)), &silent).await;
     assert_eq!(policy, PortPolicy::MustBeFree);
     assert!(matches!(
-        preflight(&silent, policy).unwrap_err(),
+        preflight(&silent, policy, BindPolicy::default()).unwrap_err(),
         DaemonError::PortInUse { .. }
     ));
     parking.abort();
+}
+
+/// The bind refusal is not a rule about addresses, it is a rule about
+/// credentials: with the install token required on every request, an address
+/// the rest of the network can reach is a decision the operator may make.
+#[test]
+fn a_token_that_is_actually_required_opens_the_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    for bind in ["0.0.0.0", "192.168.1.10", "::"] {
+        assert!(
+            preflight(
+                &spec(bind, 0, dir.path()),
+                PortPolicy::MustBeFree,
+                BindPolicy::Authenticated,
+            )
+            .is_ok(),
+            "{bind}"
+        );
+    }
+    // And nothing else about the preflight moved: a busy port is still a
+    // refusal, whatever the bind policy says.
+    let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    assert!(matches!(
+        preflight(
+            &spec("127.0.0.1", port, dir.path()),
+            PortPolicy::MustBeFree,
+            BindPolicy::Authenticated,
+        ),
+        Err(DaemonError::PortInUse { .. })
+    ));
 }

@@ -116,7 +116,20 @@ enum Startup {
 
 /// The bridge itself: a pipe with one synthetic upstream, the gateway at
 /// `url`.
+///
+/// The install token rides on the upstream's headers, read off the state
+/// directory rather than out of the client file that launched this process.
+/// That is the whole reason the bridge is the answer for the two clients
+/// whose entries cannot carry a header: the secret stays in one 0600 file
+/// instead of being copied into a config the client owns.
 fn bridge(url: &str, startup: &Startup) -> Gateway {
+    let headers = match super::token::current() {
+        Some(token) => BTreeMap::from([(
+            mcpgw_core::sync::GATEWAY_AUTH_HEADER.to_owned(),
+            token.header_value(),
+        )]),
+        None => BTreeMap::new(),
+    };
     let server = Server {
         enabled: true,
         tags: Vec::new(),
@@ -125,7 +138,7 @@ fn bridge(url: &str, startup: &Startup) -> Gateway {
         transport: Transport::Http {
             url: url.to_owned(),
             headers_command: Vec::new(),
-            headers: BTreeMap::new(),
+            headers,
             // The bridge dials the gateway, which is the party holding every
             // upstream's credential. Nothing here has a login of its own.
             auth: None,
@@ -272,6 +285,9 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
     };
     let config_path = super::canonical_config_path()?;
     let config = Config::load(&config_path)?;
+    // Read before the reloader takes the config: the auth layer is built
+    // after the listener is published, and by then it is gone.
+    let require_token = config.gateway.require_token;
     let selected = super::serve::enabled_servers(&config, &config_path)?;
     // No selection: a face per server under `/s/<name>`, exactly as a plain
     // `mcpgw serve` would. Capture is on for the same reason it is there — a
@@ -293,9 +309,16 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
 
     let stop_serving = Arc::new(tokio::sync::Notify::new());
     let stop_watching = Arc::new(tokio::sync::Notify::new());
+    // The gateway this bridge raises for the session answers the same way the
+    // daemon's would, token included: a second client's bridge dials it over
+    // the loopback socket exactly as it would dial an installed one.
+    let auth = match super::token::current() {
+        Some(token) => mcpgw_core::gateway::GatewayAuth::new(token, require_token),
+        None => mcpgw_core::gateway::GatewayAuth::open(),
+    };
     let server = tokio::spawn({
         let stop = Arc::clone(&stop_serving);
-        mcpgw_core::gateway::serve_http_with(built.endpoints, listener, async move {
+        mcpgw_core::gateway::serve_http_with(built.endpoints, auth, listener, async move {
             stop.notified().await;
         })
     });

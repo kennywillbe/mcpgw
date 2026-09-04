@@ -30,6 +30,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::gateway_token::BindPolicy;
+
 #[cfg(target_os = "macos")]
 pub mod launchd;
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -325,17 +327,22 @@ pub async fn port_policy(queried: Option<&ServiceStatus>, spec: &DaemonSpec) -> 
 /// three supervisors enforce is not a security property, and the port
 /// message is the same sentence on every OS.
 ///
-/// The bind check is unconditional; `policy` only decides whether a busy
-/// port is a refusal, and it comes from [`port_policy`] rather than from a
-/// caller's own reading of the situation.
+/// Neither check is a caller's own reading of the situation: `policy` comes
+/// from [`port_policy`] and `bind` from [`BindPolicy::new`], which is the one
+/// place that decides whether the install token makes an address past
+/// loopback defensible. Both default to the strict answer.
 ///
 /// # Errors
 ///
 /// [`DaemonError::NonLoopbackBind`] for a bind address other people could
-/// reach, [`DaemonError::PortInUse`] when the port is already taken by
-/// something this install is not replacing.
-pub fn preflight(spec: &DaemonSpec, policy: PortPolicy) -> Result<(), DaemonError> {
-    if !is_loopback(&spec.bind) {
+/// reach with nothing to authenticate them, [`DaemonError::PortInUse`] when
+/// the port is already taken by something this install is not replacing.
+pub fn preflight(
+    spec: &DaemonSpec,
+    policy: PortPolicy,
+    bind: BindPolicy,
+) -> Result<(), DaemonError> {
+    if !bind.permits(&spec.bind) {
         return Err(DaemonError::NonLoopbackBind {
             bind: spec.bind.clone(),
         });

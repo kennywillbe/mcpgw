@@ -1322,8 +1322,101 @@ pub async fn serve_http(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let table = crate::endpoints::EndpointTable::new([(name, gateway)]);
-    serve_http_with(crate::endpoints::Endpoints::new(table), listener, shutdown).await
+    serve_http_with(
+        crate::endpoints::Endpoints::new(table),
+        // No token: this shape is the single-server pipe the tests and the
+        // in-process bridge raise, never the install's own gateway. The one
+        // that answers for the machine goes through `serve_http_with`, which
+        // is handed the token the state directory holds.
+        GatewayAuth::open(),
+        listener,
+        shutdown,
+    )
+    .await
 }
+
+/// Whether the gateway checks the install token, and against what.
+///
+/// Three states, and they are not a boolean: a gateway with no token at all
+/// (an install whose state directory could not be resolved) has nothing to
+/// check, a gateway with a token in the grace period checks it but lets an
+/// unauthenticated *loopback* request through, and a gateway with
+/// `[gateway] require_token` refuses every request that does not carry it.
+#[derive(Clone, Default)]
+pub struct GatewayAuth {
+    token: Option<Arc<crate::gateway_token::GatewayToken>>,
+    require: bool,
+    /// The grace-period warning is one line per process, and this is what
+    /// spends it. Shared across every clone so a router cloned per connection
+    /// does not get a fresh allowance with it.
+    warned: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl GatewayAuth {
+    /// A gateway that checks nothing.
+    #[must_use]
+    pub fn open() -> Self {
+        Self::default()
+    }
+
+    /// A gateway holding `token`. `require` is `[gateway] require_token`: off,
+    /// the one-release grace period applies to loopback.
+    #[must_use]
+    pub fn new(token: crate::gateway_token::GatewayToken, require: bool) -> Self {
+        Self {
+            token: Some(Arc::new(token)),
+            require,
+            warned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether this gateway refuses a request that carries no token.
+    ///
+    /// What `serve` asks before it decides which warning a bind past loopback
+    /// deserves: a gateway still in the grace period is not authenticated,
+    /// whatever it holds.
+    #[must_use]
+    pub fn requires_token(&self) -> bool {
+        self.require && self.token.is_some()
+    }
+
+    /// Whether a request from `peer` may proceed.
+    ///
+    /// `notice` says whether an unauthenticated loopback request is worth
+    /// spending the grace warning on. It is not for a bare `GET` of a
+    /// per-server endpoint: that is the liveness probe `connect` and `doctor`
+    /// run against the URL a client entry names, and telling somebody to
+    /// re-sync clients that are already synced is how a warning gets ignored.
+    /// A real client's traffic is a `POST`, and it is what the notice is for.
+    fn admits(&self, peer: std::net::IpAddr, request: &axum::extract::Request) -> bool {
+        let Some(token) = &self.token else {
+            return true;
+        };
+        if crate::gateway_token::presented(request.headers()).is_some_and(|got| token.matches(got))
+        {
+            return true;
+        }
+        if self.require || !peer.is_loopback() {
+            return false;
+        }
+        // The whole of the grace period: this release still answers a
+        // loopback client that has not been re-synced, and says so once so
+        // that it is noticed before the next release stops answering.
+        let notice = request.method() != http::Method::GET;
+        if notice && !self.warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("warning: {GRACE_NOTICE}");
+        }
+        true
+    }
+}
+
+/// What the gateway says, once per process, the first time a loopback client
+/// arrives without the install token.
+pub const GRACE_NOTICE: &str =
+    "clients without a token: run mcpgw sync (this release still answers them; the next will not)";
+
+/// What a request refused for want of the token is told.
+pub const UNAUTHORIZED: &str = "unauthorized: this gateway requires its install token —      run `mcpgw sync` to write it into your client entries";
 
 /// Serves [`Base`] at `/mcp` and one per-server face under `/s/<name>` for
 /// each of `endpoints`. They share the listener, the origin guard and —
@@ -1335,6 +1428,7 @@ pub async fn serve_http(
 /// Returns the underlying I/O error when the HTTP server fails.
 pub async fn serve_http_with(
     endpoints: crate::endpoints::Endpoints,
+    auth: GatewayAuth,
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
@@ -1359,14 +1453,69 @@ pub async fn serve_http_with(
         // has to re-derive it.
         StreamableHttpServerConfig::default(),
     );
-    // Layered over the merged router, so the guard covers every face.
+    // Layered over the merged router, so both guards cover every face. The
+    // origin check runs outermost: a rebinding attempt is refused as the
+    // browser request it is, rather than being told which credential it is
+    // missing.
     let router = axum::Router::new()
         .nest_service("/mcp", service)
         .merge(crate::endpoints::router(endpoints))
+        .layer(axum::middleware::from_fn_with_state(auth, guard_token))
         .layer(axum::middleware::from_fn(guard_origin));
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
+    // Connect info, which nothing needed before: the grace period is a rule
+    // about *where a request came from*, and only the accepted socket says.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+}
+
+/// Rejects a request that does not carry this install's gateway token.
+///
+/// The one exception is a bare `GET /mcp`, which is the liveness probe
+/// `daemon status`, `doctor` and the `connect` bridge use to ask whether
+/// anything is listening. It reaches no server and returns no data of the
+/// user's; requiring the token there would mean a `status` that cannot answer
+/// on a machine whose token file is unreadable, which is the moment it is
+/// most worth an answer. Everything else — every `/s/<name>` request, and a
+/// `POST /mcp` — goes through the check.
+async fn guard_token(
+    axum::extract::State(auth): axum::extract::State<GatewayAuth>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    if is_probe(&request) {
+        return next.run(request).await;
+    }
+    // Read off the extensions rather than through the `ConnectInfo`
+    // extractor, which would have to be optional and is not: this router is
+    // always served with connect info, and a request that somehow arrives
+    // without it is treated as remote rather than granted the loopback grace.
+    let ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map_or(std::net::IpAddr::from([0, 0, 0, 0]), |peer| peer.0.ip());
+    if auth.admits(ip, &request) {
+        return next.run(request).await;
+    }
+    (
+        http::StatusCode::UNAUTHORIZED,
+        [(
+            http::header::WWW_AUTHENTICATE,
+            crate::gateway_token::CHALLENGE,
+        )],
+        format!("{UNAUTHORIZED}\n"),
+    )
+        .into_response()
+}
+
+/// Whether this is the bare liveness probe: `GET /mcp` and nothing below it.
+fn is_probe(request: &axum::extract::Request) -> bool {
+    request.method() == http::Method::GET && request.uri().path() == "/mcp"
 }
 
 /// Rejects browser requests that do not come from a loopback page.

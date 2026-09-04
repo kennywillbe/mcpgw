@@ -12,6 +12,7 @@ pub mod self_update;
 pub mod serve;
 pub mod sync;
 pub mod toggle;
+pub mod token;
 pub mod tools;
 pub mod watch;
 pub mod wizard;

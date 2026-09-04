@@ -3,7 +3,8 @@ use std::path::Path;
 use mcpgw_core::auth::TokenState;
 use mcpgw_core::doctor::{
     GatewayFault, GatewayPlan, NEEDS_OAUTH, Severity, check_server, classify_gateway_failure,
-    classify_problems, gateway_unreachable, needs_oauth, unmatched_tool_rules, unserved_endpoint,
+    classify_problems, gateway_unreachable, missing_gateway_token, needs_oauth,
+    unauthenticated_bind, unmatched_tool_rules, unserved_endpoint,
 };
 use mcpgw_core::{ClientKind, Config, Server, Transport};
 
@@ -386,4 +387,66 @@ fn a_tool_rule_matching_nothing_is_a_warning_naming_the_list() {
     let mut plain = server.clone();
     plain.tools = None;
     assert!(unmatched_tool_rules("fx", &plain, &offered).is_empty());
+}
+
+/// The gateway entry `sync` writes for `name`, with `headers` as given.
+fn gateway_entry(headers: &[(&str, &str)]) -> Server {
+    Server {
+        enabled: true,
+        tags: Vec::new(),
+        calls_per_minute: 0,
+        tools: None,
+        transport: Transport::Http {
+            url: "http://127.0.0.1:8137/s/github".to_owned(),
+            headers_command: Vec::new(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            auth: None,
+        },
+    }
+}
+
+#[test]
+fn a_managed_entry_without_the_token_is_a_warning_naming_sync() {
+    let bare = missing_gateway_token("Cursor", "github", &gateway_entry(&[]), true).unwrap();
+    assert_eq!(bare.severity, Severity::Warning);
+    assert_eq!(bare.client.as_deref(), Some("Cursor"));
+    assert_eq!(bare.server.as_deref(), Some("github"));
+    assert!(bare.message.contains("mcpgw sync"), "{}", bare.message);
+
+    // An entry that has it is not reported, whatever case the client's own
+    // writer used for the header name.
+    for name in ["Authorization", "authorization"] {
+        assert!(
+            missing_gateway_token(
+                "Cursor",
+                "github",
+                &gateway_entry(&[(name, "Bearer t")]),
+                true
+            )
+            .is_none(),
+            "{name}"
+        );
+    }
+    // Nor is one in a client that cannot carry the token at all: Zed and
+    // Claude Desktop would get a permanent warning naming a fix that does
+    // not exist for them.
+    assert!(missing_gateway_token("Zed", "github", &gateway_entry(&[]), false).is_none());
+}
+
+#[test]
+fn a_bind_past_loopback_with_no_token_required_is_an_error() {
+    let finding = unauthenticated_bind("0.0.0.0", false).unwrap();
+    assert_eq!(finding.severity, Severity::Error);
+    assert!(finding.message.contains("require_token"), "{finding:?}");
+    assert!(finding.message.contains("0.0.0.0"), "{finding:?}");
+
+    // The same address with the token required is the whole point of the
+    // knob, and loopback never needed it.
+    assert!(unauthenticated_bind("0.0.0.0", true).is_none());
+    for bind in ["127.0.0.1", "::1", "localhost"] {
+        assert!(unauthenticated_bind(bind, false).is_none(), "{bind}");
+    }
 }

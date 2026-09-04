@@ -375,3 +375,78 @@ async fn install_still_refuses_a_port_a_foreground_gateway_answers_on() {
 
     child.kill().await.unwrap();
 }
+
+/// With `[gateway] require_token` on and a token on the disk, the same bind
+/// the previous test refuses passes the check: the refusal was never about
+/// the address, it was about there being nothing to authenticate a client
+/// with.
+///
+/// Proved by what it fails on *next* rather than by installing anything. A
+/// real install bootstraps the `io.mcpgw.gateway` label into the login
+/// session running the suite and would stop whatever daemon its owner has —
+/// which is why the live cycle is opt-in behind `MCPGW_DAEMON_LIVE`. A held
+/// port makes the port check the next thing to refuse, and reaching it at all
+/// is the whole of what this test is about.
+#[test]
+fn a_bind_past_loopback_is_allowed_once_the_token_is_required() {
+    let dir = tempfile::tempdir().unwrap();
+    // The wildcard address, not loopback: BSD's `SO_REUSEADDR` lets
+    // `0.0.0.0:P` and `127.0.0.1:P` coexist, so a loopback listener would not
+    // be the conflict this test needs the preflight to reach.
+    let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+    let port = held.local_addr().unwrap().port().to_string();
+    let state = dir.path().join("state");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[gateway]\nrequire_token = true\n",
+    )
+    .unwrap();
+    mcpgw_core::gateway_token::GatewayToken::generate()
+        .save(&state)
+        .unwrap();
+
+    for command in ["install", "start"] {
+        let output = daemon(dir.path(), &[command, "--bind", "0.0.0.0", "--port", &port]);
+        let text = stderr(&output);
+        assert!(
+            !text.contains("refusing to run an unattended gateway"),
+            "{command}: {text}"
+        );
+        assert!(
+            text.contains("something already listens"),
+            "{command}: {text}"
+        );
+    }
+
+    // Take the knob away and the address goes back to being refused, before
+    // the port is ever looked at. The refusal now says how to make it allowed.
+    std::fs::write(dir.path().join("config.toml"), "version = 1\n").unwrap();
+    for command in ["install", "start"] {
+        let output = daemon(dir.path(), &[command, "--bind", "0.0.0.0", "--port", &port]);
+        let text = stderr(&output);
+        assert!(
+            text.contains("refusing to run an unattended gateway"),
+            "{command}: {text}"
+        );
+        assert!(text.contains("require_token = true"), "{command}: {text}");
+        assert!(!output.status.success(), "{command}: {text}");
+    }
+
+    // The knob alone is not enough either: `start` mints nothing, so on a
+    // machine with no token there is still nothing for a client past loopback
+    // to present. (`install` is the command that writes the token, so it can
+    // never meet this state — it has just created one.)
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "version = 1\n\n[gateway]\nrequire_token = true\n",
+    )
+    .unwrap();
+    std::fs::remove_file(mcpgw_core::gateway_token::GatewayToken::path(&state)).unwrap();
+    let output = daemon(dir.path(), &["start", "--bind", "0.0.0.0", "--port", &port]);
+    let text = stderr(&output);
+    assert!(
+        text.contains("refusing to run an unattended gateway"),
+        "{text}"
+    );
+    drop(held);
+}

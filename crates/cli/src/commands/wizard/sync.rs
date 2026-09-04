@@ -130,6 +130,9 @@ fn plan_all(cx: &Ctx, include_project: bool) -> anyhow::Result<Plans> {
     mcpgw_core::endpoints::per_server_url(&cx.gateway_url, "probe")
         .with_context(|| format!("--gateway-url {} is not a URL", cx.gateway_url))?;
     let bridge = bridge_command();
+    // The wizard's sync step writes exactly what `mcpgw sync` writes, token
+    // included. Read once for the whole pass, as it is there.
+    let token = crate::commands::token::current();
 
     let mut plans = Plans {
         ready: Vec::new(),
@@ -139,8 +142,13 @@ fn plan_all(cx: &Ctx, include_project: bool) -> anyhow::Result<Plans> {
         if matches!(detection, Detection::NotInstalled) {
             continue;
         }
-        let desired =
-            per_server_gateway_servers(*kind, &cx.config.servers, &cx.gateway_url, &bridge)?;
+        let desired = per_server_gateway_servers(
+            *kind,
+            &cx.config.servers,
+            &cx.gateway_url,
+            &bridge,
+            token.as_ref(),
+        )?;
         let managed = Scope::Home(*kind).managed(&cx.state);
         match plan_client(*kind, &desired, &managed)? {
             Planned::Ready(planned) => plans.ready.push(*planned),
@@ -154,6 +162,7 @@ fn plan_all(cx: &Ctx, include_project: bool) -> anyhow::Result<Plans> {
                 &cx.config.servers,
                 &cx.gateway_url,
                 &bridge,
+                token.as_ref(),
             )?;
             let scope = config.scope();
             match plan_project(&config, &desired, &scope.managed(&cx.state))? {

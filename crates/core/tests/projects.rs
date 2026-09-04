@@ -243,6 +243,7 @@ fn gateway_entry(kind: ClientKind, name: &str, canonical: &BTreeMap<String, Serv
         &canonical[name],
         "http://127.0.0.1:8137/mcp",
         "mcpgw",
+        None,
     )
     .unwrap()
 }

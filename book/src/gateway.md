@@ -479,6 +479,30 @@ tools:
 `--gateway-url` points the check at a gateway on another port, matching
 `sync --gateway-url`.
 
+## The install token
+
+Every request to `/s/<server>` carries this install's gateway token:
+
+```json
+{ "type": "http", "url": "http://127.0.0.1:8137/s/github",
+  "headers": { "Authorization": "Bearer l8XzX_K9…" } }
+```
+
+`sync` writes it; you never have to. It is minted on the first `mcpgw serve`
+or `mcpgw daemon install` and kept at `~/.local/share/mcpgw/gateway.token`,
+mode `0600`.
+
+```sh
+mcpgw token show                 # masked
+mcpgw token rotate               # new token, then re-syncs every client
+```
+
+This release still answers a loopback client that has not been re-synced, and
+logs one line saying so; `[gateway] require_token = true` ends that. A bare
+`GET /mcp` — the liveness probe — is always answered. Zed and Claude Desktop
+carry no header for their own reasons, both covered in
+[Trust model](./trust-model.md#the-two-clients-that-carry-no-header).
+
 ## stdio-only clients
 
 Claude Desktop only speaks stdio, so it can't be handed a URL. `mcpgw connect`
