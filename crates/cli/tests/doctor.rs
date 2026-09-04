@@ -322,6 +322,7 @@ fn fixture_server() -> mcpgw_core::Server {
     mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        tools: None,
         transport: mcpgw_core::Transport::Stdio {
             command: fixture_binary().to_string_lossy().into_owned(),
             args: vec!["healthy".to_owned()],
@@ -814,4 +815,39 @@ fn a_probe_runs_the_headers_command_without_printing_what_it_produced() {
         !String::from_utf8_lossy(&out.stderr).contains("s3cret-rotating-token"),
         "the command's output reached stderr"
     );
+}
+
+/// A rule that matches nothing is only visible to a probe: the config alone
+/// cannot say which tools a server offers today.
+#[test]
+fn probe_warns_about_a_tool_rule_that_matches_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        "version = 1\n[servers.fx]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\n\n\
+         [servers.fx.tools]\nallow = [\"echo\", \"typoed_name\"]\n",
+        fixture_binary().display()
+    );
+    let out = run_doctor(dir.path(), Some(&config), &["--probe", "--timeout", "60"]);
+    let text = stdout(&out);
+    // A warning, not an error: the gateway is doing what the file says.
+    assert!(
+        text.contains("[servers.fx.tools] allow entry \"typoed_name\" matches no tool fx offers"),
+        "{text}"
+    );
+    assert!(text.contains("0 errors, 1 warnings"), "{text}");
+    assert!(out.status.success(), "{text}");
+}
+
+/// The same run without `--probe` says nothing about the rules at all.
+#[test]
+fn a_tool_rule_is_not_checked_without_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        "version = 1\n[servers.fx]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\n\n[servers.fx.tools]\nallow = [\"typoed_name\"]\n",
+        fixture_binary().display()
+    );
+    let out = run_doctor(dir.path(), Some(&config), &[]);
+    let text = stdout(&out);
+    assert!(!text.contains("matches no tool"), "{text}");
+    assert!(out.status.success(), "{text}");
 }

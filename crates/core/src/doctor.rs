@@ -134,6 +134,33 @@ pub fn check_server(
     }
 }
 
+/// The findings for `[servers.NAME.tools]` entries that match none of
+/// `tools` — the list the server answered `tools/list` with.
+///
+/// A warning, not an error: nothing is broken, and the gateway is doing
+/// exactly what the file says. What it costs is silent, which is why it is
+/// worth a line — an `allow` entry with a typo in it takes a tool away, and
+/// the only symptom is a client that never sees it.
+#[must_use]
+pub fn unmatched_tool_rules(name: &str, server: &Server, tools: &[String]) -> Vec<Finding> {
+    let Some(rules) = &server.tools else {
+        return Vec::new();
+    };
+    rules
+        .unmatched(tools)
+        .into_iter()
+        .map(|(list, rule)| Finding {
+            client: None,
+            server: Some(name.to_owned()),
+            severity: Severity::Warning,
+            message: format!(
+                "[servers.{name}.tools] {list} entry {rule:?} matches no tool {name} offers"
+            ),
+            code: None,
+        })
+        .collect()
+}
+
 /// Turns a lenient client read's problems into findings.
 ///
 /// Severity rule: if the named server still exists in the parsed map, the

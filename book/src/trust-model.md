@@ -37,6 +37,26 @@ gateway can use any of them. The credentials did not become more exposed —
 they were already on the disk — but they became reachable through one place
 rather than thirteen.
 
+What narrows that is the per-server allowlist. `[servers.NAME.tools]` says
+which of a server's tools its endpoint offers at all, and the gateway
+enforces it on both sides: a tool outside the list is not in `tools/list`,
+and a `tools/call` naming it is refused before the request reaches the
+server. It is a reduction in blast radius rather than an authentication
+boundary — anything that can reach the gateway can still reach every server
+under its own endpoint, and a client that can edit your config can lift the
+list — but it is what keeps a project's endpoint from being able to delete a
+repository because some other project needed that tool. The lists are
+opt-in, and a server without one offers everything it always did:
+
+```sh
+mcpgw tools github                             # what this server's endpoint offers
+mcpgw tools github deny 'delete_*'             # and what it no longer will
+```
+
+Every refusal is written to the traffic log under kind `denied`, so
+`mcpgw watch` shows what a client tried to reach and did not get. See
+[`[servers.NAME.tools]`](./configuration.md#serversnametools).
+
 **One log.** Every call now passes a single capture point, and by default it
 is written down. That is the feature — it is why `mcpgw watch` can show you
 what your agent did — and it is also a file that did not exist before. See
@@ -151,6 +171,8 @@ because a helper that fails has to be fixable. mcpgw runs it with no shell.
 
 - Anything running as you can use the gateway. That was already true of your
   server credentials.
+- `[servers.NAME.tools]` narrows what any of them can call on a server. It
+  shrinks the blast radius; it does not authenticate anybody.
 - One process now holds all of them, and one log now records every call.
 - The log redacts what looks like a credential; that is a filter, not a
   proof. `--capture-bodies off` and `--no-capture` are the stronger answers.

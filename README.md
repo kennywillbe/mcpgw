@@ -186,6 +186,12 @@ version of what that does and does not protect. The short one:
   already true of the client config files those credentials sit in — loopback
   is the boundary, and it is your user account. `--bind` past loopback opens it
   up and warns loudly; a daemon refuses the same address outright.
+- A per-server tool allowlist narrows what any of them can call:
+  `[servers.NAME.tools]` (or `mcpgw tools NAME allow|deny`) decides which tools
+  the server's endpoint offers at all, and a call on anything else is refused
+  before it reaches the server and logged as `denied`. It shrinks the blast
+  radius; it does not authenticate anybody. Servers without a list are
+  unchanged.
 - Requests carrying an `Origin` header that isn't a loopback page are refused
   with 403, so a website cannot drive your gateway by rebinding its own domain
   to `127.0.0.1`. MCP clients send no `Origin` and are unaffected.

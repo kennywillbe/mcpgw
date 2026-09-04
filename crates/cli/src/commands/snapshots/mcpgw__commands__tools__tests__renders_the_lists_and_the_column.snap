@@ -1,0 +1,9 @@
+---
+source: crates/cli/src/commands/tools.rs
+expression: "render(\"fx\", Some(&rules), &rows(), false)"
+---
+fx — 2 tool(s)
+  allow = ["echo"]
+
+  echo     allowed
+  reverse  denied

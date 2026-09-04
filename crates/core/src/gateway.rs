@@ -274,6 +274,36 @@ impl Gateway {
         })
     }
 
+    /// Whether `tool` survives the upstream's `[tools]` table.
+    ///
+    /// Read from the manager on every request rather than captured when this
+    /// pipe was built: the table is the answer to "what can a client reach",
+    /// and an edit to it has to take effect on the next call, not on the
+    /// next reconnect.
+    fn allows(&self, tool: &str) -> bool {
+        self.manager
+            .server(&self.upstream)
+            .is_none_or(|server| server.allows_tool(tool))
+    }
+
+    /// The error a filtered-out tool is refused with, and the record that
+    /// says a client tried to reach it.
+    ///
+    /// `-32602` rather than `-32601`: what is refused is the `name` the
+    /// request carried, and it means the same thing in both revisions this
+    /// gateway speaks. `-32601` would claim this endpoint has no
+    /// `tools/call` at all, which is false and would tell a client to stop
+    /// trying every other tool as well.
+    fn deny(&self, who: &Attribution, tool: &str) -> ErrorData {
+        let message = not_allowed(tool, &self.upstream);
+        self.record(who, |session| {
+            CaptureRecord::new(session, &self.upstream, Kind::Denied, Duration::ZERO)
+                .with_tool(tool)
+                .with_error(&message)
+        });
+        ErrorData::new(ErrorCode::INVALID_PARAMS, message, None)
+    }
+
     /// What this face advertises at `initialize`.
     ///
     /// This face reports the upstream's own capabilities (narrowed by
@@ -847,7 +877,12 @@ impl ServerHandler for Gateway {
                 |result| format!("{} tool(s)", result.tools.len()),
             )
             .await;
-        Ok(bridged(&context, result?))
+        let mut result = result?;
+        // Applied to the merged list, whatever the upstream's paging made of
+        // it: the filter is about what this client may see, not about how
+        // the answer was assembled.
+        result.tools.retain(|tool| self.allows(&tool.name));
+        Ok(bridged(&context, result))
     }
 
     async fn call_tool(
@@ -862,6 +897,12 @@ impl ServerHandler for Gateway {
         let args = request.arguments.clone().map(|args| {
             crate::capture::body(&serde_json::Value::Object(args.into_iter().collect()))
         });
+        // Before the upstream is even acquired: a tool the table filtered out
+        // is one this endpoint does not offer, and a refusal that spawned the
+        // server first would be a way to reach it anyway.
+        if !self.allows(&tool) {
+            return Err(self.deny(&who, &tool));
+        }
 
         let started = Instant::now();
         let response = self
@@ -1022,6 +1063,15 @@ impl ServerHandler for Gateway {
         .await
         .map(|result| bridged(&context, result))
     }
+}
+
+/// What a client is told about a tool its server's `[tools]` table filtered
+/// out. Names the tool, the server and the command that shows and edits the
+/// lists, because "why can I not see this tool" is the question this answer
+/// exists to close.
+#[must_use]
+pub fn not_allowed(tool: &str, server: &str) -> String {
+    format!("tool {tool:?} is not allowed on server {server:?} (see mcpgw tools {server})")
 }
 
 /// The one wording for a request that ran out its deadline. Names the

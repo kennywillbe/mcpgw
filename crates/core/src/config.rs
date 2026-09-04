@@ -48,10 +48,90 @@ pub struct Server {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    // Flattened last so plain values serialize before the env/headers tables;
-    // TOML requires values ahead of tables within one section.
+    // Flattened before `tools` so plain values serialize before any table;
+    // TOML requires values ahead of tables within one section, and both the
+    // env/headers tables and `[tools]` are tables.
     #[serde(flatten)]
     pub transport: Transport,
+    /// The `[servers.NAME.tools]` table, or `None` for an entry that has
+    /// none — which is every entry until someone opts in, and the reason an
+    /// upgrade changes nothing about what a client sees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolRules>,
+}
+
+/// Which of a server's tools the gateway lets through, from
+/// `[servers.NAME.tools]`.
+///
+/// ```toml
+/// [servers.github.tools]
+/// allow = ["search_repositories", "get_file_contents"]
+/// deny  = ["delete_*"]
+/// ```
+///
+/// Deny-by-default starts the moment `allow` has an entry, and not before:
+/// the table is opt-in, so a config that never mentions it keeps every tool
+/// visible and callable exactly as it was.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRules {
+    /// The only tools that survive, once it is non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Tools removed from whatever `allow` left, applied second so a broad
+    /// `allow` can be trimmed without listing every name that should stay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+impl ToolRules {
+    /// Whether the table says nothing at all — no table and a table with two
+    /// empty lists mean the same thing, and both mean "unchanged".
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_empty() && self.deny.is_empty()
+    }
+
+    /// Whether `tool` survives: `allow` first (deny-by-default once it has
+    /// an entry), then `deny` over what is left.
+    #[must_use]
+    pub fn allows(&self, tool: &str) -> bool {
+        if !self.allow.is_empty() && !self.allow.iter().any(|rule| matches(rule, tool)) {
+            return false;
+        }
+        !self.deny.iter().any(|rule| matches(rule, tool))
+    }
+
+    /// Every entry that matches none of `tools`, as `(list, entry)` pairs.
+    ///
+    /// What `doctor --probe` reports: an entry matching nothing is either a
+    /// typo or a tool the server has since renamed, and in the `allow` case
+    /// it silently costs the user a tool they meant to keep.
+    #[must_use]
+    pub fn unmatched<'r>(&'r self, tools: &[String]) -> Vec<(&'static str, &'r str)> {
+        let mut dead = Vec::new();
+        for (list, rules) in [("allow", &self.allow), ("deny", &self.deny)] {
+            for rule in rules {
+                if !tools.iter().any(|tool| matches(rule, tool)) {
+                    dead.push((list, rule.as_str()));
+                }
+            }
+        }
+        dead
+    }
+}
+
+/// Glob-lite: a literal tool name, or a prefix with a trailing `*`.
+///
+/// Deliberately not a glob crate and not a regex. The names on both sides of
+/// this are MCP tool names, where the only shape anyone writes is a family
+/// prefix (`delete_*`), and a rule language that can express more than the
+/// user can predict is the wrong thing to put in front of "which tools can
+/// this agent call".
+fn matches(rule: &str, tool: &str) -> bool {
+    match rule.strip_suffix('*') {
+        Some(prefix) => tool.starts_with(prefix),
+        None => rule == tool,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +173,15 @@ pub enum Transport {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
     },
+}
+
+impl Server {
+    /// Whether `tool` is visible and callable through this server's
+    /// endpoint. Everything is, while there is no `[tools]` table.
+    #[must_use]
+    pub fn allows_tool(&self, tool: &str) -> bool {
+        self.tools.as_ref().is_none_or(|rules| rules.allows(tool))
+    }
 }
 
 /// Reads a `headers_command` as argv, from either spelling.
@@ -249,4 +338,69 @@ pub fn validate_name(name: &str) -> Result<(), Error> {
         return invalid("'__' is reserved and cannot appear in a server name");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ToolRules;
+
+    fn rules(allow: &[&str], deny: &[&str]) -> ToolRules {
+        ToolRules {
+            allow: allow.iter().map(|s| (*s).to_owned()).collect(),
+            deny: deny.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn an_empty_table_allows_everything() {
+        let rules = ToolRules::default();
+        assert!(rules.is_empty());
+        assert!(rules.allows("delete_repository"));
+    }
+
+    #[test]
+    fn an_allow_list_denies_by_default() {
+        let rules = rules(&["echo"], &[]);
+        assert!(rules.allows("echo"));
+        assert!(!rules.allows("reverse"));
+        // Prefix matching is a trailing `*` and nothing else: a name that
+        // merely starts with an allowed one is a different tool.
+        assert!(!rules.allows("echo_all"));
+    }
+
+    #[test]
+    fn a_deny_list_removes_only_what_it_names() {
+        let rules = rules(&[], &["delete_*"]);
+        assert!(rules.allows("search_repositories"));
+        assert!(!rules.allows("delete_repository"));
+        assert!(!rules.allows("delete_"));
+        // The prefix itself is not the pattern; `delete` does not start with
+        // `delete_`.
+        assert!(rules.allows("delete"));
+    }
+
+    #[test]
+    fn deny_wins_over_allow() {
+        let rules = rules(&["repo_*"], &["repo_delete"]);
+        assert!(rules.allows("repo_read"));
+        assert!(!rules.allows("repo_delete"));
+        assert!(!rules.allows("issue_read"));
+    }
+
+    #[test]
+    fn a_bare_star_allows_everything_it_is_asked_about() {
+        assert!(rules(&["*"], &[]).allows("anything"));
+        assert!(!rules(&[], &["*"]).allows("anything"));
+    }
+
+    #[test]
+    fn unmatched_names_the_list_and_the_entry() {
+        let rules = rules(&["echo", "gone"], &["missing_*"]);
+        let tools = vec!["echo".to_owned(), "reverse".to_owned()];
+        assert_eq!(
+            rules.unmatched(&tools),
+            [("allow", "gone"), ("deny", "missing_*")]
+        );
+        assert_eq!(rules.unmatched(&[]).len(), 3);
+    }
 }

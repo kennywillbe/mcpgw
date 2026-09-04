@@ -14,6 +14,7 @@ ClientRead {
                     "CONTEXT7_API_KEY": "REDACTED",
                 },
             },
+            tools: None,
         },
         "corp": Server {
             enabled: true,
@@ -26,6 +27,7 @@ ClientRead {
                 ],
                 headers: {},
             },
+            tools: None,
         },
         "sqlite": Server {
             enabled: true,
@@ -39,6 +41,7 @@ ClientRead {
                 ],
                 env: {},
             },
+            tools: None,
         },
     },
     problems: [],

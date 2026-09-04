@@ -17,6 +17,7 @@ ClientRead {
                     "GITHUB_TOKEN": "ghp_example",
                 },
             },
+            tools: None,
         },
         "linear": Server {
             enabled: true,
@@ -28,6 +29,7 @@ ClientRead {
                     "Authorization": "Bearer token",
                 },
             },
+            tools: None,
         },
         "postgres": Server {
             enabled: true,
@@ -37,6 +39,7 @@ ClientRead {
                 args: [],
                 env: {},
             },
+            tools: None,
         },
     },
     problems: [

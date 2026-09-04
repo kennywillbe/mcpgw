@@ -1,0 +1,16 @@
+---
+source: crates/core/tests/store.rs
+expression: text
+---
+# my precious header comment
+version = 1 # schema version
+
+# github powers the code review flow — do not disable
+[servers.github]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[servers.github.tools]
+allow = ["search_repositories"]
+deny = ["delete_*"]

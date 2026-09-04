@@ -16,6 +16,7 @@ Config {
                 args: [],
                 env: {},
             },
+            tools: None,
         },
         "github": Server {
             enabled: true,
@@ -33,6 +34,7 @@ Config {
                     "GITHUB_TOKEN": "ghp_test",
                 },
             },
+            tools: None,
         },
         "linear": Server {
             enabled: false,
@@ -44,6 +46,7 @@ Config {
                     "Authorization": "Bearer test",
                 },
             },
+            tools: None,
         },
     },
 }

@@ -53,6 +53,7 @@ fn canonical() -> BTreeMap<String, Server> {
         Server {
             enabled: true,
             tags: Vec::new(),
+            tools: None,
             transport: Transport::Http {
                 url: SHARED_URL.to_owned(),
                 headers_command: Vec::new(),
@@ -280,6 +281,7 @@ fn a_project_sync_writes_both_files_and_leaves_the_rest_alone() {
         Server {
             enabled: true,
             tags: Vec::new(),
+            tools: None,
             transport: Transport::Stdio {
                 command: "cargo".to_owned(),
                 args: vec!["run".to_owned()],
