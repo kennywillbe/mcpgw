@@ -3,12 +3,13 @@
 //! so these rules are unit-testable without a real machine state.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use serde::Serialize;
 
 use crate::auth::TokenState;
-use crate::clients::ClientRead;
-use crate::config::{Server, Transport};
+use crate::clients::{ClientKind, ClientRead};
+use crate::config::{ClientScope, Server, Transport};
 use crate::endpoints;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -211,6 +212,172 @@ pub fn tool_drift(name: &str, events: &[crate::pins::DriftEvent]) -> Option<Find
 /// The code on the finding for a server whose tool definitions drifted.
 pub const TOOL_DRIFT: &str = "tool_drift";
 
+/// Windsurf's own ceiling. It is not configurable there and not ours to
+/// change; a client over it does not get a truncated list, it gets a broken
+/// one, so `doctor` says so without being asked to.
+pub const WINDSURF_TOOL_CAP: usize = 100;
+
+/// What one client is actually offered, priced.
+///
+/// The whole point of the scoping milestone read back: tool definitions are
+/// the largest fixed cost in an agent's context, and "70 tools, 49k tokens
+/// before you type anything" is the number nobody could see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientBudget {
+    /// The client id, as `[clients.ID]` spells it.
+    pub client: String,
+    pub servers: usize,
+    pub tools: usize,
+    pub tokens: usize,
+    /// Servers this client is offered whose tools nothing priced, so the
+    /// total is a floor rather than an answer. Under `--probe` these are the
+    /// servers that did not answer.
+    pub unpriced: Vec<String>,
+}
+
+impl ClientBudget {
+    /// The report's one line about this client, in the words the milestone
+    /// was asked for: `cursor sees 23 tools across 4 servers (~18k tokens)`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let servers = if self.servers == 1 {
+            "server"
+        } else {
+            "servers"
+        };
+        let tools = if self.tools == 1 { "tool" } else { "tools" };
+        let mut line = format!(
+            "{} sees {} {tools} across {} {servers} (~{} tokens)",
+            self.client,
+            self.tools,
+            self.servers,
+            round_tokens(self.tokens),
+        );
+        if !self.unpriced.is_empty() {
+            let _ = write!(
+                line,
+                " — at least: {} did not answer",
+                self.unpriced.join(", ")
+            );
+        }
+        line
+    }
+}
+
+/// Tokens as a reader wants them: `18k` past a thousand, the number itself
+/// below it. A budget printed to the digit would claim a precision the
+/// estimate does not have.
+fn round_tokens(tokens: usize) -> String {
+    if tokens < 1000 {
+        return tokens.to_string();
+    }
+    format!("{}k", (tokens + 500) / 1000)
+}
+
+/// What each client sees, given what the servers offer.
+///
+/// `listings` is server name → tool name → the tool's estimated token cost,
+/// which is what a probe of that server produced. A server missing from it
+/// is one nothing could price; it still counts as a server the client is
+/// offered, and its name is reported so the total is not read as complete.
+#[must_use]
+pub fn client_budget(
+    client: ClientKind,
+    scope: Option<&ClientScope>,
+    canonical: &BTreeMap<String, Server>,
+    listings: &BTreeMap<String, BTreeMap<String, usize>>,
+) -> ClientBudget {
+    let mut budget = ClientBudget {
+        client: client.id().to_owned(),
+        servers: 0,
+        tools: 0,
+        tokens: 0,
+        unpriced: Vec::new(),
+    };
+    for (name, server) in canonical {
+        // A disabled server is not synced anywhere and costs nobody
+        // anything, exactly as it does in `sync`.
+        if !server.enabled || !scope.is_none_or(|scope| scope.has_server(name)) {
+            continue;
+        }
+        budget.servers += 1;
+        let Some(tools) = listings.get(name) else {
+            budget.unpriced.push(name.clone());
+            continue;
+        };
+        for (tool, tokens) in tools {
+            // The same two tables the gateway applies, in the same order.
+            if server.allows_tool(tool) && scope.is_none_or(|scope| scope.allows_tool(tool)) {
+                budget.tools += 1;
+                budget.tokens += tokens;
+            }
+        }
+    }
+    budget
+}
+
+/// The tool ceiling a client is judged against, and where it comes from.
+///
+/// An explicit `max_tools` wins: a user who wrote one has said what they
+/// want to hear about, including on a client whose own limit is lower.
+#[must_use]
+pub fn tool_cap(client: ClientKind, scope: Option<&ClientScope>) -> Option<(usize, String)> {
+    if let Some(max) = scope.and_then(|scope| scope.max_tools) {
+        return Some((max, format!("[clients.{}] max_tools", client.id())));
+    }
+    (client == ClientKind::Windsurf).then(|| (WINDSURF_TOOL_CAP, "Windsurf's own limit".to_owned()))
+}
+
+/// The finding for a client offered more tools than it can hold.
+///
+/// A warning: nothing is misconfigured and the gateway is doing what the
+/// file says. What it costs — a client that silently truncates its tool
+/// list, or a context spent before the first prompt — is invisible from
+/// inside the client, which is why it is worth a line.
+#[must_use]
+pub fn over_tool_cap(budget: &ClientBudget, cap: usize, source: &str) -> Option<Finding> {
+    (budget.tools > cap).then(|| Finding {
+        client: Some(budget.client.clone()),
+        server: None,
+        severity: Severity::Warning,
+        message: format!(
+            "{} tools is over {cap} ({source}) — narrow it with \
+             `mcpgw clients {} servers ...` or a [clients.{}.tools] deny list",
+            budget.tools, budget.client, budget.client,
+        ),
+        code: None,
+    })
+}
+
+/// The finding for a `[clients.ID] servers` entry naming a server the
+/// canonical config does not have.
+///
+/// Not a parse error, for the same reason an unmatched tool rule is not: the
+/// state is ordinary between `mcpgw remove` and the next edit, and a config
+/// that refused to load would take the gateway down over a stale name.
+#[must_use]
+pub fn unknown_scoped_servers(
+    client: &str,
+    scope: &ClientScope,
+    canonical: &BTreeMap<String, Server>,
+) -> Vec<Finding> {
+    scope
+        .servers
+        .iter()
+        .filter(|name| !canonical.contains_key(name.as_str()))
+        .map(|name| Finding {
+            client: Some(client.to_owned()),
+            server: Some(name.clone()),
+            severity: Severity::Warning,
+            message: format!(
+                "[clients.{client}] servers names {name:?}, which the canonical config does \
+                 not have"
+            ),
+            code: None,
+        })
+        .collect()
+}
+
 /// Turns a lenient client read's problems into findings.
 ///
 /// Severity rule: if the named server still exists in the parsed map, the
@@ -391,23 +558,34 @@ fn bridge_url(command: &str, args: &[String]) -> Option<String> {
             .cloned()
     };
     let base = flag("--url").unwrap_or_else(|| endpoints::DEFAULT_URL.to_owned());
-    match flag("--server") {
-        Some(name) => endpoints::per_server_url(&base, &name).ok(),
-        None => Some(base),
+    let Some(name) = flag("--server") else {
+        return Some(base);
+    };
+    // The client tag rides along: it is part of which endpoint this entry
+    // dials, and probing the untagged one would prove a path the client
+    // never takes.
+    match flag("--client") {
+        Some(client) => endpoints::per_client_url(&base, &name, &client).ok(),
+        None => endpoints::per_server_url(&base, &name).ok(),
     }
 }
 
-/// One endpoint's identity: the socket it reaches plus the path on it.
+/// One endpoint's identity: the socket it reaches, the path on it, and the
+/// client it was tagged for.
 fn target_key(url: &str) -> String {
     let Ok(parsed) = url::Url::parse(url) else {
         return url.to_owned();
     };
     format!(
-        "{}://{}:{}{}",
+        "{}://{}:{}{}{}",
         parsed.scheme(),
         host_key(&parsed).unwrap_or_default(),
         parsed.port_or_known_default().unwrap_or_default(),
-        parsed.path()
+        parsed.path(),
+        // Part of the identity: two clients dialing one server's endpoint
+        // under different `?client=` tags are asking it different questions
+        // and get different answers.
+        parsed.query().map(|q| format!("?{q}")).unwrap_or_default(),
     )
 }
 

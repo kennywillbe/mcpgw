@@ -33,6 +33,7 @@ use rmcp::service::{
 };
 
 use crate::capture::{CaptureRecord, CaptureWriter, Kind};
+use crate::config::ClientScopes;
 use crate::pins::{PinStore, ToolFingerprint};
 use crate::upstream::{ListChanged, OverBudget, ParamHeaders, UpstreamManager};
 
@@ -62,11 +63,17 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 struct Attribution {
     session: Option<String>,
     client: Option<String>,
+    /// The client *kind* the endpoint was dialled as, from the `?client=`
+    /// tag `sync` writes into a scoped client's entry. What the scope is
+    /// looked up by, and the fallback for a client that named itself to
+    /// nobody.
+    kind: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct Gateway {
     manager: Arc<UpstreamManager>,
+    clients: ClientScopes,
     upstream: String,
     unavailable_hint: Option<String>,
     capture: Option<Arc<CaptureWriter>>,
@@ -82,6 +89,7 @@ impl Gateway {
     pub fn new(manager: Arc<UpstreamManager>, upstream: String) -> Self {
         Self {
             manager,
+            clients: ClientScopes::default(),
             upstream,
             unavailable_hint: None,
             capture: None,
@@ -127,6 +135,16 @@ impl Gateway {
     #[must_use]
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Gives this pipe the live `[clients]` table, so an endpoint dialled
+    /// with a `?client=` tag is answered with that client's scope applied.
+    /// Left empty by default: a gateway with no scopes offers every client
+    /// the same thing, which is what every gateway did before scopes existed.
+    #[must_use]
+    pub fn with_client_scopes(mut self, clients: ClientScopes) -> Self {
+        self.clients = clients;
         self
     }
 
@@ -210,7 +228,12 @@ impl Gateway {
             .map(ToOwned::to_owned)
             .or_else(|| client.clone())
             .map(|id| crate::capture::session_fingerprint(&id));
-        Attribution { session, client }
+        let kind = crate::endpoints::client_of_query(http.and_then(|parts| parts.uri.query()));
+        Attribution {
+            session,
+            client,
+            kind,
+        }
     }
 
     /// The `Mcp-Param-*` headers this request arrived with, read from the same
@@ -239,7 +262,12 @@ impl Gateway {
         // the caller a property of the request, neither of them of the family
         // being recorded, so no call site can forget either.
         record.endpoint.clone_from(&self.endpoint);
-        record.client.clone_from(&who.client);
+        // The client's own name wins over the kind the endpoint was tagged
+        // with: both are self-reported, and `claude-code/2.1.3` says
+        // everything `claude-code` does and the version besides. The tag is
+        // what fills the column for a client that named itself to nobody,
+        // which before scopes existed was simply an empty cell.
+        record.client = who.client.clone().or_else(|| who.kind.clone());
         if let Err(err) = writer.append(&record) {
             eprintln!("warning: could not write traffic capture: {err}");
         }
@@ -301,16 +329,38 @@ impl Gateway {
         })
     }
 
-    /// Whether `tool` survives the upstream's `[tools]` table.
+    /// Why `tool` may not be reached through this endpoint, or `None` when
+    /// it may.
     ///
-    /// Read from the manager on every request rather than captured when this
-    /// pipe was built: the table is the answer to "what can a client reach",
-    /// and an edit to it has to take effect on the next call, not on the
-    /// next reconnect.
-    fn allows(&self, tool: &str) -> bool {
-        self.manager
+    /// Two tables, in order: the server's own `[tools]`, which says what the
+    /// server offers anybody, and then the scope of the client the endpoint
+    /// was dialled as, which says which of that this client gets. A client
+    /// the endpoint was not tagged for, or one with no scope, is asked
+    /// nothing beyond the server's table.
+    ///
+    /// Both are read on every request rather than captured when this pipe
+    /// was built: they are the answer to "what can a client reach", and an
+    /// edit to either has to take effect on the next call, not on the next
+    /// reconnect.
+    fn refusal(&self, tool: &str, client: Option<&str>) -> Option<String> {
+        if !self
+            .manager
             .server(&self.upstream)
             .is_none_or(|server| server.allows_tool(tool))
+        {
+            return Some(not_allowed(tool, &self.upstream));
+        }
+        let client = client?;
+        let scope = self.clients.get(client)?;
+        if !scope.has_server(&self.upstream) {
+            return Some(not_offered(&self.upstream, client));
+        }
+        (!scope.allows_tool(tool)).then(|| not_allowed_for(tool, &self.upstream, client))
+    }
+
+    /// Whether `tool` is visible and callable here for this client.
+    fn allows(&self, tool: &str, client: Option<&str>) -> bool {
+        self.refusal(tool, client).is_none()
     }
 
     /// Compares the tools this list just carried against the pinned ones and
@@ -376,8 +426,7 @@ impl Gateway {
     /// gateway speaks. `-32601` would claim this endpoint has no
     /// `tools/call` at all, which is false and would tell a client to stop
     /// trying every other tool as well.
-    fn deny(&self, who: &Attribution, tool: &str) -> ErrorData {
-        let message = not_allowed(tool, &self.upstream);
+    fn deny(&self, who: &Attribution, tool: &str, message: String) -> ErrorData {
         self.record(who, |session| {
             CaptureRecord::new(session, &self.upstream, Kind::Denied, Duration::ZERO)
                 .with_tool(tool)
@@ -985,7 +1034,9 @@ impl ServerHandler for Gateway {
         // Applied to the merged list, whatever the upstream's paging made of
         // it: the filter is about what this client may see, not about how
         // the answer was assembled.
-        result.tools.retain(|tool| self.allows(&tool.name));
+        result
+            .tools
+            .retain(|tool| self.allows(&tool.name, who.kind.as_deref()));
         self.check_drift(&who, &result);
         Ok(bridged(&context, result))
     }
@@ -1005,8 +1056,8 @@ impl ServerHandler for Gateway {
         // Before the upstream is even acquired: a tool the table filtered out
         // is one this endpoint does not offer, and a refusal that spawned the
         // server first would be a way to reach it anyway.
-        if !self.allows(&tool) {
-            return Err(self.deny(&who, &tool));
+        if let Some(message) = self.refusal(&tool, who.kind.as_deref()) {
+            return Err(self.deny(&who, &tool, message));
         }
         // After the allowlist and still before the upstream. After, because
         // a call the table refuses outright should not also cost a token —
@@ -1229,6 +1280,25 @@ pub fn over_budget(server: &str, limit: u32, retry_in: Duration) -> String {
         "server {server:?} is over its budget of {limit} calls per minute; \
          retry in ~{seconds} s (see mcpgw tools {server})"
     )
+}
+
+/// The same for a tool the *client's* scope filtered out. A separate
+/// sentence, and it names the client, because the two refusals have
+/// different files behind them: this one is nothing to do with the server,
+/// and looking for it in `mcpgw tools` would find a tool that is plainly
+/// allowed there.
+#[must_use]
+pub fn not_allowed_for(tool: &str, server: &str, client: &str) -> String {
+    format!(
+        "tool {tool:?} on server {server:?} is not offered to client {client:?} \
+         (see mcpgw clients {client})"
+    )
+}
+
+/// What a client is told about a whole server its scope leaves out.
+#[must_use]
+pub fn not_offered(server: &str, client: &str) -> String {
+    format!("server {server:?} is not offered to client {client:?} (see mcpgw clients {client})")
 }
 
 /// The one wording for a request that ran out its deadline. Names the

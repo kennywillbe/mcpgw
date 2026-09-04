@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+use mcpgw_core::config::ClientScope;
 use mcpgw_core::doctor::project_unmanaged;
 use mcpgw_core::doctor::{
-    Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
-    classify_gateway_failure, classify_problems, endpoint_server, gateway_unreachable, needs_oauth,
-    tool_drift, unmatched_tool_rules, unserved_endpoint,
+    ClientBudget, Finding, GatewayFault, GatewayPlan, GatewayTarget, Severity, check_server,
+    classify_gateway_failure, classify_problems, client_budget, endpoint_server,
+    gateway_unreachable, needs_oauth, over_tool_cap, tool_cap, tool_drift, unknown_scoped_servers,
+    unmatched_tool_rules, unserved_endpoint,
 };
 use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
 use mcpgw_core::projects::{ProjectConfig, Standing};
@@ -108,31 +110,11 @@ pub fn run(
     let managed = managed_state();
 
     let path = super::canonical_config_path()?;
-    // Kept past the match: the project pass below asks of every repo-local
-    // entry whether the canonical config already speaks for it.
-    let mut canonical_servers: BTreeMap<String, Server> = BTreeMap::new();
-    let canonical_note = match Config::load(&path) {
-        Ok(config) => {
-            for (name, server) in &config.servers {
-                findings.extend(check_server(None, name, server, &command_exists));
-                plan.collect("canonical", name, server);
-            }
-            let note = format!("{} servers", config.servers.len());
-            canonical_servers = config.servers;
-            note
-        }
-        Err(Error::NotFound { .. }) => "not created yet (run `mcpgw add`)".to_owned(),
-        Err(err) => {
-            findings.push(Finding {
-                client: None,
-                server: None,
-                severity: Severity::Error,
-                message: error_chain(&err),
-                code: None,
-            });
-            "invalid".to_owned()
-        }
-    };
+    let Canonical {
+        note: canonical_note,
+        servers: canonical_servers,
+        scopes,
+    } = load_canonical(&path, &mut findings, &mut plan, &command_exists);
 
     findings.extend(drifted_tool_definitions(&canonical_servers));
 
@@ -169,12 +151,28 @@ pub fn run(
         None => (None, None),
     };
 
-    let (errors, warnings) = tally(
-        &findings,
-        &projects,
-        probe_results.as_ref(),
-        gateway_report.as_ref(),
+    // Only under `--probe`: what a client is offered can be counted from the
+    // config, but what it *costs* is the servers' own tool definitions, and
+    // nothing on disk holds those.
+    let (budgets, budget_findings) = probe_results.as_ref().map_or_else(
+        || (Vec::new(), Vec::new()),
+        |probes| budget_report(probes, &canonical_servers, &scopes, &managed),
     );
+
+    let gateway_findings = gateway_report
+        .as_ref()
+        .map_or(&[][..], |report| &report.findings);
+    let probe_findings = probe_results
+        .as_ref()
+        .map_or(&[][..], |report| &report.findings);
+    let sets: [&[Finding]; 5] = [
+        &findings,
+        &projects.findings,
+        probe_findings,
+        gateway_findings,
+        &budget_findings,
+    ];
+    let (errors, warnings) = tally(&sets, probe_results.as_ref(), gateway_report.as_ref());
 
     if json {
         let gateway_findings = gateway_report
@@ -190,6 +188,7 @@ pub fn run(
             .chain(&projects.findings)
             .chain(probe_findings)
             .chain(gateway_findings)
+            .chain(&budget_findings)
             .cloned()
             .collect::<Vec<_>>();
         emit_json(
@@ -200,6 +199,7 @@ pub fn run(
             &projects,
             probe_results.as_ref(),
             gateway_report.as_ref(),
+            &budgets,
             errors,
             warnings,
         )?;
@@ -212,6 +212,7 @@ pub fn run(
         if let Some(report) = &gateway_report {
             render_gateway(report, color);
         }
+        render_budgets(&budgets, &budget_findings, color);
         println!();
         summary_line(errors, warnings, color);
     }
@@ -219,27 +220,57 @@ pub fn run(
     Ok(u8::from(errors > 0))
 }
 
-/// Errors and warnings across every pass. Split out so that the exit code,
-/// the summary line and the JSON all count the same set the same way.
-fn tally(
-    findings: &[Finding],
-    projects: &ProjectReport,
-    probes: Option<&ProbeReport>,
-    gateway: Option<&GatewayReport>,
-) -> (usize, usize) {
-    let gateway_findings = gateway.map_or(&[][..], |report| &report.findings);
-    let probe_findings = probes.map_or(&[][..], |report| &report.findings);
-    let errors = count(findings, Severity::Error)
-        + count(&projects.findings, Severity::Error)
-        + count(gateway_findings, Severity::Error)
-        + count(probe_findings, Severity::Error)
-        + probes.map_or(0, ProbeReport::failures)
-        + gateway.map_or(0, GatewayReport::failures);
-    let warnings = count(findings, Severity::Warning)
-        + count(&projects.findings, Severity::Warning)
-        + count(gateway_findings, Severity::Warning)
-        + count(probe_findings, Severity::Warning);
-    (errors, warnings)
+/// The canonical config as the rest of the report needs it: the line that
+/// describes it, the servers (which the project pass asks about too) and the
+/// client scopes.
+struct Canonical {
+    note: String,
+    servers: BTreeMap<String, Server>,
+    scopes: BTreeMap<String, ClientScope>,
+}
+
+/// Reads it, checks every entry, and feeds the probe plan.
+fn load_canonical(
+    path: &Path,
+    findings: &mut Vec<Finding>,
+    plan: &mut ProbePlan,
+    command_exists: &dyn Fn(&str) -> bool,
+) -> Canonical {
+    match Config::load(path) {
+        Ok(config) => {
+            for (name, server) in &config.servers {
+                findings.extend(check_server(None, name, server, command_exists));
+                plan.collect("canonical", name, server);
+            }
+            for (client, scope) in &config.clients {
+                findings.extend(unknown_scoped_servers(client, scope, &config.servers));
+            }
+            Canonical {
+                note: format!("{} servers", config.servers.len()),
+                servers: config.servers,
+                scopes: config.clients,
+            }
+        }
+        Err(err) => {
+            let note = if matches!(err, Error::NotFound { .. }) {
+                "not created yet (run `mcpgw add`)".to_owned()
+            } else {
+                findings.push(Finding {
+                    client: None,
+                    server: None,
+                    severity: Severity::Error,
+                    message: error_chain(&err),
+                    code: None,
+                });
+                "invalid".to_owned()
+            };
+            Canonical {
+                note,
+                servers: BTreeMap::new(),
+                scopes: BTreeMap::new(),
+            }
+        }
+    }
 }
 
 /// The static pass over every detected client: appends its findings, feeds
@@ -544,6 +575,7 @@ fn emit_json(
     projects: &ProjectReport,
     probes: Option<&ProbeReport>,
     gateway: Option<&GatewayReport>,
+    budgets: &[(ClientKind, ClientBudget)],
     errors: usize,
     warnings: usize,
 ) -> anyhow::Result<()> {
@@ -561,6 +593,10 @@ fn emit_json(
         "errors": errors,
         "warnings": warnings,
     });
+    if !budgets.is_empty() {
+        out["budgets"] =
+            serde_json::json!(budgets.iter().map(|(_, budget)| budget).collect::<Vec<_>>());
+    }
     if let Some(probes) = probes {
         let entries: Vec<serde_json::Value> = probes
             .results
@@ -730,6 +766,62 @@ fn drifted_tool_definitions(canonical: &BTreeMap<String, Server>) -> Vec<Finding
             tool_drift(name, &file.drift)
         })
         .collect()
+}
+
+/// What each client is offered and what it costs, for every client that has
+/// a scope of its own or that mcpgw syncs.
+///
+/// Both halves are needed: a scoped client is the point of the report, and
+/// an unscoped one is where the number people were surprised by comes from —
+/// "every client gets every server" is exactly the state worth pricing.
+fn budget_report(
+    probes: &ProbeReport,
+    canonical: &BTreeMap<String, Server>,
+    scopes: &BTreeMap<String, ClientScope>,
+    managed: &ManagedState,
+) -> (Vec<(ClientKind, ClientBudget)>, Vec<Finding>) {
+    let listings: BTreeMap<String, BTreeMap<String, usize>> = probes
+        .results
+        .iter()
+        .filter_map(|(label, outcome)| {
+            let success = outcome.as_ref().ok()?;
+            Some((probes.name(label).to_owned(), success.tokens.clone()))
+        })
+        .collect();
+    let budgets: Vec<(ClientKind, ClientBudget)> = ClientKind::ALL
+        .into_iter()
+        .filter(|kind| scopes.contains_key(kind.id()) || managed.clients.contains_key(kind.id()))
+        .map(|kind| {
+            (
+                kind,
+                client_budget(kind, scopes.get(kind.id()), canonical, &listings),
+            )
+        })
+        .collect();
+    let findings = budgets
+        .iter()
+        .filter_map(|(kind, budget)| {
+            let (cap, source) = tool_cap(*kind, scopes.get(kind.id()))?;
+            over_tool_cap(budget, cap, &source)
+        })
+        .collect();
+    (budgets, findings)
+}
+
+/// The report's totals, counted in one place so the summary line and the
+/// `--json` numbers cannot disagree about what a problem is.
+fn tally(
+    sets: &[&[Finding]],
+    probes: Option<&ProbeReport>,
+    gateway: Option<&GatewayReport>,
+) -> (usize, usize) {
+    let of = |severity| sets.iter().map(|set| count(set, severity)).sum::<usize>();
+    (
+        of(Severity::Error)
+            + probes.map_or(0, ProbeReport::failures)
+            + gateway.map_or(0, GatewayReport::failures),
+        of(Severity::Warning),
+    )
 }
 
 /// The findings for every `[servers.NAME.tools]` entry that matched nothing
@@ -1066,6 +1158,37 @@ fn render_probes(probes: &ProbeReport, color: bool) {
     }
 }
 
+/// The token budget section: one line per client, in the terms the request
+/// was made in — how many tools it is offered and what they cost it before
+/// anybody types anything.
+fn render_budgets(budgets: &[(ClientKind, ClientBudget)], findings: &[Finding], color: bool) {
+    if budgets.is_empty() {
+        return;
+    }
+    println!();
+    heading("token budget — what each client is offered", color);
+    for (kind, budget) in budgets {
+        let over = findings
+            .iter()
+            .any(|finding| finding.client.as_deref() == Some(kind.id()));
+        if over {
+            warn_line(&budget.line(), color);
+        } else {
+            ok_line(&budget.line(), color);
+        }
+    }
+    for finding in findings {
+        print_finding(finding, color);
+    }
+    println!(
+        "  {}",
+        crate::ui::dim(
+            "estimated at (name + description + schema) / 4 characters per token",
+            color,
+        )
+    );
+}
+
 /// The second probe section: the path clients actually take. A server can be
 /// perfectly healthy on the row above and unreachable on this one — a gateway
 /// that is down, an endpoint it never served, a name that went stale — which
@@ -1220,6 +1343,7 @@ mod tests {
                     server_name: "fixture".to_owned(),
                     server_version: "1".to_owned(),
                     tools: vec!["echo".to_owned(), "reverse".to_owned()],
+                    tokens: std::collections::BTreeMap::new(),
                 }),
             )
         });

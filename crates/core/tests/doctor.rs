@@ -169,6 +169,25 @@ fn the_stdio_bridge_resolves_the_url_connect_would_dial() {
     // The legacy entry a 0.3.x sync wrote, in the bare form that defaults
     // to the serve port: still ours, and still to be migrated.
     assert!(plan.collect("Codex CLI", "mcpgw", &bridge("mcpgw", &["connect"])));
+    // A scoped client's bridge dials the tagged endpoint, and that is the
+    // path the probe has to take: the untagged one answers a different
+    // question.
+    assert!(plan.collect(
+        "Claude Desktop",
+        "linear",
+        &bridge(
+            "mcpgw",
+            &[
+                "connect",
+                "--server",
+                "linear",
+                "--url",
+                BASE,
+                "--client",
+                "claude-desktop"
+            ],
+        ),
+    ));
     // Some other command called `connect` is not our bridge.
     assert!(!plan.collect("Zed", "x", &bridge("socat", &["connect"])));
 
@@ -178,13 +197,15 @@ fn the_stdio_bridge_resolves_the_url_connect_would_dial() {
         urls,
         [
             "http://127.0.0.1:8137/mcp",
-            "http://127.0.0.1:8137/s/github"
+            "http://127.0.0.1:8137/s/github",
+            "http://127.0.0.1:8137/s/linear?client=claude-desktop"
         ]
     );
     // The base endpoint belongs to no single server, which is what marks
     // that entry as one to migrate rather than one that is served.
     assert_eq!(targets[0].server, None);
     assert_eq!(targets[1].server.as_deref(), Some("github"));
+    assert_eq!(targets[2].server.as_deref(), Some("linear"));
 }
 
 #[test]
@@ -449,4 +470,134 @@ fn a_bind_past_loopback_with_no_token_required_is_an_error() {
     for bind in ["127.0.0.1", "::1", "localhost"] {
         assert!(unauthenticated_bind(bind, false).is_none(), "{bind}");
     }
+}
+
+/// The budget is the two tables applied in the gateway's own order, over the
+/// servers the client is given and nothing else.
+#[test]
+fn a_budget_counts_only_what_the_client_would_actually_be_offered() {
+    use mcpgw_core::doctor::{WINDSURF_TOOL_CAP, client_budget, over_tool_cap, tool_cap};
+
+    let config = parse(
+        r#"
+version = 1
+
+[clients.cursor]
+servers = ["github"]
+
+[clients.cursor.tools]
+deny = ["get_*"]
+
+[servers.github]
+type = "stdio"
+command = "npx"
+
+[servers.github.tools]
+deny = ["delete_*"]
+
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+
+[servers.parked]
+type = "stdio"
+command = "npx"
+enabled = false
+"#,
+    );
+    let listings = [
+        (
+            "github".to_owned(),
+            [
+                ("search".to_owned(), 100),
+                ("get_file".to_owned(), 200),
+                ("delete_repo".to_owned(), 400),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        (
+            "linear".to_owned(),
+            [("issues".to_owned(), 800)].into_iter().collect(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    let cursor = client_budget(
+        ClientKind::Cursor,
+        config.clients.get("cursor"),
+        &config.servers,
+        &listings,
+    );
+    assert_eq!(cursor.servers, 1);
+    // `get_file` is denied by the client, `delete_repo` by the server, and
+    // `linear` is not this client's at all.
+    assert_eq!(cursor.tools, 1);
+    assert_eq!(cursor.tokens, 100);
+    assert!(cursor.unpriced.is_empty());
+    assert_eq!(
+        cursor.line(),
+        "cursor sees 1 tool across 1 server (~100 tokens)"
+    );
+
+    // A client with no scope gets every enabled server, which is the number
+    // nobody could see before.
+    let zed = client_budget(ClientKind::Zed, None, &config.servers, &listings);
+    assert_eq!(zed.servers, 2);
+    assert_eq!(zed.tools, 3);
+    assert_eq!(zed.tokens, 1100);
+    assert_eq!(zed.line(), "zed sees 3 tools across 2 servers (~1k tokens)");
+
+    // A server nothing priced still counts as one the client is offered, and
+    // the line says the total is a floor.
+    let unpriced = client_budget(
+        ClientKind::Zed,
+        None,
+        &config.servers,
+        &[("github".to_owned(), std::collections::BTreeMap::default())]
+            .into_iter()
+            .collect(),
+    );
+    assert_eq!(unpriced.unpriced, ["linear"]);
+    assert!(unpriced.line().contains("at least: linear did not answer"));
+
+    // Windsurf's own ceiling applies without anybody configuring it; every
+    // other client is judged only against a threshold someone wrote.
+    assert_eq!(
+        tool_cap(ClientKind::Windsurf, None),
+        Some((WINDSURF_TOOL_CAP, "Windsurf's own limit".to_owned()))
+    );
+    assert_eq!(tool_cap(ClientKind::Cursor, None), None);
+    // A scope with no threshold in it does not invent one.
+    assert_eq!(
+        tool_cap(ClientKind::Cursor, config.clients.get("cursor")),
+        None
+    );
+    assert!(over_tool_cap(&cursor, 1, "[clients.cursor] max_tools").is_none());
+    let over = over_tool_cap(&zed, 1, "[clients.zed] max_tools").unwrap();
+    assert_eq!(over.severity, Severity::Warning);
+    assert!(over.message.contains("3 tools is over 1"), "{over:?}");
+}
+
+/// A scope naming a server that has been removed is a warning, not a broken
+/// config: the commands that would fix it have to be able to load the file.
+#[test]
+fn a_scope_naming_a_missing_server_is_reported_not_refused() {
+    use mcpgw_core::doctor::unknown_scoped_servers;
+
+    let config = parse(
+        r#"
+version = 1
+[clients.cursor]
+servers = ["github", "gone"]
+[servers.github]
+type = "stdio"
+command = "npx"
+"#,
+    );
+    let findings = unknown_scoped_servers("cursor", &config.clients["cursor"], &config.servers);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].severity, Severity::Warning);
+    assert!(findings[0].message.contains("gone"), "{findings:?}");
 }

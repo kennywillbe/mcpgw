@@ -945,3 +945,91 @@ fn a_call_budget_of_zero_is_reported_as_a_config_error() {
     );
     assert!(!out.status.success(), "{text}");
 }
+
+/// The number the milestone exists to show: how many tools each client is
+/// offered, and what they cost it before anyone types anything.
+#[test]
+fn the_probe_prices_what_each_client_is_offered() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"
+version = 1
+
+[clients.cursor]
+servers = ["fx"]
+max_tools = 1
+
+[servers.fx]
+type = "stdio"
+command = '{}'
+args = ["healthy"]
+"#,
+        fixture_binary().display()
+    );
+    let out = run_doctor(
+        dir.path(),
+        Some(&config),
+        &["--probe", "--timeout", "60", "--json"],
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let budget = value["budgets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["client"] == "cursor")
+        .unwrap_or_else(|| panic!("no cursor budget: {value}"));
+    assert_eq!(budget["client"], "cursor");
+    assert_eq!(budget["servers"], 1);
+    assert_eq!(budget["tools"], 2);
+    // The estimate is crude by design, but a real tool definition is never
+    // free and never a novel.
+    let tokens = budget["tokens"].as_u64().unwrap();
+    assert!((1..1000).contains(&tokens), "{tokens}");
+
+    // Over the threshold the config set, so the report says so rather than
+    // leaving it to be counted by hand.
+    let over = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["message"].as_str().unwrap().contains("max_tools"))
+        .unwrap_or_else(|| panic!("no cap finding: {value}"));
+    assert_eq!(over["severity"], "warning");
+    assert!(
+        over["message"]
+            .as_str()
+            .unwrap()
+            .contains("2 tools is over 1"),
+        "{over}"
+    );
+}
+
+/// The rendered half of the same, in the words the request was made in.
+#[test]
+fn the_budget_section_names_the_client_the_tools_and_the_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        r#"
+version = 1
+
+[clients.cursor]
+servers = ["fx"]
+
+[servers.fx]
+type = "stdio"
+command = '{}'
+args = ["healthy"]
+"#,
+        fixture_binary().display()
+    );
+    let out = run_doctor(dir.path(), Some(&config), &["--probe", "--timeout", "60"]);
+    let text = stdout(&out);
+    assert!(text.contains("token budget"), "{text}");
+    assert!(
+        text.contains("cursor sees 2 tools across 1 server"),
+        "{text}"
+    );
+    assert!(text.contains("tokens)"), "{text}");
+    // Nothing here is a problem, so nothing here fails the run.
+    assert!(out.status.success(), "{text}");
+}

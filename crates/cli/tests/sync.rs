@@ -1986,3 +1986,55 @@ fn project_sync_outside_a_repo_says_it_found_nothing() {
     let out = sb.ok_in(&empty, &["sync", "--project"]);
     assert!(out.contains("no repo-local MCP config here"), "{out}");
 }
+
+/// A scoped client's whole sync in one run: the announcement names it, the
+/// plan holds only the servers its table gives it, and every entry written
+/// carries the tag the gateway reads the scope back out of.
+#[test]
+fn a_scoped_client_is_written_only_its_own_servers_at_a_tagged_endpoint() {
+    let sb = Sandbox::new();
+    sb.install_cursor(None);
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&["clients", "cursor", "servers", "github"]);
+
+    let out = sb.ok(&["sync", "--client", "cursor", "--dry-run"]);
+    assert!(out.contains("scoped by [clients]: cursor"), "{out}");
+    assert!(out.contains("+ github"), "{out}");
+    assert!(!out.contains("+ linear"), "{out}");
+
+    sb.ok(&["sync", "--client", "cursor"]);
+    let entries = sb.cursor_json()["mcpServers"].clone();
+    assert_eq!(
+        entries["github"]["url"],
+        "http://127.0.0.1:8137/s/github?client=cursor"
+    );
+    assert!(entries.get("linear").is_none(), "{entries}");
+
+    // Widening the scope again takes the tag back off, so nothing about the
+    // entry outlives the table that caused it.
+    sb.ok(&["clients", "cursor", "servers", "all"]);
+    sb.ok(&["sync", "--client", "cursor"]);
+    let entries = sb.cursor_json()["mcpServers"].clone();
+    assert_eq!(entries["github"]["url"], "http://127.0.0.1:8137/s/github");
+    assert!(entries.get("linear").is_some(), "{entries}");
+}
+
+/// The other half of the promise: a client nobody scoped is written the same
+/// bytes it was written before scopes existed.
+#[test]
+fn an_unscoped_client_is_untouched_by_another_clients_scope() {
+    let sb = Sandbox::new();
+    sb.install_cursor(None);
+    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["sync", "--client", "cursor"]);
+    let before = std::fs::read_to_string(sb.home.join(".cursor/mcp.json")).unwrap();
+
+    sb.ok(&["clients", "windsurf", "servers", "github"]);
+    let out = sb.ok(&["sync", "--client", "cursor"]);
+    assert!(out.contains("no changes"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(sb.home.join(".cursor/mcp.json")).unwrap(),
+        before
+    );
+}

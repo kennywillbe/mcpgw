@@ -339,6 +339,33 @@ type = "http"
 url = "https://mcp.linear.app/mcp"
 "#;
 
+/// A config with both halves of the milestone in it: two clients given
+/// different servers, one of them narrowing what it sees on top of a server's
+/// own list.
+const WITH_CLIENTS: &str = r#"
+version = 1
+
+[clients.cursor]
+servers = ["github"]
+
+[clients.cursor.tools]
+deny = ["get_*"]
+
+[clients.claude-desktop]
+max_tools = 40
+
+[servers.github]
+type = "stdio"
+command = "npx"
+
+[servers.github.tools]
+deny = ["delete_*"]
+
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+"#;
+
 #[test]
 fn a_call_budget_parses_and_only_where_it_is_written() {
     let config = Config::parse(WITH_BUDGET, Path::new("budget.toml")).unwrap();
@@ -378,4 +405,80 @@ fn an_unusable_call_budget_is_a_config_error_that_names_the_key() {
     let err = Config::parse(text, Path::new("bad.toml")).unwrap_err();
     let message = std::error::Error::source(&err).unwrap().to_string();
     assert!(message.contains("drop the key for no budget"), "{message}");
+}
+
+#[test]
+fn a_clients_table_parses_and_only_where_it_is_written() {
+    let config = Config::parse(WITH_CLIENTS, Path::new("clients.toml")).unwrap();
+    let cursor = &config.clients["cursor"];
+    assert_eq!(cursor.servers, ["github"]);
+    assert!(cursor.has_server("github"));
+    assert!(!cursor.has_server("linear"));
+    assert!(cursor.restricts());
+    // A table holding only a reporting threshold restricts nothing, which is
+    // what decides whether `sync` writes that client a tagged endpoint.
+    let desktop = &config.clients["claude-desktop"];
+    assert_eq!(desktop.max_tools, Some(40));
+    assert!(!desktop.restricts());
+    assert!(!desktop.is_empty());
+    assert!(desktop.has_server("linear"));
+    // A client with no table at all is given everything, and every client
+    // was one of those before this existed.
+    assert!(!config.clients.contains_key("zed"));
+}
+
+/// The order the gateway reads them in: the server says what it offers
+/// anybody, the client says which of that it gets.
+#[test]
+fn client_rules_compose_over_the_servers_own() {
+    let config = Config::parse(WITH_CLIENTS, Path::new("clients.toml")).unwrap();
+    let github = &config.servers["github"];
+    let cursor = &config.clients["cursor"];
+    let allowed = |tool: &str| github.allows_tool(tool) && cursor.allows_tool(tool);
+
+    assert!(allowed("search_repositories"));
+    // Denied by the client alone — the server offers it to everybody else.
+    assert!(github.allows_tool("get_file_contents"));
+    assert!(!allowed("get_file_contents"));
+    // Denied by the server alone, which no client can widen.
+    assert!(!allowed("delete_repository"));
+    // A scope with no tool rules narrows nothing.
+    assert!(config.clients["claude-desktop"].allows_tool("anything"));
+}
+
+#[test]
+fn a_clients_table_round_trips_through_toml() {
+    let config = Config::parse(WITH_CLIENTS, Path::new("clients.toml")).unwrap();
+    let text = config.to_toml_string().unwrap();
+    let reparsed = Config::parse(&text, Path::new("roundtrip.toml")).unwrap();
+    assert_eq!(config, reparsed);
+    // A client with no tool rules must not grow empty ones on the way out.
+    assert!(!text.contains("claude-desktop.tools"), "{text}");
+}
+
+/// A `[clients.KIND]` nothing answers to is a scope that silently never
+/// applies, so it fails at parse rather than at the request it would have
+/// filtered.
+#[test]
+fn an_unknown_client_id_is_a_config_error_that_lists_the_real_ones() {
+    let err = Config::parse(
+        "version = 1\n[clients.cursorr]\nservers = []\n",
+        Path::new("clients.toml"),
+    )
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("cursorr"), "{message}");
+    assert!(message.contains("cursor"), "{message}");
+}
+
+/// The opposite call: a server name that has gone stale is left to `doctor`,
+/// because the config still has to load for the commands that would fix it.
+#[test]
+fn a_scope_naming_a_missing_server_still_parses() {
+    let config = Config::parse(
+        "version = 1\n[clients.cursor]\nservers = [\"gone\"]\n",
+        Path::new("clients.toml"),
+    )
+    .unwrap();
+    assert_eq!(config.clients["cursor"].servers, ["gone"]);
 }

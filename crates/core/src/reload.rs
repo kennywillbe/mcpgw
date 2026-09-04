@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use crate::capture::CaptureWriter;
-use crate::config::Config;
+use crate::config::{ClientScopes, Config};
 use crate::endpoints::{EndpointTable, Endpoints};
 use crate::gateway::Gateway;
 use crate::upstream::{Changes, UpstreamManager};
@@ -73,6 +73,11 @@ pub struct Reloader {
     selection: Option<Vec<String>>,
     capture: Option<Arc<CaptureWriter>>,
     pins: Option<Arc<crate::pins::PinStore>>,
+    /// The live `[clients]` table every pipe reads its scopes from. Owned
+    /// here, and handed to each pipe as a shared cell, so a reload publishes
+    /// one new set that the endpoints already serving see too — a scope edit
+    /// is not a reason to replace a client's open session.
+    clients: ClientScopes,
     /// What the file looked like when it was last read. Owned by the
     /// [`Reloader`] rather than by [`Reloader::watch`] so that the load
     /// `serve` does before the watcher is even spawned already counts as
@@ -93,6 +98,7 @@ impl Reloader {
             selection: None,
             capture: None,
             pins: None,
+            clients: ClientScopes::default(),
             seen: std::sync::Mutex::new(None),
         }
     }
@@ -138,7 +144,8 @@ impl Reloader {
     }
 
     fn pipe(&self, name: &str) -> Gateway {
-        let mut pipe = Gateway::new(Arc::clone(&self.manager), name.to_owned());
+        let mut pipe = Gateway::new(Arc::clone(&self.manager), name.to_owned())
+            .with_client_scopes(self.clients.clone());
         if let Some(writer) = &self.capture {
             pipe = pipe.with_capture(Arc::clone(writer));
         }
@@ -151,6 +158,10 @@ impl Reloader {
     /// Makes `config` the live one.
     pub async fn apply(&self, config: Config) -> Reloaded {
         let serving = self.select(&config);
+        // Ahead of the upstreams for the same reason the upstreams are ahead
+        // of the endpoints: a scope that arrives late is a window in which a
+        // client is offered what the file says it should not be.
+        self.clients.store(config.clients);
         // Upstreams first: a name that reaches its endpoint before the
         // manager knows it would get "unknown upstream" instead of an
         // answer, whereas the opposite window — an endpoint that outlives

@@ -167,6 +167,18 @@ would do; it caps what a mistake costs while you are not at the desk.
 Refusals are logged under kind `throttled`. See
 [`calls_per_minute`](./configuration.md#calls_per_minute).
 
+Per-client scoping (`[clients.KIND]`) narrows the same thing one step
+further — which client is offered which servers and tools — and it is worth
+being explicit about what it is: **a scope is per client file, not per
+caller.** `sync` writes a scoped client's entries pointing at
+`/s/<server>?client=<kind>`, and the gateway applies that client's rules to
+requests that arrive with the tag. Nothing stops anything else on the machine
+from dialing the same endpoint without the tag, or with somebody else's. The
+tag says which client config a request came from; it does not prove it. What
+scoping buys is a smaller context and a smaller blast radius per harness, not
+a boundary — the boundary is still that anything running as you can reach the
+gateway.
+
 **One log.** Every call now passes a single capture point, and by default it
 is written down. That is the feature — it is why `mcpgw watch` can show you
 what your agent did — and it is also a file that did not exist before. See
@@ -319,8 +331,10 @@ because a helper that fails has to be fixable. mcpgw runs it with no shell.
   was already true of your server credentials.
 - The gateway token is what carries that boundary across a socket. Loopback is
   still the default; the token is what makes anything else defensible.
-- `[servers.NAME.tools]` narrows what any of them can call on a server. It
-  shrinks the blast radius; it does not authenticate anybody.
+- `[servers.NAME.tools]` narrows what any of them can call on a server, and
+  `[clients.KIND]` narrows what one client is offered. Both shrink the blast
+  radius; neither authenticates anybody, and the `?client=` tag is a label a
+  client file carries, not a credential.
 - Tool definitions are pinned on first sight and a change is reported, not
   refused. It makes a rug pull visible; it does not stop one.
 - `calls_per_minute` caps how fast they can call it. It bounds a runaway

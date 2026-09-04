@@ -148,6 +148,7 @@ fn plan_all(cx: &Ctx, include_project: bool) -> anyhow::Result<Plans> {
             &cx.gateway_url,
             &bridge,
             token.as_ref(),
+            cx.config.clients.get(kind.id()),
         )?;
         let managed = Scope::Home(*kind).managed(&cx.state);
         match plan_client(*kind, &desired, &managed)? {
@@ -163,6 +164,7 @@ fn plan_all(cx: &Ctx, include_project: bool) -> anyhow::Result<Plans> {
                 &cx.gateway_url,
                 &bridge,
                 token.as_ref(),
+                cx.config.clients.get(config.kind.id()),
             )?;
             let scope = config.scope();
             match plan_project(&config, &desired, &scope.managed(&cx.state))? {

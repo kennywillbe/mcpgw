@@ -427,3 +427,57 @@ fn upsert_keeps_a_budget_the_incoming_entry_does_not_carry() {
     assert!(text.contains("calls_per_minute = 30"), "{text}");
     assert!(!text.contains("calls_per_minute = 120"), "{text}");
 }
+
+#[test]
+fn a_client_scope_is_written_as_a_table_and_removed_when_it_empties() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store
+        .set_client_scope(
+            "cursor",
+            &mcpgw_core::config::ClientScope {
+                servers: vec!["github".to_owned()],
+                max_tools: Some(40),
+                tools: Some(ToolRules {
+                    allow: Vec::new(),
+                    deny: vec!["delete_*".to_owned()],
+                    ..ToolRules::default()
+                }),
+            },
+        )
+        .unwrap();
+    store.save().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# my precious header comment"), "{text}");
+    assert!(
+        text.contains("# github powers the code review flow"),
+        "{text}"
+    );
+    insta::assert_snapshot!(text);
+
+    // Read back as a scope, not as text that happens to look like one.
+    drop(store);
+    let mut store = ConfigStore::edit(&path).unwrap();
+    let scope = &store.config().clients["cursor"];
+    assert_eq!(scope.servers, ["github"]);
+    assert_eq!(scope.max_tools, Some(40));
+    assert_eq!(scope.tools.as_ref().unwrap().deny, ["delete_*"]);
+
+    // Emptied, the table goes rather than sitting there saying nothing.
+    store
+        .set_client_scope("cursor", &mcpgw_core::config::ClientScope::default())
+        .unwrap();
+    store.save().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("clients"), "{text}");
+}
+
+#[test]
+fn a_scope_for_a_client_nothing_answers_to_is_refused() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    let err = store
+        .set_client_scope("cursorr", &mcpgw_core::config::ClientScope::default())
+        .unwrap_err();
+    assert!(matches!(err, Error::UnknownClient { .. }), "{err}");
+}

@@ -193,6 +193,13 @@ version of what that does and does not protect. The short one:
   before it reaches the server and logged as `denied`. It shrinks the blast
   radius; it does not authenticate anybody. Servers without a list are
   unchanged.
+- A per-client scope narrows it from the other end: `[clients.KIND]` (or
+  `mcpgw clients KIND servers ...`) decides which servers and tools one client
+  is given, and `sync` writes it a tagged endpoint the gateway reads that back
+  from. It is about context size and blast radius per harness — 70 tools is
+  roughly 49k tokens before you type anything — and the tag is a label a client
+  file carries, not a credential. `mcpgw doctor --probe` prices what each
+  client ends up with.
 - Requests carrying an `Origin` header that isn't a loopback page are refused
   with 403, so a website cannot drive your gateway by rebinding its own domain
   to `127.0.0.1`. MCP clients send no `Origin` and are unaffected.

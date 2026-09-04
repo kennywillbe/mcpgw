@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,11 @@ pub struct Config {
     pub capture: Capture,
     #[serde(default, skip_serializing_if = "GatewaySettings::is_default")]
     pub gateway: GatewaySettings,
+    /// The `[clients.KIND]` tables: which servers and tools each client is
+    /// given. Ahead of `servers` for the same reason `capture` is — one
+    /// section's tables have to be written before the next section starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub clients: BTreeMap<String, ClientScope>,
     #[serde(default)]
     pub servers: BTreeMap<String, Server>,
 }
@@ -42,6 +48,96 @@ impl GatewaySettings {
     #[must_use]
     pub fn is_default(&self) -> bool {
         !self.require_token
+    }
+}
+
+/// What one client is given, from `[clients.KIND]`.
+///
+/// ```toml
+/// [clients.cursor]
+/// servers = ["github", "linear"]
+/// max_tools = 60
+///
+/// [clients.cursor.tools]
+/// deny = ["delete_*"]
+/// ```
+///
+/// Every key is opt-in and a client with no table of its own is given
+/// everything, which is what every client had before this existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientScope {
+    /// The servers this client is offered at all. Empty means every one:
+    /// an absent list is "no opinion", not "nothing".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<String>,
+    /// What `doctor` warns above, in tools. `None` leaves the client with
+    /// whatever ceiling its own software has, which for most of them is
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tools: Option<usize>,
+    /// Tool rules applied on top of each server's own, in the same
+    /// glob-lite language. Written last: it is a sub-table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolRules>,
+}
+
+impl ClientScope {
+    /// Whether this client is offered `server` at all.
+    #[must_use]
+    pub fn has_server(&self, server: &str) -> bool {
+        self.servers.is_empty() || self.servers.iter().any(|name| name == server)
+    }
+
+    /// Whether `tool` survives this client's own rules. The server's rules
+    /// are asked separately, and first — see [`Server::allows_tool`].
+    #[must_use]
+    pub fn allows_tool(&self, tool: &str) -> bool {
+        self.tools.as_ref().is_none_or(|rules| rules.allows(tool))
+    }
+
+    /// Whether this scope narrows anything a client can reach.
+    ///
+    /// What decides whether `sync` writes this client a tagged endpoint: a
+    /// table holding only `max_tools` is a reporting threshold and nothing
+    /// else, and tagging for it would rewrite a client file to say something
+    /// the gateway would not act on.
+    #[must_use]
+    pub fn restricts(&self) -> bool {
+        !self.servers.is_empty() || self.tools.as_ref().is_some_and(|rules| !rules.is_empty())
+    }
+
+    /// Whether the table says nothing at all, and so may as well not be
+    /// there — what an edit that empties it reduces to.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.restricts() && self.max_tools.is_none()
+    }
+}
+
+/// The live `[clients]` table a running gateway reads on every request.
+///
+/// Behind an [`ArcSwap`](arc_swap::ArcSwap) for the same reason the endpoint
+/// table is: a reload publishes a whole new set at once, and a request that
+/// is already running keeps the one it read. Cloning shares the cell, so
+/// every pipe built from it sees a swap immediately.
+#[derive(Debug, Clone, Default)]
+pub struct ClientScopes(Arc<arc_swap::ArcSwap<BTreeMap<String, ClientScope>>>);
+
+impl ClientScopes {
+    #[must_use]
+    pub fn new(scopes: BTreeMap<String, ClientScope>) -> Self {
+        Self(Arc::new(arc_swap::ArcSwap::from_pointee(scopes)))
+    }
+
+    /// Publishes `scopes` in place of the current set.
+    pub fn store(&self, scopes: BTreeMap<String, ClientScope>) {
+        self.0.store(Arc::new(scopes));
+    }
+
+    /// The scope for a client id, as of right now.
+    #[must_use]
+    pub fn get(&self, client: &str) -> Option<ClientScope> {
+        self.0.load().get(client).cloned()
     }
 }
 
@@ -406,6 +502,7 @@ impl Config {
             version: SUPPORTED_VERSION,
             capture: Capture::default(),
             gateway: GatewaySettings::default(),
+            clients: BTreeMap::new(),
             servers: BTreeMap::new(),
         }
     }
@@ -436,6 +533,23 @@ impl Config {
         for (name, server) in &config.servers {
             validate_name(name)?;
             validate_auth(name, server)?;
+        }
+        // The client id is validated and the server names inside a scope are
+        // not: a misspelled id is a table the gateway would silently never
+        // consult, while a name that no longer exists is the ordinary state
+        // between `mcpgw remove` and the next edit — `doctor` reports it,
+        // and refusing to parse would leave the file unrepairable by the
+        // commands that edit it.
+        for id in config.clients.keys() {
+            if crate::clients::ClientKind::from_id(id).is_none() {
+                return Err(Error::UnknownClient {
+                    id: id.clone(),
+                    available: crate::clients::ClientKind::ALL
+                        .iter()
+                        .map(|kind| (*kind).id().to_owned())
+                        .collect(),
+                });
+            }
         }
         // Compiled and thrown away: the gateway builds its own rules later,
         // and the point here is that `mcpgw serve` never starts believing it

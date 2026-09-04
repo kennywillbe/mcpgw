@@ -48,6 +48,10 @@ pub struct ConnectArgs {
     /// so its tools arrive unprefixed
     #[arg(long, value_name = "NAME")]
     pub server: Option<String>,
+    /// Ask for the tools this client kind is scoped to, rather than
+    /// everything the server offers
+    #[arg(long, value_name = "KIND", requires = "server")]
+    pub client: Option<String>,
     /// Never serve a gateway of this bridge's own: fail the way the bridge
     /// failed before it could. Hidden because the answer to "I did not want
     /// that gateway" is `mcpgw daemon install`, not a flag; it exists for
@@ -62,12 +66,17 @@ pub struct ConnectArgs {
 /// which is the shape `sync` writes into stdio-only clients, so the name in
 /// the file stays the server's rather than a hard-coded path.
 fn target_url(args: &ConnectArgs) -> anyhow::Result<String> {
-    match (&args.url, &args.server) {
-        (Some(url), Some(name)) => Ok(mcpgw_core::endpoints::per_server_url(url, name)?),
-        (Some(url), None) => Ok(url.clone()),
-        (None, Some(name)) => Ok(mcpgw_core::endpoints::per_server_url(DEFAULT_URL, name)?),
-        (None, None) => Ok(DEFAULT_URL.to_owned()),
-    }
+    let base = args.url.as_deref().unwrap_or(DEFAULT_URL);
+    let Some(name) = &args.server else {
+        return Ok(base.to_owned());
+    };
+    // `--client` is the stdio spelling of the `?client=` tag `sync` writes
+    // into an http entry: same endpoint, same scope, and the bridge is the
+    // only way a stdio-only client can carry one.
+    Ok(match &args.client {
+        Some(client) => mcpgw_core::endpoints::per_client_url(base, name, client)?,
+        None => mcpgw_core::endpoints::per_server_url(base, name)?,
+    })
 }
 
 pub fn run(args: &ConnectArgs) -> anyhow::Result<()> {
@@ -347,11 +356,26 @@ mod tests {
     use super::{ConnectArgs, DEFAULT_URL, target_url};
 
     fn args(url: Option<&str>, server: Option<&str>) -> ConnectArgs {
+        tagged(url, server, None)
+    }
+
+    fn tagged(url: Option<&str>, server: Option<&str>, client: Option<&str>) -> ConnectArgs {
         ConnectArgs {
             url: url.map(ToOwned::to_owned),
             server: server.map(ToOwned::to_owned),
+            client: client.map(ToOwned::to_owned),
             no_auto_start: false,
         }
+    }
+
+    /// The stdio half of a scoped client's entry: same endpoint, plus the
+    /// tag that says whose scope to apply.
+    #[test]
+    fn a_client_tag_becomes_the_endpoints_query() {
+        assert_eq!(
+            target_url(&tagged(None, Some("github"), Some("claude-desktop"))).unwrap(),
+            "http://127.0.0.1:8137/s/github?client=claude-desktop"
+        );
     }
 
     #[test]

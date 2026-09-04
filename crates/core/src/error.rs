@@ -59,6 +59,11 @@ pub enum Error {
         available: Vec<String>,
     },
 
+    // A `[clients.KIND]` table nobody reads is a scope that silently does
+    // nothing, so the id is checked where every other name is.
+    #[error("no client named {id:?} (known clients: {})", available.join(", "))]
+    UnknownClient { id: String, available: Vec<String> },
+
     // The pattern is named because the table can hold several and only the
     // text the user typed identifies which one the engine refused.
     #[error("invalid regex {pattern:?} in [capture] redact")]

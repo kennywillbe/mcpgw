@@ -70,6 +70,44 @@ pub fn per_server_url(base: &str, name: &str) -> Result<String, url::ParseError>
     Ok(url.into())
 }
 
+/// The query parameter naming the client an endpoint was written for.
+///
+/// A query string rather than a path segment (`/c/<kind>/s/<server>`)
+/// deliberately: the endpoint stays one path, so the router, the 404 that
+/// lists what is served, `Mcp-*` header validation and every URL already in a
+/// client file all keep working unchanged, and a client that drops the query
+/// is served the unscoped endpoint rather than a 404.
+pub const CLIENT_PARAM: &str = "client";
+
+/// [`per_server_url`], tagged for the client the entry is being written for:
+/// `<base>/s/<name>?client=cursor`.
+///
+/// # Errors
+///
+/// Returns the parse error when `base` is not an absolute URL.
+pub fn per_client_url(base: &str, name: &str, client: &str) -> Result<String, url::ParseError> {
+    let mut url = url::Url::parse(base)?;
+    url.set_path(&endpoint_path(name));
+    url.query_pairs_mut().append_pair(CLIENT_PARAM, client);
+    Ok(url.into())
+}
+
+/// The client id a request's query names, if it names a known one.
+///
+/// Unknown ids are dropped rather than honoured: an id nothing can match
+/// would otherwise be a scope of its own — one nobody wrote — and the honest
+/// reading of a query the gateway does not understand is that the request
+/// carries no client at all.
+#[must_use]
+pub fn client_of_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    let id = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == CLIENT_PARAM)?
+        .1
+        .into_owned();
+    crate::clients::ClientKind::from_id(&id).map(|kind| kind.id().to_owned())
+}
+
 /// One server's ready-to-serve HTTP face.
 type ServerService = StreamableHttpService<Gateway, LocalSessionManager>;
 
@@ -262,7 +300,10 @@ fn unknown_endpoint(name: &str, table: &EndpointTable) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_path, per_server_url, rewrite_path, split_endpoint};
+    use super::{
+        client_of_query, endpoint_path, per_client_url, per_server_url, rewrite_path,
+        split_endpoint,
+    };
 
     #[test]
     fn the_endpoint_itself_reaches_the_service_as_root() {
@@ -294,5 +335,28 @@ mod tests {
             "http://localhost:9000/s/fx"
         );
         assert!(per_server_url("not a url", "fx").is_err());
+    }
+
+    #[test]
+    fn a_client_tag_is_a_query_on_the_same_path() {
+        assert_eq!(
+            per_client_url("http://127.0.0.1:8137/mcp", "github", "cursor").unwrap(),
+            "http://127.0.0.1:8137/s/github?client=cursor"
+        );
+    }
+
+    #[test]
+    fn only_a_known_client_is_read_back_off_a_query() {
+        assert_eq!(
+            client_of_query(Some("client=cursor")),
+            Some("cursor".into())
+        );
+        assert_eq!(
+            client_of_query(Some("sessionId=7&client=claude-code")),
+            Some("claude-code".to_owned())
+        );
+        assert_eq!(client_of_query(Some("client=nonesuch")), None);
+        assert_eq!(client_of_query(Some("sessionId=7")), None);
+        assert_eq!(client_of_query(None), None);
     }
 }

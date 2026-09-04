@@ -205,6 +205,65 @@ the server's transport, which replaces the connection anyway, starts a fresh
 one. A server with no `calls_per_minute` is unmetered, which is every server
 until you say otherwise.
 
+### Per-client scoping
+
+The allowlist above says what a server offers at all. Which clients get it is
+a second table:
+
+```toml
+[clients.cursor]
+servers = ["github", "linear"]
+
+[clients.cursor.tools]
+deny = ["delete_*"]
+```
+
+A client with a scope is synced only the servers its table names, and its
+entries dial a *tagged* spelling of the same endpoint:
+
+```text
+http://127.0.0.1:8137/s/github              # github, everything it offers
+http://127.0.0.1:8137/s/github?client=cursor # the same, as cursor sees it
+```
+
+A query rather than a path of its own: the endpoint stays one path, so the
+router, the 404 that lists what is served and every URL already in a client
+file keep working, and a request that arrives without the tag is answered the
+unscoped endpoint rather than a 404. A stdio-only client carries the same tag
+as `mcpgw connect --server github --client cursor`.
+
+The gateway applies the client's rules after the server's, on both sides of
+the pipe, exactly as it applies the server's own. A tool the client's table
+hides is not in its `tools/list`, and a call naming it is refused before the
+request reaches the server:
+
+```text
+tool "delete_repository" on server "github" is not offered to client "cursor" (see mcpgw clients cursor)
+```
+
+A server the client is not given at all answers it an empty tool list and
+refuses every call with `server "postgres" is not offered to client "cursor"`.
+The endpoint is still there and still answers — the tag says which client is
+asking, it does not prove it — so this is a way to keep an editor's context
+small, not a way to keep anybody out. See the
+[Trust model](./trust-model.md).
+
+Refusals are captured under kind `denied` like any other, and the capture log
+names the client: its own `clientInfo` when it sends one, otherwise the kind
+its endpoint was tagged with.
+
+`mcpgw doctor --probe` prices the outcome per client:
+
+```text
+token budget — what each client is offered
+  ✓ cursor sees 23 tools across 4 servers (~18k tokens)
+  ! windsurf sees 104 tools across 9 servers (~71k tokens)
+    104 tools is over 100 (Windsurf's own limit) — narrow it with …
+```
+
+The full shape of the table is in
+[`[clients.KIND]`](./configuration.md#clientskind).
+
 ### The base endpoint
 
 `/mcp` is the gateway's own address rather than a way through it. It answers
