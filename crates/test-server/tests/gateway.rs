@@ -1181,6 +1181,10 @@ struct InlineSession {
     /// What `_meta` says the client is, or `None` for a client that declines
     /// to say — naming yourself is a SHOULD, so that request is legal.
     client: Option<(String, String)>,
+    /// Sent on every request, so a test can add what a real client would put
+    /// there — a per-request `Mcp-Param-*`, a credential of its own — without
+    /// a second copy of the raw-request machinery.
+    extra: Vec<(String, String)>,
 }
 
 impl InlineSession {
@@ -1192,6 +1196,7 @@ impl InlineSession {
             path: path.to_owned(),
             id: 0,
             client: Some(("inline".to_owned(), "1".to_owned())),
+            extra: Vec::new(),
         }
     }
 
@@ -1202,6 +1207,14 @@ impl InlineSession {
 
     fn anonymous(mut self) -> Self {
         self.client = None;
+        self
+    }
+
+    fn with_headers(mut self, headers: &[(&str, &str)]) -> Self {
+        self.extra = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
         self
     }
 
@@ -1242,6 +1255,9 @@ impl InlineSession {
         ];
         if let Some(subject) = subject {
             headers.push(("Mcp-Name", subject));
+        }
+        for (name, value) in &self.extra {
+            headers.push((name.as_str(), value.as_str()));
         }
         let response = raw_post_body(self.addr, &self.path, None, &headers, &body).await;
         response
@@ -2692,4 +2708,232 @@ async fn a_re_pin_ends_the_drift() {
         "the accepted definitions must not report again"
     );
     assert!(store.read("fx").unwrap().unwrap().drift.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// SEP-2243 `Mcp-Param-*` forwarding
+// ---------------------------------------------------------------------------
+
+use rmcp_client_http::handler::server::ServerHandler;
+use rmcp_client_http::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, ListToolsResult,
+    MetaObject, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp_client_http::service::{RequestContext, RoleServer};
+
+/// An HTTP upstream that answers `tools/call` with the headers its own POST
+/// arrived with, in the result's `_meta`. Every question these tests ask —
+/// did this header cross, did that one stop — is then asked of the answer the
+/// client gets back, rather than of a side channel.
+#[derive(Clone)]
+struct HeaderEcho;
+
+impl ServerHandler for HeaderEcho {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> {
+        // Deliberately unannotated: a property carrying `x-mcp-header` would
+        // have rmcp's own client build the header out of the arguments, and
+        // what is under test is the header a gateway forwards *without*
+        // recognising it.
+        let schema = serde_json::json!({ "type": "object", "properties": {} })
+            .as_object()
+            .cloned()
+            .unwrap();
+        std::future::ready(Ok(ListToolsResult::with_all_items(vec![Tool::new(
+            "echo",
+            "reports the headers its request arrived with",
+            Arc::new(schema),
+        )])))
+    }
+
+    fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> {
+        let mut headers = serde_json::Map::new();
+        let mut params = serde_json::Map::new();
+        if let Some(parts) = context.extensions.get::<axum::http::request::Parts>() {
+            for (name, value) in &parts.headers {
+                let value = serde_json::Value::from(value.to_str().unwrap_or_default());
+                if name.as_str().starts_with("mcp-param-") {
+                    params.insert(name.to_string(), value.clone());
+                }
+                headers.insert(name.to_string(), value);
+            }
+        }
+        let mut result =
+            CallToolResult::success(vec![rmcp_client_http::model::ContentBlock::text("ok")]);
+        result.meta = Some(MetaObject(
+            serde_json::json!({ "params": params, "headers": headers })
+                .as_object()
+                .cloned()
+                .unwrap(),
+        ));
+        std::future::ready(Ok(CallToolResponse::Complete(result)))
+    }
+}
+
+/// A [`HeaderEcho`] on an ephemeral port, with the task serving it so the
+/// test can stop it again.
+async fn header_echo() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use rmcp_client_http::transport::streamable_http_server::session::local::LocalSessionManager;
+    use rmcp_client_http::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    let service = StreamableHttpService::new(
+        || Ok(HeaderEcho),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default(),
+    );
+    let app = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, task)
+}
+
+/// A gateway endpoint piping to a [`HeaderEcho`] upstream, plus a raw
+/// 2026-07-28 client aimed at it.
+async fn echo_pipe(
+    headers: &[(&str, &str)],
+) -> (
+    InlineSession,
+    Arc<UpstreamManager>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (upstream, task) = header_echo().await;
+    let servers: BTreeMap<String, Server> = [(
+        "remote".to_owned(),
+        Server {
+            enabled: true,
+            tags: Vec::new(),
+            transport: Transport::Http {
+                url: format!("http://{upstream}/mcp"),
+                headers_command: Vec::new(),
+                headers: BTreeMap::new(),
+                auth: None,
+            },
+            tools: None,
+        },
+    )]
+    .into_iter()
+    .collect();
+    let manager = Arc::new(
+        UpstreamManager::new(servers)
+            .with_connect_timeout(Duration::from_secs(30))
+            .with_backoff_base(Duration::from_millis(20)),
+    );
+    let addr = serve(
+        "remote",
+        Gateway::new(Arc::clone(&manager), "remote".to_owned()),
+    )
+    .await;
+    let session = InlineSession::new(addr, &endpoint_path("remote")).with_headers(headers);
+    (session, manager, task)
+}
+
+/// The `_meta` a [`HeaderEcho`] put on the answer, as `(params, headers)`.
+fn echoed(result: &serde_json::Value) -> (&serde_json::Value, &serde_json::Value) {
+    (&result["_meta"]["params"], &result["_meta"]["headers"])
+}
+
+async fn echo_call(session: &mut InlineSession) -> serde_json::Value {
+    session
+        .request(
+            "tools/call",
+            serde_json::json!({ "name": "echo", "arguments": {} }),
+        )
+        .await
+}
+
+/// The point of the issue. A client's per-request `Mcp-Param-*` is not the
+/// gateway's to eat: 2026-07-28 makes forwarding it a MUST for an
+/// intermediary that does not recognise it.
+#[tokio::test]
+async fn a_param_header_reaches_an_http_upstream() {
+    let (mut session, manager, upstream) = echo_pipe(&[("Mcp-Param-Region", "eu")]).await;
+
+    let result = echo_call(&mut session).await;
+    let (params, _) = echoed(&result);
+    assert_eq!(params["mcp-param-region"], "eu", "{result}");
+
+    manager.shutdown().await;
+    upstream.abort();
+}
+
+/// Forwarding is per request, not a property of the connection: the next call
+/// through the same upstream carries nothing.
+#[tokio::test]
+async fn a_request_without_one_forwards_nothing() {
+    let (mut session, manager, upstream) = echo_pipe(&[("Mcp-Param-Region", "eu")]).await;
+    let _ = echo_call(&mut session).await;
+
+    let mut plain = InlineSession::new(session.addr, &session.path);
+    let result = echo_call(&mut plain).await;
+    let (params, _) = echoed(&result);
+    assert_eq!(
+        params.as_object().map(serde_json::Map::len),
+        Some(0),
+        "{result}"
+    );
+
+    manager.shutdown().await;
+    upstream.abort();
+}
+
+/// Everything else the client sent belongs to the hop between the client and
+/// the gateway, and stops here — its credential above all.
+#[tokio::test]
+async fn the_clients_own_credentials_stop_at_the_gateway() {
+    let (mut session, manager, upstream) = echo_pipe(&[
+        ("Authorization", "Bearer downstream-secret"),
+        ("Mcp-Session-Id", "downstream-session"),
+        ("Mcp-Param-Region", "eu"),
+    ])
+    .await;
+
+    let result = echo_call(&mut session).await;
+    let (params, headers) = echoed(&result);
+    assert_eq!(params["mcp-param-region"], "eu", "{result}");
+    assert!(headers.get("authorization").is_none(), "{result}");
+    // The upstream connection has a session of its own — rmcp handshakes with
+    // it at 2025-11-25 — and the assertion is that it is that one, never the
+    // client's.
+    assert_ne!(headers["mcp-session-id"], "downstream-session", "{result}");
+
+    manager.shutdown().await;
+    upstream.abort();
+}
+
+/// A stdio upstream has nowhere to put a header, so the request goes through
+/// unchanged rather than failing.
+#[tokio::test]
+async fn a_stdio_upstream_ignores_them() {
+    let manager = manager(&[("fx", "healthy")]);
+    let addr = serve("fx", Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
+    let mut session =
+        InlineSession::new(addr, &endpoint_path("fx")).with_headers(&[("Mcp-Param-Region", "eu")]);
+
+    let result = session
+        .request(
+            "tools/call",
+            serde_json::json!({ "name": "echo", "arguments": { "message": "hi" } }),
+        )
+        .await;
+    assert!(format!("{result}").contains("hi"), "{result}");
+
+    manager.shutdown().await;
 }

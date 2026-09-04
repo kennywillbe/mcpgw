@@ -21,11 +21,12 @@ use std::time::{Duration, Instant};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult,
-    Cursor, ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ResultType, ServerCapabilities, ServerInfo, SubscriptionFilter,
+    CacheScope, CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest,
+    CompleteRequestParams, CompleteResult, Cursor, ErrorCode, ErrorData, GetPromptRequestParams,
+    GetPromptResponse, Implementation, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResponse, ResultType, ServerCapabilities, ServerInfo,
+    ServerResult, SubscriptionFilter,
 };
 use rmcp::service::{
     NotificationContext, Peer, RequestContext, RoleServer, SubscriptionContext, SubscriptionSink,
@@ -33,7 +34,7 @@ use rmcp::service::{
 
 use crate::capture::{CaptureRecord, CaptureWriter, Kind};
 use crate::pins::{PinStore, ToolFingerprint};
-use crate::upstream::{ListChanged, UpstreamManager};
+use crate::upstream::{ListChanged, ParamHeaders, UpstreamManager};
 
 /// Reserved inside server names (see `config::validate_name`) and the join
 /// `mcpgw watch` renders a captured call under. Nothing on the wire is
@@ -210,6 +211,18 @@ impl Gateway {
             .or_else(|| client.clone())
             .map(|id| crate::capture::session_fingerprint(&id));
         Attribution { session, client }
+    }
+
+    /// The `Mcp-Param-*` headers this request arrived with, read from the same
+    /// [`http::request::Parts`] that [`attribution`](Self::attribution) reads.
+    ///
+    /// `None` for a request that did not arrive over HTTP at all — a client
+    /// bridged over stdio has no headers — and for one that carried none.
+    /// Nothing is filtered by which upstream is behind this pipe: a stdio
+    /// upstream cannot receive them, and drops them where the transport is
+    /// (see [`ParamHeaders`](crate::upstream::ParamHeaders)).
+    fn param_headers(context: &RequestContext<RoleServer>) -> Option<ParamHeaders> {
+        ParamHeaders::collect(&context.extensions.get::<http::request::Parts>()?.headers)
     }
 
     /// Writes one record, if capture is on. Deliberately a blocking append
@@ -974,19 +987,46 @@ impl ServerHandler for Gateway {
             return Err(self.deny(&who, &tool));
         }
 
+        // SEP-2243: what the client sent for this call, forwarded on the one
+        // upstream POST that answers it and on nothing else.
+        let params = Self::param_headers(&context);
+
         let started = Instant::now();
         let response = self
             .within_deadline(
                 &upstream,
-                // The `_once` form, for the same reason `read_resource` and
-                // `get_prompt` use it: `call_tool` would drive the MRTR
-                // rounds here, against this process's client handler, which
-                // has no user to ask. An `input_required` answer belongs to
-                // the client downstream — it is the one that can collect the
-                // input and retry with `inputResponses` and `requestState`,
-                // which this pipe forwards as part of the request.
                 self.call_upstream(&upstream, |service| async move {
-                    service.call_tool_once(request).await
+                    // Spelled out rather than `call_tool_once`, which is
+                    // otherwise exactly this: the typed helper builds the
+                    // request itself, and the extensions of that request are
+                    // the only thing that travels from here to the POST. The
+                    // semantics are still `_once`, for the same reason
+                    // `read_resource` and `get_prompt` use it: `call_tool`
+                    // would drive the MRTR rounds here, against this
+                    // process's client handler, which has no user to ask. An
+                    // `input_required` answer belongs to the client
+                    // downstream — it is the one that can collect the input
+                    // and retry with `inputResponses` and `requestState`,
+                    // which this pipe forwards as part of the request.
+                    let mut request = CallToolRequest::new(request);
+                    if let Some(params) = params {
+                        request.extensions.insert(params);
+                    }
+                    match service
+                        .send_request(ClientRequest::CallToolRequest(request))
+                        .await?
+                    {
+                        ServerResult::CallToolResult(result) => {
+                            Ok(CallToolResponse::Complete(result))
+                        }
+                        ServerResult::InputRequiredResult(result) => {
+                            Ok(CallToolResponse::InputRequired(result))
+                        }
+                        ServerResult::CreateTaskResult(result) => {
+                            Ok(CallToolResponse::Task(result))
+                        }
+                        _ => Err(rmcp::service::ServiceError::UnexpectedResponse),
+                    }
                 }),
             )
             .await;
