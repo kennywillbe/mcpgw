@@ -16,3 +16,10 @@ enabled = false
 [servers.fs]
 type = "stdio"
 command = "mcp-server-filesystem"
+
+[clients.cursor]
+servers = ["github"]
+max_tools = 40
+
+[clients.cursor.tools]
+deny = ["delete_*"]

@@ -300,6 +300,77 @@ tags = ["work"]
 Values must come before sub-tables within a section — that's TOML, not mcpgw.
 `env`, `headers` and `tools` are sub-tables, so they go last.
 
+## `[clients.KIND]`
+
+Which servers and tools one client gets. Optional, and absent until you add
+it; a client with no table is given every enabled server, which is what every
+client got before this table existed:
+
+```toml
+[clients.cursor]
+servers = ["github", "linear"]
+max_tools = 60
+
+[clients.cursor.tools]
+deny = ["delete_*"]
+```
+
+`KIND` is a client id — the same ids `--client` takes, listed by
+`mcpgw clients`.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `servers` | list of names | `[]` | the only servers this client is given; empty means every one |
+| `max_tools` | integer | none | what `doctor` warns above |
+| `tools` | table | none | `allow`/`deny` over what the servers already offer, same patterns as [`[servers.NAME.tools]`](#serversnametools) |
+
+The two tool tables compose in one order: the server's says what it offers
+anybody, the client's says which of that this client gets. A client cannot
+widen what a server denied.
+
+Scoping is why tool definitions stop being a fixed cost. Around 70 tools is
+roughly 49k tokens of context before anybody types anything, Windsurf caps out
+near 100 tools, and nobody wants the whole infrastructure surface in the
+editor they use for docs.
+
+`sync` writes a scoped client only the servers its table names, and writes
+each entry pointing at a *tagged* endpoint —
+`http://127.0.0.1:8137/s/github?client=cursor`, or
+`mcpgw connect --server github --url … --client cursor` for a client that
+cannot hold a URL. The tag is what tells the gateway whose rules to apply.
+A client whose table narrows nothing (an absent table, or one holding only
+`max_tools`) is written exactly the bytes it was written before, so nothing
+migrates.
+
+The table is editable without opening the file:
+
+```sh
+mcpgw clients                                  # every client and what it gets
+mcpgw clients cursor servers github linear     # give it these two
+mcpgw clients cursor servers all               # and take that back
+mcpgw clients cursor tools deny 'delete_*'     # narrow what it sees
+mcpgw clients cursor tools clear
+```
+
+Every edit needs an `mcpgw sync` to reach the client's file.
+
+`mcpgw doctor --probe` reports what each one ends up with:
+
+```text
+cursor sees 23 tools across 4 servers (~18k tokens)
+```
+
+The token figure is an estimate — the characters of each tool's name,
+description and JSON schema, over four — which is enough to answer "am I near
+the cap" and not meant for anything finer. `doctor` warns when a client is
+over its `max_tools`, and over Windsurf's own limit of 100 tools for the
+`windsurf` kind whether or not one is set. A `servers` entry naming a server
+the config no longer has is a warning too, not a parse error: the config still
+has to load for the commands that would fix it.
+
+What scoping is **not** is authentication — see the
+[Trust model](./trust-model.md).
+
 ## `[capture]`
 
 Optional, and absent from a config that never mentions it. One key today:

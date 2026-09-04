@@ -48,6 +48,11 @@ pub struct ProbeSuccess {
     /// `[servers.NAME.tools]` entry against what is actually there rather
     /// than only count what came back.
     pub tools: Vec<String>,
+    /// Roughly what each tool's definition costs an agent's context, in
+    /// tokens — see [`estimated_tokens`]. Keyed by tool name so a caller
+    /// that filters the list (a client scope does) can add up what is left
+    /// rather than the whole server.
+    pub tokens: BTreeMap<String, usize>,
 }
 
 impl ProbeSuccess {
@@ -298,6 +303,17 @@ async fn inspect(service: Service) -> Result<ProbeSuccess, ProbeError> {
         |imp| (imp.name, imp.version),
     );
     Ok(ProbeSuccess {
+        tokens: tools
+            .iter()
+            .map(|tool| {
+                let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+                let text = tool.description.as_deref().unwrap_or_default();
+                (
+                    tool.name.to_string(),
+                    estimated_tokens(&tool.name, text, &schema),
+                )
+            })
+            .collect(),
         server_name,
         server_version,
         tools: tools
@@ -305,6 +321,19 @@ async fn inspect(service: Service) -> Result<ProbeSuccess, ProbeError> {
             .map(|tool| tool.name.into_owned())
             .collect(),
     })
+}
+
+/// What one tool definition costs the client that is offered it, in tokens.
+///
+/// The heuristic is deliberately crude — the characters of the name, the
+/// description and the JSON schema, over four — because the alternative is a
+/// tokenizer per model in a CLI whose answer to "am I near the cap" only has
+/// to be right to the nearest few thousand. It over-counts dense JSON and
+/// under-counts prose; both by less than the difference between two clients'
+/// own framing of the same tool list.
+#[must_use]
+pub fn estimated_tokens(name: &str, description: &str, schema: &str) -> usize {
+    (name.len() + description.len() + schema.len()) / 4
 }
 
 /// A tool or resource listing read straight off a server, for `mcpgw inspect`.

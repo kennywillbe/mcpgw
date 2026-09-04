@@ -4,6 +4,13 @@ expression: config.to_toml_string().unwrap()
 ---
 version = 1
 
+[clients.cursor]
+servers = ["github"]
+max_tools = 40
+
+[clients.cursor.tools]
+deny = ["delete_*"]
+
 [servers.fs]
 enabled = true
 type = "stdio"

@@ -10,6 +10,25 @@ Config {
     gateway: GatewaySettings {
         require_token: false,
     },
+    clients: {
+        "cursor": ClientScope {
+            servers: [
+                "github",
+            ],
+            max_tools: Some(
+                40,
+            ),
+            tools: Some(
+                ToolRules {
+                    allow: [],
+                    deny: [
+                        "delete_*",
+                    ],
+                    drift: Warn,
+                },
+            ),
+        },
+    },
     servers: {
         "fs": Server {
             enabled: true,

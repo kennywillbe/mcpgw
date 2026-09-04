@@ -485,9 +485,16 @@ fn per_server_gateway_entry_shapes_per_client() {
     };
 
     for kind in ClientKind::ALL {
-        let server =
-            per_server_gateway_server(kind, "github", &canonical["github"], base, "mcpgw", None)
-                .unwrap();
+        let server = per_server_gateway_server(
+            kind,
+            "github",
+            &canonical["github"],
+            base,
+            "mcpgw",
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(client_entry(kind, &server), expected(kind), "{}", kind.id());
     }
 
@@ -499,6 +506,7 @@ fn per_server_gateway_entry_shapes_per_client() {
         "http://127.0.0.1:9000",
         "mcpgw",
         None,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -512,7 +520,8 @@ fn per_server_gateway_entry_shapes_per_client() {
             &canonical["github"],
             "not a url",
             "mcpgw",
-            None
+            None,
+            false
         )
         .is_err()
     );
@@ -543,7 +552,8 @@ fn flipping_to_per_server_gateway_mode_updates_the_same_names() {
         "users-own": { "command": "deno" },
     });
     let desired =
-        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None).unwrap();
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None, None)
+            .unwrap();
     let plan = plan_sync(
         ClientKind::Cursor,
         current.as_object().unwrap(),
@@ -590,7 +600,8 @@ fn migrating_off_the_aggregate_entry_removes_it() {
         "mcpgw": { "type": "http", "url": base },
     });
     let desired =
-        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None).unwrap();
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None, None)
+            .unwrap();
     let plan = plan_sync(
         ClientKind::Cursor,
         current.as_object().unwrap(),
@@ -615,7 +626,8 @@ fn per_server_gateway_entries_keep_the_fields_the_client_owns() {
     let current = serde_json::json!({ "github": on_disk });
 
     let desired =
-        per_server_gateway_servers(ClientKind::Cline, &canonical, base, "mcpgw", None).unwrap();
+        per_server_gateway_servers(ClientKind::Cline, &canonical, base, "mcpgw", None, None)
+            .unwrap();
     let plan = plan_sync(
         ClientKind::Cline,
         current.as_object().unwrap(),
@@ -648,7 +660,8 @@ fn per_server_gateway_sync_unexcludes_its_own_names_in_gemini() {
         }
     });
     let desired =
-        per_server_gateway_servers(ClientKind::Gemini, &canonical, base, "mcpgw", None).unwrap();
+        per_server_gateway_servers(ClientKind::Gemini, &canonical, base, "mcpgw", None, None)
+            .unwrap();
     let mut plan = plan_sync(
         ClientKind::Gemini,
         document["mcpServers"].as_object().unwrap(),
@@ -870,6 +883,7 @@ fn the_gateway_token_lands_on_every_entry_that_can_carry_it() {
             base,
             "mcpgw",
             Some(&token),
+            false,
         )
         .unwrap();
         let entry = client_entry(kind, &server);
@@ -903,6 +917,7 @@ fn the_gateway_token_lands_on_every_entry_that_can_carry_it() {
         base,
         "mcpgw",
         Some(&token),
+        false,
     )
     .unwrap();
     assert!(
@@ -919,7 +934,8 @@ fn the_gateway_token_lands_on_every_entry_that_can_carry_it() {
 fn without_a_token_the_entries_are_the_ones_they_always_were() {
     let canonical = canonical();
     let base = "http://127.0.0.1:8137/mcp";
-    let with = per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None);
+    let with =
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None, None);
     let entry = client_entry(ClientKind::Cursor, &with.unwrap()["github"]);
     assert!(entry.get("headers").is_none(), "{entry}");
 }
@@ -932,9 +948,15 @@ fn ejecting_takes_the_token_back_out_of_the_client() {
     let canonical = canonical();
     let base = "http://127.0.0.1:8137/mcp";
     let token = GatewayToken::from_secret("t0ken");
-    let synced =
-        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", Some(&token))
-            .unwrap();
+    let synced = per_server_gateway_servers(
+        ClientKind::Cursor,
+        &canonical,
+        base,
+        "mcpgw",
+        Some(&token),
+        None,
+    )
+    .unwrap();
     let mut document = serde_json::json!({ "mcpServers": {} });
     let managed: BTreeSet<String> = canonical.keys().cloned().collect();
     let plan = plan_sync(
@@ -957,4 +979,141 @@ fn ejecting_takes_the_token_back_out_of_the_client() {
         !serde_json::to_string(&document).unwrap().contains("t0ken"),
         "{document}"
     );
+}
+
+/// The two things a gateway entry carries meet on the same entry: a scoped
+/// client is tagged in the URL *and* holds the install token, because the tag
+/// says whose rules to apply and the token says the request may be answered
+/// at all. Neither one is the other's job.
+#[test]
+fn a_scoped_client_carries_both_the_tag_and_the_token() {
+    let canonical = canonical();
+    let scope = mcpgw_core::config::ClientScope {
+        servers: vec!["github".to_owned()],
+        max_tools: None,
+        tools: None,
+    };
+    let desired = per_server_gateway_servers(
+        ClientKind::Cursor,
+        &canonical,
+        "http://127.0.0.1:8137/mcp",
+        "mcpgw",
+        Some(&GatewayToken::from_secret("t0ken")),
+        Some(&scope),
+    )
+    .unwrap();
+    let entry = client_entry(ClientKind::Cursor, &desired["github"]);
+    assert_eq!(entry["url"], "http://127.0.0.1:8137/s/github?client=cursor");
+    assert_eq!(entry["headers"]["Authorization"], "Bearer t0ken");
+}
+
+/// The whole of the scoping milestone as `sync` sees it: a scoped client is
+/// written fewer entries, and each one names the client so the gateway knows
+/// whose rules to apply.
+#[test]
+fn a_scoped_client_gets_fewer_entries_at_a_tagged_endpoint() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let scope = mcpgw_core::config::ClientScope {
+        servers: vec!["github".to_owned()],
+        max_tools: None,
+        tools: None,
+    };
+    let desired = per_server_gateway_servers(
+        ClientKind::Cursor,
+        &canonical,
+        base,
+        "mcpgw",
+        None,
+        Some(&scope),
+    )
+    .unwrap();
+    assert_eq!(desired.keys().collect::<Vec<_>>(), ["github"]);
+    assert_eq!(
+        client_entry(ClientKind::Cursor, &desired["github"])["url"],
+        "http://127.0.0.1:8137/s/github?client=cursor"
+    );
+
+    // The server it is no longer given falls out of the plan as a remove,
+    // which is the same rule a disabled server goes through.
+    let current = serde_json::json!({
+        "github": client_entry(ClientKind::Cursor, &canonical["github"]),
+        "linear": client_entry(ClientKind::Cursor, &canonical["linear"]),
+    });
+    let plan = plan_sync(
+        ClientKind::Cursor,
+        current.as_object().unwrap(),
+        &desired,
+        &managed(&["github", "linear"]),
+    );
+    assert_eq!(plan.updates, ["github"]);
+    assert_eq!(plan.removes, ["linear"]);
+
+    // A stdio-only client carries the same tag on its bridge command.
+    let desktop = per_server_gateway_servers(
+        ClientKind::ClaudeDesktop,
+        &canonical,
+        base,
+        "mcpgw",
+        None,
+        Some(&scope),
+    )
+    .unwrap();
+    let args = client_entry(ClientKind::ClaudeDesktop, &desktop["github"])["args"].clone();
+    assert_eq!(
+        args,
+        serde_json::json!([
+            "connect",
+            "--server",
+            "github",
+            "--url",
+            base,
+            "--client",
+            "claude-desktop"
+        ])
+    );
+}
+
+/// The promise to everyone who never writes a `[clients]` table, and to a
+/// client whose table only sets a reporting threshold: their entries do not
+/// move a byte.
+#[test]
+fn a_client_with_nothing_to_narrow_is_written_exactly_what_it_was() {
+    let canonical = canonical();
+    let base = "http://127.0.0.1:8137/mcp";
+    let untagged =
+        per_server_gateway_servers(ClientKind::Cursor, &canonical, base, "mcpgw", None, None)
+            .unwrap();
+    let threshold = mcpgw_core::config::ClientScope {
+        servers: Vec::new(),
+        max_tools: Some(40),
+        tools: None,
+    };
+    let scoped = per_server_gateway_servers(
+        ClientKind::Cursor,
+        &canonical,
+        base,
+        "mcpgw",
+        None,
+        Some(&threshold),
+    )
+    .unwrap();
+    assert_eq!(untagged, scoped);
+    assert_eq!(
+        client_entry(ClientKind::Cursor, &untagged["github"])["url"],
+        "http://127.0.0.1:8137/s/github"
+    );
+
+    // And a sync over what is already there plans nothing at all.
+    let current = serde_json::json!({
+        "github": client_entry(ClientKind::Cursor, &untagged["github"]),
+        "linear": client_entry(ClientKind::Cursor, &untagged["linear"]),
+    });
+    let plan = plan_sync(
+        ClientKind::Cursor,
+        current.as_object().unwrap(),
+        &scoped,
+        &managed(&["github", "linear"]),
+    );
+    assert!(!plan.has_changes(), "{plan:?}");
 }

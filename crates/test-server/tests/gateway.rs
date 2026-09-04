@@ -3205,3 +3205,165 @@ async fn a_gateway_that_requires_the_token_refuses_every_client_without_it() {
     assert!(refused.contains("401"), "{refused}");
     manager.shutdown().await;
 }
+
+/// The gateway half of per-client scoping: one server, one endpoint, and two
+/// clients that see different tools because the URL they dialled says which
+/// of them is asking.
+mod client_scoping {
+    use super::*;
+    use mcpgw_core::config::{ClientScope, ClientScopes};
+    use mcpgw_core::gateway::{not_allowed_for, not_offered};
+
+    fn scope(servers: &[&str], deny: &[&str]) -> ClientScope {
+        let owned = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        ClientScope {
+            servers: owned(servers),
+            max_tools: None,
+            tools: (!deny.is_empty()).then(|| mcpgw_core::ToolRules {
+                allow: Vec::new(),
+                deny: owned(deny),
+                ..mcpgw_core::ToolRules::default()
+            }),
+        }
+    }
+
+    /// Serves `fx` with `cursor` scoped as given, and hands back the address
+    /// so a test can dial the endpoint both ways.
+    async fn serve_scoped(
+        server: Server,
+        cursor: ClientScope,
+        capture: Option<&Arc<CaptureWriter>>,
+    ) -> (std::net::SocketAddr, Arc<UpstreamManager>) {
+        let manager = Arc::new(
+            UpstreamManager::new([("fx".to_owned(), server)].into_iter().collect())
+                .with_connect_timeout(Duration::from_secs(30)),
+        );
+        let scopes = ClientScopes::new([("cursor".to_owned(), cursor)].into_iter().collect());
+        let mut gateway =
+            Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_client_scopes(scopes);
+        if let Some(writer) = capture {
+            gateway = gateway.with_capture(Arc::clone(writer));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_http(
+            "fx".to_owned(),
+            gateway,
+            listener,
+            std::future::pending(),
+        ));
+        (addr, manager)
+    }
+
+    fn tagged(name: &str, client: &str) -> String {
+        format!("{}?client={client}", endpoint_path(name))
+    }
+
+    #[tokio::test]
+    async fn one_endpoint_answers_two_clients_with_different_lists() {
+        let (addr, manager) =
+            serve_scoped(stdio_server("healthy"), scope(&["fx"], &["reverse"]), None).await;
+
+        let plain = client_at(addr, &endpoint_path("fx")).await;
+        assert_eq!(
+            tool_names(&plain.list_all_tools().await.unwrap()),
+            ["echo", "reverse"]
+        );
+        plain.cancel().await.unwrap();
+
+        let cursor = client_at(addr, &tagged("fx", "cursor")).await;
+        assert_eq!(
+            tool_names(&cursor.list_all_tools().await.unwrap()),
+            ["echo"]
+        );
+        // What the scope leaves alone still works through the same endpoint.
+        cursor.call_tool(call("echo", "hi")).await.unwrap();
+
+        let err = cursor
+            .call_tool(call("reverse", "mcpgw"))
+            .await
+            .unwrap_err()
+            .to_string();
+        // Compared against the function that writes it, so the sentence a
+        // user reads cannot drift away from the one asserted here.
+        assert!(
+            err.contains(&not_allowed_for("reverse", "fx", "cursor")),
+            "{err}"
+        );
+        assert!(err.contains("mcpgw clients cursor"), "{err}");
+        cursor.cancel().await.unwrap();
+        manager.shutdown().await;
+    }
+
+    /// A whole server a client is not given: the endpoint is still there —
+    /// scoping is not authentication — and it offers that client nothing.
+    #[tokio::test]
+    async fn a_server_outside_the_scope_offers_the_client_nothing() {
+        let (addr, manager) =
+            serve_scoped(stdio_server("healthy"), scope(&["other"], &[]), None).await;
+        let cursor = client_at(addr, &tagged("fx", "cursor")).await;
+        assert!(cursor.list_all_tools().await.unwrap().is_empty());
+        let err = cursor
+            .call_tool(call("echo", "hi"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&not_offered("fx", "cursor")), "{err}");
+        cursor.cancel().await.unwrap();
+        manager.shutdown().await;
+    }
+
+    /// An id nothing answers to is not a scope of its own: the request is
+    /// served as though it carried no tag at all.
+    #[tokio::test]
+    async fn an_unknown_tag_is_served_the_unscoped_endpoint() {
+        let (addr, manager) =
+            serve_scoped(stdio_server("healthy"), scope(&["fx"], &["reverse"]), None).await;
+        let client = client_at(addr, &tagged("fx", "nonesuch")).await;
+        assert_eq!(
+            tool_names(&client.list_all_tools().await.unwrap()),
+            ["echo", "reverse"]
+        );
+        client.cancel().await.unwrap();
+        manager.shutdown().await;
+    }
+
+    /// The capture column: a client that names itself keeps its own name,
+    /// and one that declines is filed under the kind its endpoint was tagged
+    /// with rather than under nothing at all.
+    #[tokio::test]
+    async fn the_tag_names_a_client_that_named_itself_to_nobody() {
+        let state = tempfile::tempdir().unwrap();
+        let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+        let (addr, manager) =
+            serve_scoped(stdio_server("healthy"), scope(&["fx"], &[]), Some(&writer)).await;
+
+        let mut anonymous = InlineSession::new(addr, &tagged("fx", "cursor")).anonymous();
+        anonymous
+            .request(
+                "tools/call",
+                serde_json::json!({ "name": "echo", "arguments": { "message": "quiet" } }),
+            )
+            .await;
+        let mut named = InlineSession::new(addr, &tagged("fx", "cursor")).naming("cursor", "0.48");
+        named
+            .request(
+                "tools/call",
+                serde_json::json!({ "name": "echo", "arguments": { "message": "loud" } }),
+            )
+            .await;
+        manager.shutdown().await;
+
+        let clients: Vec<Option<String>> = captured(writer.dir())
+            .iter()
+            .map(|record| record.client.clone())
+            .collect();
+        assert!(clients.contains(&Some("cursor".to_owned())), "{clients:?}");
+        // The client's own name and version win over the tag: both are
+        // self-reported, and one of them says more.
+        assert!(
+            clients.contains(&Some("cursor/0.48".to_owned())),
+            "{clients:?}"
+        );
+    }
+}

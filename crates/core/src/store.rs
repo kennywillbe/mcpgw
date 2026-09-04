@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
 
-use crate::config::{Config, Server, ToolRules, Transport, validate_name};
+use crate::config::{ClientScope, Config, Server, ToolRules, Transport, validate_name};
 use crate::error::Error;
 
 const TEMPLATE: &str = "\
@@ -238,6 +238,35 @@ impl ConfigStore {
         self.commit(doc)
     }
 
+    /// Replaces `[clients.ID]`, or removes it when `scope` says nothing at
+    /// all — `mcpgw clients ID servers all` on a client with no tool rules,
+    /// and the shape every other edit reduces to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownClient`] for an id no adapter answers to; the
+    /// table would otherwise sit in the file doing nothing.
+    pub fn set_client_scope(&mut self, id: &str, scope: &ClientScope) -> Result<(), Error> {
+        if crate::clients::ClientKind::from_id(id).is_none() {
+            return Err(Error::UnknownClient {
+                id: id.to_owned(),
+                available: crate::clients::ClientKind::ALL
+                    .iter()
+                    .map(|kind| (*kind).id().to_owned())
+                    .collect(),
+            });
+        }
+        let mut doc = self.doc.clone();
+        if scope.is_empty() {
+            if let Some(clients) = doc.get_mut("clients").and_then(Item::as_table_like_mut) {
+                clients.remove(id);
+            }
+            return self.commit(doc);
+        }
+        ensure_table(&mut doc, "clients").insert(id, Item::Table(client_table(scope)));
+        self.commit(doc)
+    }
+
     /// Writes the current state to disk atomically (temp file + rename).
     ///
     /// # Errors
@@ -322,7 +351,13 @@ pub(crate) fn acquire_lock(config: &Path) -> Result<File, Error> {
 }
 
 fn ensure_servers_table(doc: &mut DocumentMut) -> &mut dyn toml_edit::TableLike {
-    let item = doc.entry("servers").or_insert_with(|| {
+    ensure_table(doc, "servers")
+}
+
+/// A top-level table of tables (`servers`, `clients`), created implicit so it
+/// renders only once it holds an entry.
+fn ensure_table<'d>(doc: &'d mut DocumentMut, key: &str) -> &'d mut dyn toml_edit::TableLike {
+    let item = doc.entry(key).or_insert_with(|| {
         let mut table = Table::new();
         // Implicit: renders only when it has entries, no bare [servers] header.
         table.set_implicit(true);
@@ -335,7 +370,7 @@ fn ensure_servers_table(doc: &mut DocumentMut) -> &mut dyn toml_edit::TableLike 
         *item = Item::Table(std::mem::take(inline).into_table());
     }
     item.as_table_like_mut()
-        .expect("servers is a table after normalization")
+        .expect("the table is a table after normalization")
 }
 
 // Generated entries write every field explicitly (agreed in M2), so the file
@@ -429,6 +464,27 @@ fn auth_table(auth: &crate::config::ServerAuth) -> toml_edit::Value {
         table.insert("scopes", string_array(&auth.scopes));
     }
     table.into()
+}
+
+/// A `[clients.ID]` table. Each key is written only when it says something,
+/// for the same reason the tool lists are: `servers = []` reads as a client
+/// that is given no servers, which is the opposite of what an absent list
+/// means.
+fn client_table(scope: &ClientScope) -> Table {
+    let mut table = Table::new();
+    if !scope.servers.is_empty() {
+        table["servers"] = value(string_array(&scope.servers));
+    }
+    if let Some(max) = scope.max_tools {
+        table["max_tools"] = value(i64::try_from(max).unwrap_or(i64::MAX));
+    }
+    // Last, because it is a sub-table.
+    if let Some(rules) = &scope.tools
+        && !rules.is_empty()
+    {
+        table["tools"] = Item::Table(tools_table(rules));
+    }
+    table
 }
 
 fn string_array(items: &[String]) -> toml_edit::Value {

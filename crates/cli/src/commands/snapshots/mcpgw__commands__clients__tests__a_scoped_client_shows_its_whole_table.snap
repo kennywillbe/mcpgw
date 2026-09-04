@@ -1,0 +1,9 @@
+---
+source: crates/cli/src/commands/clients.rs
+expression: "render_one(ClientKind::Cursor, Some(&scope()), \"/home/x/.cursor/mcp.json\", 5,\nfalse)"
+---
+cursor — 2 of 5 servers
+  /home/x/.cursor/mcp.json
+  servers = ["github", "linear"]
+  tools deny  = ["delete_*"]
+  max_tools = 40

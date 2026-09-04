@@ -48,11 +48,11 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     // The entries mirror the canonical servers by name, so the canonical
     // config is what this run is a function of.
     let config_path = super::canonical_config_path()?;
-    let canonical = match Config::load(&config_path) {
-        Ok(config) => config.servers,
+    let (canonical, scopes) = match Config::load(&config_path) {
+        Ok(config) => (config.servers, config.clients),
         // An absent canonical config means "manage nothing": previously
         // managed entries get removed, everything else is untouched.
-        Err(Error::NotFound { .. }) => BTreeMap::new(),
+        Err(Error::NotFound { .. }) => (BTreeMap::new(), BTreeMap::new()),
         Err(err) => return Err(err.into()),
     };
 
@@ -60,7 +60,7 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     // and a rotate that landed halfway through would be worse than one that
     // lands on the next run.
     let token = super::token::current();
-    let bridge = announce(args, token.as_ref(), color)?;
+    let bridge = announce(args, token.as_ref(), color, &scopes)?;
 
     let state_path = state_dir.join("managed.json");
     // Held across the whole load→modify→save window: a second `mcpgw sync
@@ -87,6 +87,7 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
             &canonical,
             &bridge,
             token.as_ref(),
+            scopes.get(kind.id()),
             &scope.resolved(&state),
         )?;
         let planned = plan_client(kind, &desired.desired, &scope.managed(&state))?;
@@ -110,6 +111,7 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
                 &canonical,
                 &bridge,
                 token.as_ref(),
+                scopes.get(kind.id()),
                 &scope.resolved(&state),
             )?;
             let planned = plan_project(&config, &desired.desired, &scope.managed(&state))?;
@@ -419,6 +421,7 @@ fn announce(
     args: &SyncArgs,
     token: Option<&mcpgw_core::gateway_token::GatewayToken>,
     color: bool,
+    scopes: &BTreeMap<String, mcpgw_core::config::ClientScope>,
 ) -> anyhow::Result<String> {
     // Checked before a single client is touched: a base URL that cannot take
     // an endpoint path is wrong for all of them, and failing halfway would
@@ -454,6 +457,21 @@ fn announce(
             )
         ),
     }
+    // Named up front because it is the one reason two clients come out of
+    // one run holding different entries, and a user looking at a shorter
+    // file than they expected should not have to guess why.
+    let narrowed: Vec<&str> = scopes
+        .iter()
+        .filter(|(_, scope)| scope.restricts())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if !narrowed.is_empty() {
+        println!(
+            "scoped by [clients]: {} — each gets only the servers its table names, \
+             at an endpoint tagged with its own name",
+            narrowed.join(", ")
+        );
+    }
     if args.project {
         println!("--project: the repo-local configs found from here are written too");
     }
@@ -478,9 +496,11 @@ fn gateway_entries(
     canonical: &BTreeMap<String, mcpgw_core::Server>,
     bridge: &str,
     token: Option<&mcpgw_core::gateway_token::GatewayToken>,
+    scope: Option<&mcpgw_core::config::ClientScope>,
     resolved: &BTreeMap<String, String>,
 ) -> anyhow::Result<mcpgw_core::sync::ClientNames> {
-    let desired = per_server_gateway_servers(kind, canonical, &args.gateway_url, bridge, token)?;
+    let desired =
+        per_server_gateway_servers(kind, canonical, &args.gateway_url, bridge, token, scope)?;
     Ok(mcpgw_core::sync::under_client_names(desired, resolved))
 }
 

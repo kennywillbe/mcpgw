@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::clients::codec::{self, ClientDocument};
 use crate::clients::{self, ClientKind};
-use crate::config::{Server, Transport};
+use crate::config::{ClientScope, Server, Transport};
 use crate::gateway_token::GatewayToken;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +318,12 @@ pub fn apply_plan(
 /// directory itself, which keeps the secret out of a config file that did not
 /// need to hold one.
 ///
+/// `scoped` writes the client-tagged spelling of the endpoint
+/// (`?client=cursor`, or `--client cursor` on the bridge), which is what
+/// tells the gateway whose scope to apply. Off for every client with no
+/// scope, so their entries stay byte-identical to the ones they already
+/// hold.
+///
 /// # Errors
 ///
 /// Returns the parse error when `base_url` is not an absolute URL.
@@ -328,10 +334,15 @@ pub fn per_server_gateway_server(
     base_url: &str,
     bridge_command: &str,
     token: Option<&GatewayToken>,
+    scoped: bool,
 ) -> Result<Server, url::ParseError> {
     let transport = if kind.supports_http_entries() {
         Transport::Http {
-            url: crate::endpoints::per_server_url(base_url, name)?,
+            url: if scoped {
+                crate::endpoints::per_client_url(base_url, name, kind.id())?
+            } else {
+                crate::endpoints::per_server_url(base_url, name)?
+            },
             headers_command: Vec::new(),
             headers: gateway_headers(kind, token),
             // The client entry points at the gateway, and the gateway is the
@@ -347,13 +358,20 @@ pub fn per_server_gateway_server(
             // The gateway's base URL plus the server's name, not the endpoint
             // path spelled out: the bridge derives the path, so a client file
             // written today keeps working if the path shape ever moves.
-            args: vec![
-                "connect".to_owned(),
-                "--server".to_owned(),
-                name.to_owned(),
-                "--url".to_owned(),
-                base_url.to_owned(),
-            ],
+            args: {
+                let mut args = vec![
+                    "connect".to_owned(),
+                    "--server".to_owned(),
+                    name.to_owned(),
+                    "--url".to_owned(),
+                    base_url.to_owned(),
+                ];
+                if scoped {
+                    args.push("--client".to_owned());
+                    args.push(kind.id().to_owned());
+                }
+                args
+            },
             env: BTreeMap::new(),
         }
     };
@@ -367,11 +385,17 @@ pub fn per_server_gateway_server(
 }
 
 /// The whole desired set for one client in per-server gateway mode: every
-/// canonical server, by its own name, pointing at its own endpoint.
+/// canonical server this client is scoped to, by its own name, pointing at
+/// its own endpoint.
 ///
 /// Disabled servers are kept in the map — as disabled — so [`plan_sync`]
 /// applies exactly the rule it applies in direct mode: not mirrored, and
-/// removed if it managed them before.
+/// removed if it managed them before. A server the client's scope leaves out
+/// is not in the map at all, which is the same thing one step further along:
+/// an entry mcpgw wrote for it before falls out of the plan as a remove.
+///
+/// `scope` is this client's `[clients.KIND]` table, or `None` for a client
+/// that has none — which writes exactly what it wrote before scopes existed.
 ///
 /// # Errors
 ///
@@ -382,12 +406,22 @@ pub fn per_server_gateway_servers(
     base_url: &str,
     bridge_command: &str,
     token: Option<&GatewayToken>,
+    scope: Option<&ClientScope>,
 ) -> Result<BTreeMap<String, Server>, url::ParseError> {
+    let scoped = scope.is_some_and(ClientScope::restricts);
     canonical
         .iter()
+        .filter(|(name, _)| scope.is_none_or(|scope| scope.has_server(name)))
         .map(|(name, server)| {
-            let entry =
-                per_server_gateway_server(kind, name, server, base_url, bridge_command, token)?;
+            let entry = per_server_gateway_server(
+                kind,
+                name,
+                server,
+                base_url,
+                bridge_command,
+                token,
+                scoped,
+            )?;
             Ok((name.clone(), entry))
         })
         .collect()

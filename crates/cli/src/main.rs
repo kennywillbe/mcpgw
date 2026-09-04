@@ -69,6 +69,8 @@ enum Command {
     Token(commands::token::TokenArgs),
     /// Show which of a server's tools clients may reach, and change it
     Tools(commands::tools::ToolsArgs),
+    /// Show which servers and tools each client is given, and change it
+    Clients(commands::clients::ClientsArgs),
     /// Follow the gateway's captured traffic live
     Watch(commands::watch::WatchArgs),
     /// Diagnose the canonical config and every detected client
@@ -195,6 +197,7 @@ fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
         Command::Inspect(args) => commands::inspect::run(&args, color).map(|()| 0),
         Command::Token(args) => commands::token::run(&args, color),
         Command::Tools(args) => commands::tools::run(&args, color).map(|()| 0),
+        Command::Clients(args) => commands::clients::run(&args, color).map(|()| 0),
         Command::Watch(args) => commands::watch::run(&args, color).map(|()| 0),
         Command::Doctor {
             json,
