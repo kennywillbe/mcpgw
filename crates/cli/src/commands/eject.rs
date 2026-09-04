@@ -69,13 +69,14 @@ pub fn run(args: &EjectArgs, color: bool) -> anyhow::Result<u8> {
     let state_dir =
         paths::state_dir().context("cannot determine a home directory for the state dir")?;
     let state_path = state_dir.join("managed.json");
-    // Held across the whole plan→confirm→write window, like sync: the plan
-    // shown to the user and the state it is applied against must be the same
-    // one a concurrent `mcpgw sync` cannot have moved underneath.
+    // Held across the plan, like sync: the plan shown to the user and the
+    // state it was read from must be one a concurrent `mcpgw sync` cannot
+    // have moved underneath. Where it stops being held is below, at the
+    // prompt.
     let state_lock = ManagedState::lock(&state_path)?;
-    let mut state = ManagedState::load(&state_path)?;
+    let state = ManagedState::load(&state_path)?;
 
-    let (mut plans, notes) = plan(&canonical, &state)?;
+    let (plans, notes) = plan(&canonical, &state)?;
 
     println!("mcpgw eject — putting every client back the way it was.");
     println!();
@@ -104,11 +105,46 @@ pub fn run(args: &EjectArgs, color: bool) -> anyhow::Result<u8> {
     if !args.yes && !std::io::stdin().is_terminal() {
         bail!("refusing to rewrite client configs without confirmation (pass --yes)");
     }
-    if !ask(args.yes, "restore these clients?")? {
-        println!();
-        ui::already_done("Stopped. Nothing was written.", color);
-        return Ok(0);
-    }
+    // A human at a terminal is arbitrary think-time, so the lock is dropped
+    // before the question and taken again after it: holding the state lock
+    // across the prompt stalls every concurrent `mcpgw sync` and `mcpgw
+    // import` for as long as the terminal goes unanswered — the argument
+    // `import` already makes about its own prompt.
+    //
+    // Taking it again means planning again. The client files were unlocked
+    // while the question sat there, so what gets written is read back rather
+    // than carried over from before the answer, and an edit made under the
+    // prompt survives instead of being overwritten by a document read before
+    // it. A plan that no longer matches the printed one is a different
+    // question than the one that was answered, so it stops the run rather
+    // than writing something nobody was shown.
+    //
+    // `--yes` never reaches the prompt, so it never releases anything: its
+    // plan and its write are the same read, exactly as sync's are.
+    let (mut plans, mut state, state_lock) = if args.yes {
+        // The echo `--yes` prints in place of the question, so the
+        // transcript still shows what was agreed to.
+        ask(true, "restore these clients?")?;
+        (plans, state, state_lock)
+    } else {
+        drop(state_lock);
+        if !ask(false, "restore these clients?")? {
+            println!();
+            ui::already_done("Stopped. Nothing was written.", color);
+            return Ok(0);
+        }
+        let state_lock = ManagedState::lock(&state_path)?;
+        let state = ManagedState::load(&state_path)?;
+        let (fresh, fresh_notes) = plan(&canonical, &state)?;
+        if shown(&fresh, &fresh_notes) != shown(&plans, &notes) {
+            bail!(
+                "your clients changed while that question was open, so the plan above is not \
+                 what would be written any more — nothing was touched.\n\
+                 Run `mcpgw eject` again to see the plan as it stands now."
+            );
+        }
+        (fresh, state, state_lock)
+    };
 
     for client in &mut plans {
         if let Applied::Refused(reason) = apply_client(client, &mut state, &state_dir, &state_path)?
@@ -187,6 +223,19 @@ fn plan(
         }
     }
     Ok((plans, notes))
+}
+
+/// The plan in comparable form: what was printed, and so what the answer to
+/// the prompt was an answer about — the per-client diffs under the labels
+/// they were printed with, and the notes below them.
+fn shown(plans: &[PlannedClient], notes: &[String]) -> (Vec<(String, SyncPlan)>, Vec<String>) {
+    (
+        plans
+            .iter()
+            .map(|client| (client.scope.label(), client.plan.clone()))
+            .collect(),
+        notes.to_vec(),
+    )
 }
 
 fn heading(scope: &Scope, text: &str, color: bool) {
