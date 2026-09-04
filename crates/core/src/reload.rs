@@ -59,6 +59,10 @@ pub struct Reloaded {
     pub changes: Changes,
     /// The servers now served, in path order.
     pub serving: Vec<String>,
+    /// Keys in the file this build does not recognize, for the caller to
+    /// report. Carried on the result rather than printed here so a reload
+    /// stays silent and testable; [`Reloader::watch`] is what prints.
+    pub unknown_keys: Vec<crate::config::UnknownKey>,
 }
 
 /// Applies config changes to a running gateway.
@@ -178,7 +182,11 @@ impl Reloader {
         // Atomic: requests that already picked a service keep running against
         // it, and the next dispatch sees the new table.
         self.endpoints.store(table);
-        Reloaded { changes, serving }
+        Reloaded {
+            changes,
+            serving,
+            unknown_keys: Vec::new(),
+        }
     }
 
     /// Re-reads the config file and applies it.
@@ -194,12 +202,15 @@ impl Reloader {
         // reads it again. The opposite order would record the new file under
         // the old content and drop the edit for good.
         let stamp = stamp(&self.path);
-        let config = Config::load(&self.path);
+        let loaded = Config::load_reporting(&self.path);
         // Recorded even when the parse failed, so a config with a typo is
         // not re-read (and re-complained about) every two seconds. The next
         // edit — or a SIGHUP — retries it.
         self.mark(stamp);
-        Ok(self.apply(config?).await)
+        let (config, unknown_keys) = loaded?;
+        let mut reloaded = self.apply(config).await;
+        reloaded.unknown_keys = unknown_keys;
+        Ok(reloaded)
     }
 
     /// Whether the file differs from what was last read.
@@ -236,13 +247,22 @@ impl Reloader {
                 continue;
             }
             match self.reload().await {
-                Ok(reloaded) if reloaded.changes.is_empty() => {}
-                Ok(reloaded) => eprintln!(
-                    "reloaded {}: {} — serving {}",
-                    self.path.display(),
-                    reloaded.changes,
-                    serving(&reloaded.serving)
-                ),
+                Ok(reloaded) => {
+                    // Reported on every reload that reads them, including one
+                    // that changed nothing else: the edit that introduced the
+                    // typo is exactly the reload with no effect to announce.
+                    for key in &reloaded.unknown_keys {
+                        eprintln!("warning: {}", key.message());
+                    }
+                    if !reloaded.changes.is_empty() {
+                        eprintln!(
+                            "reloaded {}: {} — serving {}",
+                            self.path.display(),
+                            reloaded.changes,
+                            serving(&reloaded.serving)
+                        );
+                    }
+                }
                 // Named as a *keep*, not just a failure: the useful half of
                 // this message is that the gateway is still up on the old
                 // config while the file is fixed.

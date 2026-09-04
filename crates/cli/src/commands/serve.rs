@@ -92,7 +92,13 @@ pub struct ServeArgs {
 
 pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
     let config_path = super::canonical_config_path()?;
-    let config = Config::load(&config_path)?;
+    let (config, unknown) = Config::load_reporting(&config_path)?;
+    // Before anything else the gateway prints: a key it does not recognize
+    // is usually a restriction that is not being applied, and the operator
+    // has to see that above the banner, not buried under it.
+    for key in &unknown {
+        eprintln!("warning: {}", key.message());
+    }
 
     let selected = select(args, &config, &config_path)?;
 

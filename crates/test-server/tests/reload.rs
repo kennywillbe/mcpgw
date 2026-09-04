@@ -651,3 +651,31 @@ async fn a_raised_call_budget_applies_without_reconnecting_anything() {
     client.call_tool(echo()).await.unwrap();
     client.cancel().await.unwrap();
 }
+
+/// A reload carries the file's unrecognized keys back to whoever is running
+/// the gateway, so an edit that silently drops a restriction is announced in
+/// the log rather than discovered later.
+#[tokio::test]
+async fn a_reload_reports_the_keys_it_did_not_recognize() {
+    let harness = Harness::start(&[("fx", "echo", true)]).await;
+    let with_typo = format!(
+        "{}calls_per_minutes = 10\n",
+        config(&[("fx", "echo", true)])
+    );
+
+    write(&harness.path, &with_typo);
+    let reloaded = harness.reloader.reload().await.unwrap();
+
+    // Still serving: an unknown key never costs anyone their gateway.
+    assert_eq!(reloaded.serving, ["fx"]);
+    let keys: Vec<&str> = reloaded
+        .unknown_keys
+        .iter()
+        .map(|key| key.path.as_str())
+        .collect();
+    assert_eq!(keys, ["servers.fx.calls_per_minutes"]);
+    assert_eq!(
+        reloaded.unknown_keys[0].did_you_mean,
+        Some("calls_per_minute")
+    );
+}

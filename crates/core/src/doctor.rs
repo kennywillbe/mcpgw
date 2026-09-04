@@ -378,6 +378,37 @@ pub fn unknown_scoped_servers(
         .collect()
 }
 
+/// One warning per key in `config.toml` this build does not recognize.
+///
+/// A warning, and never anything stronger, for the reasons
+/// [`unknown_keys`](crate::config::unknown_keys) documents: the key may be a
+/// typo that cost the user a restriction, or it may be a key a newer mcpgw
+/// wrote. Both are worth naming; neither is worth refusing to run over.
+#[must_use]
+pub fn unknown_config_keys(keys: &[crate::config::UnknownKey]) -> Vec<Finding> {
+    keys.iter()
+        .map(|key| Finding {
+            client: None,
+            // The server the key sits under, when it sits under one, so a
+            // `--json` consumer can group the warning with that server's
+            // other findings rather than re-parse the path.
+            server: key
+                .path
+                .strip_prefix("servers.")
+                .and_then(|rest| rest.split('.').next())
+                .map(str::to_owned),
+            severity: Severity::Warning,
+            message: key.message(),
+            code: Some(UNKNOWN_CONFIG_KEY),
+        })
+        .collect()
+}
+
+/// The code on the finding for a config key this build does not know. Worth
+/// one because the action differs by reader: a person fixes the typo, while
+/// a tool that manages configs across mixed versions may well ignore it.
+pub const UNKNOWN_CONFIG_KEY: &str = "unknown_config_key";
+
 /// Turns a lenient client read's problems into findings.
 ///
 /// Severity rule: if the named server still exists in the parsed map, the

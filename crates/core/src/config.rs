@@ -566,6 +566,21 @@ impl Config {
     /// first-run state), [`Error::Io`] for other read failures, plus
     /// everything [`Config::parse`] returns.
     pub fn load(path: &Path) -> Result<Self, Error> {
+        Ok(Self::load_reporting(path)?.0)
+    }
+
+    /// Loads it, and reports the keys this build does not recognize
+    /// alongside it.
+    ///
+    /// What every caller that has somewhere to print a warning uses —
+    /// `doctor`, and the gateway on start and on reload. The keys are
+    /// diagnostics only: the config that comes back is exactly the one
+    /// [`Config::load`] returns, unknown keys and all. See [`unknown_keys`].
+    ///
+    /// # Errors
+    ///
+    /// The same set [`Config::load`] returns.
+    pub fn load_reporting(path: &Path) -> Result<(Self, Vec<UnknownKey>), Error> {
         let text = std::fs::read_to_string(path).map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
                 Error::NotFound {
@@ -578,7 +593,8 @@ impl Config {
                 }
             }
         })?;
-        Self::parse(&text, path)
+        let config = Self::parse(&text, path)?;
+        Ok((config, unknown_keys(&text)))
     }
 
     /// Serializes the config back to TOML.
@@ -655,6 +671,201 @@ pub fn validate_name(name: &str) -> Result<(), Error> {
         return invalid("'__' is reserved and cannot appear in a server name");
     }
     Ok(())
+}
+
+/// One key in `config.toml` that this build does not recognize.
+///
+/// Reported, never enforced. The gateway keeps loading the file and keeps
+/// ignoring the key, exactly as it did before this existed — see
+/// [`unknown_keys`] for why that is the policy and not an oversight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownKey {
+    /// Where the key sits, as the file spells it:
+    /// `servers.context7.calls_per_minutes`, `clients.cursor.server`.
+    pub path: String,
+    /// The recognized key at the same level that it is one or two edits
+    /// away from, when there is one. This is what turns "something here is
+    /// wrong" into a fix, and a typo in a restriction is the case the whole
+    /// check exists for.
+    pub did_you_mean: Option<&'static str>,
+}
+
+impl UnknownKey {
+    /// The one-line diagnostic, identical wherever it is printed.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self.did_you_mean {
+            Some(known) => format!(
+                "unknown key {} in config.toml — did you mean {known:?}? \
+                 It is ignored as written",
+                self.path
+            ),
+            None => format!(
+                "unknown key {} in config.toml — it is ignored; check for a typo, or for a \
+                 key added by a newer mcpgw",
+                self.path
+            ),
+        }
+    }
+}
+
+/// Every key in `text` that this build does not know, deepest tables
+/// included.
+///
+/// # Why a warning and not a parse error
+///
+/// A typo in `deny`, `calls_per_minute` or `servers` is a restriction the
+/// user wrote and did not get, and nothing about the resulting config looks
+/// wrong: the gateway serves everything, quietly. That is worth saying out
+/// loud. It is not worth refusing to start over, for two reasons. Configs
+/// with such a typo already exist in the wild and would go from "one silent
+/// gap" to "gateway down" on upgrade, with no warning period. And a key this
+/// build does not know is not necessarily a mistake — it is also what a
+/// config written by a *newer* mcpgw looks like, and one machine's config is
+/// routinely read by more than one version of the binary (an older CLI, a
+/// gateway that has not been upgraded yet). Refusing those would make
+/// downgrades and staged rollouts unusable. So an unrecognized key is always
+/// a diagnostic, here, in `doctor`, and in the gateway's load and reload
+/// logs; enforcement is a separate decision for a later release.
+///
+/// Text that is not valid TOML yields nothing: that is a parse error, which
+/// [`Config::parse`] reports on its own and in far more detail.
+#[must_use]
+pub fn unknown_keys(text: &str) -> Vec<UnknownKey> {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut scan = |prefix: &str, table: &toml::Table, known: &'static [&'static str]| {
+        for key in table.keys() {
+            if !known.contains(&key.as_str()) {
+                found.push(UnknownKey {
+                    path: join(prefix, key),
+                    did_you_mean: nearest(key, known),
+                });
+            }
+        }
+    };
+    scan("", &table, CONFIG_KEYS);
+    for (section, keys) in [
+        ("capture", CAPTURE_KEYS),
+        ("gateway", GATEWAY_SETTINGS_KEYS),
+    ] {
+        if let Some(sub) = sub_table(&table, section) {
+            scan(section, sub, keys);
+        }
+    }
+    // Both `[clients]` and `[servers]` are tables of user-named tables, so
+    // the names themselves are never "unknown" — only what is written inside
+    // one is. An unknown client id is refused at parse time and a scoped
+    // server name that does not exist is a `doctor` finding of its own.
+    for (client, scope) in named_tables(&table, "clients") {
+        scan(&client, scope, CLIENT_SCOPE_KEYS);
+        if let Some(tools) = sub_table(scope, "tools") {
+            scan(&join(&client, "tools"), tools, TOOL_RULES_KEYS);
+        }
+    }
+    for (server, entry) in named_tables(&table, "servers") {
+        scan(&server, entry, SERVER_KEYS);
+        if let Some(tools) = sub_table(entry, "tools") {
+            scan(&join(&server, "tools"), tools, TOOL_RULES_KEYS);
+        }
+        if let Some(auth) = sub_table(entry, "auth") {
+            scan(&join(&server, "auth"), auth, SERVER_AUTH_KEYS);
+        }
+        // `env` and `headers` are deliberately not descended into: their
+        // keys are variable and header names, chosen by the user, and every
+        // one of them would be "unknown".
+    }
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+/// The keys of `Config`, as serde spells them.
+///
+/// Hand-written because serde offers no way to ask a type for its field
+/// names, and kept honest by a test that walks a fully populated config
+/// through [`unknown_keys`] and expects nothing: a field added without a
+/// line here fails that test.
+const CONFIG_KEYS: &[&str] = &["version", "capture", "gateway", "clients", "servers"];
+const CAPTURE_KEYS: &[&str] = &["redact"];
+const GATEWAY_SETTINGS_KEYS: &[&str] = &["require_token"];
+const CLIENT_SCOPE_KEYS: &[&str] = &["servers", "max_tools", "tools"];
+const TOOL_RULES_KEYS: &[&str] = &["allow", "deny", "drift"];
+/// One list for both transports, because `Transport` is flattened into the
+/// server table: which of these belong together is `type`'s business, and a
+/// `url` on a stdio entry is a different complaint than a misspelled key.
+const SERVER_KEYS: &[&str] = &[
+    "enabled",
+    "tags",
+    "calls_per_minute",
+    "tools",
+    "type",
+    "command",
+    "args",
+    "env",
+    "url",
+    "headers_command",
+    "headers",
+    "auth",
+];
+const SERVER_AUTH_KEYS: &[&str] = &["client_id", "client_secret_env", "scopes"];
+
+fn join(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
+
+fn sub_table<'t>(table: &'t toml::Table, key: &str) -> Option<&'t toml::Table> {
+    table.get(key)?.as_table()
+}
+
+/// The `[section.NAME]` tables under `section`, as `(path, table)` pairs.
+/// A section that is not a table, or an entry that is not one, is skipped:
+/// that is a type error, which the parse reports.
+fn named_tables<'t>(table: &'t toml::Table, section: &str) -> Vec<(String, &'t toml::Table)> {
+    sub_table(table, section)
+        .into_iter()
+        .flat_map(toml::Table::iter)
+        .filter_map(|(name, value)| Some((format!("{section}.{name}"), value.as_table()?)))
+        .collect()
+}
+
+/// The known key `key` is most likely a misspelling of, if any.
+///
+/// Two edits at most, and never more edits than half the key: without that
+/// second bound every three-letter key would be "close" to every other one,
+/// and a confident wrong suggestion is worse than none.
+fn nearest(key: &str, known: &'static [&'static str]) -> Option<&'static str> {
+    known
+        .iter()
+        .map(|candidate| (distance(key, candidate), *candidate))
+        .filter(|(d, _)| *d <= 2 && *d * 2 <= key.chars().count())
+        .min_by_key(|(d, candidate)| (*d, *candidate))
+        .map(|(_, candidate)| candidate)
+}
+
+/// Levenshtein distance, over chars.
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    // One row of the matrix, reused: the recurrence only ever looks at the
+    // row above, and config keys are short enough that the win is clarity,
+    // not speed.
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ac) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, bc) in b.iter().enumerate() {
+            let cost = usize::from(ac != *bc);
+            let next = (row[j + 1] + 1).min(row[j] + 1).min(diagonal + cost);
+            diagonal = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
 }
 
 #[cfg(test)]

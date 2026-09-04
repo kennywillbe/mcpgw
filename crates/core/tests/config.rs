@@ -482,3 +482,128 @@ fn a_scope_naming_a_missing_server_still_parses() {
     .unwrap();
     assert_eq!(config.clients["cursor"].servers, ["gone"]);
 }
+
+/// The typo'd keys the issue is about: each one is a restriction the user
+/// wrote and would not get.
+const TYPOS: &str = r#"
+version = 1
+
+[capture]
+redcat = ["secret"]
+
+[clients.cursor]
+server = ["github"]
+
+[clients.cursor.tools]
+deney = ["delete_*"]
+
+[servers.github]
+type = "stdio"
+command = "cargo"
+calls_per_minutes = 10
+
+[servers.github.tools]
+denny = ["delete_*"]
+
+[servers.github.auth]
+client_di = "abc"
+"#;
+
+#[test]
+fn unknown_keys_name_the_table_path_and_suggest_the_real_key() {
+    let found: Vec<(String, Option<&str>)> = mcpgw_core::config::unknown_keys(TYPOS)
+        .into_iter()
+        .map(|key| (key.path, key.did_you_mean))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("capture.redcat".to_owned(), Some("redact")),
+            ("clients.cursor.server".to_owned(), Some("servers")),
+            ("clients.cursor.tools.deney".to_owned(), Some("deny")),
+            (
+                "servers.github.auth.client_di".to_owned(),
+                Some("client_id")
+            ),
+            (
+                "servers.github.calls_per_minutes".to_owned(),
+                Some("calls_per_minute")
+            ),
+            ("servers.github.tools.denny".to_owned(), Some("deny")),
+        ]
+    );
+}
+
+#[test]
+fn a_config_with_unknown_keys_still_parses() {
+    let config = Config::parse(TYPOS, Path::new("typos.toml")).unwrap();
+    // Every restriction the file meant to express is missing, which is the
+    // whole reason the warning exists.
+    assert!(config.clients["cursor"].servers.is_empty());
+    assert_eq!(config.servers["github"].calls_per_minute, 0);
+    assert!(config.servers["github"].allows_tool("delete_repository"));
+}
+
+#[test]
+fn a_key_with_no_near_match_is_still_reported() {
+    let text = "version = 1\n[servers.fx]\ntype = \"stdio\"\ncommand = \"cargo\"\n\
+                telemetry_endpoint = \"https://example.invalid\"\n";
+    let found = mcpgw_core::config::unknown_keys(text);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, "servers.fx.telemetry_endpoint");
+    // Nothing in a server table is two edits from it, and a guess that far
+    // off would be worse than none.
+    assert_eq!(found[0].did_you_mean, None);
+    assert!(found[0].message().contains("added by a newer mcpgw"));
+}
+
+#[test]
+fn unrecognized_top_level_sections_are_reported_once() {
+    let found = mcpgw_core::config::unknown_keys("version = 1\n[gatewya]\nrequire_token = true\n");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, "gatewya");
+    assert_eq!(found[0].did_you_mean, Some("gateway"));
+}
+
+#[test]
+fn user_named_tables_are_never_unknown() {
+    // Server and client names, env vars and header names are all chosen by
+    // the user: flagging them would make the check useless.
+    let text = r#"
+version = 1
+[servers.anything-goes]
+type = "stdio"
+command = "cargo"
+env = { WEIRD_NAME = "1" }
+
+[servers.web]
+type = "http"
+url = "https://example.invalid"
+headers = { X-Made-Up = "1" }
+"#;
+    assert_eq!(mcpgw_core::config::unknown_keys(text), []);
+}
+
+#[test]
+fn every_key_the_model_writes_is_recognized() {
+    // The guard on a hand-written key list: a field added to any config type
+    // without a line in it fails here, because the config that carries it
+    // round-trips into a key nothing knows.
+    let text = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/exhaustive.toml"),
+    )
+    .unwrap();
+    let config = Config::parse(&text, Path::new("exhaustive.toml")).unwrap();
+    assert_eq!(mcpgw_core::config::unknown_keys(&text), []);
+    assert_eq!(
+        mcpgw_core::config::unknown_keys(&config.to_toml_string().unwrap()),
+        []
+    );
+}
+
+#[test]
+fn text_that_is_not_toml_reports_no_unknown_keys() {
+    // Parsing says what is wrong with it, in detail, and a list of "unknown
+    // keys" scraped out of broken TOML would only add noise.
+    assert_eq!(mcpgw_core::config::unknown_keys("version = "), []);
+}
