@@ -1,0 +1,5 @@
+---
+source: crates/cli/src/commands/watch.rs
+expression: "render_line(&record, NOW, false)"
+---
+  12s  ✓  github__create_issue               87ms  claude-code/2.1.3

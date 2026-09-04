@@ -454,6 +454,7 @@ mod tests {
             tool: None,
             endpoint: None,
             session: None,
+            client: None,
             json: false,
             tui: true,
             show_secrets: false,

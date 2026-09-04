@@ -27,6 +27,11 @@ const POLL: Duration = Duration::from_millis(500);
 /// stays in the file and in `--json`.
 const ERROR_CHARS: usize = 100;
 
+/// The same for a client name. Nothing sane is this long, but the value is
+/// whatever a downstream client chose to call itself, and one that chose a
+/// paragraph must not be able to push the error off the line.
+const CLIENT_CHARS: usize = 32;
+
 /// What a masked captured body renders as, matching `list --json`.
 const MASK: &str = "***";
 
@@ -46,6 +51,10 @@ pub struct WatchArgs {
     /// a captured line)
     #[arg(long, value_name = "ID")]
     pub session: Option<String>,
+    /// Only show traffic from this client, matched as a case-insensitive
+    /// substring of the `client` field (e.g. claude or cursor)
+    #[arg(long, value_name = "NAME")]
+    pub client: Option<String>,
     /// Stream the JSONL lines instead of the rendered stream
     #[arg(long)]
     pub json: bool,
@@ -248,14 +257,15 @@ fn json_line(record: &CaptureRecord) -> String {
         .unwrap_or_else(|err| format!(r#"{{"error":"unserializable capture record: {err}"}}"#))
 }
 
-/// The `--server` / `--tool` / `--endpoint` / `--session` narrowing, all of
-/// which have to pass for a record to be shown.
+/// The `--server` / `--tool` / `--endpoint` / `--session` / `--client`
+/// narrowing, all of which have to pass for a record to be shown.
 #[derive(Default)]
 struct Filters<'a> {
     server: Option<&'a str>,
     tool: Option<&'a str>,
     endpoint: Option<&'a str>,
     session: Option<&'a str>,
+    client: Option<&'a str>,
 }
 
 impl<'a> Filters<'a> {
@@ -271,13 +281,21 @@ impl<'a> Filters<'a> {
                 .as_deref()
                 .map(|want| want.strip_prefix('/').unwrap_or(want)),
             session: args.session.as_deref(),
+            client: args.client.as_deref(),
         }
     }
 
     /// Whether `record` passes every active filter. A tool filter excludes
     /// `tools/list` records, which name no tool; an endpoint filter likewise
     /// excludes lines written before endpoints were recorded, since there is
-    /// no honest way to guess which face they arrived on.
+    /// no honest way to guess which face they arrived on. So does a client
+    /// filter for a line nobody attributed: absent is not a match.
+    ///
+    /// The client is the one substring match here, and the one that is not
+    /// case-sensitive. The others are values the user read off a line or
+    /// pasted from a config; a client is `claude-code/2.1.3`, whose version
+    /// nobody types and whose capitalisation clients do not agree on, so
+    /// `--client claude` has to be the useful spelling.
     fn matches(&self, record: &CaptureRecord) -> bool {
         self.server.is_none_or(|want| record.server == want)
             && self
@@ -287,11 +305,17 @@ impl<'a> Filters<'a> {
                 .endpoint
                 .is_none_or(|want| record.endpoint.as_deref() == Some(want))
             && self.session.is_none_or(|want| record.session == want)
+            && self.client.is_none_or(|want| {
+                record
+                    .client
+                    .as_deref()
+                    .is_some_and(|client| client.to_lowercase().contains(&want.to_lowercase()))
+            })
     }
 }
 
 /// One line of the human stream: age, outcome, endpoint, target, latency,
-/// error.
+/// client, error.
 fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
     let target = match (record.kind, record.tool.as_deref()) {
         // A tool call is shown under the name a client would type for it.
@@ -339,6 +363,22 @@ fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
         "{age}  {mark}  {target}{}{latency:>7}",
         " ".repeat(pad).as_str()
     );
+    // Trailing the latency rather than given a column of its own, and dimmed:
+    // a client name is as wide as whoever wrote it (`claude-code/2.1.3`,
+    // `cursor`, nothing at all), so a column wide enough for the worst of
+    // them would be blank on most lines, and the four columns in front are
+    // what a reader scans. Lines nobody attributed — a client that names
+    // itself nowhere, anything captured before the field existed — render
+    // exactly as they always did.
+    if let Some(client) = &record.client {
+        let client = clip(client, CLIENT_CHARS);
+        line.push_str("  ");
+        if color {
+            line.push_str(&client.dimmed().to_string());
+        } else {
+            line.push_str(&client);
+        }
+    }
     if let Some(error) = &record.error {
         line.push_str("  ");
         line.push_str(&clip(error, ERROR_CHARS));
@@ -466,6 +506,7 @@ mod tests {
             tool: None,
             endpoint: Some("/s/github".to_owned()),
             session: None,
+            client: None,
             json: false,
             tui: false,
             show_secrets: false,
@@ -481,6 +522,41 @@ mod tests {
         };
         assert!(filters(Some("s3ss")).matches(&call()));
         assert!(!filters(Some("0ther")).matches(&call()));
+    }
+
+    #[test]
+    fn filters_narrow_by_client() {
+        let mut attributed = call();
+        attributed.client = Some("claude-code/2.1.3".to_owned());
+        let filters = |client| Filters {
+            client,
+            ..Filters::default()
+        };
+        // A substring of the name is the spelling a user has: nobody types
+        // the version, and clients disagree about capitalisation.
+        assert!(filters(Some("claude")).matches(&attributed));
+        assert!(filters(Some("Claude-Code")).matches(&attributed));
+        assert!(filters(Some("claude-code/2.1.3")).matches(&attributed));
+        assert!(!filters(Some("cursor")).matches(&attributed));
+        // A line nobody attributed is not a match for any client.
+        assert!(!filters(Some("claude")).matches(&call()));
+        assert!(filters(None).matches(&call()));
+    }
+
+    #[test]
+    fn the_client_shows_in_the_rendered_line() {
+        let mut record = call();
+        record.client = Some("claude-code/2.1.3".to_owned());
+        insta::assert_snapshot!(render_line(&record, NOW, false));
+    }
+
+    #[test]
+    fn json_carries_the_client_through_the_mask() {
+        let mut record = call().with_args(r#"{"token":"ghp_realsecret"}"#.to_owned());
+        record.client = Some("claude-code/2.1.3".to_owned());
+        let json: serde_json::Value = serde_json::from_str(&json_line(&record)).unwrap();
+        assert_eq!(json["client"], "claude-code/2.1.3");
+        assert_eq!(json["args"], MASK);
     }
 
     #[test]

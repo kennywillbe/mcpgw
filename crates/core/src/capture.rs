@@ -522,6 +522,20 @@ pub struct CaptureRecord {
     /// transport session when there is one, otherwise the gateway process's
     /// own id. See [`CaptureWriter::session`] for what each means.
     pub session: String,
+    /// Which client software made the request: `<name>/<version>` from the
+    /// identity the client put on it, or bare `<name>` when it named no
+    /// version.
+    ///
+    /// The companion to `session`, not a replacement for it: `session` says
+    /// which connection, this says which program. Two windows of one editor
+    /// share a client and not a session; a client on MCP 2026-07-28 has no
+    /// session to share at all, which is the case this field exists for.
+    ///
+    /// Absent means absent. Naming yourself is a SHOULD in the protocol, so a
+    /// client that does not is left unattributed rather than filed under a
+    /// guess — and every line written before the field existed keeps parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
     /// Which face of the gateway took the request: `s/<server>`, which is
     /// the only face that reaches a server. Absent on lines written before
     /// this field existed and on the stdio face, which has no path — and
@@ -567,6 +581,7 @@ impl CaptureRecord {
         Self {
             ts: now_millis(),
             session: session.to_owned(),
+            client: None,
             endpoint: None,
             server: server.to_owned(),
             tool: None,

@@ -864,6 +864,19 @@ impl RawSession {
     /// Opens a session on `path`: initialize, then the notification that
     /// completes the handshake.
     async fn open(addr: std::net::SocketAddr, path: &str) -> Self {
+        Self::open_as(addr, path, "2026-07-28", "raw", "0").await
+    }
+
+    /// The same, naming the revision and the client the handshake claims —
+    /// which is the only place a client on a revision with a handshake says
+    /// who it is.
+    async fn open_as(
+        addr: std::net::SocketAddr,
+        path: &str,
+        version: &str,
+        client: &str,
+        client_version: &str,
+    ) -> Self {
         let mut raw = Self {
             addr,
             path: path.to_owned(),
@@ -871,11 +884,11 @@ impl RawSession {
             session: None,
         };
         let response = raw
-            .post(
-                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-                    "protocolVersion":"2026-07-28","capabilities":{},
-                    "clientInfo":{"name":"raw","version":"0"}}}"#,
-            )
+            .post(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{
+                    "protocolVersion":"{version}","capabilities":{{}},
+                    "clientInfo":{{"name":"{client}","version":"{client_version}"}}}}}}"#
+            ))
             .await;
         raw.session = response
             .lines()
@@ -1159,6 +1172,9 @@ struct InlineSession {
     addr: std::net::SocketAddr,
     path: String,
     id: u32,
+    /// What `_meta` says the client is, or `None` for a client that declines
+    /// to say — naming yourself is a SHOULD, so that request is legal.
+    client: Option<(String, String)>,
 }
 
 impl InlineSession {
@@ -1169,7 +1185,18 @@ impl InlineSession {
             addr,
             path: path.to_owned(),
             id: 0,
+            client: Some(("inline".to_owned(), "1".to_owned())),
         }
+    }
+
+    fn naming(mut self, name: &str, version: &str) -> Self {
+        self.client = Some((name.to_owned(), version.to_owned()));
+        self
+    }
+
+    fn anonymous(mut self) -> Self {
+        self.client = None;
+        self
     }
 
     /// Sends one request and returns its `result` object verbatim.
@@ -1186,9 +1213,12 @@ impl InlineSession {
         let mut params = params;
         params["_meta"] = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": Self::VERSION,
-            "io.modelcontextprotocol/clientInfo": { "name": "inline", "version": "1" },
             "io.modelcontextprotocol/clientCapabilities": {}
         });
+        if let Some((name, version)) = &self.client {
+            params["_meta"]["io.modelcontextprotocol/clientInfo"] =
+                serde_json::json!({ "name": name, "version": version });
+        }
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": self.id, "method": method, "params": params
         })
@@ -1931,4 +1961,128 @@ async fn the_standard_headers_are_required_and_checked_against_the_body() {
     .await;
     assert!(mismatched.contains("does not match"), "{mismatched}");
     manager.shutdown().await;
+}
+
+/// Issue #138: 2026-07-28 has no sessions, so `session` collapses to one
+/// value and the log can no longer answer "which harness made this call".
+/// The answer the revision does offer is the client identity every request
+/// carries in its own `_meta` (SEP-2575), and the record keeps it.
+#[tokio::test]
+async fn a_stateless_request_is_attributed_to_the_client_that_named_itself() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) = serve_both(&[("fx", "healthy")], Some(&writer)).await;
+
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx")).naming("claude-code", "2.1.3");
+    fx.request(
+        "tools/call",
+        serde_json::json!({ "name": "echo", "arguments": { "message": "hi" } }),
+    )
+    .await;
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(
+        records[0].client.as_deref(),
+        Some("claude-code/2.1.3"),
+        "{records:#?}"
+    );
+}
+
+/// The other half of the same question, for a client on a revision that still
+/// handshakes: `clientInfo` arrives once, at `initialize`, and every later
+/// request has to be attributed from the peer rather than from its own body.
+#[tokio::test]
+async fn a_handshaking_client_is_attributed_from_its_initialize() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) = serve_both(&[("fx", "healthy")], Some(&writer)).await;
+
+    let mut fx =
+        RawSession::open_as(addr, &endpoint_path("fx"), "2025-11-25", "cursor", "0.48").await;
+    fx.request(
+        "tools/call",
+        serde_json::json!({ "name": "echo", "arguments": { "message": "hi" } }),
+    )
+    .await;
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(
+        records[0].client.as_deref(),
+        Some("cursor/0.48"),
+        "{records:#?}"
+    );
+    // The session id is still what says *which connection*, and it is still
+    // not the raw one: attribution added a field, it replaced nothing.
+    assert_ne!(records[0].session, writer.session(), "{records:#?}");
+}
+
+/// Naming yourself is a SHOULD. A client that does not is left unattributed
+/// rather than filed under a guess, and its line is a line like any other.
+#[tokio::test]
+async fn a_client_that_names_nobody_gets_no_client_field() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) = serve_both(&[("fx", "healthy")], Some(&writer)).await;
+
+    let mut fx = InlineSession::new(addr, &endpoint_path("fx")).anonymous();
+    fx.request("tools/list", serde_json::json!({})).await;
+    manager.shutdown().await;
+
+    let line = daily_file(writer.dir());
+    assert!(!line.contains("\"client\""), "{line}");
+    // …and the line is still a record, read by the same parser as any other.
+    let records = captured(writer.dir());
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_eq!(records[0].client, None, "{records:#?}");
+    assert_eq!(records[0].kind, Kind::List, "{records:#?}");
+}
+
+/// The reason the field exists: two harnesses through one gateway, on the
+/// revision that gives them no sessions to be told apart by.
+#[tokio::test]
+async fn two_stateless_clients_are_attributed_to_themselves() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let (addr, manager) = serve_both(&[("fx", "healthy")], Some(&writer)).await;
+
+    let mut one = InlineSession::new(addr, &endpoint_path("fx")).naming("claude-code", "2.1.3");
+    let mut two = InlineSession::new(addr, &endpoint_path("fx")).naming("cursor", "0.48");
+    for message in ["from one", "from two"] {
+        let session = if message == "from one" {
+            &mut one
+        } else {
+            &mut two
+        };
+        session
+            .request(
+                "tools/call",
+                serde_json::json!({ "name": "echo", "arguments": { "message": message } }),
+            )
+            .await;
+    }
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    let attributed: BTreeMap<&str, &str> = records
+        .iter()
+        .map(|r| {
+            (
+                r.client.as_deref().unwrap_or("<none>"),
+                r.args.as_deref().unwrap_or("<none>"),
+            )
+        })
+        .collect();
+    assert_eq!(attributed.len(), 2, "{records:#?}");
+    assert!(
+        attributed["claude-code/2.1.3"].contains("from one"),
+        "{records:#?}"
+    );
+    assert!(
+        attributed["cursor/0.48"].contains("from two"),
+        "{records:#?}"
+    );
 }

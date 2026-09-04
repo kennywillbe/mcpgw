@@ -23,13 +23,15 @@ mcpgw watch
 
 ```text
 watching /Users/you/.local/share/mcpgw/traffic (Ctrl-C to stop)
-  now  ✓  [s/github] github__create_issue      87ms
-  12s  ✓  [s/linear] linear tools/list          4ms
-  30s  ✗  [s/github] github__search_code       210ms  upstream "github" failed after 3 attempt(s)
+  now  ✓  [s/github] github__create_issue      87ms  claude-code/2.1.3
+  12s  ✓  [s/linear] linear tools/list          4ms  cursor/0.48
+  30s  ✗  [s/github] github__search_code       210ms  claude-code/2.1.3  upstream "github" failed after 3 attempt(s)
 ```
 
 Age, outcome, the endpoint it arrived on, what was called, how long it took,
-and the error if there was one. `watch` replays what's already in today's file
+which client made the call, and the error if there was one. The client is
+whatever it named itself as; a call from a client that named itself nowhere
+just doesn't have that part. `watch` replays what's already in today's file
 before it starts following, so you see context immediately instead of an empty
 screen.
 
@@ -38,6 +40,7 @@ mcpgw watch --server github        # one upstream
 mcpgw watch --tool create_issue    # bare tool name, no server prefix
 mcpgw watch --endpoint s/github    # one endpoint (`/s/github` works too)
 mcpgw watch --session b1e4c07a     # one downstream client connection
+mcpgw watch --client cursor        # one client, by substring of its name
 mcpgw watch --json                 # JSONL, for jq
 mcpgw watch --json --show-secrets  # …with args/response unmasked
 ```
@@ -82,8 +85,8 @@ before it hung — and a line stream can only be scrolled, not compared.
 | `?` | the key list, over the panes |
 
 At a prompt, an empty answer takes that filter off again, and `Esc` cancels.
-The `--server`, `--tool`, `--endpoint` and `--session` flags work the same as
-they do for the stream and set where the TUI starts:
+The `--server`, `--tool`, `--endpoint`, `--session` and `--client` flags work
+the same as they do for the stream and set where the TUI starts:
 
 ```sh
 mcpgw watch --tui --server github
@@ -99,6 +102,7 @@ so and points at the stream rather than writing escape sequences into a pipe.
 {
   "ts": 1756742400123,
   "session": "b1e4c07a",
+  "client": "claude-code/2.1.3",
   "endpoint": "s/github",
   "server": "github",
   "tool": "create_issue",
@@ -113,19 +117,31 @@ so and points at the stream rather than writing escape sequences into a pipe.
 
 - `ts` — when the request *finished*, epoch milliseconds. It started
   `duration_ms` earlier.
-- `session` — which downstream client connection the request came from. Over
-  HTTP this is derived from the transport session the client was given at
-  `initialize`, so two harnesses talking to one gateway get different ids and
-  a client that reconnects gets a new one. It is a fingerprint, not the
-  session id itself: the raw id is a credential and does not belong in a log
-  file. Where there is no session — a client on MCP 2026-07-28, which
-  [removed them](https://modelcontextprotocol.io/specification/2026-07-28/) —
-  it is a fingerprint of the name and version the client gives on each request
-  instead. That separates clients by software rather than by connection: two
-  windows of the same editor share a row, where two different harnesses do
-  not. Failing both, it falls back to an id for the gateway *process*, which
-  cannot tell any two clients apart. Same field either way, and the ids never
-  collide; just a coarser answer.
+- `session` — which downstream *connection* the request came from, and what
+  it means depends on the revision the client speaks:
+
+  | the client speaks | `session` is |
+  | --- | --- |
+  | a revision with sessions (2025-11-25 and earlier) | the transport session it was given at `initialize` — two harnesses get different ids, and reconnecting gets a new one |
+  | 2026-07-28, which [removed sessions](https://modelcontextprotocol.io/specification/2026-07-28/) | its own name and version, so two windows of one editor share a row where two harnesses do not |
+  | neither, having named itself nowhere | the gateway *process*, which cannot tell any two clients apart |
+
+  It is a fingerprint in every case, not the value itself: a session id is a
+  credential and does not belong in a log file. The ids never collide, so the
+  field is filterable whatever produced it; a coarser one is just a coarser
+  answer.
+- `client` — which client *software* made the call: `<name>/<version>` as the
+  client gives it, or a bare name for a client that names no version. This is
+  the field that answers "which harness was this", and the one to reach for
+  since 2026-07-28: a client on that revision repeats its identity on every
+  request, where `session` has nothing left to distinguish it by. A client on
+  an older revision gives the same identity once, at `initialize`, and it is
+  recorded here just the same.
+
+  Naming yourself is a SHOULD in the protocol, not a MUST. A client that
+  declines has no `client` on its lines at all — absent, never guessed — and
+  `--client` does not match it. Lines written before mcpgw recorded this are
+  absent for the same reason and read the same way.
 - `endpoint` — which face of the gateway took the request. It is
   `s/<server>`: a server is reached through its own endpoint and nowhere
   else. Absent on stdio traffic and on lines written before this field
