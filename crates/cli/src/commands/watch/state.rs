@@ -22,31 +22,25 @@ use super::{Filters, MASK, WatchArgs, age};
 /// growing without limit.
 pub(super) const WINDOW: usize = 1000;
 
-/// One captured line as the TUI holds it: the record every other reader
-/// parses, plus the client attribution.
+/// One captured line as the TUI holds it.
 #[derive(Debug, Clone)]
 pub(super) struct Entry {
     pub(super) record: CaptureRecord,
-    /// Which downstream client the gateway attributed the call to.
-    ///
-    /// Read straight out of the JSON rather than off [`CaptureRecord`]: the
-    /// field arrives with a later gateway than this reader may have met, and
-    /// every line already on disk was written without it. Absent is a legal
-    /// answer, not a parse failure.
-    pub(super) client: Option<String>,
 }
 
 impl Entry {
     /// One JSONL line, or `None` for a line this build cannot read — the same
     /// forgiveness the plain stream shows, for the same reason.
     pub(super) fn parse(line: &str) -> Option<Self> {
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
-        let client = value
-            .get("client")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let record = serde_json::from_value(value).ok()?;
-        Some(Self { record, client })
+        let record = serde_json::from_str(line).ok()?;
+        Some(Self { record })
+    }
+
+    /// Which downstream client the gateway attributed the call to, if any.
+    /// A gateway old enough to attribute nothing and a client that named
+    /// itself nowhere are the same absence here, and the panes say so.
+    fn client(&self) -> Option<&str> {
+        self.record.client.as_deref()
     }
 
     /// What the record is filed under in the table and named by in the log:
@@ -145,10 +139,11 @@ impl Field {
 
 /// Every narrowing the TUI can apply, and the state `f` and `/` write into.
 ///
-/// A superset of the stream's [`Filters`], which it defers to for the four
+/// A superset of the stream's [`Filters`], which it defers to for the five
 /// the flags already spell — one matcher for `--server`/`--tool`/
-/// `--endpoint`/`--session` means the TUI cannot drift from the stream on
-/// what those words mean, including the leading slash an endpoint is allowed.
+/// `--endpoint`/`--session`/`--client` means the TUI cannot drift from the
+/// stream on what those words mean, including the leading slash an endpoint
+/// is allowed and the substring a client is matched by.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Filter {
     pub(super) server: Option<String>,
@@ -170,6 +165,7 @@ impl Filter {
             tool: narrowing.tool.map(str::to_owned),
             endpoint: narrowing.endpoint.map(str::to_owned),
             session: narrowing.session.map(str::to_owned),
+            client: narrowing.client.map(str::to_owned),
             ..Self::default()
         }
     }
@@ -180,12 +176,9 @@ impl Filter {
             tool: self.tool.as_deref(),
             endpoint: self.endpoint.as_deref(),
             session: self.session.as_deref(),
+            client: self.client.as_deref(),
         };
         narrowing.matches(&entry.record)
-            && self
-                .client
-                .as_deref()
-                .is_none_or(|want| entry.client.as_deref() == Some(want))
             && self
                 .status
                 .is_none_or(|want| entry.record.ok == (want == Status::Ok))
@@ -243,7 +236,7 @@ fn haystack(entry: &Entry, want: &str) -> bool {
         Some(record.kind.method()),
         record.endpoint.as_deref(),
         Some(record.session.as_str()),
-        entry.client.as_deref(),
+        entry.client(),
         record.error.as_deref(),
     ];
     fields
@@ -497,7 +490,7 @@ impl State {
                 // An em dash rather than an empty cell: "this gateway does
                 // not attribute clients" and "this call had no client" look
                 // the same on screen, and both are the absence of an answer.
-                client: entry.client.clone().unwrap_or_else(|| "—".to_owned()),
+                client: entry.client().unwrap_or("—").to_owned(),
                 duration: format!("{}ms", entry.record.duration_ms),
                 ok: entry.record.ok,
             })
@@ -515,10 +508,7 @@ impl State {
             ("server", record.server.clone()),
             ("target", entry.target().to_owned()),
             ("method", record.kind.method().to_owned()),
-            (
-                "client",
-                entry.client.clone().unwrap_or_else(|| "—".to_owned()),
-            ),
+            ("client", entry.client().unwrap_or("—").to_owned()),
             ("session", record.session.clone()),
             (
                 "endpoint",
@@ -690,6 +680,7 @@ mod tests {
             tool: None,
             endpoint: None,
             session: None,
+            client: None,
             json: false,
             tui: true,
             show_secrets: false,
@@ -702,12 +693,21 @@ mod tests {
 
     /// A record as it appears on disk, so every test goes through the same
     /// parse the tail feeds the state through.
+    ///
+    /// `extra` names only the fields its test cares about and overrides the
+    /// base where they collide, which is what the round trip through a map is
+    /// for: the parser under test refuses a line that spells a field twice,
+    /// exactly as the stream's does, and a fixture must not be the one thing
+    /// that gets a laxer reader.
     fn line(extra: &str) -> String {
-        format!(
+        let written = format!(
             r#"{{"ts":{NOW},"session":"s3ss","server":"github","tool":"create_issue",
              "kind":"call","duration_ms":87,"ok":true{extra}}}"#
         )
-        .replace('\n', "")
+        .replace('\n', "");
+        let fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&written).unwrap();
+        serde_json::to_string(&fields).unwrap()
     }
 
     fn push(state: &mut State, extra: &str) {
@@ -813,6 +813,30 @@ mod tests {
         state.filter.set(Field::Client, "claude-code");
         assert_eq!(state.counts().0, 1);
         assert_eq!(state.log(NOW)[0].client, "claude-code");
+
+        // The same substring the `--client` flag takes, because it is the
+        // same matcher: the TUI must not mean something narrower by the word.
+        state.filter.set(Field::Client, "CLAUDE");
+        assert_eq!(state.counts().0, 1);
+        state.filter.set(Field::Client, "");
+        assert_eq!(state.counts().0, 3);
+    }
+
+    /// …and the flag seeds it, so `--tui --client` starts where `--client`
+    /// would have started the stream.
+    #[test]
+    fn the_client_flag_seeds_the_tui_filter() {
+        let mut state = State::new(
+            &WatchArgs {
+                client: Some("cursor".to_owned()),
+                ..args()
+            },
+            PathBuf::from("/traffic"),
+        );
+        push(&mut state, r#","client":"claude-code/2.1.3""#);
+        push(&mut state, r#","client":"cursor/0.48""#);
+        assert_eq!(state.counts(), (1, 2));
+        assert_eq!(state.log(NOW)[0].client, "cursor/0.48");
     }
 
     #[test]

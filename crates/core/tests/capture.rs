@@ -57,6 +57,28 @@ fn a_line_written_before_endpoints_still_parses() {
     assert_eq!(serde_json::to_string(&record).unwrap(), PRE_N13_LINE);
 }
 
+/// The same for `client`, which arrived later still: an old line names no
+/// client and comes back out of the parser byte for byte, so upgrading
+/// neither invents an attribution nor rewrites a file somebody is tailing.
+#[test]
+fn a_line_written_before_client_attribution_still_parses() {
+    let record: CaptureRecord = serde_json::from_str(PRE_N13_LINE).unwrap();
+    assert_eq!(record.client, None);
+    assert_eq!(serde_json::to_string(&record).unwrap(), PRE_N13_LINE);
+}
+
+#[test]
+fn a_client_survives_the_round_trip() {
+    let mut record = record();
+    record.client = Some("claude-code/2.1.3".to_owned());
+    let line = serde_json::to_string(&record).unwrap();
+    assert!(line.contains(r#""client":"claude-code/2.1.3""#), "{line}");
+    assert_eq!(
+        serde_json::from_str::<CaptureRecord>(&line).unwrap(),
+        record
+    );
+}
+
 #[test]
 fn an_endpoint_survives_the_round_trip() {
     let record = record().with_endpoint("s/github");

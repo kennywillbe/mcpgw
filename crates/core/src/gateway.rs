@@ -41,6 +41,20 @@ pub const SEPARATOR: &str = "__";
 /// which is what a client used to be able to wait for with no answer at all.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Who a request came from, as far as the capture log can tell.
+///
+/// Two answers rather than one, because the protocol stopped being able to
+/// give a single one: `session` says which connection, `client` says which
+/// program. Under 2026-07-28 there are no sessions, so the connection half
+/// degrades to the software identity and every window of one editor collapses
+/// into a single row — the client half is what still separates Claude Code
+/// from Cursor. Either may be absent without the other.
+#[derive(Debug)]
+struct Attribution {
+    session: Option<String>,
+    client: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Gateway {
     manager: Arc<UpstreamManager>,
@@ -108,41 +122,73 @@ impl Gateway {
         &self.manager
     }
 
-    /// Which downstream client a request belongs to, or `None` when the
-    /// transport cannot say.
+    /// Who one request came from, for the capture log.
     ///
-    /// rmcp's Streamable HTTP service injects the HTTP [`http::request::Parts`]
-    /// into every request's extensions, which is where the `Mcp-Session-Id`
-    /// its session manager minted at `initialize` is legible from a handler.
-    /// That id is what identifies one downstream connection for as long as a
-    /// client speaks a revision that has sessions at all. It is fingerprinted
-    /// rather than stored, because the raw value is a session credential; see
-    /// [`session_fingerprint`](crate::capture::session_fingerprint).
+    /// The session half is the `Mcp-Session-Id` rmcp's session manager minted
+    /// at `initialize`, which identifies one downstream connection for as
+    /// long as a client speaks a revision that has sessions at all. It is
+    /// fingerprinted rather than stored, because the raw value is a session
+    /// credential; see
+    /// [`session_fingerprint`](crate::capture::session_fingerprint). A
+    /// 2026-07-28 client has no session id to fingerprint — sessions are
+    /// gone — so it falls back to a fingerprint of the client identity, which
+    /// separates clients by software rather than by connection. `None` is
+    /// left for a request with neither, and those are filed under the gateway
+    /// process, which cannot separate clients at all.
     ///
-    /// A 2026-07-28 client has no session id to fingerprint — sessions are
-    /// gone — but it does say who it is on every request
-    /// (`_meta.io.modelcontextprotocol/clientInfo`, SEP-2575), and that is
-    /// the identity attribution falls back to. It separates clients by
-    /// software rather than by connection, so two instances of the same
-    /// client share a row; that is the most the revision offers, and it beats
-    /// filing every stateless request under the gateway process.
+    /// The client half is that same identity spelled out instead of
+    /// fingerprinted, which is what makes the log answer "which harness made
+    /// this call" rather than only "were these two calls the same caller".
+    /// Storing it as it stands is safe where storing a session id is not: a
+    /// name and a version are what a client publishes about itself.
     ///
-    /// `None` is left for a client that neither holds a session nor names
-    /// itself: those requests are attributed to the gateway process instead,
-    /// which is the pre-N13 behaviour and cannot separate clients.
-    fn session_of(context: &RequestContext<RoleServer>) -> Option<String> {
-        let session = context
-            .extensions
-            .get::<http::request::Parts>()
-            .and_then(|parts| parts.headers.get("mcp-session-id")?.to_str().ok())
+    /// Where the identity is read from depends on the revision, and the two
+    /// places are not interchangeable. A 2026-07-28 client repeats it in
+    /// every request's `_meta` (`io.modelcontextprotocol/clientInfo`,
+    /// SEP-2575); a client on a revision that still handshakes sends it once,
+    /// at `initialize`, and it lives on the peer from then on.
+    ///
+    /// The peer is asked only when there is a handshake behind it. rmcp
+    /// synthesizes a peer for a stateless request — an `Implementation`
+    /// naming the SDK, built so `protocol_version()` has something to read —
+    /// and reading the caller off that would file every unattributed request
+    /// under `rmcp`, which is a worse answer than none. `RequestContext`'s
+    /// own `client_info` does exactly that, which is why this does not use
+    /// it. A transport session, or a face with no HTTP request under it at
+    /// all (stdio), is what says the peer is a real one.
+    ///
+    /// Naming yourself is a SHOULD, so a client that declines stays
+    /// unattributed. Nothing here guesses.
+    fn attribution(context: &RequestContext<RoleServer>) -> Attribution {
+        // rmcp's Streamable HTTP service injects the HTTP
+        // [`http::request::Parts`] into every request's extensions, which is
+        // where the `Mcp-Session-Id` its session manager minted at
+        // `initialize` is legible from a handler.
+        let http = context.extensions.get::<http::request::Parts>();
+        let session_id = http.and_then(|parts| parts.headers.get("mcp-session-id")?.to_str().ok());
+        let handshaked = session_id.is_some() || http.is_none();
+        let named = context.meta.client_info().or_else(|| {
+            handshaked
+                .then(|| context.peer.peer_info())
+                .flatten()
+                .map(|info| info.client_info.clone())
+        });
+        let client = named.map(|client| {
+            // Version included: an upgrade is a different client as far as
+            // "which of these is misbehaving" is concerned. A client that
+            // sends an empty version gets its bare name rather than a
+            // trailing slash, which would read as a version nobody has.
+            if client.version.is_empty() {
+                client.name
+            } else {
+                format!("{}/{}", client.name, client.version)
+            }
+        });
+        let session = session_id
             .map(ToOwned::to_owned)
-            .or_else(|| {
-                let client = context.client_info()?;
-                // Version included: an upgrade is a different client as far
-                // as "which of these is misbehaving" is concerned.
-                Some(format!("{}/{}", client.name, client.version))
-            })?;
-        Some(crate::capture::session_fingerprint(&session))
+            .or_else(|| client.clone())
+            .map(|id| crate::capture::session_fingerprint(&id));
+        Attribution { session, client }
     }
 
     /// Writes one record, if capture is on. Deliberately a blocking append
@@ -150,14 +196,16 @@ impl Gateway {
     /// file, which costs far less than the channel and flush machinery that
     /// moving it off-thread would need. Capture never fails a request.
     ///
-    /// `session` is the downstream session from [`Gateway::session_of`]; the
-    /// writer's per-process id stands in when there was none.
-    fn record(&self, session: Option<&str>, build: impl FnOnce(&str) -> CaptureRecord) {
+    /// `who` is [`Gateway::attribution`] for the request; the writer's
+    /// per-process id stands in when it found no session.
+    fn record(&self, who: &Attribution, build: impl FnOnce(&str) -> CaptureRecord) {
         let Some(writer) = &self.capture else { return };
-        let mut record = build(session.unwrap_or_else(|| writer.session()));
-        // Stamped centrally: the endpoint is a property of this gateway, not
-        // of any one request, so no call site can forget it.
+        let mut record = build(who.session.as_deref().unwrap_or_else(|| writer.session()));
+        // Stamped centrally: the endpoint is a property of this gateway and
+        // the caller a property of the request, neither of them of the family
+        // being recorded, so no call site can forget either.
         record.endpoint.clone_from(&self.endpoint);
+        record.client.clone_from(&who.client);
         if let Err(err) = writer.append(&record) {
             eprintln!("warning: could not write traffic capture: {err}");
         }
@@ -265,7 +313,7 @@ impl Gateway {
     /// `describe` renders the successful answer for the same record.
     async fn forward<T, F>(
         &self,
-        session: Option<&str>,
+        who: &Attribution,
         upstream: &str,
         kind: Kind,
         subject: Option<String>,
@@ -280,7 +328,7 @@ impl Gateway {
             .within_deadline(upstream, self.call_upstream(upstream, call))
             .await;
         let elapsed = started.elapsed();
-        self.record(session, |session| {
+        self.record(who, |session| {
             let mut record = CaptureRecord::new(session, upstream, kind, elapsed);
             if let Some(subject) = subject {
                 record = record.with_tool(subject);
@@ -587,7 +635,7 @@ impl ServerHandler for Gateway {
             // this answer never went upstream.
             return Ok(bridged(&context, ListToolsResult::default()));
         }
-        let session = Self::session_of(&context);
+        let who = Self::attribution(&context);
         let upstream = self.upstream.clone();
         // One record for the whole walk rather than one per page: the client
         // made a single `tools/list`, and N rows against it would have
@@ -595,7 +643,7 @@ impl ServerHandler for Gateway {
         // pages are the pipe's business, not the log's.
         let result = self
             .forward(
-                session.as_deref(),
+                &who,
                 &self.upstream,
                 Kind::List,
                 None,
@@ -611,7 +659,7 @@ impl ServerHandler for Gateway {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let session = Self::session_of(&context);
+        let who = Self::attribution(&context);
         let upstream = self.upstream.clone();
         // Captured before the request moves upstream.
         let tool = request.name.to_string();
@@ -637,7 +685,7 @@ impl ServerHandler for Gateway {
             .await;
         let elapsed = started.elapsed();
 
-        self.record(session.as_deref(), |session| {
+        self.record(&who, |session| {
             let mut record =
                 CaptureRecord::new(session, &upstream, Kind::Call, elapsed).with_tool(&tool);
             if let Some(args) = args.clone() {
@@ -664,7 +712,7 @@ impl ServerHandler for Gateway {
         // entries, and collapsing that into one answer would trade a bug
         // nobody has reported for a reply nobody can hold.
         self.forward(
-            Self::session_of(&context).as_deref(),
+            &Self::attribution(&context),
             &self.upstream,
             Kind::Resources,
             None,
@@ -681,7 +729,7 @@ impl ServerHandler for Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
         self.forward(
-            Self::session_of(&context).as_deref(),
+            &Self::attribution(&context),
             &self.upstream,
             Kind::ResourceTemplates,
             None,
@@ -703,7 +751,7 @@ impl ServerHandler for Gateway {
         // is the one that can ask a human, and a pipe must not swallow a
         // round it cannot complete.
         self.forward(
-            Self::session_of(&context).as_deref(),
+            &Self::attribution(&context),
             &self.upstream,
             Kind::ResourceRead,
             Some(uri),
@@ -726,7 +774,7 @@ impl ServerHandler for Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
         self.forward(
-            Self::session_of(&context).as_deref(),
+            &Self::attribution(&context),
             &self.upstream,
             Kind::Prompts,
             None,
@@ -744,7 +792,7 @@ impl ServerHandler for Gateway {
     ) -> Result<GetPromptResponse, ErrorData> {
         let name = request.name.clone();
         self.forward(
-            Self::session_of(&context).as_deref(),
+            &Self::attribution(&context),
             &self.upstream,
             Kind::PromptGet,
             Some(name),
@@ -768,7 +816,7 @@ impl ServerHandler for Gateway {
     ) -> Result<CompleteResult, ErrorData> {
         let argument = request.argument.name.clone();
         self.forward(
-            Self::session_of(&context).as_deref(),
+            &Self::attribution(&context),
             &self.upstream,
             Kind::Complete,
             Some(argument),

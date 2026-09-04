@@ -151,8 +151,8 @@ watching /Users/you/.local/share/mcpgw/traffic (Ctrl-C to stop)
   30s  ✗  [mcp] github__search_code         210ms  upstream "github" failed after 3 attempt(s)
 ```
 
-Filter with `--server` / `--tool` / `--endpoint` / `--session`, or take the
-lines with `--json` and pipe them into `jq`. Because it's a file, `watch` works
+Filter with `--server` / `--tool` / `--endpoint` / `--session` / `--client`,
+or take the lines with `--json` and pipe them into `jq`. Because it's a file, `watch` works
 on a gateway that was already running, and on yesterday's traffic.
 
 This is the gap the official MCP Inspector leaves: Inspector connects to a
