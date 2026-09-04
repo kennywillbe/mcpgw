@@ -103,6 +103,54 @@ fn configured_auth(server: &Server) -> Option<&ServerAuth> {
     }
 }
 
+/// What a server presents to its upstream, as far as the config says.
+///
+/// `status` reports on OAuth, and most http servers never do OAuth: one
+/// carrying an `Authorization` header, or a `headers_command` that mints one,
+/// is already authenticated and has nothing to log in to. Telling its owner
+/// to run `auth login` — which is what a single "no login yet" line for every
+/// http server amounted to — is advice that would break a working server.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Credential {
+    /// An `[auth]` table, a stored login, or both.
+    Oauth,
+    /// A `headers_command`, which mints its own header at connect time.
+    Command,
+    /// A literal `headers` entry in the config.
+    Header,
+    /// Nothing the config knows about, so a login is still the open question.
+    None,
+}
+
+impl Credential {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Oauth => "oauth",
+            Self::Command => "command",
+            Self::Header => "header",
+            Self::None => "none",
+        }
+    }
+}
+
+/// `logged_in` is whether a token file is on this machine, which counts as
+/// OAuth even where the config says nothing: it is a login that happened.
+fn credential(server: &Server, logged_in: bool) -> Credential {
+    if logged_in || configured_auth(server).is_some() {
+        return Credential::Oauth;
+    }
+    match &server.transport {
+        // A command wins over a literal header for the same reason the
+        // upstream merges it over one: it is the value that ends up on the
+        // wire.
+        Transport::Http {
+            headers_command, ..
+        } if !headers_command.is_empty() => Credential::Command,
+        Transport::Http { headers, .. } if !headers.is_empty() => Credential::Header,
+        _ => Credential::None,
+    }
+}
+
 fn run_login(args: &LoginArgs, color: bool) -> anyhow::Result<u8> {
     let path = super::canonical_config_path()?;
     let config = Config::load(&path).with_context(|| format!("cannot load {}", path.display()))?;
@@ -321,19 +369,28 @@ fn run_status(args: &StatusArgs, color: bool) -> anyhow::Result<u8> {
 
     let mut rows = Vec::new();
     for name in names {
-        let configured = config.servers.get(&name).and_then(configured_client_id);
+        let server = config.servers.get(&name);
+        let configured = server.and_then(configured_client_id);
         let tokens = Tokens::load(&state_dir, &name)?;
-        rows.push((name, configured.map(str::to_owned), tokens));
+        let credential = server.map_or(Credential::None, |server| {
+            credential(server, tokens.is_some())
+        });
+        rows.push((name, configured.map(str::to_owned), tokens, credential));
     }
 
     if args.json {
         let entries: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(name, configured, tokens)| match tokens {
-                None => serde_json::json!({ "server": name, "logged_in": false }),
+            .map(|(name, configured, tokens, credential)| match tokens {
+                None => serde_json::json!({
+                    "server": name,
+                    "logged_in": false,
+                    "credential": credential.label(),
+                }),
                 Some(tokens) => serde_json::json!({
                     "server": name,
                     "logged_in": true,
+                    "credential": credential.label(),
                     "state": tokens.state().label(),
                     "expires_at": tokens.expires_at(),
                     "renewable": tokens.renewable(),
@@ -352,20 +409,28 @@ fn run_status(args: &StatusArgs, color: bool) -> anyhow::Result<u8> {
     }
 
     if rows.is_empty() {
-        println!("no http servers in the config, so nothing to log in to");
+        println!("no server needs a login");
         return Ok(0);
     }
     // Padded by hand for the same reason every other table here is: ANSI
     // escapes skew `format!` widths.
     let width = rows
         .iter()
-        .map(|(name, _, _)| name.chars().count())
+        .map(|(name, _, _, _)| name.chars().count())
         .max()
         .unwrap_or(0);
-    for (name, configured, tokens) in &rows {
+    for (name, configured, tokens, credential) in &rows {
         let pad = " ".repeat(width - name.chars().count());
         let detail = match tokens {
-            None => format!("no login yet — run mcpgw auth login {name}"),
+            // Not a login prompt for a server that already holds a
+            // credential: it is a report of the one it holds.
+            None => match credential {
+                Credential::Command => crate::ui::dim("headers from command", color),
+                Credential::Header => crate::ui::dim("static header", color),
+                Credential::Oauth | Credential::None => {
+                    format!("no login yet — run mcpgw auth login {name}")
+                }
+            },
             Some(tokens) => {
                 let identity = tokens.identity(configured.as_deref()).to_string();
                 let issuer = tokens.issuer().unwrap_or("unnamed issuer");

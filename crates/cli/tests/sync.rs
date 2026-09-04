@@ -2000,7 +2000,12 @@ fn a_scoped_client_is_written_only_its_own_servers_at_a_tagged_endpoint() {
 
     let out = sb.ok(&["sync", "--client", "cursor", "--dry-run"]);
     assert!(out.contains("scoped by [clients]: cursor"), "{out}");
-    assert!(out.contains("+ github"), "{out}");
+    // The endpoint, not just the name: the tag is the thing the run is about
+    // and a name alone cannot be checked against anything.
+    assert!(
+        out.contains("+ github → http://127.0.0.1:8137/s/github?client=cursor"),
+        "{out}"
+    );
     assert!(!out.contains("+ linear"), "{out}");
 
     sb.ok(&["sync", "--client", "cursor"]);

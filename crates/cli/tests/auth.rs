@@ -215,6 +215,62 @@ fn status_says_which_servers_have_never_been_logged_into() {
     );
 }
 
+/// A server that authenticates with a header of its own has nothing to log
+/// in to, and telling its owner to run `auth login` would be advice that
+/// breaks a working server.
+#[test]
+fn status_reports_a_header_credential_instead_of_a_login_hint() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "version = 1\n\n[servers.context7]\ntype = \"http\"\n\
+         url = \"https://mcp.context7.com/mcp\"\n\
+         [servers.context7.headers]\nAuthorization = \"Bearer ctx7-abc\"\n",
+    )
+    .unwrap();
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("context7  static header"), "{text}");
+    assert!(!text.contains("auth login"), "{text}");
+    // Something was reported, so the empty-set line stays out of the way.
+    assert!(!text.contains("no server needs a login"), "{text}");
+    assert!(
+        !text.contains("ctx7-abc"),
+        "a header reached a report: {text}"
+    );
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status", "--json"])
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["servers"][0]["credential"], "header");
+}
+
+/// The other end of the same question: nothing to report is said out loud.
+#[test]
+fn status_says_when_no_server_needs_a_login() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "version = 1\n\n[servers.local]\ntype = \"stdio\"\ncommand = \"echo\"\n",
+    )
+    .unwrap();
+
+    let out = mcpgw(home.path())
+        .args(["auth", "status"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("no server needs a login"), "{text}");
+}
+
 /// Two answers to one header is a config mistake, and it is named where it is
 /// made rather than at the next connect.
 #[test]

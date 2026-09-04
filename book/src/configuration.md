@@ -469,8 +469,10 @@ commit.
 `mcpgw eject` restores these files along with the per-user ones, without a
 flag: what mcpgw wrote is in its record, wherever it is.
 
-`mcpgw doctor` run from inside the repo adds a **project configs** section
-listing each file, what it holds, and where each entry stands:
+`mcpgw doctor` always prints a **project configs** section. Run from inside
+the repo it lists each file, what it holds, and where each entry stands; run
+from anywhere else it says `none found from <directory>`, so an empty answer
+is legible as one rather than as a check that never ran:
 
 ```text
 project configs

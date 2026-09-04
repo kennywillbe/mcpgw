@@ -94,10 +94,17 @@ loopback one.
 
 ```console
 $ mcpgw auth status
-  linear   valid (47m left)  https://auth.linear.app  client id metadata document
-  notion   expired  https://api.notion.com  dynamic client registration — run mcpgw auth login notion
-  sentry   no login yet — run mcpgw auth login sentry
+  linear     valid (47m left)  https://auth.linear.app  client id metadata document
+  notion     expired  https://api.notion.com  dynamic client registration — run mcpgw auth login notion
+  sentry     no login yet — run mcpgw auth login sentry
+  context7   static header
 ```
+
+A server that authenticates with a `headers` entry of its own reads as
+`static header`, and one with a `headers_command` as `headers from command`:
+they already carry a credential, so there is nothing to log in to and no
+login hint. With no http server to say anything about, the whole listing is
+one line — `no server needs a login`.
 
 Three states, and only one of them is a problem:
 
@@ -107,8 +114,9 @@ Three states, and only one of them is a problem:
 | `expired, renews itself` | it has, and a refresh token is stored — the next call renews it with no browser |
 | `expired` | it has, and there is nothing to renew it with |
 
-`--json` gives the same rows as objects, with `expires_at`, `issuer`,
-`client_id`, `identity` and `scopes`.
+`--json` gives the same rows as objects, each with a `credential` of
+`oauth`, `header`, `command` or `none`, and a logged-in one also with
+`expires_at`, `issuer`, `client_id`, `identity` and `scopes`.
 
 ## `mcpgw auth logout`
 
