@@ -6,7 +6,7 @@ every client at it: each client talks to mcpgw, and mcpgw talks to the servers.
 ```text
   Claude Code  ─┐                        ┌─ github    (stdio)
   Cursor       ─┼─→  mcpgw serve  ─────→ ├─ linear    (http)
-  VS Code      ─┤    :8137/mcp           └─ postgres  (stdio)
+  VS Code      ─┤    :8137/s/<server>    └─ postgres  (stdio)
   Claude Desktop┘    (mcpgw connect)
 ```
 
@@ -30,8 +30,8 @@ originals back if you want out.
 mcpgw serve
 ```
 
-Every enabled server, behind `http://127.0.0.1:8137/mcp`. Ctrl-C shuts it down
-and reaps the child processes.
+Every enabled server, each behind its own endpoint on
+`http://127.0.0.1:8137`. Ctrl-C shuts it down and reaps the child processes.
 
 ```sh
 mcpgw serve --port 9000
@@ -57,30 +57,36 @@ A gateway under a service manager refuses the same address outright — see
 [Running as a daemon](./daemon.md#binding-loopback-only). What loopback does
 and does not buy you is spelled out in the [Trust model](./trust-model.md).
 
-## Tool names
+## Endpoints
 
-Tools are exposed as `server__tool` — `github__create_issue`,
-`linear__list_issues`. Namespacing every tool up front means adding a server
-can never rename an existing one, which would otherwise silently break a prompt
-that referenced it.
-
-The exception: `--server` with exactly one name turns the gateway into a plain
-pipe to that server, tool names untouched.
-
-## Per-server endpoints
-
-Alongside `/mcp`, every served server gets its own endpoint, where its
-tools appear under their own names. No flag — serving one implies serving all
-of them:
+Every served server gets its own endpoint, where its tools appear under their
+own names. No flag, and no other shape — serving one implies serving all of
+them:
 
 ```sh
 mcpgw serve
-# http://127.0.0.1:8137/mcp      — everything, as server__tool
-# http://127.0.0.1:8137/s/github — github only, tools unprefixed
-# http://127.0.0.1:8137/s/linear — linear only, tools unprefixed
+# http://127.0.0.1:8137/s/github — github, tool names untouched
+# http://127.0.0.1:8137/s/linear — linear, tool names untouched
+# http://127.0.0.1:8137/mcp      — the gateway itself; no server, no tools
 ```
 
-A per-server endpoint is a plain pipe, so it forwards everything an MCP server
+One client, one server, one endpoint. Tool names are never rewritten, so
+adding a server cannot rename another server's tool, and a prompt that names
+one keeps working.
+
+### The base endpoint
+
+`/mcp` is the gateway's own address rather than a way through it. It answers
+who it is — `mcpgw`, and its version — and an empty tool list, and a
+`tools/call` against it comes back saying to point the client at
+`/s/<name>` instead. It is what `mcpgw doctor` and `mcpgw daemon status` ask
+whether a gateway is running, and what `--gateway-url` and `--url` name.
+
+Up to 0.4 it served every server's tools at once under `server__tool` names.
+It no longer does. An entry still pointing there is migrated to per-server
+entries by the next `mcpgw sync`.
+
+An endpoint is a plain pipe, so it forwards everything an MCP server
 can offer — tools, resources, resource templates, prompts and argument
 completion — with names, URIs and errors untouched. Answers are handed back as
 the server wrote them: caching metadata, `_meta`, and pagination cursors all
@@ -135,13 +141,6 @@ promising them would leave a client waiting forever), `logging`, and the tasks
 extension. Everything else is forwarded as-is, including capabilities newer
 than this version of mcpgw.
 
-`/mcp` serves tools only, and that is deliberate. Tools can be namespaced
-(`github__create_issue`); resource URIs and prompt names cannot. Two servers
-can both offer `file:///README.md` — one name, two different documents — and
-rewriting the URIs would break every link inside the contents that points at
-them. So `/mcp` merges what it can merge honestly, and `/s/<name>` is where the
-rest lives — which is why it is `/s/<name>` that clients are pointed at.
-
 One caveat: an endpoint reports its server's capabilities as of the last time
 it reached that server. A client connecting to a freshly started gateway,
 before anything has talked to the server yet, is told "tools" — the
@@ -154,8 +153,8 @@ what a client shows the user; before first contact, and on `/mcp`, it is
 `mcpgw`.
 
 The endpoints share one process and one set of upstream connections, so a
-client can take the whole gateway, a single server, or both at once without
-starting anything twice. A stdio-only client reaches one the same way:
+client can take one server or several without starting anything twice. A
+stdio-only client reaches one the same way:
 
 ```sh
 mcpgw connect --server github
@@ -252,9 +251,10 @@ same way and with a diff kept small enough to review. See
 
 Up to 0.3.x there was a second one — `sync --aggregate`, a single `mcpgw` entry
 per client pointing at `/mcp`, with every tool namespaced `server__tool`. The
-flag is gone. A config that still holds that entry is migrated by the next
-plain `mcpgw sync`: the entry was mcpgw's own, so it is removed and the
-per-server entries arrive in its place, in one run and without a flag.
+flag went in 0.4 and the endpoint stopped serving those tools in 0.5. A config
+that still holds that entry is migrated by the next plain `mcpgw sync`: the
+entry was mcpgw's own, so it is removed and the per-server entries arrive in
+its place, in one run and without a flag.
 
 ### Checking the path clients take
 
@@ -327,9 +327,9 @@ open, and says so on stderr — which is where the client's MCP log is:
 mcpgw connect: no gateway at http://127.0.0.1:8137/s/github; serving one for this session (install a service with `mcpgw daemon install` to keep it running)
 ```
 
-That gateway is the same one `mcpgw serve` raises — every enabled server, the
-aggregate on `/mcp`, a face per server, the config watched for edits — and it
-goes away when the client quits, taking your stdio servers with it. It is the
+That gateway is the same one `mcpgw serve` raises — every enabled server, a
+face per server, the config watched for edits — and it goes away when the
+client quits, taking your stdio servers with it. It is the
 fallback, not the arrangement: `mcpgw daemon install` gives you one gateway
 that every client shares and that survives the client restarting.
 

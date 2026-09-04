@@ -1,13 +1,13 @@
-//! Config hot reload against a running gateway: the endpoint table, the
-//! aggregate list and the upstream children all follow the config file, and
-//! nothing already in flight is disturbed while they do.
+//! Config hot reload against a running gateway: the endpoint table and the
+//! upstream children both follow the config file, and nothing already in
+//! flight is disturbed while they do.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
-use mcpgw_core::gateway::{Gateway, ServerList, serve_http_with};
+use mcpgw_core::gateway::serve_http_with;
 use mcpgw_core::reload::Reloader;
 use mcpgw_core::upstream::{UpstreamManager, UpstreamStatus};
 use rmcp_client_http::ServiceExt as _;
@@ -67,20 +67,12 @@ impl Harness {
                 .with_backoff_base(Duration::from_millis(20)),
         );
         let endpoints = Endpoints::new(EndpointTable::new(Vec::new()));
-        let aggregate = ServerList::new(Vec::new());
-        let reloader = Reloader::new(path.clone(), Arc::clone(&manager), endpoints.clone())
-            .with_aggregate(aggregate.clone());
+        let reloader = Reloader::new(path.clone(), Arc::clone(&manager), endpoints.clone());
         reloader.reload().await.unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let gateway = Gateway::aggregate_shared(Arc::clone(&manager), aggregate);
-        tokio::spawn(serve_http_with(
-            gateway,
-            Some(endpoints),
-            listener,
-            std::future::pending(),
-        ));
+        tokio::spawn(serve_http_with(endpoints, listener, std::future::pending()));
         Self {
             addr,
             path,
@@ -167,17 +159,16 @@ async fn a_server_added_to_the_config_is_served_without_a_restart() {
         .await;
     assert_eq!(serving, ["fx1", "fx2"]);
 
+    // The endpoint route is registered once, for the whole process: a server
+    // that was not in the config when it was built answering on it is what
+    // proves the swap reaches the running router rather than a fresh one.
     assert_eq!(
         gateway.tools(&endpoint_path("fx2")).await,
         ["echo", "reverse"]
     );
-    // The aggregate is the same running `/mcp` service it was before the
-    // reload, so this is the half that proves the swap reaches an existing
-    // route rather than only a freshly built one.
-    assert_eq!(
-        gateway.tools("/mcp").await,
-        ["fx1__echo", "fx1__reverse", "fx2__echo", "fx2__reverse"]
-    );
+    // The base endpoint is not part of any of this and says so before and
+    // after: it fronts no server, so a reload cannot change what it serves.
+    assert!(gateway.tools("/mcp").await.is_empty());
     gateway.manager.shutdown().await;
 }
 
@@ -197,7 +188,6 @@ async fn a_server_removed_from_the_config_404s_and_names_what_is_left() {
     // usual cause, and the answer to it is the names actually served now.
     assert!(response.contains("known endpoints: /s/fx1"), "{response}");
     assert!(!response.contains("/s/fx2"), "{response}");
-    assert_eq!(gateway.tools("/mcp").await, ["fx1__echo", "fx1__reverse"]);
     gateway.manager.shutdown().await;
 }
 
@@ -215,7 +205,6 @@ async fn a_disabled_server_drops_out() {
             .await
             .contains("404")
     );
-    assert_eq!(gateway.tools("/mcp").await, ["fx1__echo", "fx1__reverse"]);
     // Still configured, just not served: the manager knows the name and
     // refuses it, rather than reporting it as unknown.
     assert_eq!(
@@ -284,7 +273,6 @@ async fn a_config_that_does_not_parse_keeps_the_old_table_serving() {
         gateway.tools(&endpoint_path("fx1")).await,
         ["echo", "reverse"]
     );
-    assert_eq!(gateway.tools("/mcp").await, ["fx1__echo", "fx1__reverse"]);
 
     // And the gateway is not wedged: fixing the file still reloads.
     let serving = gateway

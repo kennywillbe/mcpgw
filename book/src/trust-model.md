@@ -98,8 +98,8 @@ it.
 
 Binding to loopback is not protection against a browser. Under DNS rebinding
 a hostile page's own domain resolves to `127.0.0.1`, which makes its requests
-same-origin and lets it `POST /mcp` with no CORS preflight — a web page
-driving your MCP servers.
+same-origin and lets it `POST /s/<server>` with no CORS preflight — a web
+page driving your MCP servers.
 
 So the gateway rejects any request whose `Origin` header is not a loopback
 page (`http(s)://localhost`, `127.0.0.1` or `[::1]`, with any port) with

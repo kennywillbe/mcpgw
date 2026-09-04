@@ -1,29 +1,31 @@
 //! The gateway's downstream face: an rmcp server that forwards MCP requests
-//! to upstreams managed by [`UpstreamManager`]. Two shapes: a pure pipe to a
-//! single upstream (names untouched, every request family forwarded) and the
-//! aggregate mode that merges the tools of N upstreams under `server__tool`
-//! names.
+//! to upstreams managed by [`UpstreamManager`]. One shape only — a pure pipe
+//! to a single upstream, names untouched, every request family forwarded —
+//! raised once per server and served at `/s/<name>`.
+//!
+//! [`Base`] is the other service here and forwards nothing. It is what
+//! answers on `/mcp`, so that probing the gateway and asking it who it is
+//! have somewhere to land.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult,
-    ErrorData, GetPromptRequestMethod, GetPromptRequestParams, GetPromptResponse, Implementation,
+    ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestMethod, ReadResourceRequestParams,
-    ReadResourceResponse, ResultType, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ResultType, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 
 use crate::capture::{CaptureRecord, CaptureWriter, Kind};
 use crate::upstream::UpstreamManager;
 
-/// Separator between server and tool name in aggregate mode. Server names
-/// may not contain it (see `config::validate_name`), so the server half of
-/// a prefixed name is always unambiguous.
+/// Reserved inside server names (see `config::validate_name`) and the join
+/// `mcpgw watch` renders a captured call under. Nothing on the wire is
+/// spelled with it: no face of this gateway prefixes a tool name.
 pub const SEPARATOR: &str = "__";
 
 /// Ceiling on one downstream request, covering both acquiring the upstream
@@ -36,45 +38,9 @@ pub const SEPARATOR: &str = "__";
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
-enum Mode {
-    /// Single upstream, names passed through verbatim.
-    Pipe(String),
-    /// N upstreams, every tool exposed as `server__tool`.
-    Aggregate(ServerList),
-}
-
-/// The set of servers an aggregate gateway fronts, shared and atomically
-/// replaceable.
-///
-/// Shared rather than owned because the `/mcp` service is built once, from a
-/// factory that clones one `Gateway` per session: a reload that rebuilt the
-/// list by value would only reach sessions opened afterwards. Cloning this
-/// handle shares the cell, so a swap is visible to every session at its next
-/// request — and to none of them mid-request, since each read is one load.
-#[derive(Clone)]
-pub struct ServerList(Arc<arc_swap::ArcSwap<Vec<String>>>);
-
-impl ServerList {
-    #[must_use]
-    pub fn new(names: Vec<String>) -> Self {
-        Self(Arc::new(arc_swap::ArcSwap::from_pointee(names)))
-    }
-
-    /// Publishes `names` in place of the current list.
-    pub fn store(&self, names: Vec<String>) {
-        self.0.store(Arc::new(names));
-    }
-
-    #[must_use]
-    pub fn load(&self) -> Arc<Vec<String>> {
-        self.0.load_full()
-    }
-}
-
-#[derive(Clone)]
 pub struct Gateway {
     manager: Arc<UpstreamManager>,
-    mode: Mode,
+    upstream: String,
     unavailable_hint: Option<String>,
     capture: Option<Arc<CaptureWriter>>,
     endpoint: Option<String>,
@@ -88,29 +54,7 @@ impl Gateway {
     pub fn new(manager: Arc<UpstreamManager>, upstream: String) -> Self {
         Self {
             manager,
-            mode: Mode::Pipe(upstream),
-            unavailable_hint: None,
-            capture: None,
-            endpoint: None,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
-        }
-    }
-
-    /// Aggregates `upstreams` under `server__tool` names. Prefixing happens
-    /// even for a single upstream so tool names stay stable as servers are
-    /// added later.
-    #[must_use]
-    pub fn aggregate(manager: Arc<UpstreamManager>, upstreams: Vec<String>) -> Self {
-        Self::aggregate_shared(manager, ServerList::new(upstreams))
-    }
-
-    /// Aggregates whatever `upstreams` holds at each request, so a config
-    /// reload can change the set under a running `/mcp` service.
-    #[must_use]
-    pub fn aggregate_shared(manager: Arc<UpstreamManager>, upstreams: ServerList) -> Self {
-        Self {
-            manager,
-            mode: Mode::Aggregate(upstreams),
+            upstream,
             unavailable_hint: None,
             capture: None,
             endpoint: None,
@@ -137,9 +81,9 @@ impl Gateway {
         self
     }
 
-    /// Names the face this gateway serves — `s/github`, `mcp` — so every
-    /// record it writes says which endpoint the request arrived on. Left
-    /// unset for the stdio face, which has no path to name.
+    /// Names the face this gateway serves — `s/github` — so every record it
+    /// writes says which endpoint the request arrived on. Left unset for the
+    /// stdio face, which has no path to name.
     #[must_use]
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
@@ -271,25 +215,9 @@ impl Gateway {
         })
     }
 
-    /// The single upstream a request belongs to, or `None` in aggregate mode.
-    ///
-    /// Only a pipe can answer the resource, prompt and completion families,
-    /// and that is a decision rather than a gap: those families are addressed
-    /// by opaque strings with no namespace to prefix the way `server__tool`
-    /// does. Two servers can both serve `file:///README.md` — one name, two
-    /// different documents — and rewriting the URIs would break every link
-    /// inside the contents that refer to them. So the aggregate keeps merging
-    /// tools only, and `/s/<name>` is where a client goes for the rest.
-    fn pipe_upstream(&self) -> Option<&str> {
-        match &self.mode {
-            Mode::Pipe(upstream) => Some(upstream),
-            Mode::Aggregate(_) => None,
-        }
-    }
-
     /// What this face advertises at `initialize`.
     ///
-    /// A pipe reports the upstream's own capabilities (narrowed by
+    /// This face reports the upstream's own capabilities (narrowed by
     /// [`forwarded`]), because it forwards every family and guessing costs
     /// either way: claim too much and a client asks a tools-only server for
     /// resources, claim too little and a server's prompts stay invisible.
@@ -304,11 +232,8 @@ impl Gateway {
     /// reconnects, which is the same cost as a client that connected before
     /// the upstream had started.
     fn capabilities(&self) -> ServerCapabilities {
-        let Some(upstream) = self.pipe_upstream() else {
-            return tools_only();
-        };
         self.manager
-            .last_server_info(upstream)
+            .last_server_info(&self.upstream)
             .map_or_else(tools_only, |info| forwarded(&info.capabilities))
     }
 
@@ -320,11 +245,10 @@ impl Gateway {
     /// about which server they are looking at. The source is the same
     /// snapshot [`Gateway::capabilities`] uses, and for the same reason —
     /// this runs inside the handshake, so it may not go and ask. Before
-    /// first contact, and for the aggregate, the honest answer is that this
-    /// is mcpgw.
+    /// first contact the honest answer is that this is mcpgw.
     fn identity(&self) -> Implementation {
-        self.pipe_upstream()
-            .and_then(|upstream| self.manager.last_server_info(upstream))
+        self.manager
+            .last_server_info(&self.upstream)
             .and_then(|info| info.server_info.clone())
             .unwrap_or_else(|| Implementation::new("mcpgw", env!("CARGO_PKG_VERSION")))
     }
@@ -364,107 +288,10 @@ impl Gateway {
         });
         result
     }
-
-    /// Lists every upstream's tools in parallel and merges them under their
-    /// `server__` prefixes. An upstream that cannot answer is reported on
-    /// the gateway console and omitted: degraded, but never silent and never
-    /// fatal for the healthy upstreams.
-    async fn aggregate_tools(
-        &self,
-        session: Option<&str>,
-        upstreams: &[String],
-    ) -> ListToolsResult {
-        let mut tasks = tokio::task::JoinSet::new();
-        for name in upstreams {
-            let manager = Arc::clone(&self.manager);
-            let name = name.clone();
-            // Per upstream rather than over the whole merge: one hung server
-            // must not decide how long the healthy ones get.
-            let deadline = self.request_timeout;
-            tasks.spawn(async move {
-                let started = Instant::now();
-                let work = async {
-                    manager
-                        .call(
-                            &name,
-                            |service| async move { service.list_all_tools().await },
-                        )
-                        .await
-                        .map_err(|err| err.to_string())
-                };
-                let tools = match tokio::time::timeout(deadline, work).await {
-                    Ok(tools) => tools,
-                    Err(_) => Err(timed_out(&name, deadline)),
-                };
-                (name, started.elapsed(), tools)
-            });
-        }
-
-        // Collected by name so the merged list is ordered by server
-        // regardless of which upstream answers first.
-        let mut by_server: BTreeMap<String, Vec<Tool>> = BTreeMap::new();
-        while let Some(joined) = tasks.join_next().await {
-            let (name, elapsed, tools) = match joined {
-                Ok(result) => result,
-                Err(err) => {
-                    eprintln!("warning: listing tools panicked: {err}");
-                    continue;
-                }
-            };
-            // Every upstream attempt is recorded, failures included — a
-            // degraded merge is exactly what `watch` needs to show.
-            self.record(session, |session| {
-                let record = CaptureRecord::new(session, &name, Kind::List, elapsed);
-                match &tools {
-                    Ok(tools) => record.with_response(format!("{} tool(s)", tools.len())),
-                    Err(err) => record.with_error(err),
-                }
-            });
-            match tools {
-                Ok(tools) => {
-                    by_server.insert(name, tools);
-                }
-                Err(err) => eprintln!(
-                    "warning: upstream {name:?} failed ({err}); its tools are omitted from tools/list"
-                ),
-            }
-        }
-
-        let tools = by_server
-            .into_iter()
-            .flat_map(|(server, tools)| {
-                tools.into_iter().map(move |mut tool| {
-                    tool.name = format!("{server}{SEPARATOR}{}", tool.name).into();
-                    tool
-                })
-            })
-            .collect();
-        ListToolsResult {
-            tools,
-            ..ListToolsResult::default()
-        }
-    }
-}
-
-/// Splits a prefixed tool name into `(server, tool)` by longest known server
-/// prefix. Matching requires the separator right after the server name, so
-/// servers whose names are prefixes of one another stay distinguishable and
-/// `__` inside tool names remains legal.
-#[must_use]
-pub fn resolve<'a>(name: &'a str, servers: &'a [String]) -> Option<(&'a str, &'a str)> {
-    servers
-        .iter()
-        .filter_map(|server| {
-            let tool = name
-                .strip_prefix(server.as_str())?
-                .strip_prefix(SEPARATOR)?;
-            Some((server.as_str(), tool))
-        })
-        .max_by_key(|(server, _)| server.len())
 }
 
 /// The conservative answer for a face that cannot know better yet: tools are
-/// the one family both gateway shapes always serve.
+/// the one family every face of this gateway serves.
 fn tools_only() -> ServerCapabilities {
     ServerCapabilities::builder().enable_tools().build()
 }
@@ -647,62 +474,34 @@ impl ServerHandler for Gateway {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let session = Self::session_of(&context);
-        let result = match &self.mode {
-            // One request, one answer, handed back exactly as the upstream
-            // wrote it. The pipe used to collect every page with
-            // `list_all_tools` and rebuild the result around the tools it
-            // found, which threw away everything else the upstream had put
-            // there — the SEP-2549 caching fields (`ttlMs`, `cacheScope`)
-            // among them, which a strict client rejects the answer for — and
-            // left the client with no cursor to page with either.
-            Mode::Pipe(upstream) => {
-                self.forward(
-                    session.as_deref(),
-                    upstream,
-                    Kind::List,
-                    None,
-                    |service| async move { service.list_tools(request).await },
-                    |result| format!("{} tool(s)", result.tools.len()),
-                )
-                .await
-            }
-            Mode::Aggregate(upstreams) => Ok(self
-                .aggregate_tools(session.as_deref(), &upstreams.load())
-                .await),
-        };
+        // One request, one answer, handed back exactly as the upstream wrote
+        // it. The pipe used to collect every page with `list_all_tools` and
+        // rebuild the result around the tools it found, which threw away
+        // everything else the upstream had put there — the SEP-2549 caching
+        // fields (`ttlMs`, `cacheScope`) among them, which a strict client
+        // rejects the answer for — and left the client with no cursor to page
+        // with either.
+        let result = self
+            .forward(
+                session.as_deref(),
+                &self.upstream,
+                Kind::List,
+                None,
+                |service| async move { service.list_tools(request).await },
+                |result| format!("{} tool(s)", result.tools.len()),
+            )
+            .await;
         Ok(bridged(&context, result?))
     }
 
     async fn call_tool(
         &self,
-        mut request: CallToolRequestParams,
+        request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let session = Self::session_of(&context);
-        let upstream = match &self.mode {
-            Mode::Pipe(upstream) => upstream.clone(),
-            Mode::Aggregate(upstreams) => {
-                // One load for the whole request: the name is resolved
-                // against exactly the list the error message would name.
-                let upstreams = upstreams.load();
-                let Some((server, tool)) = resolve(&request.name, &upstreams) else {
-                    return Err(ErrorData::invalid_params(
-                        format!(
-                            "tool {:?} does not name a known server (expected \
-                             <server>{SEPARATOR}<tool> with server one of: {})",
-                            request.name,
-                            upstreams.join(", ")
-                        ),
-                        None,
-                    ));
-                };
-                let (server, tool) = (server.to_owned(), tool.to_owned());
-                request.name = tool.into();
-                server
-            }
-        };
-        // Captured before the request moves upstream; `request.name` is the
-        // bare tool name by now, which is what a per-server view wants.
+        let upstream = self.upstream.clone();
+        // Captured before the request moves upstream.
         let tool = request.name.to_string();
         let args = request.arguments.clone().map(|args| {
             crate::capture::body(&serde_json::Value::Object(args.into_iter().collect()))
@@ -745,15 +544,12 @@ impl ServerHandler for Gateway {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let Some(upstream) = self.pipe_upstream() else {
-            return Ok(bridged(&context, ListResourcesResult::default()));
-        };
-        // Pagination is forwarded rather than collapsed the way tools/list
-        // does it: the cursor a pipe hands back came from the one upstream
-        // that will be asked for the next page, so it stays meaningful.
+        // Pagination is forwarded rather than collapsed: the cursor a pipe
+        // hands back came from the one upstream that will be asked for the
+        // next page, so it stays meaningful.
         self.forward(
             Self::session_of(&context).as_deref(),
-            upstream,
+            &self.upstream,
             Kind::Resources,
             None,
             |service| async move { service.list_resources(request).await },
@@ -768,12 +564,9 @@ impl ServerHandler for Gateway {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        let Some(upstream) = self.pipe_upstream() else {
-            return Ok(bridged(&context, ListResourceTemplatesResult::default()));
-        };
         self.forward(
             Self::session_of(&context).as_deref(),
-            upstream,
+            &self.upstream,
             Kind::ResourceTemplates,
             None,
             |service| async move { service.list_resource_templates(request).await },
@@ -788,11 +581,6 @@ impl ServerHandler for Gateway {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        let Some(upstream) = self.pipe_upstream() else {
-            // The aggregate serves no resources, so the honest answer is the
-            // one rmcp's default handler gives: the method is not here.
-            return Err(ErrorData::method_not_found::<ReadResourceRequestMethod>());
-        };
         let uri = request.uri.clone();
         // The `_once` form forwards an `input_required` answer downstream
         // instead of trying to satisfy it here: the client on the other side
@@ -800,7 +588,7 @@ impl ServerHandler for Gateway {
         // round it cannot complete.
         self.forward(
             Self::session_of(&context).as_deref(),
-            upstream,
+            &self.upstream,
             Kind::ResourceRead,
             Some(uri),
             |service| async move { service.read_resource_once(request).await },
@@ -821,12 +609,9 @@ impl ServerHandler for Gateway {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let Some(upstream) = self.pipe_upstream() else {
-            return Ok(bridged(&context, ListPromptsResult::default()));
-        };
         self.forward(
             Self::session_of(&context).as_deref(),
-            upstream,
+            &self.upstream,
             Kind::Prompts,
             None,
             |service| async move { service.list_prompts(request).await },
@@ -841,13 +626,10 @@ impl ServerHandler for Gateway {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        let Some(upstream) = self.pipe_upstream() else {
-            return Err(ErrorData::method_not_found::<GetPromptRequestMethod>());
-        };
         let name = request.name.clone();
         self.forward(
             Self::session_of(&context).as_deref(),
-            upstream,
+            &self.upstream,
             Kind::PromptGet,
             Some(name),
             |service| async move { service.get_prompt_once(request).await },
@@ -868,15 +650,10 @@ impl ServerHandler for Gateway {
         request: CompleteRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CompleteResult, ErrorData> {
-        let Some(upstream) = self.pipe_upstream() else {
-            // An empty completion, which is what rmcp's default answers and
-            // what the spec expects of a server with nothing to suggest.
-            return Ok(bridged(&context, CompleteResult::default()));
-        };
         let argument = request.argument.name.clone();
         self.forward(
             Self::session_of(&context).as_deref(),
-            upstream,
+            &self.upstream,
             Kind::Complete,
             Some(argument),
             |service| async move { service.complete(request).await },
@@ -910,31 +687,87 @@ fn preview(response: &CallToolResponse) -> String {
     }
 }
 
-/// Serves the gateway over Streamable HTTP at `/mcp` on `listener` until
-/// `shutdown` resolves. Used by both `mcpgw serve` and the test suite.
+/// The gateway's own endpoint, served at `/mcp`. It fronts no server and
+/// forwards nothing.
+///
+/// Something has to be there: `doctor` and `daemon status` ask the port
+/// whether a gateway is answering, and a client that dials the base can ask
+/// it who it is. What it must not be is a second way to reach the servers —
+/// one client, one server, one endpoint, and that endpoint is `/s/<name>`.
+#[derive(Clone)]
+pub struct Base;
+
+/// What the base answers a `tools/call` with. It names the fix rather than
+/// the rule: whoever sent it has a client config pointing one path too high,
+/// and where to point it instead is the whole of the help there is.
+pub const NO_TOOLS_HERE: &str =
+    "the gateway serves each server at /s/<name>; point the client at one";
+
+impl ServerHandler for Base {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::default();
+        // Tools declared and none served. The alternative — declaring
+        // nothing — leaves a client with no reason to ask, and then no way
+        // to find out that this endpoint holds nothing for it.
+        info.capabilities = tools_only();
+        info.server_info = Implementation::new("mcpgw", env!("CARGO_PKG_VERSION"));
+        info
+    }
+
+    // Answered without awaiting anything: this face reaches no upstream, so
+    // both replies are ready the moment the request arrives.
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
+        // Bridged like any other list: a 2026-07-28 client rejects a result
+        // with no `resultType` and no caching fields, empty or not.
+        std::future::ready(Ok(bridged(&context, ListToolsResult::default())))
+    }
+
+    fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> + Send + '_ {
+        // -32601 is JSON-RPC's own code and means the same thing in both
+        // revisions this gateway speaks.
+        std::future::ready(Err(ErrorData::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            NO_TOOLS_HERE,
+            None,
+        )))
+    }
+}
+
+/// Serves one server — `gateway`, at `/s/<name>` — next to the base
+/// endpoint, on `listener` until `shutdown` resolves. The one-server shape of
+/// [`serve_http_with`].
 ///
 /// # Errors
 ///
 /// Returns the underlying I/O error when the HTTP server fails.
 pub async fn serve_http(
+    name: String,
     gateway: Gateway,
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    serve_http_with(gateway, None, listener, shutdown).await
+    let table = crate::endpoints::EndpointTable::new([(name, gateway)]);
+    serve_http_with(crate::endpoints::Endpoints::new(table), listener, shutdown).await
 }
 
-/// Serves the gateway at `/mcp` and, when `endpoints` is given, one
-/// per-server face under `/s/<name>` for each of them. Both share the
-/// listener, the origin guard and — because every gateway is built over the
-/// same [`UpstreamManager`] — the upstream connections.
+/// Serves [`Base`] at `/mcp` and one per-server face under `/s/<name>` for
+/// each of `endpoints`. They share the listener, the origin guard and —
+/// because every gateway is built over the same [`UpstreamManager`] — the
+/// upstream connections.
 ///
 /// # Errors
 ///
 /// Returns the underlying I/O error when the HTTP server fails.
 pub async fn serve_http_with(
-    gateway: Gateway,
-    endpoints: Option<crate::endpoints::Endpoints>,
+    endpoints: crate::endpoints::Endpoints,
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
@@ -943,11 +776,8 @@ pub async fn serve_http_with(
         StreamableHttpServerConfig, StreamableHttpService,
     };
 
-    // The aggregate learns its own name here for the same reason the endpoint
-    // table stamps its pipes: this function owns the `/mcp` route.
-    let gateway = gateway.with_endpoint(crate::endpoints::AGGREGATE_LABEL);
     let service = StreamableHttpService::new(
-        move || Ok(gateway.clone()),
+        || Ok(Base),
         // Kept for the clients that still have sessions. 2026-07-28 removed
         // them (SEP-2567) and rmcp serves every request on that revision
         // statelessly whatever this manager says, so it allocates nothing for
@@ -962,12 +792,11 @@ pub async fn serve_http_with(
         // has to re-derive it.
         StreamableHttpServerConfig::default(),
     );
-    let mut router = axum::Router::new().nest_service("/mcp", service);
-    if let Some(endpoints) = endpoints {
-        router = router.merge(crate::endpoints::router(endpoints));
-    }
     // Layered over the merged router, so the guard covers every face.
-    let router = router.layer(axum::middleware::from_fn(guard_origin));
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .merge(crate::endpoints::router(endpoints))
+        .layer(axum::middleware::from_fn(guard_origin));
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
         .await

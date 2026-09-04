@@ -99,7 +99,7 @@ async fn http_server_reports_identity_and_tools() {
         enabled: true,
         tags: Vec::new(),
         transport: Transport::Http {
-            url: format!("http://{addr}/mcp"),
+            url: format!("http://{addr}/s/fx"),
             headers_command: Vec::new(),
             headers: BTreeMap::new(),
         },
@@ -152,7 +152,12 @@ async fn fixture_gateway() -> (std::net::SocketAddr, Arc<UpstreamManager>) {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_http(gateway, listener, std::future::pending()));
+    tokio::spawn(serve_http(
+        "fx".to_owned(),
+        gateway,
+        listener,
+        std::future::pending(),
+    ));
     (addr, manager)
 }
 

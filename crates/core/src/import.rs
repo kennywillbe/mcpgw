@@ -333,8 +333,8 @@ pub fn slugify(name: &str) -> String {
             pending_dash = true;
         }
     }
-    // `__` is reserved for the gateway's server__tool split, so a client
-    // name carrying it must not slugify into a still-invalid name.
+    // `__` is reserved in server names, so a client name carrying it must
+    // not slugify into a still-invalid name.
     while out.contains("__") {
         out = out.replace("__", "_");
     }

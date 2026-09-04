@@ -1,8 +1,8 @@
 //! Per-server HTTP endpoints: one Streamable HTTP service per server, served
 //! at `/s/<name>`, every one of them a [`Gateway`] pipe over the same shared
 //! [`UpstreamManager`](crate::upstream::UpstreamManager). A client dialing an
-//! endpoint sees that server's tools under their own names, with no aggregate
-//! prefix to strip.
+//! endpoint sees that server's tools under their own names — this is the only
+//! way to reach a server through the gateway.
 //!
 //! Why a table plus a hand-written dispatch handler instead of one service
 //! that reads the path: rmcp builds the handler through a factory closure
@@ -37,10 +37,9 @@ pub fn endpoint_path(name: &str) -> String {
     format!("{PREFIX}/{name}")
 }
 
-/// How the aggregate face names itself in capture records.
-pub const AGGREGATE_LABEL: &str = "mcp";
-
-/// Where `mcpgw serve` listens with its own defaults. It lives here rather
+/// Where `mcpgw serve` listens with its own defaults, base endpoint and all:
+/// it is the URL `doctor` and `daemon status` probe, and the one a legacy
+/// client entry `sync` has yet to migrate still names. It lives here rather
 /// than beside the CLI's bridge because the entries `sync` writes and the
 /// checks `doctor` runs over those entries have to agree on one spelling.
 pub const DEFAULT_URL: &str = "http://127.0.0.1:8137/mcp";
@@ -95,7 +94,7 @@ impl EndpointTable {
                 let service = StreamableHttpService::new(
                     move || Ok(gateway.clone()),
                     // One per endpoint, and it stays for the same reason the
-                    // `/mcp` one does: 2026-07-28 dropped sessions (SEP-2567)
+                    // base one does: 2026-07-28 dropped sessions (SEP-2567)
                     // and rmcp routes those requests statelessly regardless,
                     // so nothing is allocated for a current client — but a
                     // 2025-11-25 client still opens a session at `initialize`
@@ -105,7 +104,7 @@ impl EndpointTable {
                     // when a list is configured, `Origin`. Its default leaves
                     // the origin list empty, so it never double-rejects what
                     // `guard_origin` already screens; the `Host` half is
-                    // complementary and stays on. This mirrors the `/mcp`
+                    // complementary and stays on. This mirrors the base
                     // service exactly — one config for both faces.
                     StreamableHttpServerConfig::default(),
                 );

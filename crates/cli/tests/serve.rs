@@ -79,7 +79,7 @@ async fn try_tool_names(url: &str) -> anyhow::Result<Vec<String>> {
 }
 
 /// The G1 promise: no flag, and every served server already has its own
-/// endpoint beside the aggregate.
+/// endpoint — which is the only place its tools are.
 #[tokio::test]
 async fn a_bare_serve_answers_on_the_per_server_endpoints() {
     let dir = tempfile::tempdir().unwrap();
@@ -88,15 +88,15 @@ async fn a_bare_serve_answers_on_the_per_server_endpoints() {
     assert!(endpoints.contains("/s/fx1"), "{endpoints}");
     assert!(endpoints.contains("/s/fx2"), "{endpoints}");
 
-    // Unprefixed on the endpoint, namespaced on the aggregate: two faces of
-    // the same running gateway.
     assert_eq!(
         tool_names(&format!("http://{addr}/s/fx1")).await,
         ["echo", "reverse"]
     );
-    assert_eq!(
-        tool_names(&format!("http://{addr}/mcp")).await,
-        ["fx1__echo", "fx1__reverse", "fx2__echo", "fx2__reverse"]
+    // The base endpoint answers, and serves nothing: it is the gateway's own
+    // address, not a way through it.
+    assert!(
+        tool_names(&format!("http://{addr}/mcp")).await.is_empty(),
+        "the base endpoint served tools"
     );
 
     child.kill().await.unwrap();
@@ -127,11 +127,6 @@ async fn a_server_added_to_the_config_is_served_without_a_restart() {
         tool_names(&format!("http://{addr}/s/fx1")).await,
         ["echo", "reverse"]
     );
-    assert_eq!(
-        tool_names(&format!("http://{addr}/mcp")).await,
-        ["fx1__echo", "fx1__reverse", "fx2__echo", "fx2__reverse"]
-    );
-
     child.kill().await.unwrap();
 }
 

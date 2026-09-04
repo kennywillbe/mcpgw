@@ -9,8 +9,8 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 mod util;
 use util::{daemon, fixture_config, free_port, stderr, stdout};
 
-/// A gateway serving one healthy fixture server, with the URL of its
-/// aggregate endpoint read off the banner.
+/// A gateway serving one healthy fixture server, with the URL of its base
+/// endpoint read off the banner.
 async fn serve(home: &Path) -> (tokio::process::Child, String) {
     std::fs::write(home.join("config.toml"), fixture_config(&["fx1"])).unwrap();
     let (child, addr, _endpoints) = util::serve(home, &[]).await;

@@ -20,9 +20,8 @@
 //! # The invariant
 //!
 //! A reload never mutates a live connection in place. It publishes new
-//! handles — a new [`EndpointTable`], a new server map, a new aggregate list
-//! — and lets the old ones be reaped by refcount once the requests holding
-//! them finish. See [`UpstreamManager::apply`] and the endpoint dispatch in
+//! handles — a new [`EndpointTable`] and a new server map — and lets the old
+//! ones be reaped by refcount once the requests holding them finish. See [`UpstreamManager::apply`] and the endpoint dispatch in
 //! [`crate::endpoints`] for the two halves of that.
 
 use std::path::{Path, PathBuf};
@@ -32,7 +31,7 @@ use std::time::{Duration, SystemTime};
 use crate::capture::CaptureWriter;
 use crate::config::Config;
 use crate::endpoints::{EndpointTable, Endpoints};
-use crate::gateway::{Gateway, ServerList};
+use crate::gateway::Gateway;
 use crate::upstream::{Changes, UpstreamManager};
 
 /// How often the canonical config is stat-ed for changes.
@@ -71,7 +70,6 @@ pub struct Reloader {
     path: PathBuf,
     manager: Arc<UpstreamManager>,
     endpoints: Endpoints,
-    aggregate: Option<ServerList>,
     selection: Option<Vec<String>>,
     capture: Option<Arc<CaptureWriter>>,
     /// What the file looked like when it was last read. Owned by the
@@ -91,20 +89,10 @@ impl Reloader {
             path,
             manager,
             endpoints,
-            aggregate: None,
             selection: None,
             capture: None,
             seen: std::sync::Mutex::new(None),
         }
-    }
-
-    /// Also keeps the `/mcp` aggregate's server list in step. Left unset for
-    /// a gateway serving a single upstream as a pipe, whose one server is
-    /// fixed by the command line.
-    #[must_use]
-    pub fn with_aggregate(mut self, servers: ServerList) -> Self {
-        self.aggregate = Some(servers);
-        self
     }
 
     /// Restricts serving to `names` (`serve --server`), whatever else the
@@ -166,9 +154,6 @@ impl Reloader {
         // Atomic: requests that already picked a service keep running against
         // it, and the next dispatch sees the new table.
         self.endpoints.store(table);
-        if let Some(aggregate) = &self.aggregate {
-            aggregate.store(serving.clone());
-        }
         Reloaded { changes, serving }
     }
 
