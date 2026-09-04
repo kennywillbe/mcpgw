@@ -81,14 +81,63 @@ pub struct ToolRules {
     /// `allow` can be trimmed without listing every name that should stay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    /// What the gateway does when this server's tool definitions stop
+    /// matching the ones it pinned.
+    #[serde(default, skip_serializing_if = "Drift::is_default")]
+    pub drift: Drift,
+}
+
+/// What a server's drifted tool definitions cost it.
+///
+/// There is no `"deny"`: a gateway that refuses calls on a description
+/// change is a gateway people turn off, and servers do legitimately version
+/// their tools. See [`crate::pins`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Drift {
+    /// Pin on first sight, report every later disagreement, keep serving.
+    #[default]
+    Warn,
+    /// Do not pin and do not compare. Nothing is written and nothing is
+    /// reported for this server.
+    Off,
+}
+
+impl Drift {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Drift::Warn => "warn",
+            Drift::Off => "off",
+        }
+    }
+
+    #[must_use]
+    pub fn is_watched(self) -> bool {
+        matches!(self, Drift::Warn)
+    }
+
+    // By reference because that is the shape `skip_serializing_if` calls
+    // with; `as_str`/`is_watched` are the by-value ones callers reach for.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Drift::default()
+    }
+}
+
+impl std::fmt::Display for Drift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl ToolRules {
-    /// Whether the table says nothing at all — no table and a table with two
-    /// empty lists mean the same thing, and both mean "unchanged".
+    /// Whether the table says nothing at all — no table, and a table whose
+    /// lists are empty and whose `drift` is the default, mean the same thing:
+    /// "unchanged".
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.allow.is_empty() && self.deny.is_empty()
+        self.allow.is_empty() && self.deny.is_empty() && self.drift.is_default()
     }
 
     /// Whether `tool` survives: `allow` first (deny-by-default once it has
@@ -194,6 +243,15 @@ impl Server {
     #[must_use]
     pub fn allows_tool(&self, tool: &str) -> bool {
         self.tools.as_ref().is_none_or(|rules| rules.allows(tool))
+    }
+
+    /// What this server's tool definitions are watched for. Warn, until an
+    /// entry says otherwise.
+    #[must_use]
+    pub fn drift(&self) -> Drift {
+        self.tools
+            .as_ref()
+            .map_or(Drift::default(), |rules| rules.drift)
     }
 }
 
@@ -415,13 +473,27 @@ pub fn validate_name(name: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::ToolRules;
+    use super::{Drift, ToolRules};
 
     fn rules(allow: &[&str], deny: &[&str]) -> ToolRules {
         ToolRules {
             allow: allow.iter().map(|s| (*s).to_owned()).collect(),
             deny: deny.iter().map(|s| (*s).to_owned()).collect(),
+            ..ToolRules::default()
         }
+    }
+
+    #[test]
+    fn drift_defaults_to_warn_and_a_table_that_only_turns_it_off_is_not_empty() {
+        assert_eq!(ToolRules::default().drift, Drift::Warn);
+        let watched = ToolRules {
+            drift: Drift::Off,
+            ..ToolRules::default()
+        };
+        assert!(!watched.is_empty());
+        // Still an allow-everything table: turning drift off says nothing
+        // about which tools reach a client.
+        assert!(watched.allows("anything"));
     }
 
     #[test]

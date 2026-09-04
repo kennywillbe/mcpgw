@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use mcpgw_core::capture::{CaptureRecord, Kind};
 
-use super::{Filters, MASK, WatchArgs, age};
+use super::{Filters, MASK, WatchArgs, age, sizes};
 
 /// How many records the state keeps.
 ///
@@ -49,11 +49,35 @@ impl Entry {
         match (self.record.kind, self.record.tool.as_deref()) {
             // A refused call is filed under the tool it named, so the TUI
             // groups it with the calls that did get through.
-            (Kind::Call | Kind::Denied, Some(tool)) => tool,
+            // A drift line is filed under its tool like a call is: the
+            // whole point is seeing the change next to the traffic that came
+            // after it.
+            (Kind::Call | Kind::Denied | Kind::Drift, Some(tool)) => tool,
             (Kind::Call | Kind::Denied, None) => "?",
             (kind, _) => kind.method(),
         }
     }
+
+    /// How the row is marked: a drift line is neither a success nor a
+    /// failure, and marking it with either hides the one line on the screen
+    /// that is not about a request at all.
+    fn outcome(&self) -> Outcome {
+        match (self.record.kind, self.record.ok) {
+            (Kind::Drift, _) => Outcome::Drift,
+            (_, true) => Outcome::Ok,
+            (_, false) => Outcome::Failed,
+        }
+    }
+}
+
+/// What the mark in front of a log row says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Ok,
+    Failed,
+    /// A tool definition stopped matching its pin — see
+    /// [`mcpgw_core::pins`].
+    Drift,
 }
 
 /// The outcome half of the filter cycle. `ok` and `error` are the two words
@@ -319,7 +343,7 @@ pub(super) struct LogRow {
     pub(super) kind: &'static str,
     pub(super) client: String,
     pub(super) duration: String,
-    pub(super) ok: bool,
+    pub(super) outcome: Outcome,
 }
 
 /// The detail pane: label/value pairs, already masked.
@@ -494,7 +518,7 @@ impl State {
                 // the same on screen, and both are the absence of an answer.
                 client: entry.client().unwrap_or("—").to_owned(),
                 duration: format!("{}ms", entry.record.duration_ms),
-                ok: entry.record.ok,
+                outcome: entry.outcome(),
             })
             .collect()
     }
@@ -520,12 +544,21 @@ impl State {
             // bodies underneath it, which are the reason it was opened.
             (
                 "outcome",
-                format!(
-                    "{} · {}ms · captured {}",
-                    if record.ok { "ok" } else { "error" },
-                    record.duration_ms,
-                    record.bodies
-                ),
+                match (entry.outcome(), record.change) {
+                    // A drift row has no duration worth showing and no body
+                    // to have captured: what it has is the change, and the
+                    // sizes either side of it. Never the description — the
+                    // record does not carry one, deliberately.
+                    (Outcome::Drift, Some(change)) => {
+                        format!("definition {change}{}", sizes(record))
+                    }
+                    _ => format!(
+                        "{} · {}ms · captured {}",
+                        if record.ok { "ok" } else { "error" },
+                        record.duration_ms,
+                        record.bodies
+                    ),
+                },
             ),
         ];
         // Not masked, and deliberately: `--json` does not mask it either.
@@ -716,6 +749,47 @@ mod tests {
         state.push_line(&line(extra));
     }
 
+    /// One drift line, as the gateway writes it.
+    fn drift_line() -> String {
+        format!(
+            r#"{{"ts":{NOW},"session":"s3ss","server":"github","tool":"create_issue",
+             "kind":"drift","duration_ms":0,"ok":true,"change":"changed",
+             "desc_len_before":21,"desc_len_after":384}}"#
+        )
+        .replace('\n', "")
+    }
+
+    #[test]
+    fn a_drift_line_gets_its_own_outcome_and_sits_with_the_tool_it_is_about() {
+        let mut state = fresh();
+        push(&mut state, "");
+        state.push_line(&drift_line());
+        let log = state.log(NOW);
+        assert_eq!(log[0].outcome, Outcome::Ok);
+        assert_eq!(log[1].outcome, Outcome::Drift);
+        // Filed under the tool, not under the method, so the change and the
+        // calls that follow it share a row in the table.
+        assert_eq!(log[1].target, "create_issue");
+        assert_eq!(log[1].kind, "tools/list");
+
+        state.selected = 1;
+        let detail = state.detail(NOW).unwrap();
+        let outcome = detail
+            .fields
+            .iter()
+            .find(|(label, _)| *label == "outcome")
+            .unwrap();
+        assert_eq!(outcome.1, "definition changed, 21 → 384 bytes");
+        // Nothing in the pane can carry the rewritten text, because the
+        // record does not carry it.
+        assert!(
+            detail
+                .fields
+                .iter()
+                .all(|(_, value)| !value.contains("bytes captured"))
+        );
+    }
+
     #[test]
     fn percentiles_are_observed_latencies() {
         assert_eq!(percentile(&[], 50), 0);
@@ -848,10 +922,10 @@ mod tests {
         push(&mut state, r#","ok":false,"error":"refused""#);
         state.filter.set(Field::Status, "error");
         assert_eq!(state.counts().0, 1);
-        assert!(!state.log(NOW)[0].ok);
+        assert_eq!(state.log(NOW)[0].outcome, Outcome::Failed);
         state.filter.set(Field::Status, "ok");
         assert_eq!(state.counts().0, 1);
-        assert!(state.log(NOW)[0].ok);
+        assert_eq!(state.log(NOW)[0].outcome, Outcome::Ok);
         // A word the vocabulary does not have takes the filter off rather
         // than silently matching nothing.
         state.filter.set(Field::Status, "maybe");

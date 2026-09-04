@@ -223,6 +223,7 @@ fn tool_rules_are_written_as_a_table_and_keep_the_comments_around_them() {
             &ToolRules {
                 allow: vec!["search_repositories".to_owned()],
                 deny: vec!["delete_*".to_owned()],
+                ..ToolRules::default()
             },
         )
         .unwrap();
@@ -254,7 +255,7 @@ fn clearing_the_rules_removes_the_table() {
             "github",
             &ToolRules {
                 allow: vec!["echo".to_owned()],
-                deny: Vec::new(),
+                ..ToolRules::default()
             },
         )
         .unwrap();
@@ -286,7 +287,7 @@ fn overwriting_an_entry_keeps_its_tool_rules() {
             "github",
             &ToolRules {
                 allow: vec!["search_repositories".to_owned()],
-                deny: Vec::new(),
+                ..ToolRules::default()
             },
         )
         .unwrap();

@@ -72,6 +72,7 @@ pub struct Reloader {
     endpoints: Endpoints,
     selection: Option<Vec<String>>,
     capture: Option<Arc<CaptureWriter>>,
+    pins: Option<Arc<crate::pins::PinStore>>,
     /// What the file looked like when it was last read. Owned by the
     /// [`Reloader`] rather than by [`Reloader::watch`] so that the load
     /// `serve` does before the watcher is even spawned already counts as
@@ -91,6 +92,7 @@ impl Reloader {
             endpoints,
             selection: None,
             capture: None,
+            pins: None,
             seen: std::sync::Mutex::new(None),
         }
     }
@@ -113,6 +115,14 @@ impl Reloader {
         self
     }
 
+    /// Watches every served server's tool definitions against `pins`, the
+    /// way the initial table does.
+    #[must_use]
+    pub fn with_pins(mut self, pins: Arc<crate::pins::PinStore>) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
     /// The servers `config` says to serve, honouring the selection.
     fn select(&self, config: &Config) -> Vec<String> {
         let enabled = |name: &str| config.servers.get(name).is_some_and(|s| s.enabled);
@@ -128,11 +138,14 @@ impl Reloader {
     }
 
     fn pipe(&self, name: &str) -> Gateway {
-        let pipe = Gateway::new(Arc::clone(&self.manager), name.to_owned());
-        match &self.capture {
-            Some(writer) => pipe.with_capture(Arc::clone(writer)),
-            None => pipe,
+        let mut pipe = Gateway::new(Arc::clone(&self.manager), name.to_owned());
+        if let Some(writer) = &self.capture {
+            pipe = pipe.with_capture(Arc::clone(writer));
         }
+        if let Some(pins) = &self.pins {
+            pipe = pipe.with_pins(Arc::clone(pins));
+        }
+        pipe
     }
 
     /// Makes `config` the live one.

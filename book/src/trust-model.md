@@ -57,6 +57,35 @@ Every refusal is written to the traffic log under kind `denied`, so
 `mcpgw watch` shows what a client tried to reach and did not get. See
 [`[servers.NAME.tools]`](./configuration.md#serversnametools).
 
+**Tool definitions.** A server's tool descriptions and input schemas are
+prompt material — the model reads them and obeys them — and a server can
+rewrite them at any time, on a machine where you reviewed it weeks ago and
+changed nothing since. Nothing about that shows up in a version number, and
+for a remote URL there is not even one to pin.
+
+So the gateway remembers. The first time an endpoint lists a server it hashes
+each tool's `name`, `description` and `inputSchema` (plus `outputSchema` and
+`annotations` when present) into `<state>/pins/<name>.json`, and every later
+list is compared against it. A description that changed, a tool that vanished
+and a tool that appeared are each reported: a `drift` record in the traffic
+log, a marked line in `mcpgw watch`, a `mcpgw doctor` warning.
+
+It warns and does not block, deliberately — servers do version their tools,
+and a gateway that refuses calls over a description change is one people turn
+off. So this is detection, not prevention: it tells you the definitions moved
+while you can still act on it, in the same stream as the calls that follow.
+It says nothing about whether the *new* definition is malicious, and a server
+that was hostile the first time you listed it is pinned as hostile.
+
+Note that the records carry the description's length and never its text. The
+rewritten string is the attack, and the traffic log is a file people `cat`
+and paste — and that `mcpgw watch` reads back onto a screen next to an agent.
+
+```sh
+mcpgw tools github pin --show   # what was pinned, and what has moved since
+mcpgw tools github pin          # accept what it serves now
+```
+
 **One log.** Every call now passes a single capture point, and by default it
 is written down. That is the feature — it is why `mcpgw watch` can show you
 what your agent did — and it is also a file that did not exist before. See
@@ -193,6 +222,8 @@ because a helper that fails has to be fixable. mcpgw runs it with no shell.
   server credentials.
 - `[servers.NAME.tools]` narrows what any of them can call on a server. It
   shrinks the blast radius; it does not authenticate anybody.
+- Tool definitions are pinned on first sight and a change is reported, not
+  refused. It makes a rug pull visible; it does not stop one.
 - One process now holds all of them, and one log now records every call.
 - The log redacts what looks like a credential; that is a filter, not a
   proof. `--capture-bodies off` and `--no-capture` are the stronger answers.

@@ -851,3 +851,72 @@ fn a_tool_rule_is_not_checked_without_probe() {
     assert!(!text.contains("matches no tool"), "{text}");
     assert!(out.status.success(), "{text}");
 }
+
+/// The drift pass reads the pin file the gateway wrote and needs no `--probe`
+/// and no server: the comparison already happened, on a list a client
+/// received.
+fn write_pins(home: &Path, drift: &str) {
+    let dir = home.join("state").join("pins");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("fx.json"),
+        format!(
+            r#"{{"version":1,"server":"fx","pinned_at":1756742400123,
+                 "tools":{{"echo":{{"hash":"abc","desc_len":12}}}},
+                 "drift":[{drift}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+const FX: &str = "version = 1\n[servers.fx]\ntype = \"stdio\"\ncommand = \"cargo\"\n";
+
+#[test]
+fn a_drifted_tool_definition_is_a_warning_naming_the_command_that_accepts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pins(
+        dir.path(),
+        r#"{"tool":"echo","change":"changed","at":1756742400123,
+            "desc_len_before":12,"desc_len_after":384}"#,
+    );
+    let out = run_doctor(dir.path(), Some(FX), &[]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("fx changed its tool definitions since they were pinned"),
+        "{text}"
+    );
+    assert!(text.contains("echo (changed, 12 → 384 bytes)"), "{text}");
+    assert!(text.contains("run mcpgw tools fx pin to accept"), "{text}");
+    // A warning, never an error: the gateway is still serving, and a red
+    // doctor over a server that versioned its tools is a check people
+    // switch off.
+    assert!(text.contains("0 errors, 1 warnings"), "{text}");
+    assert!(out.status.success(), "{text}");
+}
+
+#[test]
+fn a_pinned_server_that_has_not_moved_says_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pins(dir.path(), "");
+    let out = run_doctor(dir.path(), Some(FX), &[]);
+    let text = stdout(&out);
+    assert!(!text.contains("tool definitions"), "{text}");
+    assert!(text.contains("0 errors, 0 warnings"), "{text}");
+}
+
+/// A server whose watching was turned off keeps whatever pin file it had;
+/// the config is what decides whether anyone is told about it.
+#[test]
+fn drift_off_silences_the_finding() {
+    let dir = tempfile::tempdir().unwrap();
+    write_pins(
+        dir.path(),
+        r#"{"tool":"echo","change":"changed","at":1756742400123,
+            "desc_len_before":12,"desc_len_after":384}"#,
+    );
+    let config = format!("{FX}\n[servers.fx.tools]\ndrift = \"off\"\n");
+    let out = run_doctor(dir.path(), Some(&config), &[]);
+    let text = stdout(&out);
+    assert!(!text.contains("tool definitions"), "{text}");
+    assert!(text.contains("0 errors, 0 warnings"), "{text}");
+}

@@ -175,6 +175,42 @@ pub fn unmatched_tool_rules(name: &str, server: &Server, tools: &[String]) -> Ve
         .collect()
 }
 
+/// The one finding for a server whose tool definitions have moved since they
+/// were pinned, or `None` for one whose have not.
+///
+/// A warning, not an error, and one line for the whole server rather than
+/// one per tool: the gateway is still serving, the tools still work, and
+/// there is a single decision to make about all of them — accept the new
+/// definitions or go and look at the server. The message names the command
+/// that makes it.
+///
+/// Tool names and lengths, never descriptions: the text is what a poisoned
+/// tool carries, and `doctor` is read by people and pasted into issues.
+#[must_use]
+pub fn tool_drift(name: &str, events: &[crate::pins::DriftEvent]) -> Option<Finding> {
+    if events.is_empty() {
+        return None;
+    }
+    let moved: Vec<String> = events
+        .iter()
+        .map(crate::pins::DriftEvent::summary)
+        .collect();
+    Some(Finding {
+        client: None,
+        server: Some(name.to_owned()),
+        severity: Severity::Warning,
+        message: format!(
+            "{name} changed its tool definitions since they were pinned: {} — \
+             review them, then run mcpgw tools {name} pin to accept",
+            moved.join(", ")
+        ),
+        code: Some(TOOL_DRIFT),
+    })
+}
+
+/// The code on the finding for a server whose tool definitions drifted.
+pub const TOOL_DRIFT: &str = "tool_drift";
+
 /// Turns a lenient client read's problems into findings.
 ///
 /// Severity rule: if the named server still exists in the parsed map, the

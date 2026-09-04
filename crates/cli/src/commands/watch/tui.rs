@@ -22,7 +22,7 @@ use ratatui::widgets::{
     Block, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
 };
 
-use super::state::{Action, Detail, KEYS, Key, LogRow, State, TableRow};
+use super::state::{Action, Detail, KEYS, Key, LogRow, Outcome, State, TableRow};
 use super::{Follow, POLL, WatchArgs, clip};
 
 /// How much of the screen the per-server table gets before the log starts
@@ -323,17 +323,18 @@ fn log(frame: &mut Frame, area: Rect, state: &State, now_ms: u64) {
 }
 
 fn item(entry: &LogRow) -> ListItem<'static> {
-    let mark = if entry.ok { "✓" } else { "✗" };
+    // Its own mark and its own colour: a drift row is not a request that
+    // went well or badly, and either of the other two marks would file the
+    // one line on the screen that is about the server changing under you as
+    // ordinary traffic.
+    let (mark, style) = match entry.outcome {
+        Outcome::Ok => ("✓", Style::new().green()),
+        Outcome::Failed => ("✗", Style::new().red()),
+        Outcome::Drift => ("⚠", Style::new().yellow()),
+    };
     ListItem::new(Line::from(vec![
         Span::styled(format!("{:>5} ", entry.age), Style::new().dark_gray()),
-        Span::styled(
-            mark,
-            if entry.ok {
-                Style::new().green()
-            } else {
-                Style::new().red()
-            },
-        ),
+        Span::styled(mark, style),
         Span::raw(format!(
             " {:<16} {:<22} {:<20} {:<14} {:>8}",
             clip(&entry.server, 16),

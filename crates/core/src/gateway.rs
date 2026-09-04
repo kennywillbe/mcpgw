@@ -32,6 +32,7 @@ use rmcp::service::{
 };
 
 use crate::capture::{CaptureRecord, CaptureWriter, Kind};
+use crate::pins::{PinStore, ToolFingerprint};
 use crate::upstream::{ListChanged, UpstreamManager};
 
 /// Reserved inside server names (see `config::validate_name`) and the join
@@ -68,6 +69,7 @@ pub struct Gateway {
     upstream: String,
     unavailable_hint: Option<String>,
     capture: Option<Arc<CaptureWriter>>,
+    pins: Option<Arc<PinStore>>,
     endpoint: Option<String>,
     request_timeout: Duration,
 }
@@ -82,6 +84,7 @@ impl Gateway {
             upstream,
             unavailable_hint: None,
             capture: None,
+            pins: None,
             endpoint: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
@@ -103,6 +106,17 @@ impl Gateway {
     #[must_use]
     pub fn with_capture(mut self, writer: Arc<CaptureWriter>) -> Self {
         self.capture = Some(writer);
+        self
+    }
+
+    /// Compares every `tools/list` against the definitions pinned in
+    /// `pins`, and pins them the first time. Off by default, and independent
+    /// of capture: the pin file is what `doctor` and `mcpgw tools NAME pin
+    /// --show` read, and a gateway started with `--no-capture` still has to
+    /// notice a server rewriting its tools.
+    #[must_use]
+    pub fn with_pins(mut self, pins: Arc<PinStore>) -> Self {
+        self.pins = Some(pins);
         self
     }
 
@@ -284,6 +298,61 @@ impl Gateway {
         self.manager
             .server(&self.upstream)
             .is_none_or(|server| server.allows_tool(tool))
+    }
+
+    /// Compares the tools this list just carried against the pinned ones and
+    /// writes one [`Kind::Drift`] record per tool that moved.
+    ///
+    /// Warn-only by decision: the drifted tool stays in the list and stays
+    /// callable. Quarantining it would refuse calls on a server that had
+    /// merely versioned its tools, which is how `MCPProxy`'s equivalent came
+    /// to over-report — and a check people turn off reports nothing at all.
+    ///
+    /// Never for a *page*. Comparing a fraction of the list against the whole
+    /// pin would report every tool on the other pages as removed, so only a
+    /// whole list is compared. `merged_tools` walks the upstream's pages into
+    /// one and takes the cursor, and a client's own cursor is answered before
+    /// this is reached, so what arrives here is the whole list — the cursor
+    /// check is what keeps that true if the walk ever stops handing back one.
+    fn check_drift(&self, who: &Attribution, result: &ListToolsResult) {
+        let Some(pins) = &self.pins else { return };
+        if result.next_cursor.is_some() {
+            return;
+        }
+        // Read per request like the allow list, and for the same reason: an
+        // edit to the table has to take effect on the next list.
+        if !self
+            .manager
+            .server(&self.upstream)
+            .is_none_or(|server| server.drift().is_watched())
+        {
+            return;
+        }
+        // After the filter: a tool the table hides is not part of what this
+        // endpoint offers, so it is not part of what this endpoint pinned.
+        let tools: Vec<ToolFingerprint> = result.tools.iter().map(ToolFingerprint::of).collect();
+        let events = match pins.observe(&self.upstream, &tools) {
+            Ok(events) => events,
+            Err(err) => {
+                eprintln!(
+                    "warning: could not check tool definitions for {}: {err}",
+                    self.upstream
+                );
+                return;
+            }
+        };
+        for event in &events {
+            eprintln!(
+                "warning: tool definition drift on {}: {} — accept it with `mcpgw tools {} pin`",
+                self.upstream,
+                event.summary(),
+                self.upstream
+            );
+            self.record(who, |session| {
+                CaptureRecord::new(session, &self.upstream, Kind::Drift, Duration::ZERO)
+                    .with_drift(event)
+            });
+        }
     }
 
     /// The error a filtered-out tool is refused with, and the record that
@@ -882,6 +951,7 @@ impl ServerHandler for Gateway {
         // it: the filter is about what this client may see, not about how
         // the answer was assembled.
         result.tools.retain(|tool| self.allows(&tool.name));
+        self.check_drift(&who, &result);
         Ok(bridged(&context, result))
     }
 
