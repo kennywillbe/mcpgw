@@ -141,6 +141,18 @@ promising them would leave a client waiting forever), `logging`, and the tasks
 extension. Everything else is forwarded as-is, including capabilities newer
 than this version of mcpgw.
 
+`tools/list` is merged. A server is allowed to hand its tools back a page at a
+time and expect the client to follow `nextCursor`, and several widely used
+clients — Cursor and Codex among them — simply don't, so every tool past the
+first page silently disappears with no error to explain it. The gateway walks
+the pages itself and answers with all of them in one list, keeping the first
+page's caching fields and `_meta`, so clients that ignore `nextCursor` still
+see every tool. A client that does paginate and asks for a second page gets an
+empty list, which is the end of its loop. `resources/list`,
+`resources/templates/list` and `prompts/list` are still paged through
+unchanged: it's tools that clients lose, and a resource list can be far too
+long to collapse into one reply.
+
 One caveat: an endpoint reports its server's capabilities as of the last time
 it reached that server. A client connecting to a freshly started gateway,
 before anything has talked to the server yet, is told "tools" — the

@@ -3,6 +3,10 @@
 //! to a single upstream, names untouched, every request family forwarded —
 //! raised once per server and served at `/s/<name>`.
 //!
+//! The one thing the pipe does not pass through unchanged is `tools/list`
+//! pagination, which it merges into a single answer, because the clients
+//! that matter do not follow `nextCursor` and lose every tool past page one.
+//!
 //! [`Base`] is the other service here and forwards nothing. It is what
 //! answers on `/mcp`, so that probing the gateway and asking it who it is
 //! have somewhere to land.
@@ -13,7 +17,7 @@ use std::time::{Duration, Instant};
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CompleteRequestParams, CompleteResult,
-    ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation,
+    Cursor, ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     ResultType, ServerCapabilities, ServerInfo,
@@ -460,6 +464,103 @@ completes_when_complete!(
     GetPromptResponse => GetPromptResponse::Complete,
 );
 
+/// How far the pipe will walk a server's `tools/list` before it stops and
+/// answers with what it has: at most this many pages, carrying at most
+/// [`MAX_MERGED_TOOLS`] tools.
+///
+/// Both ceilings are far above any real server — the largest lists in the
+/// wild are a few hundred tools over a handful of pages — because they are
+/// not a policy about list size. They exist so that a server which is broken,
+/// or hostile, cannot hold one client request open for as long as it feels
+/// like handing out cursors.
+pub const MAX_TOOL_PAGES: usize = 64;
+
+/// The tool ceiling on a merged `tools/list`; see [`MAX_TOOL_PAGES`].
+pub const MAX_MERGED_TOOLS: usize = 10_000;
+
+/// Collects every page of the upstream's `tools/list` into one answer.
+///
+/// Pagination is a promise the client has to keep, and two of the three
+/// harnesses most people run do not keep it: Cursor and Codex both ignore
+/// `nextCursor` on `tools/list`, so a server with more tools than one page
+/// shows a truncated list with no error anywhere to say so. Cursor's own
+/// staff suggest the fix is a proxy that merges the pages, and a pipe already
+/// standing in the path is exactly that proxy.
+///
+/// The merged result *is* page one's, with the later pages' tools appended:
+/// its `ttlMs`, `cacheScope` and `_meta` are what the upstream said about
+/// this list, and rebuilding the result around the tools is what once dropped
+/// them (issue #62). What page two onwards say about caching is discarded —
+/// there is one answer now, and one thing it can claim.
+async fn merged_tools(
+    service: &crate::upstream::UpstreamService,
+    upstream: &str,
+    request: Option<PaginatedRequestParams>,
+) -> Result<ListToolsResult, rmcp::service::ServiceError> {
+    let mut merged = service.list_tools(request.clone()).await?;
+    // Taken, not read: the cursor is the pipe's to follow, and handing it
+    // back would offer the client a second page of tools it already has.
+    let mut cursor = merged.next_cursor.take();
+    let mut seen: std::collections::HashSet<Cursor> = std::collections::HashSet::new();
+    let mut pages = 1_usize;
+
+    while let Some(next) = cursor {
+        // A cursor that has already been handed out means the server is
+        // paging in a circle, which is an unbounded walk however high the
+        // page ceiling is.
+        if !seen.insert(next.clone()) {
+            eprintln!(
+                "{}",
+                stopped_merging(
+                    upstream,
+                    &format!("it handed back the cursor {next:?} twice")
+                )
+            );
+            break;
+        }
+        if pages >= MAX_TOOL_PAGES {
+            eprintln!(
+                "{}",
+                stopped_merging(
+                    upstream,
+                    &format!("its list runs past {MAX_TOOL_PAGES} pages")
+                )
+            );
+            break;
+        }
+        if merged.tools.len() >= MAX_MERGED_TOOLS {
+            eprintln!(
+                "{}",
+                stopped_merging(
+                    upstream,
+                    &format!("its list runs past {MAX_MERGED_TOOLS} tools")
+                )
+            );
+            break;
+        }
+        // The client's own params carry forward — only the cursor is the
+        // pipe's — so a request's `_meta` reaches every page of the walk.
+        let params = request.clone().unwrap_or_default().with_cursor(Some(next));
+        let mut page = service.list_tools(Some(params)).await?;
+        merged.tools.append(&mut page.tools);
+        cursor = page.next_cursor;
+        pages += 1;
+    }
+    Ok(merged)
+}
+
+/// The one wording for a `tools/list` walk that had to stop early. Names the
+/// server, because with several upstreams behind one gateway "which one is
+/// doing this" is the whole of what the operator can act on, and says the
+/// list is partial, because that is what the user will otherwise notice as a
+/// missing tool and blame on the client.
+fn stopped_merging(upstream: &str, reason: &str) -> String {
+    format!(
+        "warning: stopped merging tools/list for upstream {upstream:?} because {reason}; \
+         clients will see a partial tool list"
+    )
+}
+
 impl ServerHandler for Gateway {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
@@ -473,21 +574,32 @@ impl ServerHandler for Gateway {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        // A client that sends a cursor is one that *does* paginate, asking
+        // for the page after a list that has no page after it. An empty list
+        // ends its loop; the alternative the spec offers for a cursor a
+        // server does not recognise is an error, which would fail a
+        // `tools/list` for a client that did nothing wrong.
+        if request
+            .as_ref()
+            .is_some_and(|params| params.cursor.is_some())
+        {
+            // Nothing recorded: capture is a log of upstream traffic, and
+            // this answer never went upstream.
+            return Ok(bridged(&context, ListToolsResult::default()));
+        }
         let session = Self::session_of(&context);
-        // One request, one answer, handed back exactly as the upstream wrote
-        // it. The pipe used to collect every page with `list_all_tools` and
-        // rebuild the result around the tools it found, which threw away
-        // everything else the upstream had put there — the SEP-2549 caching
-        // fields (`ttlMs`, `cacheScope`) among them, which a strict client
-        // rejects the answer for — and left the client with no cursor to page
-        // with either.
+        let upstream = self.upstream.clone();
+        // One record for the whole walk rather than one per page: the client
+        // made a single `tools/list`, and N rows against it would have
+        // `mcpgw watch` reporting traffic nobody downstream generated. The
+        // pages are the pipe's business, not the log's.
         let result = self
             .forward(
                 session.as_deref(),
                 &self.upstream,
                 Kind::List,
                 None,
-                |service| async move { service.list_tools(request).await },
+                |service| async move { merged_tools(&service, &upstream, request).await },
                 |result| format!("{} tool(s)", result.tools.len()),
             )
             .await;
@@ -544,9 +656,13 @@ impl ServerHandler for Gateway {
         request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        // Pagination is forwarded rather than collapsed: the cursor a pipe
-        // hands back came from the one upstream that will be asked for the
-        // next page, so it stays meaningful.
+        // Still paged, unlike `tools/list`: the cursor a pipe hands back came
+        // from the one upstream that will be asked for the next page, so it
+        // stays meaningful, and nothing is lost by keeping it. Merging is a
+        // concession to clients that ignore `nextCursor`, and what they lose
+        // by ignoring it is tools — a resource list can run to thousands of
+        // entries, and collapsing that into one answer would trade a bug
+        // nobody has reported for a reply nobody can hold.
         self.forward(
             Self::session_of(&context).as_deref(),
             &self.upstream,
@@ -877,7 +993,18 @@ pub async fn serve_stdio(gateway: Gateway) -> Result<rmcp::service::QuitReason, 
 
 #[cfg(test)]
 mod tests {
-    use super::is_local_origin;
+    use super::{is_local_origin, stopped_merging};
+
+    /// The line is the only trace a capped walk leaves, and it is read by
+    /// someone wondering where their tools went.
+    #[test]
+    fn the_capped_walk_warning_names_the_server_and_the_consequence() {
+        let line = stopped_merging("github", "it handed back the cursor \"c\" twice");
+        assert!(line.contains("github"), "{line}");
+        assert!(line.contains("tools/list"), "{line}");
+        assert!(line.contains("cursor"), "{line}");
+        assert!(line.contains("partial tool list"), "{line}");
+    }
 
     #[test]
     fn loopback_origins_pass_in_every_spelling() {
