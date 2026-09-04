@@ -7,6 +7,11 @@
 //! pagination, which it merges into a single answer, because the clients
 //! that matter do not follow `nextCursor` and lose every tool past page one.
 //!
+//! Traffic also runs the other way: an upstream's `list_changed`
+//! notifications reach the sessions this file serves, over the session's own
+//! stream for a client that handshook and over `subscriptions/listen` for one
+//! on 2026-07-28. The upstream half of that is [`UpstreamManager::subscribe`].
+//!
 //! [`Base`] is the other service here and forwards nothing. It is what
 //! answers on `/mcp`, so that probing the gateway and asking it who it is
 //! have somewhere to land.
@@ -20,12 +25,14 @@ use rmcp::model::{
     Cursor, ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResponse, Implementation,
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     PaginatedRequestParams, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
-    ResultType, ServerCapabilities, ServerInfo,
+    ResultType, ServerCapabilities, ServerInfo, SubscriptionFilter,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{
+    NotificationContext, Peer, RequestContext, RoleServer, SubscriptionContext, SubscriptionSink,
+};
 
 use crate::capture::{CaptureRecord, CaptureWriter, Kind};
-use crate::upstream::UpstreamManager;
+use crate::upstream::{ListChanged, UpstreamManager};
 
 /// Reserved inside server names (see `config::validate_name`) and the join
 /// `mcpgw watch` renders a captured call under. Nothing on the wire is
@@ -357,13 +364,18 @@ fn tools_only() -> ServerCapabilities {
 /// missing the day it landed, and each future one would have too. A pipe that
 /// forwards the requests has no business hiding the advertisement.
 ///
+/// `listChanged` on tools, resources and prompts is *not* subtracted, and used
+/// to be: the pipe now carries those notifications in both directions the two
+/// revisions define — to a 2025-11-25 session's peer, and over
+/// `subscriptions/listen` for 2026-07-28 (issue #140) — so advertising what
+/// the upstream declared is a promise it keeps.
+///
 /// The subtractions, and why each is a promise this gateway would break:
 ///
-/// - `listChanged` on tools, resources and prompts, and `resources.subscribe`:
-///   both are notifications travelling upstream-to-downstream, and nothing in
-///   the pipe carries them. A client that believed them would wait for updates
-///   that never come, and stop polling. Lifted when subscription forwarding
-///   lands (`subscriptions/listen`, issue #140).
+/// - `resources.subscribe`: per-resource `notifications/resources/updated`
+///   needs the pipe to hold one subscription per URI against the upstream and
+///   fan it out, which it does not do. Only the list-changed half of the
+///   notification story crossed with #140.
 /// - `logging`: `logging/setLevel` is not forwarded and `notifications/message`
 ///   does not cross the pipe either. Deprecated in 2026-07-28 (SEP-2577), so
 ///   this one is not waiting on anything.
@@ -374,14 +386,7 @@ fn tools_only() -> ServerCapabilities {
 ///   being offered one.
 fn forwarded(upstream: &ServerCapabilities) -> ServerCapabilities {
     let mut capabilities = upstream.clone();
-    if let Some(tools) = capabilities.tools.as_mut() {
-        tools.list_changed = None;
-    }
-    if let Some(prompts) = capabilities.prompts.as_mut() {
-        prompts.list_changed = None;
-    }
     if let Some(resources) = capabilities.resources.as_mut() {
-        resources.list_changed = None;
         resources.subscribe = None;
     }
     capabilities.logging = None;
@@ -397,6 +402,116 @@ fn forwarded(upstream: &ServerCapabilities) -> ServerCapabilities {
 /// The tasks extension's key in `capabilities.extensions` (SEP-2663). Spelled
 /// out rather than taken from rmcp, which keeps its copy private.
 const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
+
+/// The list-changed families `capabilities` promises.
+///
+/// This is what a session is allowed to be sent, and it is read from what the
+/// session was *told* rather than from what the upstream says right now: a
+/// client acts on the capabilities it saw at `initialize`, and a notification
+/// for a family it was never offered is one it has no reason to expect.
+fn promised(capabilities: &ServerCapabilities) -> Vec<ListChanged> {
+    declared([
+        (
+            capabilities.tools.as_ref().and_then(|it| it.list_changed),
+            ListChanged::Tools,
+        ),
+        (
+            capabilities
+                .resources
+                .as_ref()
+                .and_then(|it| it.list_changed),
+            ListChanged::Resources,
+        ),
+        (
+            capabilities.prompts.as_ref().and_then(|it| it.list_changed),
+            ListChanged::Prompts,
+        ),
+    ])
+}
+
+/// The same, read off an accepted `subscriptions/listen` filter.
+fn subscribed(filter: &SubscriptionFilter) -> Vec<ListChanged> {
+    declared([
+        (filter.tools_list_changed, ListChanged::Tools),
+        (filter.resources_list_changed, ListChanged::Resources),
+        (filter.prompts_list_changed, ListChanged::Prompts),
+    ])
+}
+
+/// The families whose flag is an explicit yes. `None` and `Some(false)` are
+/// the same answer here: neither is a promise.
+fn declared(flags: [(Option<bool>, ListChanged); 3]) -> Vec<ListChanged> {
+    flags
+        .into_iter()
+        .filter(|(flag, _)| *flag == Some(true))
+        .map(|(_, what)| what)
+        .collect()
+}
+
+/// How often a session that has heard nothing is checked for still being
+/// there.
+///
+/// A relay task parks on the upstream's channel, and an upstream that never
+/// changes its lists never wakes it — so without this a session that ended
+/// quietly would leave its task parked for the life of the process. Long,
+/// because the cost of noticing late is one idle task and the cost of
+/// noticing often is a timer per session.
+const LIVENESS_POLL: Duration = Duration::from_secs(30);
+
+/// Forwards `changes` to a 2025-11-25 session's peer until the session ends.
+///
+/// This is the revision that has nowhere else to put a server-initiated
+/// notification: it rides the session's standalone stream, which is what the
+/// peer writes to. A send that fails is not the end of the relay — a client
+/// is entitled to open that stream late, or never — so only the transport
+/// going away stops it.
+async fn relay(peer: Peer<RoleServer>, mut changes: Changes, promised: Vec<ListChanged>) {
+    loop {
+        let event = tokio::select! {
+            () = tokio::time::sleep(LIVENESS_POLL) => {
+                if peer.is_transport_closed() {
+                    return;
+                }
+                continue;
+            }
+            event = changes.recv() => event,
+        };
+        let due = match event {
+            Ok(what) if promised.contains(&what) => vec![what],
+            Ok(_) => continue,
+            // Nothing is lost by a full lap: the notification carries no
+            // payload, so N missed events and one event ask the client for
+            // exactly the same thing — read the list again.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => promised.clone(),
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        for what in due {
+            let sent = match what {
+                ListChanged::Tools => peer.notify_tool_list_changed().await,
+                ListChanged::Resources => peer.notify_resource_list_changed().await,
+                ListChanged::Prompts => peer.notify_prompt_list_changed().await,
+            };
+            if sent.is_err() && peer.is_transport_closed() {
+                return;
+            }
+        }
+    }
+}
+
+/// The receiving half of one upstream's list-changed stream.
+type Changes = tokio::sync::broadcast::Receiver<ListChanged>;
+
+/// Sends one list-changed over a `subscriptions/listen` stream. The sink
+/// enforces the accepted filter itself, so a family that was not subscribed
+/// is refused here rather than reaching the client.
+async fn push(sink: &SubscriptionSink, what: ListChanged) -> bool {
+    let sent = match what {
+        ListChanged::Tools => sink.notify_tool_list_changed().await,
+        ListChanged::Resources => sink.notify_resource_list_changed().await,
+        ListChanged::Prompts => sink.notify_prompt_list_changed().await,
+    };
+    sent.is_ok()
+}
 
 /// The revision that made `resultType` required on every result (SEP-2322)
 /// and `ttlMs`/`cacheScope` required on the cacheable ones (SEP-2549).
@@ -615,6 +730,87 @@ impl ServerHandler for Gateway {
         info.capabilities = self.capabilities();
         info.server_info = self.identity();
         info
+    }
+
+    /// Starts relaying the upstream's list-changed notifications to this
+    /// session (issue #140).
+    ///
+    /// Only a session with a handshake reaches here — 2026-07-28 has no
+    /// `initialize` and therefore no `notifications/initialized`, and asks
+    /// for the same events through `subscriptions/listen` instead.
+    ///
+    /// Nothing is spawned for a session that was promised nothing: before the
+    /// gateway has ever reached the upstream it advertises tools only, and a
+    /// server that never announces a change gets no relay either. The task
+    /// ends with the session; see [`relay`].
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        let promised = promised(&self.capabilities());
+        if promised.is_empty() {
+            return;
+        }
+        let Some(changes) = self.manager.subscribe(&self.upstream) else {
+            return;
+        };
+        tokio::spawn(relay(context.peer.clone(), changes, promised));
+    }
+
+    /// What of a `subscriptions/listen` filter this pipe will honour — the
+    /// 2026-07-28 shape of the same forwarding (SEP-2568).
+    ///
+    /// rmcp narrows whatever is returned here by both the request and the
+    /// capabilities [`Gateway::get_info`] advertises, so this only has to
+    /// subtract what the pipe itself cannot carry: `resource_subscriptions`,
+    /// which needs a per-URI subscription upstream that the pipe does not
+    /// hold. `None` — which rmcp answers "method not found" to — is the
+    /// honest reply when the server behind this endpoint promises no
+    /// notifications at all.
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        let mut accepted = requested.supported_by(&self.capabilities());
+        accepted.resource_subscriptions = None;
+        (!subscribed(&accepted).is_empty()).then_some(accepted)
+    }
+
+    /// Runs one `subscriptions/listen` stream until the client cancels it.
+    ///
+    /// The same upstream events [`relay`] forwards to a session peer, put on
+    /// the request's own stream instead — which is where this revision says a
+    /// server-initiated notification belongs, now that there is no session to
+    /// hold one.
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let subscribed = subscribed(context.accepted());
+        let Some(mut changes) = self.manager.subscribe(&self.upstream) else {
+            // The server was removed from the config under a stream that was
+            // already open. Nothing is coming, so hold it until the client
+            // lets go rather than closing it as if it had been served.
+            context.cancelled().await;
+            return Ok(());
+        };
+        let sink = context.sink().clone();
+        loop {
+            let event = tokio::select! {
+                () = context.cancelled() => return Ok(()),
+                event = changes.recv() => event,
+            };
+            let due = match event {
+                Ok(what) if subscribed.contains(&what) => vec![what],
+                Ok(_) => continue,
+                // See [`relay`]: a lap of the filter says the same thing the
+                // dropped events would have.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => subscribed.clone(),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    context.cancelled().await;
+                    return Ok(());
+                }
+            };
+            for what in due {
+                if !push(&sink, what).await {
+                    return Ok(());
+                }
+            }
+        }
     }
 
     async fn list_tools(

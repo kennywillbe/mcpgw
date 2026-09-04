@@ -18,7 +18,84 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::config::{Server, Transport};
 
-pub type UpstreamService = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+pub type UpstreamService = rmcp::service::RunningService<rmcp::RoleClient, UpstreamClient>;
+
+/// Which of an upstream's lists it said had changed.
+///
+/// One value per `notifications/*/list_changed` the protocol has, and nothing
+/// else: the notification carries no payload, so there is nothing to relay
+/// but the fact that it happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListChanged {
+    Tools,
+    Resources,
+    Prompts,
+}
+
+/// How many list-changed events one upstream keeps for a downstream session
+/// that is not draining them.
+///
+/// Small on purpose. These events carry no data — a client's only reaction is
+/// to re-read the list — so a receiver that falls behind has lost nothing but
+/// the count, and the answer to overflow is one more notification rather than
+/// a bigger buffer. See the `Lagged` arms downstream, which resend instead of
+/// giving up.
+const CHANGE_BACKLOG: usize = 16;
+
+/// The rmcp client handler on every upstream connection: it exists so that a
+/// server's list-changed notifications have somewhere to land.
+///
+/// It used to be `()`, which meant rmcp decoded each notification and dropped
+/// it on the floor — the whole of issue #140. Everything else about a
+/// connection is unchanged; this type answers no requests and holds no state
+/// beyond the channel it publishes on.
+#[derive(Clone, Debug)]
+pub struct UpstreamClient {
+    /// `None` for a connection nobody is listening to. The probe dials one
+    /// per run, asks it what it can do and drops it, so wiring a channel to
+    /// it would only give the events a queue to rot in.
+    changes: Option<tokio::sync::broadcast::Sender<ListChanged>>,
+}
+
+impl UpstreamClient {
+    /// A connection whose notifications go nowhere.
+    #[must_use]
+    pub fn detached() -> Self {
+        Self { changes: None }
+    }
+
+    /// Publishes one event, if anything is listening. A send with no
+    /// receivers fails and that is not an error: an upstream is allowed to
+    /// announce a change while no client is connected.
+    fn publish(&self, what: ListChanged) {
+        if let Some(changes) = &self.changes {
+            let _ = changes.send(what);
+        }
+    }
+}
+
+impl rmcp::ClientHandler for UpstreamClient {
+    async fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.publish(ListChanged::Tools);
+    }
+
+    async fn on_resource_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.publish(ListChanged::Resources);
+    }
+
+    async fn on_prompt_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.publish(ListChanged::Prompts);
+    }
+}
 
 // Explicit cancellation and transport death (child exit) are reported by
 // different rmcp signals; either one means the slot is stale. Neither ever
@@ -210,6 +287,16 @@ struct Upstream {
     /// remembered ones. Survives a disconnect for the same reason — a server
     /// that had prompts a second ago still has them while it restarts.
     info: arc_swap::ArcSwapOption<rmcp::model::ServerPeerInfo>,
+    /// Where this upstream's list-changed notifications are published, and
+    /// what every downstream session on it subscribes to.
+    ///
+    /// Broadcast rather than a per-session channel because one upstream can
+    /// be serving several sessions at once and each of them needs the same
+    /// event; kept on the entry rather than on the connection so a subscriber
+    /// outlives a reconnect. A transport swap carries this sender across to
+    /// the replacement entry — see [`UpstreamManager::apply`] — so a client
+    /// that subscribed before a reload is still listening after it.
+    changes: tokio::sync::broadcast::Sender<ListChanged>,
 }
 
 impl Upstream {
@@ -345,12 +432,23 @@ pub struct UpstreamManager {
 }
 
 fn upstream(server: Server) -> Arc<Upstream> {
+    upstream_publishing(server, tokio::sync::broadcast::Sender::new(CHANGE_BACKLOG))
+}
+
+/// A fresh entry that publishes on an existing channel: what a transport swap
+/// builds, so the sessions already subscribed do not have to be told to
+/// resubscribe to something they cannot see.
+fn upstream_publishing(
+    server: Server,
+    changes: tokio::sync::broadcast::Sender<ListChanged>,
+) -> Arc<Upstream> {
     Arc::new(Upstream {
         server: arc_swap::ArcSwap::from_pointee(server),
         retired: std::sync::atomic::AtomicBool::new(false),
         slot: Mutex::new(Slot::Idle),
         settled: Notify::new(),
         info: arc_swap::ArcSwapOption::empty(),
+        changes,
     })
 }
 
@@ -436,6 +534,20 @@ impl UpstreamManager {
     #[must_use]
     pub fn last_server_info(&self, name: &str) -> Option<Arc<rmcp::model::ServerPeerInfo>> {
         self.get(name)?.info.load_full()
+    }
+
+    /// A stream of `name`'s list-changed notifications, or `None` for a name
+    /// this manager does not serve.
+    ///
+    /// Subscribing does not connect anything: a session can be listening
+    /// before the upstream behind it has ever been reached, which is the
+    /// ordinary case for a client that dials the gateway at boot. The
+    /// subscription survives reconnects and transport swaps; what it does not
+    /// survive is the server being removed from the config, which takes its
+    /// endpoint with it.
+    #[must_use]
+    pub fn subscribe(&self, name: &str) -> Option<tokio::sync::broadcast::Receiver<ListChanged>> {
+        Some(self.get(name)?.changes.subscribe())
     }
 
     /// Returns a live service for `name`, spawning it on first demand.
@@ -527,7 +639,9 @@ impl UpstreamManager {
             upstream,
             live: Arc::clone(&live),
         };
-        let outcome = self.connect_with_backoff(name, &server, attempts).await;
+        let outcome = self
+            .connect_with_backoff(name, &server, attempts, &upstream.changes)
+            .await;
 
         let mut slot = upstream.slot.lock().await;
         // A shutdown during the ladder left the slot Idle, and a demand that
@@ -707,6 +821,12 @@ impl UpstreamManager {
         let mut next = Upstreams::new();
         let mut changes = Changes::default();
         let mut retire = Vec::new();
+        // The channels of the entries a transport swap replaced. Whatever the
+        // new connection lists first is a different list by definition — a
+        // different command, or a different URL — so every session already on
+        // this name is owed the news, and the sender it is subscribed to is
+        // the one carried into the replacement.
+        let mut announce = Vec::new();
 
         for (name, server) in servers {
             let Some(existing) = current.get(&name) else {
@@ -731,7 +851,9 @@ impl UpstreamManager {
             }
             changes.replaced.push(name.clone());
             retire.push(Arc::clone(existing));
-            next.insert(name, upstream(server));
+            let published = existing.changes.clone();
+            announce.push(published.clone());
+            next.insert(name, upstream_publishing(server, published));
         }
         for (name, existing) in current.iter() {
             if !next.contains_key(name) {
@@ -745,6 +867,20 @@ impl UpstreamManager {
         self.upstreams.store(Arc::new(next));
         for upstream in retire {
             upstream.retire().await;
+        }
+        // Announced after the swap, so a client that re-reads a list on the
+        // news reaches the entry that replaced the one it was told about.
+        // Every family, because the pipe cannot know which of them the new
+        // transport serves differently — and each session filters this down
+        // to what it was actually promised at `initialize`.
+        for published in announce {
+            for what in [
+                ListChanged::Tools,
+                ListChanged::Resources,
+                ListChanged::Prompts,
+            ] {
+                let _ = published.send(what);
+            }
         }
         changes
     }
@@ -773,6 +909,7 @@ impl UpstreamManager {
         name: &str,
         server: &Server,
         attempts: u32,
+        changes: &tokio::sync::broadcast::Sender<ListChanged>,
     ) -> Result<UpstreamService, UpstreamError> {
         let mut last = String::new();
         for attempt in 0..attempts {
@@ -785,7 +922,7 @@ impl UpstreamManager {
             // is reached from every downstream request handler, whose frames
             // would all have to be big enough to hold it. One allocation per
             // connect attempt buys that back.
-            match Box::pin(self.connect_attempt(name, server)).await {
+            match Box::pin(self.connect_attempt(name, server, changes)).await {
                 Ok(service) => return Ok(service),
                 // Retrying a 401 only asks the same question again, more
                 // slowly: the credential this connection lacks cannot appear
@@ -825,10 +962,11 @@ impl UpstreamManager {
         &self,
         name: &str,
         server: &Server,
+        changes: &tokio::sync::broadcast::Sender<ListChanged>,
     ) -> Result<UpstreamService, UpstreamError> {
-        match self.connect_once(name, server).await {
+        match self.connect_once(name, server, changes).await {
             Err(UpstreamError::AuthRequired { .. }) if headers_command(server).is_some() => {
-                self.connect_once(name, server).await
+                self.connect_once(name, server, changes).await
             }
             outcome => outcome,
         }
@@ -838,7 +976,14 @@ impl UpstreamManager {
         &self,
         name: &str,
         server: &Server,
+        changes: &tokio::sync::broadcast::Sender<ListChanged>,
     ) -> Result<UpstreamService, UpstreamError> {
+        // Every rung of the ladder dials with the same handler, so a
+        // connection that replaces a dead one publishes to the receivers the
+        // dead one had.
+        let client = UpstreamClient {
+            changes: Some(changes.clone()),
+        };
         let failed = |message: String| UpstreamError::Failed {
             name: name.to_owned(),
             attempts: 1,
@@ -860,9 +1005,22 @@ impl UpstreamManager {
                     TokioChildProcess::new(cmd)
                         .map_err(|err| failed(format!("spawn failed: {err}")))
                 };
-                match dial(spawn()?, Lifecycle::Legacy, Some(self.connect_timeout)).await {
+                match dial(
+                    spawn()?,
+                    Lifecycle::Legacy,
+                    Some(self.connect_timeout),
+                    client.clone(),
+                )
+                .await
+                {
                     Err(err) if err.refused_initialize => {
-                        dial(spawn()?, Lifecycle::Modern, Some(self.connect_timeout)).await
+                        dial(
+                            spawn()?,
+                            Lifecycle::Modern,
+                            Some(self.connect_timeout),
+                            client,
+                        )
+                        .await
                     }
                     other => other,
                 }
@@ -895,13 +1053,26 @@ impl UpstreamManager {
                 // the same backoff ladder as a stdio spawn failure.
                 let transport =
                     || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
-                match dial(transport(), Lifecycle::Legacy, Some(self.connect_timeout)).await {
+                match dial(
+                    transport(),
+                    Lifecycle::Legacy,
+                    Some(self.connect_timeout),
+                    client.clone(),
+                )
+                .await
+                {
                     // A 401 is not "this server has no `initialize`": it is a
                     // server that will not answer anything without a
                     // credential, so asking it again over the other lifecycle
                     // only spends a second round trip on the same refusal.
                     Err(err) if err.refused_initialize => {
-                        dial(transport(), Lifecycle::Modern, Some(self.connect_timeout)).await
+                        dial(
+                            transport(),
+                            Lifecycle::Modern,
+                            Some(self.connect_timeout),
+                            client,
+                        )
+                        .await
                     }
                     other => other,
                 }
@@ -979,6 +1150,7 @@ pub(crate) async fn dial<T, E, A>(
     transport: T,
     lifecycle: Lifecycle,
     timeout: Option<Duration>,
+    client: UpstreamClient,
 ) -> Result<UpstreamService, DialError>
 where
     T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
@@ -988,15 +1160,16 @@ where
 
     let handshake = async {
         match lifecycle {
-            Lifecycle::Legacy => ().serve(transport).await,
+            Lifecycle::Legacy => client.serve(transport).await,
             Lifecycle::Modern => {
-                ().serve_with_lifecycle(
-                    transport,
-                    rmcp::ClientLifecycleMode::Discover {
-                        preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
-                    },
-                )
-                .await
+                client
+                    .serve_with_lifecycle(
+                        transport,
+                        rmcp::ClientLifecycleMode::Discover {
+                            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+                        },
+                    )
+                    .await
             }
         }
     };

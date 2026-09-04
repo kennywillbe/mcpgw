@@ -79,7 +79,7 @@ pub enum ProbeError {
     Aborted { reason: String },
 }
 
-type Service = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+type Service = crate::upstream::UpstreamService;
 
 /// Probes `server` over its configured transport: `initialize` plus
 /// `tools/list`.
@@ -208,7 +208,15 @@ where
     T: rmcp::transport::IntoTransport<rmcp::RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    crate::upstream::dial(transport, lifecycle, None).await
+    // Detached: the probe asks one connection what it can do and drops it,
+    // so a list-changed notification arriving on it has nobody to reach.
+    crate::upstream::dial(
+        transport,
+        lifecycle,
+        None,
+        crate::upstream::UpstreamClient::detached(),
+    )
+    .await
 }
 
 /// What a failed handshake means for the report: a server that will not talk
