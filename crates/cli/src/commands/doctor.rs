@@ -11,6 +11,7 @@ use mcpgw_core::doctor::{
     unknown_scoped_servers, unmatched_tool_rules, unserved_endpoint,
 };
 use mcpgw_core::probe::{ProbeError, ProbeSuccess, gateway_listening, probe_server};
+use mcpgw_core::probe_state::{AuthObservation, ProbeState};
 use mcpgw_core::projects::{ProjectConfig, Standing};
 use mcpgw_core::state::ManagedState;
 use mcpgw_core::{ClientKind, Config, Detection, Error, Server, Transport};
@@ -21,6 +22,10 @@ use owo_colors::OwoColorize as _;
 /// black-holed address, and waiting a full probe timeout to be told the
 /// daemon is down would make a down gateway feel like a hang.
 const REACH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How a target the canonical config named labels itself, and the source
+/// name [`ProbePlan::collect`] recognises as that config.
+const CANONICAL_SOURCE: &str = "canonical";
 
 /// Key = the exact endpoint a probe would talk to; entries shared between
 /// the canonical config and clients (or several clients) probe once. The
@@ -48,6 +53,13 @@ struct ProbeTarget {
     /// report against the config file otherwise finds an entry with no
     /// credential in it and no explanation of how it authenticated.
     helper: Option<String>,
+    /// Whether the canonical config named this endpoint.
+    ///
+    /// Only what the canonical config points at is worth recording for
+    /// `auth status` to read back: a client entry can carry the same name as
+    /// a canonical server while pointing somewhere else entirely, and a
+    /// record written under that name would answer for the wrong server.
+    canonical: bool,
 }
 
 #[derive(Default)]
@@ -73,23 +85,22 @@ impl ProbePlan {
                 ..
             } => TargetKey::Http(url.clone(), headers_command.clone(), headers.clone()),
         };
-        self.targets
-            .entry(key)
-            .or_insert_with(|| ProbeTarget {
-                helper: match &server.transport {
-                    Transport::Http {
-                        headers_command, ..
-                    } if !headers_command.is_empty() => {
-                        Some(mcpgw_core::headers::display(headers_command))
-                    }
-                    Transport::Http { .. } | Transport::Stdio { .. } => None,
-                },
-                server: server.clone(),
-                labels: Vec::new(),
-                name: name.to_owned(),
-            })
-            .labels
-            .push(format!("{name} ({source})"));
+        let target = self.targets.entry(key).or_insert_with(|| ProbeTarget {
+            helper: match &server.transport {
+                Transport::Http {
+                    headers_command, ..
+                } if !headers_command.is_empty() => {
+                    Some(mcpgw_core::headers::display(headers_command))
+                }
+                Transport::Http { .. } | Transport::Stdio { .. } => None,
+            },
+            server: server.clone(),
+            labels: Vec::new(),
+            name: name.to_owned(),
+            canonical: false,
+        });
+        target.canonical |= source == CANONICAL_SOURCE;
+        target.labels.push(format!("{name} ({source})"));
     }
 }
 
@@ -241,7 +252,7 @@ fn load_canonical(
             findings.extend(unknown_config_keys(&unknown));
             for (name, server) in &config.servers {
                 findings.extend(check_server(None, name, server, command_exists));
-                plan.collect("canonical", name, server);
+                plan.collect(CANONICAL_SOURCE, name, server);
             }
             for (client, scope) in &config.clients {
                 findings.extend(unknown_scoped_servers(client, scope, &config.servers));
@@ -856,6 +867,58 @@ fn stale_tool_rules(probes: &ProbeReport, canonical: &BTreeMap<String, Server>) 
         .collect()
 }
 
+/// Whether a probe of `server` would dial with no credential of any kind:
+/// no stored login, no `[auth]` table, no headers written down or minted.
+///
+/// Only such a probe can prove a server needs no login, which is the whole
+/// point of recording one.
+fn presents_nothing(server: &Server, name: &str, state_dir: Option<&Path>) -> bool {
+    let bare_transport = match &server.transport {
+        Transport::Http {
+            url: _,
+            headers,
+            headers_command,
+            auth,
+            ..
+        } => headers.is_empty() && headers_command.is_empty() && auth.is_none(),
+        Transport::Stdio { .. } => false,
+    };
+    bare_transport
+        && state_dir.is_none_or(|dir| {
+            mcpgw_core::auth::Tokens::load(dir, name)
+                .ok()
+                .flatten()
+                .is_none()
+        })
+}
+
+/// Leaves what this pass learned about authentication where `auth status`
+/// can read it back.
+///
+/// Best effort: a state directory that will not take a write costs the user
+/// a sharper `auth status` line later, and nothing about the report they
+/// asked for now, so a failure here is not one to report.
+fn record_observations(
+    state_dir: &Path,
+    results: &[(String, Result<ProbeSuccess, ProbeError>)],
+    recordable: &BTreeMap<String, (String, bool)>,
+) {
+    let seen = results.iter().filter_map(|(label, outcome)| {
+        let (name, bare) = recordable.get(label)?;
+        let observed = match outcome {
+            Ok(_) if *bare => AuthObservation::NoAuthNeeded,
+            Err(ProbeError::AuthRequired) => AuthObservation::LoginRequired,
+            // Every other outcome — a timeout, a spawn failure, a handshake
+            // error, a success that presented a credential — says nothing
+            // about whether a login is wanted, so the last thing that did
+            // say something is left standing.
+            _ => return None,
+        };
+        Some((name.clone(), observed))
+    });
+    drop(ProbeState::record(state_dir, seen));
+}
+
 fn run_probes(
     runtime: &tokio::runtime::Runtime,
     plan: ProbePlan,
@@ -868,12 +931,21 @@ fn run_probes(
     // for one server and without for the next would be reporting on two
     // different gateways.
     let state_dir = mcpgw_core::paths::state_dir();
+    // Which rows may leave a record behind, and whether the probe dialed
+    // with nothing at all: a handshake that only worked because a token was
+    // attached says nothing about whether the server would take a caller
+    // without one.
+    let mut recordable: BTreeMap<String, (String, bool)> = BTreeMap::new();
     let mut results = runtime.block_on(async {
         let mut set = tokio::task::JoinSet::new();
         let mut labels: BTreeMap<tokio::task::Id, String> = BTreeMap::new();
         for target in plan.targets.into_values() {
             let label = target.labels.join(", ");
             let probe_name = target.name.clone();
+            if target.canonical {
+                let bare = presents_nothing(&target.server, &probe_name, state_dir.as_deref());
+                recordable.insert(label.clone(), (probe_name.clone(), bare));
+            }
             names.insert(label.clone(), target.name);
             if let Some(helper) = target.helper {
                 helpers.insert(label.clone(), helper);
@@ -895,6 +967,9 @@ fn run_probes(
         collect_probes(set, &labels).await
     });
     results.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(dir) = &state_dir {
+        record_observations(dir, &results, &recordable);
+    }
     let findings = results
         .iter()
         .filter(|(_, outcome)| matches!(outcome, Err(ProbeError::AuthRequired)))
