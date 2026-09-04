@@ -214,7 +214,11 @@ What each side gets:
   not the gateway's. A tool that needs something from the user answers
   `resultType: "input_required"`, and that answer, the requests inside it and
   the opaque `requestState` that correlates the retry all cross the gateway
-  untouched: it is your client, not the gateway, that can ask you.
+  untouched: it is your client, not the gateway, that can ask you. The
+  `Mcp-Param-*` headers a client mirrors onto a `tools/call` (the parameters a
+  server marked `x-mcp-header`) are forwarded to an HTTP server on that one
+  request and nothing else of the client's is — not its session, not its
+  credential — while a stdio server, which has no headers, never sees them.
 - **A client on 2025-11-25 or older** still handshakes with `initialize` and
   still gets a session, and nothing about it changed. Fields belonging to a
   newer revision are not forced on it.

@@ -1116,6 +1116,7 @@ impl UpstreamManager {
         // object: rmcp's transport is generic over its client, and the
         // authorized one is a different type, not a configured one.
         let outcome = if let Some(auth) = credentials {
+            let auth = ForwardsParams(auth);
             let transport = || {
                 rmcp::transport::StreamableHttpClientTransport::with_client(
                     auth.clone(),
@@ -1142,8 +1143,17 @@ impl UpstreamManager {
                 other => other,
             }
         } else {
-            let transport =
-                || rmcp::transport::StreamableHttpClientTransport::from_config(config.clone());
+            // `from_config` would build rmcp's own reqwest client and give no
+            // way to wrap it, so the client is built here — see
+            // [`plain_http_client`] for the settings that have to be kept in
+            // step with it.
+            let plain = ForwardsParams(plain_http_client());
+            let transport = || {
+                rmcp::transport::StreamableHttpClientTransport::with_client(
+                    plain.clone(),
+                    config.clone(),
+                )
+            };
             match dial(
                 transport(),
                 Lifecycle::Legacy,
@@ -1338,6 +1348,217 @@ pub(crate) fn http_config(
     )
 }
 
+/// The `Mcp-Param-*` headers one downstream request arrived with, on their
+/// way to the upstream POST that answers it.
+///
+/// SEP-2243 mirrors the `tools/call` arguments a server annotated with
+/// `x-mcp-header` into `Mcp-Param-{Name}` headers, and 2026-07-28 makes
+/// forwarding them a MUST for an intermediary that does not recognise them —
+/// a gateway that ate them would make an upstream behave differently through
+/// mcpgw than it does direct. Nothing else the client sent travels:
+/// `Authorization` and `Mcp-Session-Id` belong to the hop between the client
+/// and this gateway, and `Mcp-Method`/`Mcp-Name` are rmcp's to derive from
+/// the message it is actually sending.
+///
+/// These ride the outgoing request's rmcp extensions, which are process-local
+/// and never serialized. A stdio upstream therefore drops them on its own:
+/// its transport writes JSON to a pipe and has no headers to put them in,
+/// which is the whole of the right answer there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParamHeaders(Vec<(HeaderName, HeaderValue)>);
+
+impl ParamHeaders {
+    /// Every `Mcp-Param-*` header in `headers`, or `None` when there is none.
+    ///
+    /// The prefix is matched case-insensitively because RFC 9110 field names
+    /// are: [`HeaderName`] has already lowercased what came off the wire, and
+    /// the constant it is compared against is not lowercase.
+    #[must_use]
+    pub fn collect(headers: &http::HeaderMap) -> Option<Self> {
+        const PREFIX: &str = rmcp::transport::common::http_header::HEADER_MCP_PARAM_PREFIX;
+
+        let forwarded: Vec<(HeaderName, HeaderValue)> = headers
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str()
+                    .get(..PREFIX.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(PREFIX))
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        (!forwarded.is_empty()).then_some(Self(forwarded))
+    }
+}
+
+/// An HTTP client that adds the [`ParamHeaders`] carried by the message it is
+/// sending to that one POST.
+///
+/// The mechanism exists because rmcp's client has no per-request header hook:
+/// `custom_headers` is transport-wide and fixed when the connection is built,
+/// and one connection serves every downstream client of an upstream. The
+/// message is the only thing that travels from the caller to the POST, so the
+/// pipe attaches the headers to the request's extensions (see
+/// [`ParamHeaders`]) and they are read back off it here, one layer above the
+/// socket.
+///
+/// Headers already present win, and that is the spec's rule rather than an
+/// implementation detail: rmcp builds `Mcp-Param-*` itself for arguments the
+/// upstream's own schema annotated, and only the ones it did *not* recognise
+/// are the ones an intermediary forwards.
+#[derive(Clone)]
+pub(crate) struct ForwardsParams<C>(C);
+
+/// `base` plus whatever `message` is carrying that it does not already have.
+fn with_params(
+    message: &rmcp::model::ClientJsonRpcMessage,
+    mut base: std::collections::HashMap<HeaderName, HeaderValue>,
+) -> std::collections::HashMap<HeaderName, HeaderValue> {
+    use rmcp::model::GetExtensions as _;
+
+    let rmcp::model::ClientJsonRpcMessage::Request(request) = message else {
+        return base;
+    };
+    let Some(ParamHeaders(forwarded)) = request.request.extensions().get::<ParamHeaders>() else {
+        return base;
+    };
+    for (name, value) in forwarded {
+        base.entry(name.clone()).or_insert_with(|| value.clone());
+    }
+    base
+}
+
+impl<C> rmcp::transport::streamable_http_client::StreamableHttpClient for ForwardsParams<C>
+where
+    C: rmcp::transport::streamable_http_client::StreamableHttpClient,
+{
+    type Error = C::Error;
+
+    fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<HeaderName, HeaderValue>,
+    ) -> impl Future<
+        Output = Result<
+            rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+    + '_ {
+        let custom_headers = with_params(&message, custom_headers);
+        self.0
+            .post_message(uri, message, session_id, auth_header, custom_headers)
+    }
+
+    // Overridden as well as `post_message`: the worker calls this one, and
+    // the trait's default would route it back through `post_message` on the
+    // *inner* client, dropping whatever SSE size limit that client enforces.
+    fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> impl Future<
+        Output = Result<
+            rmcp::transport::streamable_http_client::StreamableHttpPostResponse,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+    + '_ {
+        let custom_headers = with_params(&message, custom_headers);
+        self.0.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            max_sse_event_size,
+        )
+    }
+
+    // The rest carry no request of their own — a session teardown and a
+    // stream open — so there is nothing per-request to forward on them.
+    fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<HeaderName, HeaderValue>,
+    ) -> impl Future<
+        Output = Result<
+            (),
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+    + '_ {
+        self.0
+            .delete_session(uri, session_id, auth_header, custom_headers)
+    }
+
+    fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<HeaderName, HeaderValue>,
+    ) -> impl Future<
+        Output = Result<
+            rmcp::transport::common::client_side_sse::BoxedSseResponse,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+    + '_ {
+        self.0
+            .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+    }
+
+    fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: std::collections::HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> impl Future<
+        Output = Result<
+            rmcp::transport::common::client_side_sse::BoxedSseResponse,
+            rmcp::transport::streamable_http_client::StreamableHttpError<Self::Error>,
+        >,
+    > + Send
+    + '_ {
+        self.0.get_stream_with_max_sse_event_size(
+            uri,
+            session_id,
+            last_event_id,
+            auth_header,
+            custom_headers,
+            max_sse_event_size,
+        )
+    }
+}
+
+/// The client the unauthenticated http path dials through.
+///
+/// A copy of rmcp's own default, which is private: idle pooling off (a reused
+/// connection whose previous body was not drained stalls ~40ms on Linux's
+/// delayed ACK) and redirects off (so custom headers cannot be replayed to a
+/// redirect target). Both are behaviour, not taste — if rmcp changes them,
+/// this has to follow.
+fn plain_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to build the default http client")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1395,5 +1616,37 @@ mod tests {
             .collect();
         let err = http_config("https://mcp.example.com/mcp", &headers).unwrap_err();
         assert!(err.contains("invalid header name"), "{err}");
+    }
+
+    /// The whole of what a request is allowed to carry to an upstream: the
+    /// `Mcp-Param-*` family, whatever case it arrived in, and nothing else.
+    #[test]
+    fn only_the_param_family_is_collected() {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in [
+            ("MCP-PARAM-Region", "eu"),
+            ("mcp-param-tenant", "acme"),
+            ("authorization", "Bearer t0ken"),
+            ("mcp-session-id", "s1"),
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "deploy"),
+        ] {
+            headers.insert(
+                http::HeaderName::try_from(name).unwrap(),
+                http::HeaderValue::from_static(value),
+            );
+        }
+
+        let super::ParamHeaders(collected) = super::ParamHeaders::collect(&headers).unwrap();
+        let mut names: Vec<&str> = collected.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["mcp-param-region", "mcp-param-tenant"]);
+    }
+
+    #[test]
+    fn a_request_carrying_none_collects_nothing() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("authorization", http::HeaderValue::from_static("Bearer x"));
+        assert_eq!(super::ParamHeaders::collect(&headers), None);
     }
 }
