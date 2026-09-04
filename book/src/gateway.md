@@ -31,7 +31,8 @@ mcpgw serve
 ```
 
 Every enabled server, each behind its own endpoint on
-`http://127.0.0.1:8137`. Ctrl-C shuts it down and reaps the child processes.
+`http://127.0.0.1:8137`. Ctrl-C shuts it down and reaps the child processes,
+and so does the `SIGTERM` a service manager sends on stop.
 
 ```sh
 mcpgw serve --port 9000

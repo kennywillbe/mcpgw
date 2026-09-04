@@ -207,7 +207,36 @@ async fn a_clean_shutdown_withdraws_the_record() {
         .status()
         .unwrap();
     assert!(killed.success(), "{killed}");
-    child.wait().await.unwrap();
+    assert_eq!(child.wait().await.unwrap().code(), Some(0));
+
+    assert_eq!(
+        mcpgw_core::runtime::read_record(&state, port).unwrap(),
+        None
+    );
+}
+
+/// The same shutdown, reached the way a supervisor reaches it. `launchctl
+/// bootout`, `systemctl stop` and a bare `kill` all send SIGTERM, so an
+/// ordinary stop of the service must not be the path a crash takes.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_supervisor_stop_shuts_down_as_cleanly_as_ctrl_c() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let (mut child, addr, _) = serve(dir.path(), &[]).await;
+    let port = port_of(&addr);
+    wait_for_record(&state, port).await;
+
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &child.id().unwrap().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success(), "{killed}");
+    let status = tokio::time::timeout(READY_DEADLINE, child.wait())
+        .await
+        .expect("the gateway never ended after SIGTERM")
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "{status}");
 
     assert_eq!(
         mcpgw_core::runtime::read_record(&state, port).unwrap(),
