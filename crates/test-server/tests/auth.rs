@@ -240,6 +240,7 @@ impl Protected {
                     env: BTreeMap::new(),
                 },
                 tools: None,
+                calls_per_minute: 0,
             },
         )])));
         let gateway = mcpgw_core::gateway::Gateway::new(Arc::clone(&inner), "fx".to_owned());
@@ -295,6 +296,7 @@ impl Protected {
                     auth: None,
                 },
                 tools: None,
+                calls_per_minute: 0,
             },
         )]))
         .with_backoff_base(Duration::from_millis(50))

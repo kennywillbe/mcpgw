@@ -120,6 +120,7 @@ fn bridge(url: &str, startup: &Startup) -> Gateway {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: url.to_owned(),

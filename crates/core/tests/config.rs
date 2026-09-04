@@ -325,3 +325,57 @@ fn a_server_cannot_have_both_headers_command_and_auth() {
         "{err}"
     );
 }
+
+const WITH_BUDGET: &str = r#"
+version = 1
+
+[servers.github]
+type = "stdio"
+command = "npx"
+calls_per_minute = 120
+
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+"#;
+
+#[test]
+fn a_call_budget_parses_and_only_where_it_is_written() {
+    let config = Config::parse(WITH_BUDGET, Path::new("budget.toml")).unwrap();
+    assert_eq!(config.servers["github"].calls_per_minute, 120);
+    // The promise the upgrade makes: a server that never mentions a budget
+    // is unmetered, which is what it always was.
+    assert_eq!(config.servers["linear"].calls_per_minute, 0);
+}
+
+#[test]
+fn a_call_budget_round_trips_through_toml() {
+    let config = Config::parse(WITH_BUDGET, Path::new("budget.toml")).unwrap();
+    let text = config.to_toml_string().unwrap();
+    let reparsed = Config::parse(&text, Path::new("roundtrip.toml")).unwrap();
+    assert_eq!(config, reparsed);
+    // A `calls_per_minute = 0` on the way out would be a file this build
+    // refuses to load again.
+    assert_eq!(text.matches("calls_per_minute").count(), 1, "{text}");
+}
+
+/// Zero, negative and fractional are all config errors rather than values
+/// the gateway silently reinterprets — a budget nobody can read is worse
+/// than no budget.
+#[test]
+fn an_unusable_call_budget_is_a_config_error_that_names_the_key() {
+    for bad in ["0", "-1", "1.5", "\"120\""] {
+        let text = format!(
+            "version = 1\n[servers.fx]\ntype = \"stdio\"\ncommand = \"x\"\ncalls_per_minute = {bad}\n"
+        );
+        let err = Config::parse(&text, Path::new("bad.toml")).unwrap_err();
+        let message = format!("{err}: {}", std::error::Error::source(&err).unwrap());
+        assert!(message.contains("calls_per_minute"), "{bad}: {message}");
+    }
+    // And the wording for zero says what to do instead of guessing.
+    let text =
+        "version = 1\n[servers.fx]\ntype = \"stdio\"\ncommand = \"x\"\ncalls_per_minute = 0\n";
+    let err = Config::parse(text, Path::new("bad.toml")).unwrap_err();
+    let message = std::error::Error::source(&err).unwrap().to_string();
+    assert!(message.contains("drop the key for no budget"), "{message}");
+}

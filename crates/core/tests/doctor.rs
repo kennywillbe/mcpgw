@@ -105,6 +105,7 @@ fn http(url: &str) -> mcpgw_core::Server {
     mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: mcpgw_core::Transport::Http {
             url: url.to_owned(),
@@ -119,6 +120,7 @@ fn bridge(command: &str, args: &[&str]) -> mcpgw_core::Server {
     mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: mcpgw_core::Transport::Stdio {
             command: command.to_owned(),
@@ -356,6 +358,7 @@ fn a_tool_rule_matching_nothing_is_a_warning_naming_the_list() {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: Some(mcpgw_core::ToolRules {
             allow: vec!["echo".to_owned(), "gone".to_owned()],
             deny: vec!["dead_*".to_owned()],

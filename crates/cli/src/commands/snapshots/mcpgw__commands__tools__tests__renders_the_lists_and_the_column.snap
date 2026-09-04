@@ -1,9 +1,10 @@
 ---
 source: crates/cli/src/commands/tools.rs
-expression: "render(\"fx\", Some(&rules), &rows(), false)"
+expression: "render(\"fx\", Some(&rules), 0, &rows(), false)"
 ---
 fx — 2 tool(s)
   allow = ["echo"]
+  no budget — calls are unmetered
 
   echo     allowed   pinned
   reverse  denied    -

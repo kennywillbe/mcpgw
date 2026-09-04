@@ -7,6 +7,7 @@ ClientRead {
         "filesystem": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "npx",
                 args: [
@@ -21,6 +22,7 @@ ClientRead {
         "github": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "npx",
                 args: [

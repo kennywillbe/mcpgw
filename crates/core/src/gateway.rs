@@ -34,7 +34,7 @@ use rmcp::service::{
 
 use crate::capture::{CaptureRecord, CaptureWriter, Kind};
 use crate::pins::{PinStore, ToolFingerprint};
-use crate::upstream::{ListChanged, ParamHeaders, UpstreamManager};
+use crate::upstream::{ListChanged, OverBudget, ParamHeaders, UpstreamManager};
 
 /// Reserved inside server names (see `config::validate_name`) and the join
 /// `mcpgw watch` renders a captured call under. Nothing on the wire is
@@ -384,6 +384,28 @@ impl Gateway {
                 .with_error(&message)
         });
         ErrorData::new(ErrorCode::INVALID_PARAMS, message, None)
+    }
+
+    /// The error a call over its server's budget is refused with, and the
+    /// record that says the budget is what refused it.
+    ///
+    /// `-32603` rather than the `-32602` a denied tool gets: nothing is
+    /// wrong with the request, and the same bytes would have been served a
+    /// moment earlier and will be again a moment later. Saying "invalid
+    /// params" to a caller whose params are fine invites the one reaction
+    /// that cannot help — rewriting the call and sending it straight back,
+    /// which is the loop this exists to break. `-32603` is JSON-RPC's own
+    /// "the server could not do this", spelled the same way in both
+    /// revisions this gateway speaks, and deliberately outside the
+    /// `-32000..-32099` band MCP reserves for its own meanings.
+    fn throttle(&self, who: &Attribution, tool: &str, over: OverBudget) -> ErrorData {
+        let message = over_budget(&self.upstream, over.limit, over.retry_in);
+        self.record(who, |session| {
+            CaptureRecord::new(session, &self.upstream, Kind::Throttled, Duration::ZERO)
+                .with_tool(tool)
+                .with_error(&message)
+        });
+        ErrorData::new(ErrorCode::INTERNAL_ERROR, message, None)
     }
 
     /// What this face advertises at `initialize`.
@@ -986,6 +1008,14 @@ impl ServerHandler for Gateway {
         if !self.allows(&tool) {
             return Err(self.deny(&who, &tool));
         }
+        // After the allowlist and still before the upstream. After, because
+        // a call the table refuses outright should not also cost a token —
+        // it was never going to reach the server. Before, because a call the
+        // budget refuses must not be the thing that spawns the process it is
+        // being kept away from.
+        if let Some(over) = self.manager.charge(&self.upstream) {
+            return Err(self.throttle(&who, &tool, over));
+        }
 
         // SEP-2243: what the client sent for this call, forwarded on the one
         // upstream POST that answers it and on nothing else.
@@ -1182,6 +1212,23 @@ impl ServerHandler for Gateway {
 #[must_use]
 pub fn not_allowed(tool: &str, server: &str) -> String {
     format!("tool {tool:?} is not allowed on server {server:?} (see mcpgw tools {server})")
+}
+
+/// What a client is told about a call its server's budget refused. Names the
+/// server, the ceiling and a wait it can actually act on, because an agent
+/// that is only told "no" retries immediately and an agent told how long is
+/// one that can stop.
+///
+/// The wait is rounded up to a whole second and never reported as zero: it
+/// is a hint, and a client that acted on "retry in ~0s" would be back inside
+/// the same window it just left.
+#[must_use]
+pub fn over_budget(server: &str, limit: u32, retry_in: Duration) -> String {
+    let seconds = retry_in.as_millis().div_ceil(1000).max(1);
+    format!(
+        "server {server:?} is over its budget of {limit} calls per minute; \
+         retry in ~{seconds} s (see mcpgw tools {server})"
+    )
 }
 
 /// The one wording for a request that ran out its deadline. Names the

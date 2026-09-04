@@ -168,6 +168,44 @@ separate opt-in and not a default.
 The pins live in `<state>/pins/<name>.json`, one file per server, mode
 `0600`. See [Tool definition drift](./gateway.md#tool-definition-drift).
 
+#### `calls_per_minute`
+
+A ceiling on how fast clients may call a server through its endpoint. Absent
+from every entry until you set it, and unlimited while it is:
+
+```toml
+[servers.linear]
+type = "http"
+url = "https://mcp.linear.app/mcp"
+calls_per_minute = 120
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `calls_per_minute` | integer ≥ 1 | *(absent)* | `tools/call` ceiling for the whole server |
+
+It is a token bucket, not a fixed window: a server at 120 may burst 120 calls
+back to back, and then gets one more every half second. That is the shape
+that survives normal work — bursty by nature — while still stopping a loop
+dead.
+
+Over the ceiling, a `tools/call` comes back as an error naming the limit and
+a wait, and the traffic log records it under kind `throttled` — see
+[Gateway](./gateway.md#call-budgets).
+
+`0` is a config error rather than a synonym for "unlimited": it reads equally
+well as "refuse everything", and the way to say "no budget" is to have no
+key. `mcpgw tools NAME budget off` is what removes it:
+
+```sh
+mcpgw tools linear budget 120   # 120 calls per minute
+mcpgw tools linear budget off   # unmetered again
+```
+
+The budget covers the whole server, not one tool and not one client: what it
+protects is the thing on the other end, which cannot tell whose loop is
+hammering it.
+
 #### `headers_command`
 
 A token you paste into `headers` lasts as long as the token does. Anything an

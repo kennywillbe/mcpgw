@@ -10,6 +10,7 @@ fn stdio_server(mode: &str) -> Server {
     Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Stdio {
             command: env!("CARGO_BIN_EXE_mcpgw-test-server").to_owned(),
@@ -23,6 +24,7 @@ fn http_server(url: &str, headers: &[(&str, &str)]) -> Server {
     Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: url.to_owned(),
@@ -480,6 +482,7 @@ fn helper_server(url: &str, mode: &str, arg: Option<&std::path::Path>) -> Server
     Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: url.to_owned(),

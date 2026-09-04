@@ -322,6 +322,7 @@ fn fixture_server() -> mcpgw_core::Server {
     mcpgw_core::Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: mcpgw_core::Transport::Stdio {
             command: fixture_binary().to_string_lossy().into_owned(),
@@ -919,4 +920,22 @@ fn drift_off_silences_the_finding() {
     let text = stdout(&out);
     assert!(!text.contains("tool definitions"), "{text}");
     assert!(text.contains("0 errors, 0 warnings"), "{text}");
+}
+
+/// A budget nobody can read is a config error, reported as one and counted
+/// as one — not a value the gateway quietly picks a meaning for.
+#[test]
+fn a_call_budget_of_zero_is_reported_as_a_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = format!(
+        "version = 1\n[servers.fx]\ntype = \"stdio\"\ncommand = '{}'\nargs = [\"healthy\"]\ncalls_per_minute = 0\n",
+        fixture_binary().display()
+    );
+    let out = run_doctor(dir.path(), Some(&config), &[]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("calls_per_minute must be at least 1"),
+        "{text}"
+    );
+    assert!(!out.status.success(), "{text}");
 }

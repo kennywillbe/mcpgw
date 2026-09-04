@@ -86,6 +86,15 @@ mcpgw tools github pin --show   # what was pinned, and what has moved since
 mcpgw tools github pin          # accept what it serves now
 ```
 
+`calls_per_minute` bounds the same endpoint in the other direction: how
+many calls, rather than which ones. It is a circuit breaker for a runaway
+agent — the thing that turns a broken loop into a hot laptop, a metered bill
+or an account-level rate limit that takes your other tooling down with it —
+and explicitly **not** a security boundary. It stops nothing an attacker
+would do; it caps what a mistake costs while you are not at the desk.
+Refusals are logged under kind `throttled`. See
+[`calls_per_minute`](./configuration.md#calls_per_minute).
+
 **One log.** Every call now passes a single capture point, and by default it
 is written down. That is the feature — it is why `mcpgw watch` can show you
 what your agent did — and it is also a file that did not exist before. See
@@ -224,6 +233,8 @@ because a helper that fails has to be fixable. mcpgw runs it with no shell.
   shrinks the blast radius; it does not authenticate anybody.
 - Tool definitions are pinned on first sight and a change is reported, not
   refused. It makes a rug pull visible; it does not stop one.
+- `calls_per_minute` caps how fast they can call it. It bounds a runaway
+  loop; it is not a security boundary either.
 - One process now holds all of them, and one log now records every call.
 - The log redacts what looks like a credential; that is a filter, not a
   proof. `--capture-bodies off` and `--no-capture` are the stronger answers.

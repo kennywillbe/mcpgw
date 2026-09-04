@@ -25,6 +25,7 @@ fn http_server(url: &str) -> Server {
     Server {
         enabled: true,
         tags: vec!["work".to_owned()],
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: url.to_owned(),
@@ -352,4 +353,77 @@ fn set_auth_records_the_identity_without_rewriting_the_file() {
         matches!(err, mcpgw_core::Error::UnknownServer { .. }),
         "{err}"
     );
+}
+
+#[test]
+fn a_call_budget_is_written_as_a_value_and_removed_again() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store.set_call_budget("github", 120).unwrap();
+    store.save().unwrap();
+    // Released before the next `edit`: the store holds the config lock.
+    drop(store);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("# my precious header comment"), "{text}");
+    assert!(
+        text.contains("# github powers the code review flow"),
+        "{text}"
+    );
+    assert!(text.contains("calls_per_minute = 120"), "{text}");
+    // Loadable by the parser that has to live with it, not just written.
+    assert_eq!(
+        Config::parse(&text, &path).unwrap().servers["github"].calls_per_minute,
+        120
+    );
+
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store.set_call_budget("github", 0).unwrap();
+    store.save().unwrap();
+    drop(store);
+    let text = std::fs::read_to_string(&path).unwrap();
+    // Removed rather than zeroed: `calls_per_minute = 0` is a config error.
+    assert!(!text.contains("calls_per_minute"), "{text}");
+    assert!(text.contains("# my precious header comment"), "{text}");
+}
+
+#[test]
+fn a_call_budget_on_an_unknown_server_is_an_error() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    let err = store.set_call_budget("ghost", 10).unwrap_err();
+    assert!(matches!(err, Error::UnknownServer { .. }), "{err:?}");
+}
+
+/// An overwrite redefines the transport, not the brake on it: a re-import
+/// that silently dropped the budget is the edit nobody would check for.
+#[test]
+fn upsert_keeps_a_budget_the_incoming_entry_does_not_carry() {
+    let (_dir, path) = temp_config(Some(COMMENTED));
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store
+        .upsert_server("linear", &http_server("https://mcp.linear.app/mcp"), false)
+        .unwrap();
+    store.set_call_budget("linear", 120).unwrap();
+    store.save().unwrap();
+    drop(store);
+
+    let mut store = ConfigStore::edit(&path).unwrap();
+    store
+        .upsert_server("linear", &http_server("https://mcp.linear.app/v2"), true)
+        .unwrap();
+    store.save().unwrap();
+    drop(store);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("calls_per_minute = 120"), "{text}");
+    assert!(text.contains("/v2"), "{text}");
+
+    // An entry that carries its own budget still wins.
+    let mut store = ConfigStore::edit(&path).unwrap();
+    let mut incoming = http_server("https://mcp.linear.app/v3");
+    incoming.calls_per_minute = 30;
+    store.upsert_server("linear", &incoming, true).unwrap();
+    store.save().unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("calls_per_minute = 30"), "{text}");
+    assert!(!text.contains("calls_per_minute = 120"), "{text}");
 }

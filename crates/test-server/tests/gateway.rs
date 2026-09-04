@@ -7,7 +7,7 @@ use mcpgw_core::capture::{
 };
 use mcpgw_core::endpoints::{EndpointTable, Endpoints, endpoint_path};
 use mcpgw_core::gateway::{
-    Gateway, MAX_TOOL_PAGES, NO_TOOLS_HERE, not_allowed, serve_http, serve_http_with,
+    Gateway, MAX_TOOL_PAGES, NO_TOOLS_HERE, not_allowed, over_budget, serve_http, serve_http_with,
 };
 use mcpgw_core::pins::Change;
 use mcpgw_core::upstream::{CallError, UpstreamManager, UpstreamStatus};
@@ -19,6 +19,7 @@ fn stdio_server(mode: &str) -> Server {
     Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Stdio {
             command: env!("CARGO_BIN_EXE_mcpgw-test-server").to_owned(),
@@ -175,6 +176,7 @@ async fn chained_client(upstream: &str) -> (Client, Arc<UpstreamManager>, Arc<Up
     let remote = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: format!("http://{addr}{}", endpoint_path("fx")),
@@ -1440,6 +1442,7 @@ fn remote_manager(addr: std::net::SocketAddr) -> Arc<UpstreamManager> {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: format!("http://{addr}{}", endpoint_path("fx")),
@@ -2405,6 +2408,7 @@ async fn subscriptions_listen_is_refused_when_the_server_announces_nothing() {
 fn filtered_server(mode: &str, allow: &[&str], deny: &[&str]) -> Server {
     let owned = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
     Server {
+        calls_per_minute: 0,
         tools: Some(mcpgw_core::ToolRules {
             allow: owned(allow),
             deny: owned(deny),
@@ -2820,6 +2824,7 @@ async fn echo_pipe(
         Server {
             enabled: true,
             tags: Vec::new(),
+            calls_per_minute: 0,
             transport: Transport::Http {
                 url: format!("http://{upstream}/mcp"),
                 headers_command: Vec::new(),
@@ -2934,6 +2939,124 @@ async fn a_stdio_upstream_ignores_them() {
         )
         .await;
     assert!(format!("{result}").contains("hi"), "{result}");
+    manager.shutdown().await;
+}
 
+/// A fixture server carrying a `calls_per_minute` ceiling.
+fn metered_server(mode: &str, calls_per_minute: u32) -> Server {
+    Server {
+        calls_per_minute,
+        ..stdio_server(mode)
+    }
+}
+
+#[tokio::test]
+async fn a_call_over_the_budget_is_refused_and_captured_as_throttled() {
+    let state = tempfile::tempdir().unwrap();
+    let writer = Arc::new(CaptureWriter::under_state_dir(state.path()));
+    let manager = Arc::new(
+        UpstreamManager::new(
+            [("fx".to_owned(), metered_server("healthy", 2))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30)),
+    );
+    let gateway =
+        Gateway::new(Arc::clone(&manager), "fx".to_owned()).with_capture(Arc::clone(&writer));
+    let client = connect("fx", gateway).await;
+
+    // Listing is not metered, and doing it first pays the child's start-up
+    // cost outside the window — so the three calls below land milliseconds
+    // apart and the wait the third is told to take is a whole 30 seconds
+    // rather than 30 seconds minus a spawn.
+    assert_eq!(
+        tool_names(&client.list_all_tools().await.unwrap()),
+        ["echo", "reverse"]
+    );
+    for n in 0..2 {
+        client
+            .call_tool(call("echo", "hi"))
+            .await
+            .unwrap_or_else(|err| panic!("call {n} was refused: {err}"));
+    }
+    let err = client.call_tool(call("echo", "hi")).await.unwrap_err();
+    let text = err.to_string();
+    // Compared against the one function that writes it, so the wording here
+    // cannot drift away from the wording a user reads.
+    assert!(
+        text.contains(&over_budget("fx", 2, Duration::from_secs(30))),
+        "{text}"
+    );
+
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+
+    let records = captured(writer.dir());
+    let shape: Vec<(Kind, Option<&str>, bool)> = records
+        .iter()
+        .map(|r| (r.kind, r.tool.as_deref(), r.ok))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (Kind::List, None, true),
+            (Kind::Call, Some("echo"), true),
+            (Kind::Call, Some("echo"), true),
+            (Kind::Throttled, Some("echo"), false),
+        ],
+        "{records:#?}"
+    );
+    // On disk under its own name, not only in this build's enum.
+    let line = std::fs::read_to_string(
+        std::fs::read_dir(writer.dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(line.contains(r#""kind":"throttled""#), "{line}");
+}
+
+/// The upgrade promise: a server with no `calls_per_minute` is metered by
+/// nothing, however hard a client leans on it.
+#[tokio::test]
+async fn no_budget_leaves_a_burst_alone() {
+    let (client, manager) = gateway_client("healthy").await;
+    for n in 0..50 {
+        client
+            .call_tool(call("echo", "hi"))
+            .await
+            .unwrap_or_else(|err| panic!("call {n} of an unmetered server was refused: {err}"));
+    }
+    client.cancel().await.unwrap();
+    manager.shutdown().await;
+}
+
+/// A throttled call must not be the thing that starts a server, for the same
+/// reason a denied one must not: the budget is spent before the upstream is
+/// acquired, so being over it cannot be a way to spawn a process.
+#[tokio::test]
+async fn a_throttled_call_never_reaches_the_upstream() {
+    let manager = Arc::new(
+        UpstreamManager::new(
+            // A budget of 1 with nothing spent yet still lets the first call
+            // through, so this asks the second one.
+            [("fx".to_owned(), metered_server("exit", 1))]
+                .into_iter()
+                .collect(),
+        )
+        .with_connect_timeout(Duration::from_secs(30))
+        .with_backoff_base(Duration::from_millis(20)),
+    );
+    let client = connect("fx", Gateway::new(Arc::clone(&manager), "fx".to_owned())).await;
+    // The first call spends the budget and fails on the upstream itself,
+    // which is the fixture dying on spawn.
+    let first = client.call_tool(call("echo", "x")).await.unwrap_err();
+    assert!(!first.to_string().contains("over its budget"), "{first}");
+    let second = client.call_tool(call("echo", "x")).await.unwrap_err();
+    assert!(second.to_string().contains("over its budget"), "{second}");
     manager.shutdown().await;
 }

@@ -21,6 +21,7 @@ fn stdio_server(command: &str, args: &[&str]) -> Server {
     Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Stdio {
             command: command.to_owned(),
@@ -99,6 +100,7 @@ async fn http_server_reports_identity_and_tools() {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: format!("http://{addr}/s/fx"),
@@ -121,6 +123,7 @@ async fn unreachable_http_server_fails_the_handshake() {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             // Port 1 on loopback refuses connections instantly.
@@ -186,6 +189,7 @@ async fn a_failing_headers_command_fails_the_probe_by_name() {
     let server = Server {
         enabled: true,
         tags: Vec::new(),
+        calls_per_minute: 0,
         tools: None,
         transport: Transport::Http {
             url: "http://127.0.0.1:1/mcp".to_owned(),

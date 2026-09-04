@@ -7,6 +7,7 @@ ClientRead {
         "github": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "npx",
                 args: [
@@ -22,6 +23,7 @@ ClientRead {
         "linear": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Http {
                 url: "https://mcp.linear.app/mcp",
                 headers_command: [],
@@ -35,6 +37,7 @@ ClientRead {
         "postgres": Server {
             enabled: true,
             tags: [],
+            calls_per_minute: 0,
             transport: Stdio {
                 command: "postgres-context-server",
                 args: [],

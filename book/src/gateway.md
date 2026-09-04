@@ -164,6 +164,47 @@ tool on the other pages would read as removed. Only a request with no cursor
 answered with no cursor is the whole list. The comparison is also made after
 the allowlist, on exactly the tools the endpoint hands on.
 
+### Call budgets
+
+An agent in a loop can call one tool a few thousand times before anybody
+notices. A server can carry a ceiling:
+
+```toml
+[servers.linear]
+calls_per_minute = 120
+```
+
+A token bucket per server, spent by `tools/call` and refilled at the same
+rate: 120 calls may go out back to back, and after that one more arrives
+every half second. Over the ceiling the call is refused before it reaches the
+server, exactly like a denied tool, and the client is told what to do about
+it:
+
+```text
+server "linear" is over its budget of 120 calls per minute; retry in ~1 s (see mcpgw tools linear)
+```
+
+Naming the wait is the point. An agent told only "no" sends the same call
+straight back; an agent told how long can stop, which is the difference
+between a circuit breaker and a busier loop.
+
+Refusals are captured under kind `throttled` — its own kind, next to
+`denied`, because the two say different things about the client that hit
+them — so `mcpgw watch` shows a runaway loop while it is running rather than
+after the invoice.
+
+```sh
+mcpgw tools linear budget 120
+mcpgw tools linear budget off
+```
+
+The ceiling is read live, like the tool lists: raising it applies to the next
+call, on sessions that are already open and without the server behind the
+endpoint restarting. The bucket itself survives that reload; only a change to
+the server's transport, which replaces the connection anyway, starts a fresh
+one. A server with no `calls_per_minute` is unmetered, which is every server
+until you say otherwise.
+
 ### The base endpoint
 
 `/mcp` is the gateway's own address rather than a way through it. It answers
@@ -327,8 +368,9 @@ loses both and its process is stopped. A server the edit didn't mention is left
 completely alone — same connection, same child process — so adding one server
 never interrupts the others. Only a change to a server's own transport (its
 command, args, env or URL) restarts that server: editing a
-[`[tools]`](./configuration.md#serversnametools) list changes what the next
-request sees and nothing else.
+[`[tools]`](./configuration.md#serversnametools) list or a
+[`calls_per_minute`](./configuration.md#calls_per_minute) changes what the
+next request sees and nothing else.
 
 Nothing is torn down under a request in flight: a `tools/call` that was already
 running when the config changed still gets its answer from the process it

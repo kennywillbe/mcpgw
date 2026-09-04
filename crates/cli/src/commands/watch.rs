@@ -322,7 +322,7 @@ fn render_line(record: &CaptureRecord, now_ms: u64, color: bool) -> String {
         // A tool call is shown under the name a client would type for it —
         // including the one the allowlist refused, which is the row a reader
         // is looking for when a client says a tool is missing.
-        (Kind::Call | Kind::Denied, tool) => format!(
+        (Kind::Call | Kind::Denied | Kind::Throttled, tool) => format!(
             "{}{}{}",
             record.server,
             mcpgw_core::gateway::SEPARATOR,

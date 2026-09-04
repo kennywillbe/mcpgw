@@ -38,6 +38,7 @@ pub fn run(args: &AddArgs) -> anyhow::Result<()> {
     let server = Server {
         enabled: !args.disabled,
         tags: args.tags.clone(),
+        calls_per_minute: 0,
         tools: None,
         transport: build_transport(args)?,
     };
