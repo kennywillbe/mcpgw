@@ -102,6 +102,13 @@ pub fn token_path(state_dir: &Path, server: &str) -> PathBuf {
     dir(state_dir).join(format!("{server}.json"))
 }
 
+/// Binds `path` into an [`Error::Io`] constructor. Local to this module
+/// because the token store carries its own error type, not the crate's.
+fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> Error {
+    let path = path.to_owned();
+    move |source| Error::Io { path, source }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("cannot read {path}")]
@@ -242,35 +249,11 @@ impl Tokens {
     ///
     /// [`Error::Io`] for any filesystem failure.
     pub fn save(&self, state_dir: &Path) -> Result<(), Error> {
-        use std::io::Write as _;
-
         let path = token_path(state_dir, &self.server);
-        let io_err = |p: &Path| {
-            let p = p.to_owned();
-            move |source| Error::Io { path: p, source }
-        };
-        let parent = dir(state_dir);
-        crate::private::create_dir_all(&parent).map_err(io_err(&parent))?;
         let json = serde_json::to_vec_pretty(self)
             .map_err(std::io::Error::other)
             .map_err(io_err(&path))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".token.json.")
-            .tempfile_in(&parent)
-            .map_err(io_err(&parent))?;
-        // Narrowed before a byte of it is written: a temp file created at the
-        // process umask and hardened afterwards is world-readable for the
-        // length of the write, and what is being written is a bearer token.
-        crate::private::harden_file(tmp.path()).map_err(io_err(&path))?;
-        tmp.write_all(&json).map_err(io_err(&path))?;
-        tmp.as_file().sync_all().map_err(io_err(&path))?;
-        tmp.persist(&path).map_err(|err| Error::Io {
-            path: path.clone(),
-            source: err.error,
-        })?;
-        crate::private::harden_file(&path).map_err(io_err(&path))?;
-        crate::private::sync_dir(&parent).map_err(io_err(&parent))?;
-        Ok(())
+        crate::private::write_atomically(&path, &json).map_err(io_err(&path))
     }
 
     /// Deletes the tokens for `server`; `false` if there were none.

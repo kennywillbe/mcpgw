@@ -36,14 +36,13 @@
 //! a change.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 /// Subdirectory of the state dir holding the per-server pin files.
 pub const PINS_DIR: &str = "pins";
@@ -419,33 +418,15 @@ impl PinStore {
     /// [`Error::Io`] for any filesystem failure.
     pub fn write(&self, file: &PinFile) -> Result<(), Error> {
         let path = self.path(&file.server);
-        let io_err = |path: &Path| {
-            let path = path.to_owned();
-            move |source| Error::Io { path, source }
-        };
-        crate::private::create_dir_all(&self.dir).map_err(io_err(&self.dir))?;
         let json = serde_json::to_vec_pretty(file)
             .map_err(std::io::Error::other)
             .map_err(io_err(&path))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".pins.json.")
-            .tempfile_in(&self.dir)
-            .map_err(io_err(&self.dir))?;
-        tmp.write_all(&json).map_err(io_err(&path))?;
         // Temp-and-rename: the gateway rewrites this file while `doctor` and
         // `mcpgw tools` read it, and half a file parses as a corrupt one.
-        tmp.as_file().sync_all().map_err(io_err(&path))?;
-        tmp.persist(&path).map_err(|err| Error::Io {
-            path: path.clone(),
-            source: err.error,
-        })?;
-        // Not a secret in itself — it holds hashes and lengths, never a
-        // description — but it lives under the same owner-only rule as
-        // everything else derived from the user's configs, rather than a
-        // second rule to remember.
-        crate::private::harden_file(&path).map_err(io_err(&path))?;
-        crate::private::sync_dir(&self.dir).map_err(io_err(&self.dir))?;
-        Ok(())
+        // Owner-only too — not a secret in itself, it holds hashes and
+        // lengths and never a description, but it lives under the same rule
+        // as everything else derived from the user's configs.
+        crate::private::write_atomically(&path, &json).map_err(io_err(&path))
     }
 
     /// Forgets `server`'s pins, and says whether there were any.

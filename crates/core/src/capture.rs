@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 /// Subdirectory of the state dir holding the daily JSONL files.
 pub const TRAFFIC_DIR: &str = "traffic";
@@ -1239,11 +1239,6 @@ fn open(path: &Path) -> std::io::Result<std::fs::File> {
         options.mode(0o600);
     }
     options.open(path)
-}
-
-fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> Error {
-    let path = path.to_owned();
-    move |source| Error::Io { path, source }
 }
 
 /// Short, collision-unlikely id from the clock and the pid — enough to tell
