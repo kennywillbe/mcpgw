@@ -1203,7 +1203,7 @@ mod tests {
     const NEVER_ENDS: &[&str] = &["/C", "ping", "-n", "60", "127.0.0.1"];
 
     /// What the service actually executes: `mcpgw serve`, with the two paths
-    /// spelled out because LocalSystem resolves neither of them the way the
+    /// spelled out because `LocalSystem` resolves neither of them the way the
     /// person who installed it does.
     #[test]
     fn the_supervised_gateway_runs_serve_with_the_paths_it_was_installed_with() {
