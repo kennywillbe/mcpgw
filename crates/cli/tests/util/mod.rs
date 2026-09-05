@@ -197,6 +197,56 @@ pub fn binary_copy(dir: &Path) -> PathBuf {
     copy
 }
 
+/// A file that runs and answers `--version` the way mcpgw does, and does
+/// nothing else, written at `path` and made executable.
+///
+/// Most of the upgrade tests never run the binary they publish as anything
+/// but a `--version`: the supervisor that would relaunch it is the test
+/// itself, and what is under test is which line the watcher prints. Forking
+/// a full copy of the real CLI for that puts the pre-flight check in
+/// competition with every `rustc` the machine is running, which is how those
+/// tests came to time out (#218). `verify_runs` only asks for a zero exit
+/// and a line starting `mcpgw `, and a shell script answers both in the time
+/// it takes to fork.
+///
+/// `marker` goes into the file, so two stubs published one after the other
+/// differ in the length the watcher stats.
+#[allow(dead_code)]
+pub fn stub_binary(path: &Path, marker: &str) -> PathBuf {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, stub_bytes(marker)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path.to_owned()
+}
+
+/// A stub published over a path that already holds a binary, by the same
+/// rename-into-place [`publish_binary`] does.
+#[allow(dead_code)]
+pub fn publish_stub(path: &Path, marker: &str) {
+    publish_binary(path, &stub_bytes(marker));
+}
+
+/// Windows has no shebang, so there the cheap stub is the real binary with
+/// the marker appended — which is what these tests published before, and
+/// costs a fork of the full CLI on the one platform where the pre-flight
+/// check has never been the slow part of the run.
+fn stub_bytes(marker: &str) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        format!("#!/bin/sh\n# {marker}\necho \"mcpgw 0.0.0-stub\"\n").into_bytes()
+    }
+    #[cfg(not(unix))]
+    {
+        let mut bytes = std::fs::read(assert_cmd::cargo::cargo_bin("mcpgw")).unwrap();
+        bytes.extend_from_slice(marker.as_bytes());
+        bytes
+    }
+}
+
 /// Publishes a new binary at `path` the way an upgrade does: whole-file, so
 /// the stamp the watcher sees is stable from the first tick that sees it.
 ///
@@ -475,7 +525,44 @@ pub async fn serve_binary(
     String,
     std::sync::Arc<std::sync::Mutex<String>>,
 ) {
+    serve_binary_with_env(exe, home, args, &[]).await
+}
+
+/// How long a gateway started by the suite gives a replacement to answer
+/// `--version`.
+///
+/// The default is five seconds of wall clock, which is generous for a
+/// `println` and not generous at all on a machine that is compiling the rest
+/// of the workspace at the same time: the fork can wait that long just to be
+/// scheduled, and the gateway then reports a good binary as one that does
+/// not run (#218). Nothing here is measuring how fast the check is, so the
+/// suite buys room it will not normally use.
+#[allow(dead_code)]
+pub const TEST_VERIFY_TIMEOUT_SECS: &str = "60";
+
+/// [`serve_binary`], with environment of the caller's choosing on top of the
+/// sandbox — including the verify timeout, for the one test that is about
+/// the deadline itself rather than working around it.
+#[allow(dead_code)]
+pub async fn serve_binary_with_env(
+    exe: &Path,
+    home: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (
+    Spawned,
+    String,
+    String,
+    std::sync::Arc<std::sync::Mutex<String>>,
+) {
     let mut command = tokio::process::Command::from(mcpgw_binary(exe, home));
+    command.env(
+        mcpgw_core::upgrade::VERIFY_TIMEOUT_ENV,
+        TEST_VERIFY_TIMEOUT_SECS,
+    );
+    for (key, value) in env {
+        command.env(key, value);
+    }
     let mut child = spawn_retrying_while_busy(
         command
             .arg("serve")

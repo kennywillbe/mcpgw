@@ -97,6 +97,43 @@ pub const RESTART_COOLDOWN: Duration = Duration::from_mins(10);
 /// broken file can hold the watcher up, not how long a good one needs.
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Environment variable that replaces [`VERIFY_TIMEOUT`], in whole seconds.
+///
+/// What the deadline measures is wall clock, not the work the replacement
+/// does: on a machine running more compilers than it has cores, the fork can
+/// wait out five seconds before it is scheduled at all, and a perfectly good
+/// binary is then reported as one that does not run. Anyone in that position
+/// — the test suite most of all — can buy room here rather than have the
+/// number chosen for them.
+pub const VERIFY_TIMEOUT_ENV: &str = "MCPGW_VERIFY_TIMEOUT_SECS";
+
+/// [`VERIFY_TIMEOUT`], or the whole seconds [`VERIFY_TIMEOUT_ENV`] asked for
+/// instead.
+///
+/// Read once. A gateway runs for weeks and asks this per confirmed change,
+/// and a value that moved underneath it would make two runs of the same
+/// check answer differently for no reason the operator could see.
+#[must_use]
+pub fn verify_timeout() -> Duration {
+    static TIMEOUT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+        parse_verify_timeout(std::env::var(VERIFY_TIMEOUT_ENV).ok().as_deref())
+    });
+    *TIMEOUT
+}
+
+/// The value half of [`verify_timeout`], so the parsing can be tested
+/// without a process whose environment says something in particular.
+///
+/// Anything that is not a positive whole number of seconds falls back to the
+/// default rather than failing: this is a knob for a loaded machine, and a
+/// typo in it must not be the reason a gateway refuses to start.
+fn parse_verify_timeout(value: Option<&str>) -> Duration {
+    value
+        .and_then(|secs| secs.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map_or(VERIFY_TIMEOUT, Duration::from_secs)
+}
+
 /// How often the verification run is checked for having finished.
 const VERIFY_POLL: Duration = Duration::from_millis(25);
 
@@ -130,11 +167,11 @@ pub fn stamp(path: &Path) -> Stamp {
 ///
 /// A sentence rather than an error type, because the callers put it in
 /// parentheses in a line they print and nothing branches on it: the file
-/// could not be started, it did not answer within [`VERIFY_TIMEOUT`], it
+/// could not be started, it did not answer within [`verify_timeout`], it
 /// ended badly — `signal: 9 (SIGKILL)` is what an in-place overwrite looks
 /// like on macOS — or what it printed was not an mcpgw version.
 pub fn verify_runs(path: &Path) -> Result<(), String> {
-    version_within(path, VERIFY_TIMEOUT).map(|_| ())
+    version_within(path, verify_timeout()).map(|_| ())
 }
 
 /// [`verify_runs`], plus the version the file reported and a ceiling of the
@@ -494,7 +531,7 @@ fn unix_seconds(time: SystemTime) -> Option<u64> {
 mod tests {
     use std::cell::Cell;
 
-    use super::{ExeStamp, Outcome, Stamp, UpgradeRestart, Watcher};
+    use super::{ExeStamp, Outcome, Stamp, UpgradeRestart, Watcher, parse_verify_timeout};
 
     const NOW: u64 = 1_700_000_000;
 
@@ -717,5 +754,30 @@ mod tests {
         reported.set(Some(200));
         assert_eq!(watcher.tick(NOW), Outcome::Unchanged);
         assert!(matches!(watcher.tick(NOW), Outcome::Replaced(_)));
+    }
+
+    /// The escape hatch a loaded machine needs, and what it does with an
+    /// answer it cannot use: a gateway must come up on the default rather
+    /// than refuse to start over a mistyped environment variable.
+    #[test]
+    fn the_verify_timeout_is_overridden_only_by_a_positive_number_of_seconds() {
+        assert_eq!(
+            parse_verify_timeout(Some(" 60 ")),
+            std::time::Duration::from_secs(60)
+        );
+        for unusable in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("-1"),
+            Some("60s"),
+            Some("2.5"),
+        ] {
+            assert_eq!(
+                parse_verify_timeout(unusable),
+                super::VERIFY_TIMEOUT,
+                "{unusable:?}"
+            );
+        }
     }
 }
