@@ -117,6 +117,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         &args.server,
         &selected,
         capture_policy(args.no_capture, args.capture_bodies.into(), &config)?,
+        config.capture.retain_days,
     )?;
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -227,8 +228,9 @@ pub(crate) fn build(
     selection: &[String],
     selected: &[String],
     capture: Option<CapturePolicy>,
+    retain_days: u32,
 ) -> anyhow::Result<Built> {
-    let (capture, capture_note) = capture_writer(capture)?;
+    let (capture, capture_note) = capture_writer(capture, retain_days)?;
 
     // Started empty and filled by the first `apply` in the caller, so the
     // servers present at boot arrive through exactly the code path a reload
@@ -360,6 +362,7 @@ pub(crate) fn capture_policy(
 /// it goes and how much of each request it keeps — or that there is none.
 fn capture_writer(
     policy: Option<CapturePolicy>,
+    retain_days: u32,
 ) -> anyhow::Result<(Option<Arc<CaptureWriter>>, String)> {
     let Some(policy) = policy else {
         return Ok((None, "traffic capture disabled (--no-capture)".to_owned()));
@@ -367,9 +370,20 @@ fn capture_writer(
     let state_dir = mcpgw_core::paths::state_dir()
         .context("cannot determine a home directory to resolve the state directory")?;
     let bodies = policy.bodies();
-    let writer = CaptureWriter::under_state_dir(&state_dir).with_policy(policy);
+    let writer = CaptureWriter::under_state_dir(&state_dir)
+        .with_policy(policy)
+        .with_retain_days(retain_days);
+    // Once here, and again on every rotation from `append`. A gateway that
+    // starts and then sits idle for a week still has to drop the days that
+    // fell out of the window.
+    writer.prune_if_due(mcpgw_core::capture::now_millis());
+    let retention = if retain_days == 0 {
+        "kept forever".to_owned()
+    } else {
+        format!("kept {retain_days} days")
+    };
     let note = format!(
-        "capturing traffic to {} (bodies: {bodies})",
+        "capturing traffic to {} (bodies: {bodies}, {retention})",
         writer.dir().display()
     );
     Ok((Some(Arc::new(writer)), note))

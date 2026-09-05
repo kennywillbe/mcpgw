@@ -314,3 +314,150 @@ fn a_stored_oauth_login_never_reaches_the_capture_log() {
     assert!(!text.contains("lin_ort_0badc0ffee"), "{text}");
     assert!(text.contains("[redacted]"), "{text}");
 }
+
+/// Retention: the days outside the window go, the days inside it stay, and
+/// anything that is not one of mcpgw's daily files is left alone.
+const DAY: u64 = 86_400_000;
+
+fn seed(dir: &std::path::Path, names: &[&str]) {
+    std::fs::create_dir_all(dir).unwrap();
+    for name in names {
+        std::fs::write(dir.join(name), "{}\n").unwrap();
+    }
+}
+
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    found
+}
+
+#[test]
+fn prune_keeps_the_window_and_deletes_what_fell_out_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let traffic = dir.path().join("traffic");
+    // 2026-01-15 as the "now" every name below is relative to.
+    let now = 1_768_435_200_000;
+    let day_of = |back: u64| mcpgw_core::capture::daily_name(now - back * DAY);
+    seed(
+        &traffic,
+        &[&day_of(0), &day_of(2), &day_of(6), &day_of(7), &day_of(30)],
+    );
+
+    // retain_days counts today, so a window of 7 keeps today back to day 6.
+    let removed = mcpgw_core::capture::prune(&traffic, 7, now).unwrap();
+    assert_eq!(
+        removed,
+        vec![traffic.join(day_of(30)), traffic.join(day_of(7))],
+    );
+    assert_eq!(names(&traffic), vec![day_of(6), day_of(2), day_of(0)]);
+}
+
+#[test]
+fn prune_never_touches_a_file_it_did_not_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let traffic = dir.path().join("traffic");
+    let now = 1_768_435_200_000;
+    seed(
+        &traffic,
+        &[
+            "2020-01-01.jsonl.gz",
+            "2020-01-02.json",
+            "notes.md",
+            "2020-01-03.jsonl",
+            "old.jsonl",
+        ],
+    );
+
+    let removed = mcpgw_core::capture::prune(&traffic, 7, now).unwrap();
+    assert_eq!(removed, vec![traffic.join("2020-01-03.jsonl")]);
+    assert_eq!(
+        names(&traffic),
+        vec![
+            "2020-01-01.jsonl.gz",
+            "2020-01-02.json",
+            "notes.md",
+            "old.jsonl",
+        ],
+    );
+}
+
+#[test]
+fn a_retention_of_zero_keeps_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let traffic = dir.path().join("traffic");
+    seed(&traffic, &["2001-01-01.jsonl"]);
+
+    assert!(
+        mcpgw_core::capture::prune(&traffic, 0, 1_768_435_200_000)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(names(&traffic), vec!["2001-01-01.jsonl"]);
+}
+
+#[test]
+fn a_traffic_directory_that_does_not_exist_yet_prunes_to_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let removed =
+        mcpgw_core::capture::prune(&dir.path().join("traffic"), 14, 1_768_435_200_000).unwrap();
+    assert!(removed.is_empty());
+}
+
+/// A writer nobody configured retains a finite number of days, and the
+/// append that opens a new day is what drops the ones that aged out.
+#[test]
+fn appending_on_a_new_day_prunes_the_days_that_aged_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path());
+    assert_eq!(
+        writer.retain_days(),
+        mcpgw_core::capture::DEFAULT_RETAIN_DAYS
+    );
+
+    let now = 1_768_435_200_000;
+    let day_of = |back: u64| mcpgw_core::capture::daily_name(now - back * DAY);
+    seed(writer.dir(), &[&day_of(20), &day_of(3)]);
+
+    let mut record = CaptureRecord::new(writer.session(), "fx", Kind::List, Duration::ZERO);
+    record.ts = now;
+    writer.append(&record).unwrap();
+
+    assert_eq!(names(writer.dir()), vec![day_of(3), day_of(0)]);
+}
+
+#[test]
+fn a_writer_told_to_keep_one_day_keeps_only_today() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path()).with_retain_days(1);
+    let now = 1_768_435_200_000;
+    let day_of = |back: u64| mcpgw_core::capture::daily_name(now - back * DAY);
+    seed(writer.dir(), &[&day_of(1)]);
+
+    let mut record = CaptureRecord::new(writer.session(), "fx", Kind::List, Duration::ZERO);
+    record.ts = now;
+    writer.append(&record).unwrap();
+
+    assert_eq!(names(writer.dir()), vec![day_of(0)]);
+}
+
+#[test]
+fn usage_measures_the_daily_files_and_ignores_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let traffic = dir.path().join("traffic");
+    std::fs::create_dir_all(&traffic).unwrap();
+    std::fs::write(traffic.join("2026-01-01.jsonl"), "aaaa").unwrap();
+    std::fs::write(traffic.join("2026-02-01.jsonl"), "bb").unwrap();
+    std::fs::write(traffic.join("notes.md"), "ignored entirely").unwrap();
+
+    let usage = mcpgw_core::capture::usage(&traffic).unwrap();
+    assert_eq!(usage.files, 2);
+    assert_eq!(usage.bytes, 6);
+    assert_eq!(usage.oldest.as_deref(), Some("2026-01-01"));
+
+    let empty = mcpgw_core::capture::usage(&dir.path().join("nothing")).unwrap();
+    assert_eq!(empty, mcpgw_core::capture::Usage::default());
+}

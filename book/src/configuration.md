@@ -401,13 +401,14 @@ What scoping is **not** is authentication — see the
 
 ## `[capture]`
 
-Optional, and absent from a config that never mentions it. One key today:
+Optional, and absent from a config that never mentions it:
 
 ```toml
 version = 1
 
 [capture]
 redact = ["ACME-[0-9]{4}"]
+retain_days = 30
 
 [servers.github]
 type = "stdio"
@@ -420,6 +421,19 @@ site-specific shapes only you know about. A pattern that does not compile is a
 config error naming the pattern, so a rule can never quietly match nothing.
 Read once at gateway startup, so an edit needs a restart. See
 [Watching traffic](./traffic.md) for what is redacted without it.
+
+`retain_days` is how many daily traffic files to keep, counting today.
+Defaults to **14**. The gateway prunes when it starts and again the first time
+it writes on a new day, deleting only its own `YYYY-MM-DD.jsonl` files — a
+`notes.md` or a `2026-01-01.jsonl.gz` you compressed by hand is left alone —
+and printing one line when it removes anything. `retain_days = 0` keeps every
+day forever, which is what every version before 0.5.1 did.
+
+`mcpgw doctor` reports the window next to what the log currently costs:
+
+```text
+traffic capture (~/.local/share/mcpgw/traffic) — 9 files, 4.1 MB, kept 14 days, oldest 2026-08-23
+```
 
 ## `[gateway]`
 
@@ -538,6 +552,7 @@ the repo root.
 │   └── cursor-1f0c…/     a repo's .cursor/mcp.json, keyed by its path
 └── traffic/
     └── 2026-09-01.jsonl  daily capture log, mode 0600, bodies redacted
+                          (the last 14 days, see `[capture] retain_days`)
 ```
 
 Resolution order:

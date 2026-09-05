@@ -125,7 +125,9 @@ pub fn run(
         note: canonical_note,
         servers: canonical_servers,
         scopes,
+        retain_days,
     } = load_canonical(&path, &mut findings, &mut plan, &command_exists);
+    let traffic = TrafficReport::gather(retain_days);
 
     findings.extend(drifted_tool_definitions(&canonical_servers));
 
@@ -209,6 +211,7 @@ pub fn run(
             &detections,
             &all,
             &projects,
+            &traffic,
             probe_results.as_ref(),
             gateway_report.as_ref(),
             &budgets,
@@ -217,6 +220,7 @@ pub fn run(
         )?;
     } else {
         render(&path, &canonical_note, &detections, &findings, color);
+        render_traffic(&traffic, color);
         render_projects(&projects, color);
         if let Some(probes) = &probe_results {
             render_probes(probes, color);
@@ -232,6 +236,88 @@ pub fn run(
     Ok(u8::from(errors > 0))
 }
 
+/// What the traffic log costs on disk and how long it is kept.
+///
+/// Reported unconditionally, including when nothing has been captured yet: a
+/// reader asking "how big is this going to get" needs the retention window
+/// answered whether or not there are files today.
+struct TrafficReport {
+    dir: Option<std::path::PathBuf>,
+    usage: mcpgw_core::capture::Usage,
+    retain_days: u32,
+}
+
+impl TrafficReport {
+    fn gather(retain_days: u32) -> Self {
+        let dir = mcpgw_core::paths::state_dir()
+            .map(|state| state.join(mcpgw_core::capture::TRAFFIC_DIR));
+        let usage = dir
+            .as_deref()
+            .and_then(|dir| mcpgw_core::capture::usage(dir).ok())
+            .unwrap_or_default();
+        Self {
+            dir,
+            usage,
+            retain_days,
+        }
+    }
+
+    /// `14 days` — or the fact that nothing prunes, spelled out rather than
+    /// left as a bare `0`.
+    fn retention(&self) -> String {
+        if self.retain_days == 0 {
+            "kept forever".to_owned()
+        } else {
+            format!("kept {} days", self.retain_days)
+        }
+    }
+
+    fn line(&self) -> String {
+        let size = human_bytes(self.usage.bytes);
+        let files = self.usage.files;
+        let plural = if files == 1 { "" } else { "s" };
+        let oldest = self
+            .usage
+            .oldest
+            .as_ref()
+            .map_or(String::new(), |date| format!(", oldest {date}"));
+        format!("{files} file{plural}, {size}, {}{oldest}", self.retention())
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "dir": self.dir,
+            "files": self.usage.files,
+            "bytes": self.usage.bytes,
+            "oldest": self.usage.oldest,
+            "retain_days": self.retain_days,
+        })
+    }
+}
+
+/// Bytes at one decimal place, in the largest unit that keeps the number
+/// under 1024 — a traffic log is read as "is this big", not as a byte count.
+fn human_bytes(bytes: u64) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a display size is allowed to round"
+    )]
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KB", "MB", "GB", "TB"] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {unit}")
+    }
+}
+
 /// The canonical config as the rest of the report needs it: the line that
 /// describes it, the servers (which the project pass asks about too) and the
 /// client scopes.
@@ -239,6 +325,9 @@ struct Canonical {
     note: String,
     servers: BTreeMap<String, Server>,
     scopes: BTreeMap<String, ClientScope>,
+    /// `[capture] retain_days` as this config asks for it, so the traffic
+    /// line reports the window the gateway would actually prune to.
+    retain_days: u32,
 }
 
 /// Reads it, checks every entry, and feeds the probe plan.
@@ -260,6 +349,7 @@ fn load_canonical(
             }
             Canonical {
                 note: format!("{} servers", config.servers.len()),
+                retain_days: config.capture.retain_days,
                 servers: config.servers,
                 scopes: config.clients,
             }
@@ -281,6 +371,10 @@ fn load_canonical(
                 note,
                 servers: BTreeMap::new(),
                 scopes: BTreeMap::new(),
+                // A config that will not load is a gateway running on the
+                // defaults or not running at all; either way the default
+                // window is the honest thing to report.
+                retain_days: mcpgw_core::capture::DEFAULT_RETAIN_DAYS,
             }
         }
     }
@@ -583,6 +677,18 @@ fn standing_text(standing: Standing) -> &'static str {
 /// Printed even with nothing to name: a section that disappears reads as a
 /// check that never ran, and the empty answer — no repo-local config around
 /// this directory — is one of the things people run `doctor` to find out.
+fn render_traffic(report: &TrafficReport, color: bool) {
+    let where_it_is = report.dir.as_deref().map_or_else(
+        || "no state directory".to_owned(),
+        |dir| dir.display().to_string(),
+    );
+    println!();
+    heading(
+        &format!("traffic capture ({where_it_is}) — {}", report.line()),
+        color,
+    );
+}
+
 fn render_projects(report: &ProjectReport, color: bool) {
     println!();
     heading("project configs", color);
@@ -623,6 +729,7 @@ fn emit_json(
     detections: &[(&'static str, String)],
     findings: &[Finding],
     projects: &ProjectReport,
+    traffic: &TrafficReport,
     probes: Option<&ProbeReport>,
     gateway: Option<&GatewayReport>,
     budgets: &[(ClientKind, ClientBudget)],
@@ -639,6 +746,7 @@ fn emit_json(
         // Always present, empty included: a consumer should not have to
         // tell "no project configs" from "an mcpgw that does not look".
         "projects": projects.json(),
+        "capture": traffic.json(),
         "findings": findings,
         "errors": errors,
         "warnings": warnings,
