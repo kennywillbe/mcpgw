@@ -11,7 +11,7 @@ use util::{daemon, fixture_config, free_port, stderr, stdout};
 
 /// A gateway serving one healthy fixture server, with the URL of its base
 /// endpoint read off the banner.
-async fn serve(home: &Path) -> (tokio::process::Child, String) {
+async fn serve(home: &Path) -> (util::Spawned, String) {
     std::fs::write(home.join("config.toml"), fixture_config(&["fx1"])).unwrap();
     let (child, addr, _endpoints) = util::serve(home, &[]).await;
     (child, format!("http://{addr}/mcp"))
@@ -43,7 +43,7 @@ fn status_reports_a_gateway_that_is_not_there_and_exits_nonzero() {
 #[tokio::test]
 async fn status_names_a_running_foreground_gateway_with_no_service_installed() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, url) = serve(dir.path()).await;
+    let (_gateway, url) = serve(dir.path()).await;
 
     let home = dir.path().to_owned();
     let output = tokio::task::spawn_blocking(move || daemon(&home, &["status", "--url", &url]))
@@ -60,8 +60,6 @@ async fn status_names_a_running_foreground_gateway_with_no_service_installed() {
     );
     assert!(text.contains("foreground `mcpgw serve`"), "{text}");
     assert_eq!(output.status.code(), Some(0), "{text}");
-
-    child.kill().await.unwrap();
 }
 
 /// The record `daemon install` leaves behind, naming a binary these tests do
@@ -75,7 +73,7 @@ fn record_installed_spec(home: &Path, bind: &str, port: u16) {
 #[tokio::test]
 async fn status_probes_the_address_the_service_was_installed_with() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, url) = serve(dir.path()).await;
+    let (_gateway, url) = serve(dir.path()).await;
     let port: u16 = url
         .rsplit_once(':')
         .and_then(|(_, tail)| tail.split('/').next())
@@ -95,8 +93,6 @@ async fn status_probes_the_address_the_service_was_installed_with() {
     assert!(text.contains(&url), "{text}");
     assert!(!text.contains(":8137"), "probed the default anyway: {text}");
     assert_eq!(output.status.code(), Some(0), "{text}");
-
-    child.kill().await.unwrap();
 }
 
 /// The state a `cargo uninstall` followed by a Homebrew install leaves
@@ -154,7 +150,7 @@ fn status_names_a_service_running_a_different_binary_than_you_are() {
 #[tokio::test]
 async fn status_names_a_gateway_answering_on_another_build() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, url) = serve(dir.path()).await;
+    let (_gateway, url) = serve(dir.path()).await;
     util::rewrite_record_version(dir.path(), &url, "0.0.1").await;
 
     let home = dir.path().to_owned();
@@ -177,8 +173,6 @@ async fn status_names_a_gateway_answering_on_another_build() {
     );
     // A gateway is answering, which is the only thing the exit code tracks.
     assert_eq!(output.status.code(), Some(0), "{text}");
-
-    child.kill().await.unwrap();
 }
 
 /// The record a crash leaves behind names a version nobody is serving. It
@@ -187,11 +181,11 @@ async fn status_names_a_gateway_answering_on_another_build() {
 #[tokio::test]
 async fn a_record_left_by_a_dead_gateway_says_nothing_about_versions() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, url) = serve(dir.path()).await;
+    let (child, url) = serve(dir.path()).await;
     util::rewrite_record_version(dir.path(), &url, "0.0.1").await;
     // SIGKILL, so the record outlives the process exactly as a crash leaves
     // it — a clean shutdown would withdraw it and prove nothing.
-    child.kill().await.unwrap();
+    child.stop().await;
 
     let home = dir.path().to_owned();
     let probed = url.clone();
@@ -309,11 +303,14 @@ async fn logs_follow_prints_lines_appended_after_it_started() {
     daemon(dir.path(), &["logs"]);
     std::fs::write(logs.join("daemon.out.log"), "already there\n").unwrap();
 
-    let mut child = tokio::process::Command::from(util::mcpgw(dir.path()))
-        .args(["daemon", "logs", "--follow"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = util::Spawned::new(
+        tokio::process::Command::from(util::mcpgw(dir.path()))
+            .args(["daemon", "logs", "--follow"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap(),
+    );
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
 
     // Appended repeatedly rather than once: the follower may still be
@@ -342,7 +339,6 @@ async fn logs_follow_prints_lines_appended_after_it_started() {
         }
     };
     appender.abort();
-    child.kill().await.unwrap();
     assert!(found, "--follow never printed the appended line");
 }
 
@@ -352,7 +348,7 @@ async fn logs_follow_prints_lines_appended_after_it_started() {
 #[tokio::test]
 async fn install_still_refuses_a_port_a_foreground_gateway_answers_on() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, url) = serve(dir.path()).await;
+    let (_gateway, url) = serve(dir.path()).await;
     let port = url
         .rsplit_once(':')
         .and_then(|(_, tail)| tail.split('/').next())
@@ -372,8 +368,6 @@ async fn install_still_refuses_a_port_a_foreground_gateway_answers_on() {
         "{}",
         stdout(&output)
     );
-
-    child.kill().await.unwrap();
 }
 
 /// With `[gateway] require_token` on and a token on the disk, the same bind

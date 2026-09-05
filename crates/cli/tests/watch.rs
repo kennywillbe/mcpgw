@@ -6,6 +6,8 @@ use std::process::Output;
 
 use assert_cmd::Command;
 
+mod util;
+
 fn run_watch(home: &Path, args: &[&str]) -> Output {
     Command::cargo_bin("mcpgw")
         .unwrap()
@@ -69,13 +71,15 @@ fn the_client_filter_narrows_the_json_stream() {
     )
     .unwrap();
 
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
-        .args(["watch", "--json", "--client", "CURSOR"])
-        .env("MCPGW_NO_UPDATE_CHECK", "1")
-        .env("MCPGW_STATE_DIR", state.path())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = util::SpawnedBlocking::new(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("mcpgw"))
+            .args(["watch", "--json", "--client", "CURSOR"])
+            .env("MCPGW_NO_UPDATE_CHECK", "1")
+            .env("MCPGW_STATE_DIR", state.path())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
 
     let stdout = child.stdout.take().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -98,9 +102,6 @@ fn the_client_filter_narrows_the_json_stream() {
     // one is a different harness, one nobody attributed.
     let extra = receiver.recv_timeout(std::time::Duration::from_secs(2));
     assert!(extra.is_err(), "{extra:?}");
-
-    child.kill().unwrap();
-    child.wait().unwrap();
 }
 
 /// One captured line as a gateway writes it, optionally attributed.

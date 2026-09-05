@@ -157,11 +157,14 @@ async fn an_already_finished_machine_gets_the_status_card() {
 
     // Port 0 and the banner rather than a number of our own: a fixed port
     // is a race against every other test in the suite (#54, #83).
-    let mut gateway = command(dir.path())
-        .args(["serve", "--port", "0", "--no-capture"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut gateway = util::Spawned::new(
+        command(dir.path())
+            .args(["serve", "--port", "0", "--no-capture"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap(),
+    );
     let url = gateway_url(&mut gateway).await;
     // And answering on a build that is not this one, which is the other
     // half the card reports: the two are different facts and both print.
@@ -175,7 +178,6 @@ async fn an_already_finished_machine_gets_the_status_card() {
         .spawn()
         .unwrap();
     let output = finish(child, "`mcpgw init --yes` against a live gateway").await;
-    gateway.kill().await.unwrap();
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -209,11 +211,14 @@ async fn a_running_gateway_is_left_alone_and_no_service_is_installed() {
 
     // No `managed.json`, so the last step still has something to say and the
     // wizard walks its steps rather than printing the status card.
-    let mut gateway = command(dir.path())
-        .args(["serve", "--port", "0", "--no-capture"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut gateway = util::Spawned::new(
+        command(dir.path())
+            .args(["serve", "--port", "0", "--no-capture"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap(),
+    );
     let url = gateway_url(&mut gateway).await;
 
     let child = command(dir.path())
@@ -224,7 +229,6 @@ async fn a_running_gateway_is_left_alone_and_no_service_is_installed() {
         .spawn()
         .unwrap();
     let output = finish(child, "`mcpgw init --yes` beside a running gateway").await;
-    gateway.kill().await.unwrap();
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -651,7 +655,7 @@ async fn a_conflict_can_be_overwritten_on_purpose() {
 
 /// Reads the served address out of the gateway's own banner and keeps
 /// draining its stdout, so a later banner line cannot hit a closed pipe.
-async fn gateway_url(child: &mut tokio::process::Child) -> String {
+async fn gateway_url(child: &mut util::Spawned) -> String {
     use tokio::io::{AsyncBufReadExt as _, BufReader};
 
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
@@ -727,11 +731,14 @@ async fn the_sync_step_points_every_client_at_a_live_gateway_and_checks_it() {
     std::fs::write(dir.path().join("config.toml"), config()).unwrap();
     let (cursor, claude) = install_two_clients(dir.path());
 
-    let mut gateway = command(dir.path())
-        .args(["serve", "--port", "0", "--no-capture"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut gateway = util::Spawned::new(
+        command(dir.path())
+            .args(["serve", "--port", "0", "--no-capture"])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap(),
+    );
     let url = gateway_url(&mut gateway).await;
 
     let child = command(dir.path())
@@ -742,7 +749,6 @@ async fn the_sync_step_points_every_client_at_a_live_gateway_and_checks_it() {
         .spawn()
         .unwrap();
     let output = finish(child, "`mcpgw init --yes` with two clients installed").await;
-    gateway.kill().await.unwrap();
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8(output.stdout).unwrap();

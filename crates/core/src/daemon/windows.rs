@@ -112,6 +112,15 @@ const NO_SUCH_SERVICE: i32 = 1060;
 /// `ERROR_SERVICE_EXISTS`.
 const SERVICE_EXISTS: i32 = 1073;
 
+/// How the service starts the gateway it supervises.
+///
+/// The seam the other two backends have for their supervisor commands. There
+/// is no `sc.exe` here — registering and controlling the service goes through
+/// the SCM API rather than through a command line — so the one thing this
+/// file runs as a process is the gateway itself, and this is what lets the
+/// supervision loop be tested without a service database.
+pub type Spawn<'a> = dyn Fn(&DaemonSpec) -> Result<Child, DaemonError> + 'a;
+
 /// The Windows service control manager.
 #[derive(Debug, Clone, Copy)]
 pub struct WindowsService {
@@ -582,7 +591,7 @@ fn supervise(spec: &DaemonSpec) -> Result<(), DaemonError> {
         ))
         .map_err(|err| service_error(&err))?;
 
-    let ended = run_gateway(spec, &stop_rx, |state| {
+    let ended = run_gateway(spec, &stop_rx, &spawn_gateway, |state| {
         let _ = handle.set_service_status(status(state, ServiceExitCode::Win32(0), STOP_HINT));
     });
     let exit = match ended {
@@ -604,9 +613,10 @@ fn supervise(spec: &DaemonSpec) -> Result<(), DaemonError> {
 fn run_gateway(
     spec: &DaemonSpec,
     stop: &Receiver<()>,
+    spawn: &Spawn<'_>,
     report_state: impl Fn(ServiceState),
 ) -> Result<ServiceExitCode, DaemonError> {
-    let mut child = spawn_gateway(spec)?;
+    let mut child = spawn(spec)?;
     loop {
         if let Some(exit) = child.try_wait().map_err(|source| DaemonError::Io {
             action: "wait for",
@@ -640,14 +650,7 @@ fn run_gateway(
 }
 
 fn spawn_gateway(spec: &DaemonSpec) -> Result<Child, DaemonError> {
-    Command::new(&spec.exe)
-        .args(spec.serve_args())
-        // A service inherits no user profile: under LocalSystem the two
-        // paths the gateway resolves from `%USERPROFILE%` land in system32's
-        // profile directory rather than in the config the person who
-        // installed it edits. So they are handed over rather than guessed.
-        .env(crate::paths::CONFIG_ENV, &spec.config_path)
-        .env(crate::paths::STATE_ENV, &spec.state_dir)
+    gateway_command(spec)
         // A service has no console to inherit, which is the whole reason
         // these three are set: without them the gateway's output goes
         // nowhere and `mcpgw daemon logs` has nothing to show.
@@ -660,6 +663,24 @@ fn spawn_gateway(spec: &DaemonSpec) -> Result<Child, DaemonError> {
             path: spec.exe.clone(),
             source,
         })
+}
+
+/// The gateway the service runs, program and arguments and environment.
+///
+/// Separate from the spawn so what the service executes can be read and
+/// asserted on without a service database to register it in — the same reason
+/// `render_unit` and `render_plist` are separate on the other two platforms.
+fn gateway_command(spec: &DaemonSpec) -> Command {
+    let mut command = Command::new(&spec.exe);
+    command
+        .args(spec.serve_args())
+        // A service inherits no user profile: under LocalSystem the two
+        // paths the gateway resolves from `%USERPROFILE%` land in system32's
+        // profile directory rather than in the config the person who
+        // installed it edits. So they are handed over rather than guessed.
+        .env(crate::paths::CONFIG_ENV, &spec.config_path)
+        .env(crate::paths::STATE_ENV, &spec.state_dir);
+    command
 }
 
 /// One of the log files, opened for append. `prepare_logs` has already
@@ -1154,6 +1175,156 @@ mod tests {
         assert_eq!(failure_code(ServiceExitCode::Win32(0)), None);
         assert_eq!(failure_code(ServiceExitCode::Win32(1)), Some(1));
         assert_eq!(failure_code(ServiceExitCode::ServiceSpecific(7)), Some(7));
+    }
+
+    /// A runner that starts `cmd.exe` with `args` instead of the gateway.
+    ///
+    /// `cmd.exe` rather than a fixture binary because the supervision loop
+    /// only cares that it has a process to watch and an exit code to report.
+    fn runs(args: &'static [&'static str]) -> impl Fn(&DaemonSpec) -> Result<Child, DaemonError> {
+        move |_: &DaemonSpec| {
+            Command::new("cmd.exe")
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|source| DaemonError::Io {
+                    action: "start",
+                    path: PathBuf::from("cmd.exe"),
+                    source,
+                })
+        }
+    }
+
+    /// A gateway that does not end on its own. `ping` to a loopback address is
+    /// the wait every Windows script uses, and unlike `timeout` it needs no
+    /// console — which a service does not have.
+    const NEVER_ENDS: &[&str] = &["/C", "ping", "-n", "60", "127.0.0.1"];
+
+    /// What the service actually executes: `mcpgw serve`, with the two paths
+    /// spelled out because LocalSystem resolves neither of them the way the
+    /// person who installed it does.
+    #[test]
+    fn the_supervised_gateway_runs_serve_with_the_paths_it_was_installed_with() {
+        let spec = spec();
+        let command = gateway_command(&spec);
+
+        assert_eq!(command.get_program(), spec.exe.as_os_str());
+        let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
+        let expected: Vec<OsString> = spec.serve_args().into_iter().map(OsString::from).collect();
+        assert_eq!(args, expected);
+
+        let env: Vec<(OsString, Option<OsString>)> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+            .collect();
+        let handed_over = |key: &str, value: &Path| {
+            env.iter().any(|(seen_key, seen_value)| {
+                seen_key == OsStr::new(key) && seen_value.as_deref() == Some(value.as_os_str())
+            })
+        };
+        assert!(
+            handed_over(crate::paths::CONFIG_ENV, &spec.config_path),
+            "the service would resolve its own config, not the installed one"
+        );
+        assert!(
+            handed_over(crate::paths::STATE_ENV, &spec.state_dir),
+            "the service would resolve its own state dir, not the installed one"
+        );
+    }
+
+    /// A gateway that ended by itself has failed whatever it says on the way
+    /// out — the service exists to keep it up, and only a non-zero code makes
+    /// the SCM run its restart actions.
+    #[test]
+    fn a_gateway_that_exits_cleanly_is_still_a_failure_to_the_scm() {
+        let (_stop_tx, stop) = std::sync::mpsc::channel();
+        let spawn = runs(&["/C", "exit", "0"]);
+
+        let exit = run_gateway(&spec(), &stop, &spawn, |_| {}).unwrap();
+
+        assert!(
+            matches!(exit, ServiceExitCode::Win32(1)),
+            "a clean exit was not turned into a failure"
+        );
+    }
+
+    /// The code the gateway died with is the one the SCM is told, so the
+    /// Services console and `mcpgw daemon status` name the same number.
+    #[test]
+    fn the_code_a_gateway_died_with_reaches_the_scm() {
+        let (_stop_tx, stop) = std::sync::mpsc::channel();
+        let spawn = runs(&["/C", "exit", "3"]);
+
+        let exit = run_gateway(&spec(), &stop, &spawn, |_| {}).unwrap();
+
+        assert!(
+            matches!(exit, ServiceExitCode::Win32(3)),
+            "the gateway's own exit code did not reach the SCM"
+        );
+    }
+
+    /// A stop is a clean end: the SCM is told the stop is under way, the child
+    /// is killed, and the service reports zero rather than the failure that
+    /// would have it restarted.
+    #[test]
+    fn a_stop_reports_the_stop_then_kills_the_gateway() {
+        let (stop_tx, stop) = std::sync::mpsc::channel();
+        // Queued before the loop starts, so the first poll sees it and the
+        // test never waits out a real timeout.
+        stop_tx.send(()).unwrap();
+        let spawn = runs(NEVER_ENDS);
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        let exit = run_gateway(&spec(), &stop, &spawn, |state| {
+            seen.borrow_mut().push(state);
+        })
+        .unwrap();
+
+        assert!(
+            matches!(exit, ServiceExitCode::Win32(0)),
+            "a stop was reported as a failure"
+        );
+        let seen = seen.into_inner();
+        assert!(
+            matches!(seen[..], [ServiceState::StopPending]),
+            "the SCM was not told the stop was under way"
+        );
+    }
+
+    /// The handler being gone is not a state this process can go on serving
+    /// from, so a closed channel ends the service the same way a stop does.
+    #[test]
+    fn a_handler_that_disappeared_ends_the_service_too() {
+        let (stop_tx, stop) = std::sync::mpsc::channel::<()>();
+        drop(stop_tx);
+        let spawn = runs(NEVER_ENDS);
+
+        let exit = run_gateway(&spec(), &stop, &spawn, |_| {}).unwrap();
+
+        assert!(
+            matches!(exit, ServiceExitCode::Win32(0)),
+            "a lost handler was reported as a failure"
+        );
+    }
+
+    /// A gateway that cannot be started is a service that fails, rather than
+    /// one reporting itself running with nothing behind it.
+    #[test]
+    fn a_gateway_that_cannot_be_started_ends_the_service() {
+        let (_stop_tx, stop) = std::sync::mpsc::channel();
+        let spawn = |spec: &DaemonSpec| -> Result<Child, DaemonError> {
+            Err(DaemonError::Io {
+                action: "start",
+                path: spec.exe.clone(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            })
+        };
+
+        let ended = run_gateway(&spec(), &stop, &spawn, |_| {});
+
+        assert!(ended.is_err());
     }
 
     #[test]

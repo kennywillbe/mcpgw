@@ -30,15 +30,11 @@ fn write_config(path: &Path, text: &str) {
 
 /// A gateway on an ephemeral port, returned with its address and the banner
 /// line that lists the per-server endpoints.
-async fn serve(home: &Path, args: &[&str]) -> (tokio::process::Child, String, String) {
+async fn serve(home: &Path, args: &[&str]) -> (util::Spawned, String, String) {
     serve_config(home, &fixture_config(&["fx1", "fx2"]), args).await
 }
 
-async fn serve_config(
-    home: &Path,
-    text: &str,
-    args: &[&str],
-) -> (tokio::process::Child, String, String) {
+async fn serve_config(home: &Path, text: &str, args: &[&str]) -> (util::Spawned, String, String) {
     write_config(&home.join("config.toml"), text);
     util::serve(home, args).await
 }
@@ -83,7 +79,7 @@ async fn try_tool_names(url: &str) -> anyhow::Result<Vec<String>> {
 #[tokio::test]
 async fn a_bare_serve_answers_on_the_per_server_endpoints() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, addr, endpoints) = serve(dir.path(), &[]).await;
+    let (_gateway, addr, endpoints) = serve(dir.path(), &[]).await;
 
     assert!(endpoints.contains("/s/fx1"), "{endpoints}");
     assert!(endpoints.contains("/s/fx2"), "{endpoints}");
@@ -98,8 +94,6 @@ async fn a_bare_serve_answers_on_the_per_server_endpoints() {
         tool_names(&format!("http://{addr}/mcp")).await.is_empty(),
         "the base endpoint served tools"
     );
-
-    child.kill().await.unwrap();
 }
 
 /// The G2 promise, end to end through the real binary: `mcpgw add` while
@@ -107,7 +101,7 @@ async fn a_bare_serve_answers_on_the_per_server_endpoints() {
 #[tokio::test]
 async fn a_server_added_to_the_config_is_served_without_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, addr, endpoints) =
+    let (_gateway, addr, endpoints) =
         serve_config(dir.path(), &fixture_config(&["fx1"]), &[]).await;
     assert!(!endpoints.contains("/s/fx2"), "{endpoints}");
 
@@ -127,7 +121,6 @@ async fn a_server_added_to_the_config_is_served_without_a_restart() {
         tool_names(&format!("http://{addr}/s/fx1")).await,
         ["echo", "reverse"]
     );
-    child.kill().await.unwrap();
 }
 
 /// `--per-server` outlives the behaviour it used to gate, so scripts that
@@ -135,15 +128,13 @@ async fn a_server_added_to_the_config_is_served_without_a_restart() {
 #[tokio::test]
 async fn the_old_per_server_flag_is_still_accepted() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, addr, endpoints) = serve(dir.path(), &["--per-server"]).await;
+    let (_gateway, addr, endpoints) = serve(dir.path(), &["--per-server"]).await;
 
     assert!(endpoints.contains("/s/fx1"), "{endpoints}");
     assert_eq!(
         tool_names(&format!("http://{addr}/s/fx2")).await,
         ["echo", "reverse"]
     );
-
-    child.kill().await.unwrap();
 }
 
 /// Port off the banner address, which is where the record's name comes from.
@@ -176,7 +167,7 @@ async fn wait_for_record(state: &Path, port: u16) -> mcpgw_core::runtime::Gatewa
 #[tokio::test]
 async fn a_running_gateway_records_what_it_is() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, addr, _) = serve(dir.path(), &[]).await;
+    let (child, addr, _) = serve(dir.path(), &[]).await;
     let port = port_of(&addr);
 
     let record = wait_for_record(&dir.path().join("state"), port).await;
@@ -185,8 +176,6 @@ async fn a_running_gateway_records_what_it_is() {
     assert_eq!(record.pid, child.id().unwrap());
     assert_eq!(record.port, port);
     assert!(record.exe.exists(), "{}", record.exe.display());
-
-    child.kill().await.unwrap();
 }
 
 /// A gateway that shut down cleanly must not leave a record claiming it is
@@ -266,10 +255,7 @@ async fn wait_for_stderr(errors: &std::sync::Mutex<String>, needle: &str) {
 }
 
 /// Waits for the gateway to end, and says which line it ended on.
-async fn wait_for_exit(
-    child: &mut tokio::process::Child,
-    errors: &std::sync::Mutex<String>,
-) -> i32 {
+async fn wait_for_exit(child: &mut util::Spawned, errors: &std::sync::Mutex<String>) -> i32 {
     let ended = tokio::time::timeout(READY_DEADLINE, child.wait()).await;
     let status = ended.unwrap_or_else(|_| {
         panic!(
@@ -395,8 +381,6 @@ async fn a_gateway_without_the_flag_serves_straight_through_a_replacement() {
         tool_names(&format!("http://{addr}/s/fx1")).await,
         ["echo", "reverse"]
     );
-
-    child.kill().await.unwrap();
 }
 
 /// Which binary is watched is not "the one this process is running": it is
@@ -509,12 +493,12 @@ fn an_unknown_capture_bodies_mode_is_refused() {
 #[tokio::test]
 async fn a_captured_tool_argument_is_redacted_on_disk() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, addr, _) = serve_capturing(dir.path(), &[]).await;
+    let (child, addr, _) = serve_capturing(dir.path(), &[]).await;
 
     let url = format!("http://{addr}/s/fx1");
     tool_names(&url).await;
     call_tool(&url, "echo", FAKE_TOKEN).await;
-    child.kill().await.unwrap();
+    child.stop().await;
 
     let captured = traffic(dir.path());
     assert!(!captured.contains(FAKE_TOKEN), "{captured}");
@@ -527,12 +511,12 @@ async fn a_captured_tool_argument_is_redacted_on_disk() {
 #[tokio::test]
 async fn capture_bodies_off_records_metadata_and_no_bodies() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut child, addr, _) = serve_capturing(dir.path(), &["--capture-bodies", "off"]).await;
+    let (child, addr, _) = serve_capturing(dir.path(), &["--capture-bodies", "off"]).await;
 
     let url = format!("http://{addr}/s/fx1");
     tool_names(&url).await;
     call_tool(&url, "echo", FAKE_TOKEN).await;
-    child.kill().await.unwrap();
+    child.stop().await;
 
     let captured = traffic(dir.path());
     assert!(!captured.contains(FAKE_TOKEN), "{captured}");
@@ -544,7 +528,7 @@ async fn capture_bodies_off_records_metadata_and_no_bodies() {
 
 /// A gateway that writes a traffic log, which every other test in this file
 /// deliberately does not.
-async fn serve_capturing(home: &Path, args: &[&str]) -> (tokio::process::Child, String, String) {
+async fn serve_capturing(home: &Path, args: &[&str]) -> (util::Spawned, String, String) {
     write_config(&home.join("config.toml"), &fixture_config(&["fx1"]));
     util::serve_with(home, &[], args).await
 }
@@ -558,7 +542,7 @@ async fn a_client_without_the_token_is_answered_and_named_once() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
     write_config(&home.join("config.toml"), &fixture_config(&["fx1"]));
-    let (mut child, addr, _endpoints, errors) =
+    let (_gateway, addr, _endpoints, errors) =
         util::serve_binary(&assert_cmd::cargo::cargo_bin("mcpgw"), home, &[]).await;
 
     // The gateway minted its token at startup and holds it in memory. Taking
@@ -580,6 +564,40 @@ async fn a_client_without_the_token_is_answered_and_named_once() {
         errors.lock().unwrap().matches("run mcpgw sync").count(),
         before
     );
+}
 
-    child.kill().await.unwrap();
+/// The harness's own promise: a gateway spawned by a test that then fails is
+/// killed anyway.
+///
+/// The whole point of the guard — the pattern it replaced killed the child on
+/// the last line of the test body, which a panic never reaches, so one failed
+/// assertion left a gateway holding a port (and its stdio fixture servers
+/// under it) for the rest of the run. The panic is raised inside a task so it
+/// is a real unwind rather than a scope ending, and the port coming back is
+/// what proves the process is gone rather than merely unreachable.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_test_that_panics_does_not_leave_its_gateway_running() {
+    let dir = tempfile::tempdir().unwrap();
+    write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
+    let home = dir.path().to_owned();
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let failed = tokio::spawn(async move {
+        let (_gateway, addr, _endpoints) = util::serve(&home, &[]).await;
+        sender.send(port_of(&addr)).unwrap();
+        panic!("the failed assertion this test is standing in for");
+    });
+
+    let port = receiver.await.unwrap();
+    assert!(failed.await.is_err(), "the task was supposed to panic");
+
+    let deadline = std::time::Instant::now() + READY_DEADLINE;
+    while std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the gateway on port {port} outlived the test that panicked"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
