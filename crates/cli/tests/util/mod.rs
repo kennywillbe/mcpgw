@@ -511,6 +511,7 @@ impl Drop for SpawnedBlocking {
 /// resorts to a kill. Generous for the same reason the banner deadline is:
 /// the shutdown drains upstreams and flushes a traffic log on a runner that
 /// is busy with the rest of the suite.
+#[cfg(unix)]
 const STOP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How long a banner line may take to arrive. Generous because it covers a
