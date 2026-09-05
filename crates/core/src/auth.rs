@@ -63,6 +63,14 @@ pub const CLIENT_ID_URL: &str = "https://kennywillbe.github.io/mcpgw/client.json
 /// The name an authorization server shows the user on its consent screen when
 /// it registers us dynamically. The document at [`CLIENT_ID_URL`] carries the
 /// same string for the CIMD path.
+///
+/// It only ever reaches a provider through a registration body: an
+/// authorization request built on a metadata document carries the document's
+/// URL as the client id and nothing else about the client, so a server that
+/// does not fetch and render that document has no name to show and falls back
+/// to whatever else it has — the loopback redirect URI, in Notion's case. That
+/// is a rendering choice on their side and not one this constant reaches; see
+/// `book/src/auth.md`.
 pub const CLIENT_NAME: &str = "mcpgw";
 
 /// How long a login waits for the browser to come back.
