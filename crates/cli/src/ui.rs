@@ -124,9 +124,35 @@ pub fn dim(text: &str, color: bool) -> String {
     }
 }
 
+/// A count with the noun it counts, singular when there is exactly one:
+/// `0 errors`, `1 error`, `2 errors`.
+///
+/// One place for it because a line like doctor's summary is read as a
+/// sentence, and `1 errors` reads as a program that did not bother. Only the
+/// `+s` plural — every noun mcpgw counts is a regular one, and a table of
+/// irregulars would be a feature nothing asks for.
+#[must_use]
+pub fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("{n} {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_count_is_singular_only_at_one() {
+        assert_eq!(count(0, "error"), "0 errors");
+        assert_eq!(count(1, "error"), "1 error");
+        assert_eq!(count(2, "error"), "2 errors");
+        assert_eq!(count(1, "server"), "1 server");
+        assert_eq!(count(0, "warning"), "0 warnings");
+        assert_eq!(count(2, "file"), "2 files");
+    }
 
     #[test]
     fn only_a_real_yes_or_no_overrides_the_default() {

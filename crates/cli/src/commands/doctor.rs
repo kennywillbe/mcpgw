@@ -269,20 +269,22 @@ impl TrafficReport {
         if self.retain_days == 0 {
             "kept forever".to_owned()
         } else {
-            format!("kept {} days", self.retain_days)
+            format!(
+                "kept {}",
+                crate::ui::count(self.retain_days as usize, "day")
+            )
         }
     }
 
     fn line(&self) -> String {
         let size = human_bytes(self.usage.bytes);
-        let files = self.usage.files;
-        let plural = if files == 1 { "" } else { "s" };
+        let files = crate::ui::count(self.usage.files, "file");
         let oldest = self
             .usage
             .oldest
             .as_ref()
             .map_or(String::new(), |date| format!(", oldest {date}"));
-        format!("{files} file{plural}, {size}, {}{oldest}", self.retention())
+        format!("{files}, {size}, {}{oldest}", self.retention())
     }
 
     fn json(&self) -> serde_json::Value {
@@ -349,7 +351,7 @@ fn load_canonical(
                 findings.extend(unknown_scoped_servers(client, scope, &config.servers));
             }
             Canonical {
-                note: format!("{} servers", config.servers.len()),
+                note: crate::ui::count(config.servers.len(), "server"),
                 retain_days: config.capture.retain_days,
                 servers: config.servers,
                 scopes: config.clients,
@@ -753,12 +755,11 @@ fn render_projects(report: &ProjectReport, color: bool) {
         return;
     }
     for row in &report.files {
-        let count = row.servers.len();
-        let plural = if count == 1 { "server" } else { "servers" };
         println!(
-            "  {} — {}, {count} {plural}",
+            "  {} — {}, {}",
             row.config.path.display(),
-            row.config.kind.display_name()
+            row.config.kind.display_name(),
+            crate::ui::count(row.servers.len(), "server")
         );
         for (name, standing) in &row.servers {
             println!("      {name}: {}", standing_text(*standing));
@@ -1399,10 +1400,10 @@ fn render_probes(probes: &ProbeReport, color: bool) {
         match outcome {
             Ok(success) => {
                 let line = format!(
-                    "{label}: {} {}, {} tools{helper}",
+                    "{label}: {} {}, {}{helper}",
                     success.server_name,
                     success.server_version,
-                    success.tool_count(),
+                    crate::ui::count(success.tool_count(), "tool"),
                 );
                 ok_line(&line, color);
             }
@@ -1485,10 +1486,10 @@ fn render_gateway(report: &GatewayReport, color: bool) {
         match outcome {
             GatewayOutcome::Ok(success) => ok_line(
                 &format!(
-                    "{where_}: {} {}, {} tools",
+                    "{where_}: {} {}, {}",
                     success.server_name,
                     success.server_version,
-                    success.tool_count()
+                    crate::ui::count(success.tool_count(), "tool")
                 ),
                 color,
             ),
@@ -1582,7 +1583,11 @@ fn print_finding(finding: &Finding, color: bool) {
 }
 
 fn summary_line(errors: usize, warnings: usize, color: bool) {
-    let text = format!("{errors} errors, {warnings} warnings");
+    let text = format!(
+        "{}, {}",
+        crate::ui::count(errors, "error"),
+        crate::ui::count(warnings, "warning")
+    );
     if !color {
         println!("{text}");
     } else if errors > 0 {

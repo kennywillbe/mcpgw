@@ -134,6 +134,83 @@ fn add_warns_when_the_daemon_could_not_start_the_command() {
     );
 }
 
+/// A command that resolves nowhere is worth saying at the moment it is
+/// written: nothing else looks until the gateway tries to spawn it, and what
+/// that reports is a closed connection.
+#[cfg(unix)]
+#[test]
+fn add_warns_when_the_command_is_on_no_path_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let empty = dir.path().join("empty-bin");
+    std::fs::create_dir(&empty).unwrap();
+
+    let out = add_with_path(
+        dir.path(),
+        &config,
+        &empty.display().to_string(),
+        &["add", "badcmd", "--", "definitely-not-a-command-xyz"],
+    );
+    let said = stderr(&out);
+    assert!(out.status.success(), "{said}");
+    assert!(
+        said.contains("\"definitely-not-a-command-xyz\" is not on your PATH"),
+        "{said}"
+    );
+    assert!(
+        said.contains("spell out the full path or install it"),
+        "{said}"
+    );
+    // Not the daemon sentence: no service is installed here, and the command
+    // resolves for nobody rather than for the shell alone.
+    assert!(!said.contains("resolves in your shell"), "{said}");
+
+    // Written all the same — `add` records what it was asked for.
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        text.contains("command = \"definitely-not-a-command-xyz\""),
+        "{text}"
+    );
+
+    // A command that same PATH does resolve says nothing, and neither does a
+    // command spelled as a path to a file that exists.
+    let tool = empty.join("realcmd");
+    std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    for command in ["realcmd".to_owned(), tool.display().to_string()] {
+        let out = add_with_path(
+            dir.path(),
+            &config,
+            &empty.display().to_string(),
+            &["add", "ok", "--force", "--", &command],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(
+            !stderr(&out).contains("is not on your PATH"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+/// `add_in_home` with the PATH the invoking shell is pretending to have, so
+/// the lookup cannot see the machine running the suite.
+#[cfg(unix)]
+fn add_with_path(home: &Path, config: &Path, path: &str, args: &[&str]) -> Output {
+    Command::cargo_bin("mcpgw")
+        .unwrap()
+        .env("MCPGW_NO_UPDATE_CHECK", "1")
+        .args(args)
+        .env("MCPGW_CONFIG", config)
+        .env("HOME", home)
+        .env("PATH", path)
+        .env("MCPGW_STATE_DIR", home.join("state"))
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap()
+}
+
 /// `add` in a home of the test's own, which is where the service definition
 /// it reads has to live.
 #[cfg(unix)]

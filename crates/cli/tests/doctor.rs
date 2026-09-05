@@ -84,6 +84,36 @@ fn healthy_config_exits_zero() {
     assert!(stdout(&out).contains("0 errors"));
 }
 
+/// Counts read as a sentence rather than as machine output: one of a thing
+/// is `1 error`, and none of it is still `0 warnings`.
+#[test]
+fn counts_are_singular_only_at_one() {
+    let dir = tempfile::tempdir().unwrap();
+    // One client file holding exactly one server, so the detection note has
+    // a count of its own to get right.
+    let cursor = dir.path().join(".cursor");
+    std::fs::create_dir_all(&cursor).unwrap();
+    std::fs::write(
+        cursor.join("mcp.json"),
+        r#"{"mcpServers": {"build": {"command": "cargo"}}}"#,
+    )
+    .unwrap();
+
+    let out = run_doctor(dir.path(), Some(BROKEN_COMMAND), &[]);
+    let text = stdout(&out);
+    assert!(text.contains("1 error, 0 warnings"), "{text}");
+    assert!(text.contains("1 server"), "{text}");
+    assert!(!text.contains("1 servers"), "{text}");
+
+    // A count of none keeps the plural.
+    let out = run_doctor(dir.path(), Some(HEALTHY), &[]);
+    assert!(
+        stdout(&out).contains("0 errors, 0 warnings"),
+        "{}",
+        stdout(&out)
+    );
+}
+
 #[test]
 fn unresolvable_command_is_an_error_exit() {
     let dir = tempfile::tempdir().unwrap();
@@ -111,7 +141,10 @@ fn a_command_the_daemons_path_cannot_resolve_is_a_warning() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("resolves in your shell"), "{text}");
     assert!(text.contains("`mcpgw daemon install`"), "{text}");
-    assert!(text.contains("1 warnings"), "{text}");
+    assert!(
+        text.contains("1 warning") && !text.contains("1 warnings"),
+        "{text}"
+    );
 }
 
 /// The same machine with a service installed from this very shell: the
@@ -153,7 +186,10 @@ fn client_warnings_do_not_fail_the_exit_code() {
     assert!(out.status.success(), "{}", stdout(&out));
     let text = stdout(&out);
     assert!(text.contains("legacy `sse`"));
-    assert!(text.contains("1 warnings"));
+    assert!(
+        text.contains("1 warning") && !text.contains("1 warnings"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -314,7 +350,7 @@ url = "http://127.0.0.1:1/mcp"
     assert!(!out.status.success(), "{}", stdout(&out));
     let text = stdout(&out);
     assert!(text.contains("remote (canonical)"), "{text}");
-    assert!(text.contains("1 errors"), "{text}");
+    assert!(text.contains("1 error,"), "{text}");
 }
 
 #[test]
@@ -501,7 +537,7 @@ fn an_entry_the_gateway_does_not_serve_is_an_actionable_error() {
     assert!(text.contains("does not serve"), "{text}");
     // Actionable means naming what it does serve.
     assert!(text.contains("/s/fx"), "{text}");
-    assert!(text.contains("1 errors"), "{text}");
+    assert!(text.contains("1 error,"), "{text}");
 }
 
 #[test]
@@ -761,7 +797,7 @@ fn a_server_behind_oauth_is_a_warning_naming_the_login() {
         &["--probe", "--timeout", "60"],
     ));
     assert!(text.contains("run mcpgw auth login linear"), "{text}");
-    assert!(text.contains("0 errors, 1 warnings"), "{text}");
+    assert!(text.contains("0 errors, 1 warning"), "{text}");
 }
 
 /// Once `sync --project` owns an entry the section says so: "mcpgw writes
@@ -895,7 +931,7 @@ fn probe_warns_about_a_tool_rule_that_matches_nothing() {
         text.contains("[servers.fx.tools] allow entry \"typoed_name\" matches no tool fx offers"),
         "{text}"
     );
-    assert!(text.contains("0 errors, 1 warnings"), "{text}");
+    assert!(text.contains("0 errors, 1 warning"), "{text}");
     assert!(out.status.success(), "{text}");
 }
 
@@ -952,7 +988,7 @@ fn a_drifted_tool_definition_is_a_warning_naming_the_command_that_accepts_it() {
     // A warning, never an error: the gateway is still serving, and a red
     // doctor over a server that versioned its tools is a check people
     // switch off.
-    assert!(text.contains("0 errors, 1 warnings"), "{text}");
+    assert!(text.contains("0 errors, 1 warning"), "{text}");
     assert!(out.status.success(), "{text}");
 }
 

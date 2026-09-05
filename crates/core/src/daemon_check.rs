@@ -389,6 +389,30 @@ pub fn stdio_command_reach(command: &str, service_path: Option<&str>) -> Command
     command_reach(command, shell_path.as_deref(), service_path)
 }
 
+/// Whether `command` is a bare name that `shell_path` resolves nowhere.
+///
+/// The question [`command_reach`] deliberately does not answer: that one
+/// compares two `PATH`s, and a command neither of them finds is not a
+/// disagreement between them. It is still worth saying at the moment an entry
+/// is written — `crate::doctor::check_server` reports it as an error, but
+/// running doctor is something you do after a server has failed to start, not
+/// before.
+///
+/// Bare names only, for the same reason [`resolve_in`] takes them: a command
+/// spelled as a path is not `PATH`'s to resolve. A caller with no `PATH` at
+/// all gets `false`, because it has nothing to have looked in.
+#[must_use]
+pub fn command_missing_from_path(command: &str, shell_path: Option<&str>) -> bool {
+    is_bare(command) && shell_path.is_some_and(|path| resolve_in(command, path).is_none())
+}
+
+/// [`command_missing_from_path`] against this process's own `PATH`, which is
+/// the shell that typed the command.
+#[must_use]
+pub fn stdio_command_missing(command: &str) -> bool {
+    command_missing_from_path(command, std::env::var("PATH").ok().as_deref())
+}
+
 /// The `PATH` the installed service definition on this machine runs with, or
 /// `None` when nothing is installed — or when the platform's service does not
 /// record one, which is the Windows case: its service takes the machine
@@ -564,6 +588,31 @@ mod tests {
             command_reach(&absolute, Some(&path_env(&[&shim])), Some("")),
             CommandReach::Fine
         );
+    }
+
+    /// The case `command_reach` stays quiet about, asked directly: a bare
+    /// name the caller's own PATH cannot resolve.
+    #[test]
+    fn a_command_no_shell_path_resolves_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let npx = write_tool(&bin, "npx");
+        let path = path_env(&[&bin]);
+
+        assert!(command_missing_from_path(
+            "definitely-not-a-command-xyz",
+            Some(&path)
+        ));
+        assert!(!command_missing_from_path(&npx, Some(&path)));
+
+        // A path the caller spelled out and a caller with no PATH: neither is
+        // a PATH lookup, so neither is a missing one.
+        assert!(!command_missing_from_path(
+            &bin.join(&npx).display().to_string(),
+            Some(&path)
+        ));
+        assert!(!command_missing_from_path("npx", None));
     }
 
     /// A machine with no service installed has no second PATH to disagree
