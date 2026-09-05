@@ -380,31 +380,53 @@ impl FileStore {
     fn store_err(err: &Error) -> rmcp::transport::auth::AuthError {
         rmcp::transport::auth::AuthError::CredentialStoreError(err.to_string())
     }
+
+    fn task_err(what: &str, err: &tokio::task::JoinError) -> rmcp::transport::auth::AuthError {
+        rmcp::transport::auth::AuthError::CredentialStoreError(format!("{what} task failed: {err}"))
+    }
 }
 
 #[async_trait::async_trait]
 impl CredentialStore for FileStore {
+    /// rmcp awaits this before every request that needs a token, so the read
+    /// goes where the refresh lock below already goes: a blocked worker is a
+    /// blocked gateway, and the token file is on the same possibly-slow
+    /// state directory as everything else here.
     async fn load(&self) -> Result<Option<StoredCredentials>, rmcp::transport::auth::AuthError> {
-        Tokens::load(&self.state_dir, &self.server)
+        let (state_dir, server) = (self.state_dir.clone(), self.server.clone());
+        tokio::task::spawn_blocking(move || Tokens::load(&state_dir, &server))
+            .await
+            .map_err(|err| Self::task_err("token load", &err))?
             .map(|tokens| tokens.map(|tokens| tokens.credentials))
             .map_err(|err| Self::store_err(&err))
     }
 
+    /// Offloaded like [`load`](Self::load), and with more to offload:
+    /// [`Tokens::save`] writes a temporary file and fsyncs both it and the
+    /// directory before the rename.
     async fn save(
         &self,
         credentials: StoredCredentials,
     ) -> Result<(), rmcp::transport::auth::AuthError> {
-        Tokens {
-            version: TOKEN_VERSION,
-            server: self.server.clone(),
-            credentials,
-        }
-        .save(&self.state_dir)
+        let (state_dir, server) = (self.state_dir.clone(), self.server.clone());
+        tokio::task::spawn_blocking(move || {
+            Tokens {
+                version: TOKEN_VERSION,
+                server,
+                credentials,
+            }
+            .save(&state_dir)
+        })
+        .await
+        .map_err(|err| Self::task_err("token save", &err))?
         .map_err(|err| Self::store_err(&err))
     }
 
     async fn clear(&self) -> Result<(), rmcp::transport::auth::AuthError> {
-        Tokens::delete(&self.state_dir, &self.server)
+        let (state_dir, server) = (self.state_dir.clone(), self.server.clone());
+        tokio::task::spawn_blocking(move || Tokens::delete(&state_dir, &server))
+            .await
+            .map_err(|err| Self::task_err("token clear", &err))?
             .map(|_| ())
             .map_err(|err| Self::store_err(&err))
     }
@@ -755,6 +777,32 @@ mod tests {
             )
             .with_issuer(Some("https://auth.example.com".to_owned())),
         }
+    }
+
+    /// The store rmcp calls on the request path: both halves do their file
+    /// work on a blocking thread, and both still round trip what they were
+    /// given.
+    #[tokio::test]
+    async fn the_credential_store_round_trips_off_the_runtime() {
+        use rmcp::transport::auth::CredentialStore as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileStore::new(dir.path(), "linear");
+        assert!(store.load().await.unwrap().is_none());
+
+        store
+            .save(tokens(Some(3600), true, "id").credentials)
+            .await
+            .unwrap();
+        let loaded = store.load().await.unwrap().unwrap();
+        assert_eq!(loaded.client_id, "id");
+        assert_eq!(
+            Tokens::load(dir.path(), "linear").unwrap().unwrap().server,
+            "linear"
+        );
+
+        store.clear().await.unwrap();
+        assert!(store.load().await.unwrap().is_none());
     }
 
     /// The three states a report distinguishes, and the one that matters: an

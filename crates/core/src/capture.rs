@@ -9,6 +9,12 @@
 //! written itself, because a traffic directory is a place people also put
 //! things of their own.
 //!
+//! A gateway does not write these lines itself: [`CaptureWriter::offload`]
+//! puts the open-write-flush on a thread of its own behind a bounded queue,
+//! because the state directory may be a network mount and a request must not
+//! wait on one. A full queue drops records rather than stalling the traffic
+//! it is describing.
+//!
 //! Bodies are redacted and then truncated, in that order, by
 //! [`CapturePolicy`] on the way into the file — never by the call site that
 //! built the record. One choke point is what makes "a secret cut in half by
@@ -16,7 +22,8 @@
 //! from a new caller.
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
@@ -927,59 +934,39 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
-/// Appends records to the daily file in one traffic directory. Every append
-/// re-resolves the filename, so a writer created before midnight keeps
-/// writing to the right file after it — that is the whole of rotation.
-pub struct CaptureWriter {
-    dir: PathBuf,
-    session: String,
-    policy: CapturePolicy,
-    retain_days: u32,
-    /// The UTC day this writer last pruned on, or [`u64::MAX`] for "never".
-    /// Rotation is the only clock retention needs: the writer that opens a
-    /// new day's file is the one that notices the oldest day fell out of the
-    /// window.
-    pruned_day: std::sync::atomic::AtomicU64,
+/// How many records an offloaded writer holds before it starts dropping
+/// them. A record is a few hundred bytes, so this is kilobytes of queue and
+/// not megabytes: a gateway this far behind on its writes is one where the
+/// disk cannot keep up with the traffic at all, and holding the backlog for
+/// it would only move the stall onto the next request.
+const QUEUE_DEPTH: usize = 1024;
+
+/// What crosses the channel to an offloaded writer.
+enum Message {
+    /// One record, already redacted and truncated by the sender.
+    Record(Box<CaptureRecord>),
+    /// Answered once every record queued ahead of it is on disk.
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
-impl CaptureWriter {
-    /// A writer over `dir`, with a fresh session id and the default
-    /// [`CapturePolicy`] — redacting, because a writer nobody configured must
-    /// not be the one that puts a credential on disk.
-    #[must_use]
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            session: new_session_id(),
-            policy: CapturePolicy::default(),
-            retain_days: DEFAULT_RETAIN_DAYS,
-            pruned_day: std::sync::atomic::AtomicU64::new(u64::MAX),
-        }
-    }
+/// The half of a writer that touches the filesystem: where the files live,
+/// how long they are kept, and which day retention last ran for.
+///
+/// Split out so the writer task owns exactly the state it needs. It
+/// deliberately holds no handle back to the [`CaptureWriter`] that fed it,
+/// which is what lets the queue close when the last writer goes away.
+#[derive(Clone)]
+struct Sink {
+    dir: PathBuf,
+    retain_days: u32,
+    /// The UTC day this directory was last pruned on, or [`u64::MAX`] for
+    /// "never". Shared with the writer rather than copied, so the prune at
+    /// startup and the ones on rotation are counted against the same day.
+    pruned_day: Arc<AtomicU64>,
+}
 
-    /// Keeps `days` of daily files instead of [`DEFAULT_RETAIN_DAYS`]; `0`
-    /// keeps them forever.
-    #[must_use]
-    pub fn with_retain_days(mut self, days: u32) -> Self {
-        self.retain_days = days;
-        self
-    }
-
-    /// How many days of traffic this writer keeps.
-    #[must_use]
-    pub fn retain_days(&self) -> u32 {
-        self.retain_days
-    }
-
-    /// Prunes the traffic directory unless it has already been pruned on the
-    /// UTC day `now_millis` falls in. Called once when the gateway starts and
-    /// again on every rotation.
-    ///
-    /// Failures are reported and swallowed: a traffic directory that cannot
-    /// be tidied is not a reason to stop capturing, let alone serving.
-    pub fn prune_if_due(&self, now_millis: u64) {
-        use std::sync::atomic::Ordering;
-
+impl Sink {
+    fn prune_if_due(&self, now_millis: u64) {
         let day = now_millis / DAY_MILLIS;
         // Swap rather than load-then-store so two requests crossing midnight
         // together only prune once.
@@ -998,57 +985,9 @@ impl CaptureWriter {
         }
     }
 
-    /// Writes under `policy` instead of the default one.
-    #[must_use]
-    pub fn with_policy(mut self, policy: CapturePolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    #[must_use]
-    pub fn policy(&self) -> &CapturePolicy {
-        &self.policy
-    }
-
-    /// The traffic dir under a state dir, the layout `serve` and `watch` share.
-    #[must_use]
-    pub fn under_state_dir(state_dir: &Path) -> Self {
-        Self::new(state_dir.join(TRAFFIC_DIR))
-    }
-
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Identifies this gateway process. Records fall back to it when the
-    /// downstream transport offers no session of its own — a stdio face, or
-    /// an HTTP client on MCP 2026-07-28, which removed protocol sessions
-    /// (SEP-2567). Traffic attributed to it is "this gateway run", not "this
-    /// client": a long-lived daemon serving several harnesses cannot tell
-    /// them apart through this id.
-    ///
-    /// When the transport does hand out a session id, records carry
-    /// [`session_fingerprint`] of it instead.
-    #[must_use]
-    pub fn session(&self) -> &str {
-        &self.session
-    }
-
-    /// Appends `record` as one JSON line to today's file, creating the
-    /// directory and the file (0600 on unix) as needed, and pruning the days
-    /// that fell out of the retention window on the first append of each day.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Io`] when the line cannot be written.
-    pub fn append(&self, record: &CaptureRecord) -> Result<(), Error> {
+    /// Puts one already-redacted record on disk.
+    fn write(&self, record: &CaptureRecord) -> Result<(), Error> {
         use std::io::Write as _;
-
-        // The one place a body is redacted and cut, and in that order — see
-        // the module header.
-        let stored = self.policy.applied(record);
-        let record = stored.as_ref().unwrap_or(record);
 
         // Before the write, so the day that just rolled over is tidied by
         // the same call that opens the new file.
@@ -1072,6 +1011,220 @@ impl CaptureWriter {
         };
         file.write_all(line.as_bytes()).map_err(io_err(&path))?;
         file.flush().map_err(io_err(&path))
+    }
+}
+
+/// Appends records to the daily file in one traffic directory. Every append
+/// re-resolves the filename, so a writer created before midnight keeps
+/// writing to the right file after it — that is the whole of rotation.
+///
+/// A writer starts out writing on the calling thread, which is what the CLI
+/// subcommands and the tests want. [`CaptureWriter::offload`] moves the
+/// open-write-flush onto a dedicated thread behind a bounded queue, which is
+/// what a gateway wants: see that method for what happens when the queue
+/// fills.
+pub struct CaptureWriter {
+    sink: Sink,
+    session: String,
+    policy: CapturePolicy,
+    /// Set once by [`CaptureWriter::offload`]; absent for a writer that
+    /// writes on the caller's own thread.
+    queue: std::sync::OnceLock<tokio::sync::mpsc::Sender<Message>>,
+    /// Records this writer never queued because the writer thread was
+    /// behind. Counted rather than merely reported, so the log line can say
+    /// how bad it got.
+    dropped: AtomicU64,
+    /// Whether the first drop has been reported. One line per gateway run:
+    /// a writer that cannot keep up cannot keep up with warning about it
+    /// either, and the second thousand lines say nothing the first did not.
+    reported_drops: AtomicBool,
+}
+
+impl CaptureWriter {
+    /// A writer over `dir`, with a fresh session id and the default
+    /// [`CapturePolicy`] — redacting, because a writer nobody configured must
+    /// not be the one that puts a credential on disk.
+    #[must_use]
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            sink: Sink {
+                dir: dir.into(),
+                retain_days: DEFAULT_RETAIN_DAYS,
+                pruned_day: Arc::new(AtomicU64::new(u64::MAX)),
+            },
+            session: new_session_id(),
+            policy: CapturePolicy::default(),
+            queue: std::sync::OnceLock::new(),
+            dropped: AtomicU64::new(0),
+            reported_drops: AtomicBool::new(false),
+        }
+    }
+
+    /// Keeps `days` of daily files instead of [`DEFAULT_RETAIN_DAYS`]; `0`
+    /// keeps them forever.
+    #[must_use]
+    pub fn with_retain_days(mut self, days: u32) -> Self {
+        self.sink.retain_days = days;
+        self
+    }
+
+    /// How many days of traffic this writer keeps.
+    #[must_use]
+    pub fn retain_days(&self) -> u32 {
+        self.sink.retain_days
+    }
+
+    /// Prunes the traffic directory unless it has already been pruned on the
+    /// UTC day `now_millis` falls in. Called once when the gateway starts and
+    /// again on every rotation.
+    ///
+    /// Failures are reported and swallowed: a traffic directory that cannot
+    /// be tidied is not a reason to stop capturing, let alone serving.
+    pub fn prune_if_due(&self, now_millis: u64) {
+        self.sink.prune_if_due(now_millis);
+    }
+
+    /// Moves the actual file writing onto a dedicated thread fed by a queue
+    /// [`QUEUE_DEPTH`] records deep, and returns immediately. Call it once,
+    /// from inside a tokio runtime, before the writer starts serving
+    /// requests; a second call does nothing.
+    ///
+    /// This is what keeps a gateway's request path free of filesystem
+    /// latency. An append is `open(2)`, `write(2)`, `flush` and `close`, all
+    /// of which are unbounded on a state directory that lives on a network
+    /// mount — and a handler waiting on them is a request waiting on them.
+    ///
+    /// Records are dropped, not blocked on, when the queue is full: capture
+    /// is a log, and a log that can stall the traffic it describes is worse
+    /// than a log with a gap in it. The gap is counted
+    /// ([`CaptureWriter::dropped`]) and reported once.
+    ///
+    /// Ordering is preserved — the queue is FIFO and one thread drains it —
+    /// and [`CaptureWriter::flush`] is how a shutdown waits for the backlog.
+    pub fn offload(&self) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(QUEUE_DEPTH);
+        if self.queue.set(tx).is_err() {
+            return;
+        }
+        let sink = self.sink.clone();
+        // A blocking task rather than an async one: the work inside the loop
+        // is the blocking filesystem work this method exists to move, and
+        // parking a runtime worker on it would only have moved which request
+        // it delays.
+        tokio::task::spawn_blocking(move || {
+            while let Some(message) = rx.blocking_recv() {
+                match message {
+                    Message::Record(record) => {
+                        if let Err(err) = sink.write(&record) {
+                            eprintln!("warning: could not write traffic capture: {err}");
+                        }
+                    }
+                    Message::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+    }
+
+    /// Waits until everything appended so far is on disk. A no-op for a
+    /// writer that was never [`offloaded`](CaptureWriter::offload), which
+    /// writes before `append` returns anyway.
+    ///
+    /// The shutdown path calls this: the queue is the one place a record
+    /// that a client was told about can still be in memory.
+    pub async fn flush(&self) {
+        let Some(queue) = self.queue.get() else {
+            return;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Awaited rather than tried: unlike a record, the barrier is worth
+        // waiting a full queue out for, and there is no request behind it.
+        if queue.send(Message::Flush(tx)).await.is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// How many records this writer dropped because the writer thread was
+    /// behind. Always `0` for a writer that was never offloaded.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Writes under `policy` instead of the default one.
+    #[must_use]
+    pub fn with_policy(mut self, policy: CapturePolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    #[must_use]
+    pub fn policy(&self) -> &CapturePolicy {
+        &self.policy
+    }
+
+    /// The traffic dir under a state dir, the layout `serve` and `watch` share.
+    #[must_use]
+    pub fn under_state_dir(state_dir: &Path) -> Self {
+        Self::new(state_dir.join(TRAFFIC_DIR))
+    }
+
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.sink.dir
+    }
+
+    /// Identifies this gateway process. Records fall back to it when the
+    /// downstream transport offers no session of its own — a stdio face, or
+    /// an HTTP client on MCP 2026-07-28, which removed protocol sessions
+    /// (SEP-2567). Traffic attributed to it is "this gateway run", not "this
+    /// client": a long-lived daemon serving several harnesses cannot tell
+    /// them apart through this id.
+    ///
+    /// When the transport does hand out a session id, records carry
+    /// [`session_fingerprint`] of it instead.
+    #[must_use]
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Appends `record` as one JSON line to today's file, creating the
+    /// directory and the file (0600 on unix) as needed, and pruning the days
+    /// that fell out of the retention window on the first append of each day.
+    ///
+    /// On an [`offloaded`](CaptureWriter::offload) writer this queues the
+    /// line and returns without touching the filesystem, so `Ok(())` means
+    /// "accepted", not "on disk" — [`CaptureWriter::flush`] is what makes
+    /// that distinction go away.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] when the line cannot be written.
+    pub fn append(&self, record: &CaptureRecord) -> Result<(), Error> {
+        // The one place a body is redacted and cut, and in that order — see
+        // the module header. On the sending side of the queue, so a record
+        // waiting to be written is already as redacted as the file is.
+        let stored = self.policy.applied(record);
+        let record = stored.as_ref().unwrap_or(record);
+
+        let Some(queue) = self.queue.get() else {
+            return self.sink.write(record);
+        };
+        if queue
+            .try_send(Message::Record(Box::new(record.clone())))
+            .is_err()
+        {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if !self.reported_drops.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "warning: traffic capture is behind and is dropping records \
+                     (first of {dropped}); the traffic log has a gap while {} keeps up",
+                    self.sink.dir.display()
+                );
+            }
+        }
+        Ok(())
     }
 }
 

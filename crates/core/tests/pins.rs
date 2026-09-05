@@ -194,3 +194,36 @@ fn a_newer_pin_file_is_left_alone() {
     );
     assert_eq!(store.read("fx").unwrap().unwrap(), future);
 }
+
+/// The gateway observes off the request path now, on as many blocking
+/// threads as there are concurrent lists. The store's lock is what keeps the
+/// read-compare-write whole, so a drift that several lists meet at once is
+/// reported by exactly one of them and is on the file afterwards — never
+/// half-written, never lost to the list that wrote last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drift_several_lists_meet_at_once_is_recorded_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(PinStore::under_state_dir(dir.path()));
+    store
+        .observe("fx", &[tool("echo", "echoes input")])
+        .unwrap();
+
+    let moved = [tool("echo", "echoes input, and more besides")];
+    let lists: Vec<_> = (0..16)
+        .map(|_| {
+            let store = std::sync::Arc::clone(&store);
+            let moved = moved.clone();
+            tokio::task::spawn_blocking(move || store.observe("fx", &moved).unwrap().len())
+        })
+        .collect();
+
+    let mut reported = 0;
+    for list in lists {
+        reported += list.await.unwrap();
+    }
+    assert_eq!(reported, 1, "the same drift was reported more than once");
+    assert_eq!(
+        shape(&store.read("fx").unwrap().unwrap().drift),
+        [("echo", Change::Changed, Some(12), Some(30))]
+    );
+}

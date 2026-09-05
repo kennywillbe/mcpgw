@@ -461,3 +461,76 @@ fn usage_measures_the_daily_files_and_ignores_the_rest() {
     let empty = mcpgw_core::capture::usage(&dir.path().join("nothing")).unwrap();
     assert_eq!(empty, mcpgw_core::capture::Usage::default());
 }
+
+/// The queue an offloaded writer appends through is FIFO and drained by one
+/// thread, so the file reads in the order the requests finished — and a
+/// flush is what makes "appended" mean "on disk".
+#[tokio::test]
+async fn an_offloaded_writer_keeps_the_order_and_flush_writes_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path());
+    writer.offload();
+
+    let day = 1_768_435_200_000;
+    for i in 0..200u64 {
+        let mut record = CaptureRecord::new(writer.session(), "fx", Kind::Call, Duration::ZERO)
+            .with_tool(format!("t{i}"));
+        record.ts = day;
+        writer.append(&record).unwrap();
+    }
+    writer.flush().await;
+
+    let tools: Vec<String> = lines(&daily_path(writer.dir(), day))
+        .into_iter()
+        .map(|record| record.tool.unwrap())
+        .collect();
+    let expected: Vec<String> = (0..200).map(|i| format!("t{i}")).collect();
+    assert_eq!(tools, expected);
+    assert_eq!(writer.dropped(), 0);
+}
+
+/// A writer that cannot keep up loses records rather than the requests that
+/// produced them. What survives is still whole lines, still in order, and
+/// the loss is counted.
+#[tokio::test]
+async fn a_backlogged_writer_drops_records_instead_of_holding_the_caller_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = CaptureWriter::under_state_dir(dir.path());
+    writer.offload();
+
+    let day = 1_768_435_200_000;
+    let total = 20_000u64;
+    // Appended in a tight loop with nothing awaited, which is a burst no
+    // open-write-flush per record can be expected to keep up with.
+    for i in 0..total {
+        let mut record = CaptureRecord::new(writer.session(), "fx", Kind::Call, Duration::ZERO)
+            .with_tool(format!("t{i}"));
+        record.ts = day;
+        writer.append(&record).unwrap();
+    }
+    writer.flush().await;
+
+    let dropped = writer.dropped();
+    assert!(
+        dropped > 0,
+        "the queue never filled, so nothing was dropped"
+    );
+    let written: Vec<u64> = lines(&daily_path(writer.dir(), day))
+        .into_iter()
+        .map(|record| record.tool.unwrap()[1..].parse().unwrap())
+        .collect();
+    assert_eq!(written.len() as u64, total - dropped);
+    assert!(
+        written.windows(2).all(|pair| pair[0] < pair[1]),
+        "records reached the file out of order"
+    );
+}
+
+/// Every line of one daily file, parsed.
+fn lines(path: &std::path::Path) -> Vec<CaptureRecord> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}

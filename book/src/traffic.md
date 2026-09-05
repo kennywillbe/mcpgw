@@ -28,6 +28,15 @@ different window, and `0` keeps every day forever; see
 [Configuration](./configuration.md#capture). `mcpgw doctor` prints what the log
 costs today next to the window it is kept for.
 
+Lines are written by a thread of the gateway's own, not by the request being
+recorded, so a slow disk — a state directory on a network mount, say — costs
+the log its latency and not your tool calls. If a burst outruns that thread the
+gateway drops records instead of holding requests up, and says so once:
+
+```text
+warning: traffic capture is behind and is dropping records (first of 1); the traffic log has a gap while ~/.local/share/mcpgw/traffic keeps up
+```
+
 ## Following it live
 
 ```sh
