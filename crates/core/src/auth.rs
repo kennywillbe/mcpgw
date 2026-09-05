@@ -112,8 +112,27 @@ pub enum Error {
 
     /// Whatever rmcp's OAuth client reported: discovery, registration, the
     /// authorization request, the exchange, the `iss` check.
+    ///
+    /// Deliberately not a `#[source]`: the message already carries the inner
+    /// error's own text through `{0}`, and the CLI prints the whole source
+    /// chain — which printed that same text a second time under it.
     #[error("OAuth failed: {0}")]
-    OAuth(#[from] rmcp::transport::auth::AuthError),
+    OAuth(rmcp::transport::auth::AuthError),
+
+    /// The authorization server offers no way for a client to obtain an
+    /// identity, so there is nothing to open a browser for. The one thing
+    /// that fixes it is a client id registered with the provider by hand,
+    /// which is what the message says.
+    #[error(
+        "this server's authorization server ({authorization_server}) supports neither a client \
+         id metadata document nor dynamic client registration; register an OAuth client there, \
+         then run: mcpgw auth login {server} --client-id <id> (add --client-secret-env <VAR> if \
+         the provider issues a secret too)"
+    )]
+    NoClientIdentity {
+        server: String,
+        authorization_server: String,
+    },
 
     #[error("cannot listen on 127.0.0.1 for the OAuth redirect")]
     Listener(#[source] std::io::Error),
@@ -133,6 +152,12 @@ pub enum Error {
 
     #[error("{var} is not set, and server {name:?} names it as its client secret")]
     MissingSecret { name: String, var: String },
+}
+
+impl From<rmcp::transport::auth::AuthError> for Error {
+    fn from(error: rmcp::transport::auth::AuthError) -> Self {
+        Self::OAuth(error)
+    }
 }
 
 /// One server's stored OAuth credentials, as the file holds them.
@@ -513,8 +538,10 @@ pub struct Login<'a> {
 /// # Errors
 ///
 /// [`Error::Listener`] when the loopback socket cannot be bound,
-/// [`Error::OAuth`] for anything rmcp's client refuses — discovery,
-/// registration, the PKCE exchange, an `iss` that does not match —
+/// [`Error::NoClientIdentity`] when the authorization server offers no way to
+/// obtain a client id at all, [`Error::OAuth`] for anything else rmcp's client
+/// refuses — discovery, registration, the PKCE exchange, an `iss` that does
+/// not match —
 /// [`Error::Timeout`] when the browser never comes back, [`Error::Refused`]
 /// when the authorization server redirects with an error, and [`Error::Io`]
 /// when the tokens cannot be written.
@@ -558,7 +585,24 @@ pub async fn login(request: &Login<'_>, announce: impl FnOnce(&str)) -> Result<T
     if let Some(challenge) = request.challenge {
         authorization = authorization.with_challenge(challenge);
     }
-    state.start_authorization(authorization).await?;
+    if let Err(err) = state.start_authorization(authorization).await {
+        // rmcp reports "this server has no registration endpoint" with the
+        // same variant it reports a registration endpoint that broke, so the
+        // metadata is read back to tell the two apart — and only then, on a
+        // path that has already failed, does the second resolution cost
+        // anything.
+        if matches!(err, rmcp::transport::auth::AuthError::RegistrationFailed(_))
+            && request.client_id.is_none()
+            && let Some(authorization_server) =
+                unregistrable_authorization_server(&state, request.challenge).await
+        {
+            return Err(Error::NoClientIdentity {
+                server: request.server.to_owned(),
+                authorization_server,
+            });
+        }
+        return Err(Error::OAuth(err));
+    }
 
     announce(&state.get_authorization_url().await?);
 
@@ -573,6 +617,43 @@ pub async fn login(request: &Login<'_>, announce: impl FnOnce(&str)) -> Result<T
     Tokens::load(request.state_dir, request.server)?.ok_or_else(|| Error::Refused {
         message: "the authorization server issued no token".to_owned(),
     })
+}
+
+/// Names the authorization server when it offers no way at all to obtain a
+/// client identity — neither a client id metadata document nor a registration
+/// endpoint. `None` when it offers one, because then whatever went wrong is
+/// not something `--client-id` fixes and the provider's own words are the
+/// better message.
+///
+/// Read back off the state rather than threaded down from the failure: rmcp
+/// resolves the metadata inside `start_authorization` and keeps it on a
+/// manager it does not expose, and this only ever runs after a login has
+/// already failed.
+async fn unregistrable_authorization_server(
+    state: &OAuthState,
+    challenge: Option<&str>,
+) -> Option<String> {
+    let OAuthState::Unauthorized(manager) = state else {
+        return None;
+    };
+    let metadata = manager
+        .resolve_metadata_from_challenge(challenge)
+        .await
+        .ok()?
+        .metadata;
+    let offers_registration = metadata.registration_endpoint.is_some()
+        || metadata
+            .additional_fields
+            .get("client_id_metadata_document_supported")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if offers_registration {
+        return None;
+    }
+    // The issuer is what the provider calls itself; the authorization
+    // endpoint is where the user will end up registering an app by hand, and
+    // is all there is to go on when discovery fell back to the legacy paths.
+    Some(metadata.issuer.unwrap_or(metadata.authorization_endpoint))
 }
 
 /// Waits for the browser's one redirect and returns its query string.

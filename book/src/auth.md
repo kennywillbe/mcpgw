@@ -39,6 +39,7 @@ upstream "linear" needs OAuth; run mcpgw auth login linear on this machine
 mcpgw auth login linear            # one server
 mcpgw auth login                   # every server that is waiting on a login
 mcpgw auth login jira --client-id abc123
+mcpgw auth login github --client-id Ov23li... --client-secret-env GITHUB_CLIENT_SECRET
 mcpgw auth login linear --no-browser
 ```
 
@@ -81,6 +82,35 @@ In the order the [2026-07-28 spec][spec] asks for:
 3. **Dynamic Client Registration**, when the server offers a
    `registration_endpoint`. Deprecated in 2026-07-28 and still what Notion,
    Sentry and Cloudflare do.
+
+### When the provider registers no clients
+
+Some authorization servers offer none of the three: no client id metadata
+document, no `registration_endpoint`, and no client id unless you go and create
+one in their web UI. GitHub's remote MCP server is the one most people meet
+first. There is nothing for mcpgw to open a browser for, so the login stops
+before the browser with the one thing that fixes it:
+
+```console
+$ mcpgw auth login github
+github: this server's authorization server (https://github.com/login/oauth) supports neither a client id metadata document nor dynamic client registration; register an OAuth client there, then run: mcpgw auth login github --client-id <id> (add --client-secret-env <VAR> if the provider issues a secret too)
+```
+
+For GitHub, register an [OAuth app][github-oauth] with the callback URL
+`http://127.0.0.1/callback`, then:
+
+```sh
+export GITHUB_CLIENT_SECRET=...
+mcpgw auth login github --client-id Ov23li... --client-secret-env GITHUB_CLIENT_SECRET
+```
+
+The secret is not optional there, PKCE or not: GitHub does not distinguish
+public clients from confidential ones and [requires `client_secret` at the
+token endpoint][github-best-practices] even for a CLI. `--client-secret-env`
+names the environment variable rather than taking the value, so the secret
+never reaches your shell history, the config file or `mcpgw list`. Both the
+client id and the variable name are written into the server's `[auth]` table,
+so refreshes in the daemon present the same identity.
 
 The redirect URI in that document is `http://127.0.0.1/callback` with no port.
 [RFC 8252 §7.3][rfc8252] obliges an authorization server to accept whichever
@@ -219,3 +249,5 @@ refused at parse time rather than silently letting one win.
 
 [spec]: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration
 [rfc8252]: https://www.rfc-editor.org/rfc/rfc8252.html#section-7.3
+[github-oauth]: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app
+[github-best-practices]: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/best-practices-for-creating-an-oauth-app
