@@ -185,7 +185,7 @@ async fn a_record_left_by_a_dead_gateway_says_nothing_about_versions() {
     util::rewrite_record_version(dir.path(), &url, "0.0.1").await;
     // SIGKILL, so the record outlives the process exactly as a crash leaves
     // it — a clean shutdown would withdraw it and prove nothing.
-    child.stop().await;
+    child.stop_hard().await;
 
     let home = dir.path().to_owned();
     let probed = url.clone();

@@ -194,6 +194,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         }
 
         let restart = decided.borrow().clone();
+        let standing_aside = restart.is_some();
         if let Some(restart) = restart {
             stand_aside(restart, state_dir.as_deref(), record, &manager).await;
         }
@@ -201,13 +202,25 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         // Withdrawn before the error is propagated: this gateway is gone
         // either way, and a record left behind by a bind that died under us
         // is exactly the stale one readers should not have to reason about.
-        if let Some(dir) = &state_dir {
+        //
+        // Never on the stand-aside, which has just written the record the
+        // gateway replacing this one reads to find out which binary it has
+        // already restarted for.
+        if !standing_aside && let Some(dir) = &state_dir {
             mcpgw_core::runtime::remove_record(dir, addr.port());
         }
-        // Before anything that can return early: the queue is the one place
-        // a record of traffic that already happened is still only in memory.
+        // Before anything that can return early — or exit — because the
+        // queue is the one place a record of traffic that already happened
+        // is still only in memory.
         if let Some(writer) = &capture {
             writer.flush().await;
+        }
+        // The upgrade restart is a status the supervisor reads, not a return
+        // value, so it is the one exit this function does not walk out of.
+        // Taken here rather than in `stand_aside` so it comes after the
+        // flush above, like every other way out of this gateway.
+        if standing_aside {
+            std::process::exit(i32::from(upgrade::UPGRADE_EXIT));
         }
         if let Some(served) = served {
             served?;
@@ -518,7 +531,9 @@ fn first_update_check() -> std::time::Duration {
     FIRST_UPDATE_CHECK
 }
 
-/// Ends this process so its supervisor starts the binary that replaced it.
+/// Readies this process to end so its supervisor starts the binary that
+/// replaced it: the restart is recorded and the children are stopped, and
+/// the caller does the exiting once it has flushed everything it holds.
 ///
 /// The runtime record is left in place rather than withdrawn: another gateway
 /// is about to come up on this port within seconds, and the restart written
@@ -529,7 +544,7 @@ async fn stand_aside(
     state_dir: Option<&std::path::Path>,
     record: Option<GatewayRecord>,
     manager: &UpstreamManager,
-) -> ! {
+) {
     if let (Some(dir), Some(mut record)) = (state_dir, record) {
         record.last_upgrade_restart = Some(restart);
         if let Err(err) = mcpgw_core::runtime::write_record(dir, &record) {
@@ -543,7 +558,6 @@ async fn stand_aside(
     // Bounded like the drain, and for the same reason: a stdio server that
     // will not die must not keep the old binary running.
     let _ = tokio::time::timeout(UPGRADE_DRAIN, manager.shutdown()).await;
-    std::process::exit(i32::from(upgrade::UPGRADE_EXIT));
 }
 
 /// How long the gateway keeps serving after the exe watcher has decided it

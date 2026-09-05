@@ -37,6 +37,11 @@ gateway drops records instead of holding requests up, and says so once:
 warning: traffic capture is behind and is dropping records (first of 1); the traffic log has a gap while ~/.local/share/mcpgw/traffic keeps up
 ```
 
+Stopping the gateway the ordinary way — Ctrl-C, `mcpgw daemon stop`, or the
+restart it does for a new binary — waits for that thread to finish, so nothing
+already answered for is lost; a hard kill (`kill -9`, a machine losing power)
+ends the process where it stands and takes whatever was still queued with it.
+
 ## Following it live
 
 ```sh
