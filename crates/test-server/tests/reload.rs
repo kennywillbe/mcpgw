@@ -133,6 +133,13 @@ impl Harness {
     }
 }
 
+/// The status line of a raw response. Status codes are only ever asserted
+/// through this: a search over the whole response hits the headers and the
+/// body too, and either can spell a three-digit number of its own.
+fn status_line(response: &str) -> &str {
+    response.lines().next().unwrap_or_default()
+}
+
 /// Calls the `pid` fixture's one tool and returns the process id it reports.
 /// A server that was restarted answers with a different one.
 async fn pid(client: &Client, tool: &str) -> String {
@@ -152,12 +159,7 @@ async fn pid(client: &Client, tool: &str) -> String {
 #[tokio::test]
 async fn a_server_added_to_the_config_is_served_without_a_restart() {
     let gateway = Harness::start(&[("fx1", "healthy", true)]).await;
-    assert!(
-        gateway
-            .raw_post(&endpoint_path("fx2"))
-            .await
-            .contains("404")
-    );
+    assert!(status_line(&gateway.raw_post(&endpoint_path("fx2")).await).contains("404"));
 
     let serving = gateway
         .set(&[("fx1", "healthy", true), ("fx2", "healthy", true)])
@@ -188,7 +190,7 @@ async fn a_server_removed_from_the_config_404s_and_names_what_is_left() {
     gateway.set(&[("fx1", "healthy", true)]).await;
 
     let response = gateway.raw_post(&endpoint_path("fx2")).await;
-    assert!(response.contains("404"), "{response}");
+    assert!(status_line(&response).contains("404"), "{response}");
     // The 404 has to list the *new* table: a stale client config is the
     // usual cause, and the answer to it is the names actually served now.
     assert!(response.contains("known endpoints: /s/fx1"), "{response}");
@@ -204,12 +206,7 @@ async fn a_disabled_server_drops_out() {
         .await;
     assert_eq!(serving, ["fx1"]);
 
-    assert!(
-        gateway
-            .raw_post(&endpoint_path("fx2"))
-            .await
-            .contains("404")
-    );
+    assert!(status_line(&gateway.raw_post(&endpoint_path("fx2")).await).contains("404"));
     // Still configured, just not served: the manager knows the name and
     // refuses it, rather than reporting it as unknown.
     assert_eq!(
@@ -318,12 +315,7 @@ async fn a_call_in_flight_completes_against_the_old_service() {
     );
 
     // The endpoint is gone for anything that starts *after* the swap.
-    assert!(
-        gateway
-            .raw_post(&endpoint_path("going"))
-            .await
-            .contains("404")
-    );
+    assert!(status_line(&gateway.raw_post(&endpoint_path("going")).await).contains("404"));
     client.cancel().await.unwrap();
     gateway.manager.shutdown().await;
 }
