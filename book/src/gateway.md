@@ -455,6 +455,11 @@ down.
 mcpgw sync
 ```
 
+`add`, `remove`, `enable` and `disable` end by running exactly this, so the
+clients are current when the command returns; `--no-sync` on any of them leaves
+that for later. Running it by hand is for everything else — a preview, a subset
+of clients, an edit made in the config file directly.
+
 Every enabled server keeps its entry and its name; only the transport changes,
 to that server's own `/s/<name>` endpoint. So the client's list of servers
 looks the same before and after, tools stay unprefixed, and anything the client

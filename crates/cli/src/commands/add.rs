@@ -29,12 +29,16 @@ pub struct AddArgs {
     /// Overwrite an existing server without asking
     #[arg(long)]
     pub force: bool,
+    /// Add without syncing the clients. They do not carry the new server
+    /// until `mcpgw sync` runs
+    #[arg(long)]
+    pub no_sync: bool,
     /// Command and arguments for a stdio server, verbatim after `--`
     #[arg(last = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
-pub fn run(args: &AddArgs) -> anyhow::Result<()> {
+pub fn run(args: &AddArgs, color: bool) -> anyhow::Result<()> {
     let server = Server {
         enabled: !args.disabled,
         tags: args.tags.clone(),
@@ -78,7 +82,7 @@ pub fn run(args: &AddArgs) -> anyhow::Result<()> {
         args.name
     );
     warn_unreachable_by_daemon(&server.transport);
-    Ok(())
+    super::sync::after_edit(args.no_sync, color)
 }
 
 /// Says so when the command just stored resolves for the caller but not for

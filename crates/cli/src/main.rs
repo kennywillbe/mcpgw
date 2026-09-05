@@ -44,11 +44,19 @@ enum Command {
     Enable {
         /// Server name
         name: String,
+        /// Enable without syncing the clients. They do not carry the server
+        /// again until `mcpgw sync` runs
+        #[arg(long)]
+        no_sync: bool,
     },
     /// Disable a server without deleting its entry
     Disable {
         /// Server name
         name: String,
+        /// Disable without syncing the clients. They keep the server's entry
+        /// until `mcpgw sync` runs
+        #[arg(long)]
+        no_sync: bool,
     },
     /// Pull servers from client configs into the canonical list
     Import(commands::import::ImportArgs),
@@ -184,11 +192,15 @@ fn dispatch(command: Command, color: bool) -> anyhow::Result<u8> {
         Command::List { json, show_secrets } => {
             commands::list::run(json, show_secrets, color).map(|()| 0)
         }
-        Command::Add(args) => commands::add::run(&args).map(|()| 0),
+        Command::Add(args) => commands::add::run(&args, color).map(|()| 0),
         Command::Auth(args) => commands::auth::run(&args, color),
-        Command::Remove(args) => commands::remove::run(&args).map(|()| 0),
-        Command::Enable { name } => commands::toggle::run(&name, true).map(|()| 0),
-        Command::Disable { name } => commands::toggle::run(&name, false).map(|()| 0),
+        Command::Remove(args) => commands::remove::run(&args, color).map(|()| 0),
+        Command::Enable { name, no_sync } => {
+            commands::toggle::run(&name, true, no_sync, color).map(|()| 0)
+        }
+        Command::Disable { name, no_sync } => {
+            commands::toggle::run(&name, false, no_sync, color).map(|()| 0)
+        }
         Command::Import(args) => commands::import::run(&args).map(|()| 0),
         Command::Sync(args) => commands::sync::run(&args, color).map(|()| 0),
         Command::Eject(args) => commands::eject::run(&args, color),

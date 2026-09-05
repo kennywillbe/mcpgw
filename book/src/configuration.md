@@ -380,7 +380,8 @@ mcpgw clients cursor tools deny 'delete_*'     # narrow what it sees
 mcpgw clients cursor tools clear
 ```
 
-Every edit needs an `mcpgw sync` to reach the client's file.
+Every edit needs an `mcpgw sync` to reach the client's file — unlike `add`,
+`remove`, `enable` and `disable`, which run that sync themselves.
 
 `mcpgw doctor --probe` reports what each one ends up with:
 

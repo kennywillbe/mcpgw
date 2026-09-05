@@ -5,13 +5,24 @@ use assert_cmd::Command;
 
 mod util;
 
+/// `config` always sits in a temp directory of the test's own, and that
+/// directory is the home every run gets: `add`, `remove`, `enable` and
+/// `disable` sync the clients now, so a run that inherited the real home
+/// would rewrite the client files of whoever is running the suite.
 fn mcpgw(config: &Path, args: &[&str]) -> Output {
+    let home = config.parent().unwrap();
     Command::cargo_bin("mcpgw")
         .unwrap()
         // Hermetic: no test may phone home for a version notice.
         .env("MCPGW_NO_UPDATE_CHECK", "1")
         .args(args)
         .env("MCPGW_CONFIG", config)
+        .env("MCPGW_STATE_DIR", home.join("state"))
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("APPDATA", home.join("AppData"))
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
         .output()
         .unwrap()
 }
@@ -135,6 +146,7 @@ fn add_in_home(home: &Path, config: &Path, args: &[&str]) -> Output {
         .env("HOME", home)
         .env("MCPGW_STATE_DIR", home.join("state"))
         .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
         .output()
         .unwrap()
 }
@@ -293,4 +305,118 @@ fn a_headers_command_is_refused_on_a_stdio_server() {
     );
     assert!(!out.status.success());
     assert!(stderr(&out).contains("--headers-command is for http servers"));
+}
+
+/// A config directory that is also a home with one client installed in it,
+/// so the sync these commands now run has somewhere to write.
+fn temp_config_with_cursor() -> (tempfile::TempDir, PathBuf) {
+    let (dir, config) = temp_config();
+    std::fs::create_dir_all(dir.path().join(".cursor")).unwrap();
+    std::fs::write(
+        dir.path().join(".cursor/mcp.json"),
+        "{\n  \"mcpServers\": {}\n}\n",
+    )
+    .unwrap();
+    (dir, config)
+}
+
+fn cursor_entries(home: &Path) -> String {
+    std::fs::read_to_string(home.join(".cursor/mcp.json")).unwrap()
+}
+
+#[test]
+fn add_writes_the_new_server_into_the_clients_itself() {
+    let (dir, config) = temp_config_with_cursor();
+    let out = mcpgw(
+        &config,
+        &["add", "linear", "--url", "https://mcp.linear.app/mcp"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // The per-client lines `mcpgw sync` prints, from the add itself.
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.contains("Cursor —"), "{said}");
+    assert!(said.contains("+ linear"), "{said}");
+
+    // And no second command was needed to make them true.
+    let written = cursor_entries(dir.path());
+    assert!(written.contains("linear"), "{written}");
+}
+
+#[test]
+fn add_no_sync_leaves_the_clients_where_they_were() {
+    let (dir, config) = temp_config_with_cursor();
+    let out = mcpgw(
+        &config,
+        &[
+            "add",
+            "--no-sync",
+            "linear",
+            "--url",
+            "https://mcp.linear.app/mcp",
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Said, because the two halves are now out of step until it runs.
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.contains("mcpgw sync"), "{said}");
+
+    assert_eq!(list_json(&config)["servers"]["linear"]["type"], "http");
+    let written = cursor_entries(dir.path());
+    assert!(!written.contains("linear"), "{written}");
+}
+
+#[test]
+fn remove_takes_the_entry_out_of_the_clients_itself() {
+    let (dir, config) = temp_config_with_cursor();
+    mcpgw(
+        &config,
+        &["add", "linear", "--url", "https://mcp.linear.app/mcp"],
+    );
+    assert!(cursor_entries(dir.path()).contains("linear"));
+
+    let out = mcpgw(&config, &["remove", "linear", "--yes"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.contains("- linear"), "{said}");
+
+    let written = cursor_entries(dir.path());
+    assert!(!written.contains("linear"), "{written}");
+}
+
+/// A disabled server is mirrored into no client, so the switch is a client
+/// edit too — and the sync that makes it one runs from `disable` itself.
+#[test]
+fn disable_and_enable_move_the_entry_with_them() {
+    let (dir, config) = temp_config_with_cursor();
+    mcpgw(
+        &config,
+        &["add", "linear", "--url", "https://mcp.linear.app/mcp"],
+    );
+
+    let out = mcpgw(&config, &["disable", "linear"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let written = cursor_entries(dir.path());
+    assert!(!written.contains("linear"), "{written}");
+
+    let out = mcpgw(&config, &["enable", "linear"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let written = cursor_entries(dir.path());
+    assert!(written.contains("linear"), "{written}");
+}
+
+/// One line rather than one "not found, skipped" per client: on a machine
+/// with no MCP client at all, that list would be the whole output and none
+/// of it the answer.
+#[test]
+fn an_edit_on_a_machine_with_no_client_says_so_once() {
+    let (_dir, config) = temp_config();
+    let out = mcpgw(
+        &config,
+        &["add", "linear", "--url", "https://mcp.linear.app/mcp"],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.contains("no MCP client found"), "{said}");
+    assert!(!said.contains("skipped"), "{said}");
 }
