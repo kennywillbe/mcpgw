@@ -268,6 +268,15 @@ clients send no `Origin` at all and are unaffected.
   your client configs, `managed.json`, the traffic logs, the daemon logs, the
   gateway token — is `0600`. Those backups are copies of files that hold tokens, which is why
   they get the same treatment as the traffic log.
+- Those modes are set on every write and checked on every read that matters:
+  `mcpgw doctor` audits `config.toml`, the gateway token, each OAuth login,
+  `probes.json` and the state directory itself, and warns once per file that
+  any other account on the machine can read — naming the file and the `chmod`
+  that fixes it. A mode is only true of the moment it was set, and a restore
+  from a backup tool or a `chmod -R` aimed at a parent directory is how it
+  stops being true. Nothing refuses to load over it: a warning you can act on
+  in one command beats being locked out of your own gateway. Unix only —
+  Windows ACLs are not these bits.
 - The canonical config holds your `env` values and headers in plaintext, the
   same way every client config already does. `mcpgw list` masks them, on both
   the table and `--json`, and it runs the same redaction over the target — a

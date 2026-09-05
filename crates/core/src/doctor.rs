@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::Path;
 
 use serde::Serialize;
 
@@ -747,6 +748,50 @@ pub fn unauthenticated_bind(bind: &str, require_token: bool) -> Option<Finding> 
              127.0.0.1"
         ),
         code: Some(UNAUTHENTICATED_BIND),
+    })
+}
+
+/// The code on the finding for a file or directory of mcpgw's that anyone
+/// but its owner can read.
+pub const LOOSE_PERMISSIONS: &str = "loose_permissions";
+
+/// The warning for one of mcpgw's own files whose mode has been widened
+/// since it was written.
+///
+/// [`crate::private`] hardens these on every write — files 0600, the
+/// directories holding them 0700 — but a mode is only an invariant of the
+/// moment it is set. A restore from a backup tool, an editor that writes a
+/// new file through the ambient umask, a `chmod -R` aimed at a parent: any
+/// of those leaves a token, a set of OAuth credentials or a config full of
+/// `Authorization` headers readable by every account on the machine, and
+/// nothing on the read path notices, because refusing to load the file
+/// would lock the user out of their own gateway over something they can fix
+/// in one command. So it is reported instead, with that command.
+///
+/// A warning, not an error: nothing is broken and the multi-user machine
+/// where this is a real exposure is not the common case. `mode` is the full
+/// permission word, `is_dir` picks the mode it should have had; the caller
+/// does the [`std::fs::metadata`] call, and only on unix, where the bits
+/// mean something.
+#[must_use]
+pub fn loose_permissions(path: &Path, mode: u32, is_dir: bool) -> Option<Finding> {
+    let others = mode & 0o077;
+    if others == 0 {
+        return None;
+    }
+    let want = if is_dir { "700" } else { "600" };
+    let what = if is_dir { "directory" } else { "file" };
+    let path = path.display();
+    Some(Finding {
+        client: None,
+        server: None,
+        severity: Severity::Warning,
+        message: format!(
+            "the {what} {path} is mode {:04o}, which lets other accounts on this machine \
+             read it — run `chmod {want} {path}`",
+            mode & 0o7777
+        ),
+        code: Some(LOOSE_PERMISSIONS),
     })
 }
 

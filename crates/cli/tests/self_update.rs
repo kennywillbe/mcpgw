@@ -165,9 +165,16 @@ fn built_binary() -> PathBuf {
     assert_cmd::cargo::cargo_bin("mcpgw")
 }
 
-/// What the stand-in release binary prints, whatever it is asked.
+/// What the stand-in release binary prints for `--version`.
+///
+/// It has to be the version being published: `self-update` runs the staged
+/// file before swapping it in and refuses anything that answers with a
+/// different number, so a stand-in that printed a fixed string would be
+/// refused exactly like the corrupt download it is standing in for.
 #[cfg(unix)]
-const STAND_IN_OUTPUT: &str = "the downloaded binary";
+fn stand_in_output() -> String {
+    format!("mcpgw {NEWER}")
+}
 
 /// A few hundred kilobytes of real machine code to ship inside the fake
 /// release, compiled here rather than taken from `target/`.
@@ -183,13 +190,9 @@ const STAND_IN_OUTPUT: &str = "the downloaded binary";
 /// that lands is executable, and a hello-world proves that as well as a
 /// 250 MB debug build while staying the same size forever.
 #[cfg(unix)]
-fn stand_in_binary(dir: &Path) -> Vec<u8> {
+fn stand_in_binary(dir: &Path, body: &str) -> Vec<u8> {
     let source = dir.join("stand-in.rs");
-    std::fs::write(
-        &source,
-        format!("fn main() {{ println!(\"{STAND_IN_OUTPUT}\"); }}"),
-    )
-    .unwrap();
+    std::fs::write(&source, format!("fn main() {{ {body} }}")).unwrap();
 
     // Whatever compiled this test is what compiles the stand-in: cargo sets
     // RUSTC for the session, and a session that got this far has one.
@@ -331,7 +334,7 @@ fn a_verified_archive_replaces_the_running_binary() {
     let exe = bin.join("mcpgw");
     std::fs::copy(built_binary(), &exe).unwrap();
 
-    let payload = stand_in_binary(dir.path());
+    let payload = stand_in_binary(dir.path(), &format!("println!(\"{}\");", stand_in_output()));
     let archive = release_archive(NEWER, &payload);
     let asset = asset_name(NEWER);
     let sums = format!(
@@ -366,7 +369,7 @@ fn a_verified_archive_replaces_the_running_binary() {
     assert!(version.status.success());
     assert_eq!(
         String::from_utf8_lossy(&version.stdout).trim(),
-        STAND_IN_OUTPUT
+        stand_in_output()
     );
     // Nothing was left staged beside it.
     let leftovers: Vec<_> = std::fs::read_dir(&bin)
@@ -375,6 +378,99 @@ fn a_verified_archive_replaces_the_running_binary() {
         .filter(|name| name != "mcpgw")
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// A release host serving one archive that passes its own checksums, so a
+/// test about what happens *after* the download only has to say what the
+/// payload does.
+#[cfg(unix)]
+fn host_serving(payload: &[u8]) -> ReleaseHost {
+    let asset = asset_name(NEWER);
+    let archive = release_archive(NEWER, payload);
+    let sums = format!("{}  {asset}\n", sha256_hex(&archive));
+    ReleaseHost::start(HashMap::from([
+        (
+            "/releases/latest".to_owned(),
+            format!(r#"{{"tag_name": "v{NEWER}"}}"#).into_bytes(),
+        ),
+        (format!("/releases/download/v{NEWER}/{asset}"), archive),
+        (
+            format!("/releases/download/v{NEWER}/SHA256SUMS"),
+            sums.into_bytes(),
+        ),
+    ]))
+}
+
+/// The download is intact — right checksum, right archive — and the binary
+/// inside it does not run. Replacing a working mcpgw with that one leaves
+/// the machine with no mcpgw at all and nothing to run the update from, so
+/// the staged file is executed first and the swap never happens.
+#[cfg(unix)]
+#[test]
+fn a_staged_binary_that_will_not_run_is_refused_before_the_swap() {
+    if !SHIPPED_TARGETS.contains(&TARGET) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join("mcpgw");
+    std::fs::copy(built_binary(), &exe).unwrap();
+    let before = std::fs::read(&exe).unwrap();
+
+    let host = host_serving(&stand_in_binary(dir.path(), "std::process::exit(1);"));
+    let out = run(&exe, &host.base, dir.path(), &["self-update"]);
+
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let stderr = stderr(&out);
+    assert!(
+        stderr.contains(&format!("mcpgw {NEWER} was not installed")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--version"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("{} is unchanged", exe.display())),
+        "{stderr}"
+    );
+
+    // The whole point: the binary that was there still is, byte for byte,
+    // and nothing was left staged next to it.
+    assert_eq!(std::fs::read(&exe).unwrap(), before);
+    let leftovers: Vec<_> = std::fs::read_dir(&bin)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "mcpgw")
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+/// A binary that starts and answers, with somebody else's version number:
+/// the archive that was fetched for one release carrying another. It runs,
+/// so "does it run" would wave it through; the version it reports is what
+/// catches it.
+#[cfg(unix)]
+#[test]
+fn a_staged_binary_reporting_another_version_is_refused() {
+    if !SHIPPED_TARGETS.contains(&TARGET) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let exe = bin.join("mcpgw");
+    std::fs::copy(built_binary(), &exe).unwrap();
+    let before = std::fs::read(&exe).unwrap();
+
+    let host = host_serving(&stand_in_binary(dir.path(), "println!(\"mcpgw 1.2.3\");"));
+    let out = run(&exe, &host.base, dir.path(), &["self-update"]);
+
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let stderr = stderr(&out);
+    assert!(
+        stderr.contains("it reports itself as mcpgw 1.2.3"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&exe).unwrap(), before);
 }
 
 #[cfg(unix)]
