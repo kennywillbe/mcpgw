@@ -571,6 +571,78 @@ async fn capture_bodies_off_records_metadata_and_no_bodies() {
     assert!(captured.contains(r#""tool":"echo""#), "{captured}");
 }
 
+/// Since #221 an accepted record is a queued record: the client has its
+/// answer while the line is still in memory. What makes that safe is the
+/// flush on the way out, so a gateway asked to stop has to leave the record
+/// behind on disk.
+///
+/// The writer is told to hold everything until that flush, which is the
+/// state this is about — otherwise the test only asserts that a background
+/// thread usually wins a race.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_record_accepted_just_before_a_graceful_stop_is_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_config(&home.join("config.toml"), &fixture_config(&["fx1"]));
+    let (child, addr, _, _errors) = util::serve_binary_capturing(
+        &assert_cmd::cargo::cargo_bin("mcpgw"),
+        home,
+        &[],
+        &[(mcpgw_core::capture::HOLD_UNTIL_FLUSH_ENV, "1")],
+    )
+    .await;
+    let state = home.join("state");
+    let port = port_of(&addr);
+    wait_for_record(&state, port).await;
+
+    call_tool(&format!("http://{addr}/s/fx1"), "echo", "the last call").await;
+    child.stop().await;
+
+    // The withdrawn record is what says the stop went through the shutdown
+    // path at all: a hard kill leaves it, and skips the flush with it.
+    assert_eq!(
+        mcpgw_core::runtime::read_record(&state, port).unwrap(),
+        None
+    );
+    let captured = traffic(home);
+    assert!(captured.contains(r#""tool":"echo""#), "{captured}");
+}
+
+/// The same guarantee on the exit nobody sends a signal for: a supervised
+/// gateway standing aside for a replaced binary ends itself, and the traffic
+/// it has already answered for has to survive that too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_record_accepted_just_before_a_stand_aside_is_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = util::binary_copy(dir.path());
+    let state = dir.path().join("state");
+    write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
+    let (mut child, addr, _, errors) = util::serve_binary_capturing(
+        &copy,
+        dir.path(),
+        &["--supervised"],
+        &[(mcpgw_core::capture::HOLD_UNTIL_FLUSH_ENV, "1")],
+    )
+    .await;
+    let port = port_of(&addr);
+    wait_for_record(&state, port).await;
+    wait_for_stderr(&errors, "watching").await;
+
+    call_tool(&format!("http://{addr}/s/fx1"), "echo", "the last call").await;
+    util::publish_stub(&copy, "the upgrade this gateway stands aside for");
+
+    wait_for_stderr(&errors, "changed; restarting so the service runs it").await;
+    assert_eq!(
+        wait_for_exit(&mut child, &errors).await,
+        i32::from(mcpgw_core::upgrade::UPGRADE_EXIT)
+    );
+
+    let captured = traffic(dir.path());
+    assert!(captured.contains(r#""tool":"echo""#), "{captured}");
+}
+
 /// A gateway that writes a traffic log, which every other test in this file
 /// deliberately does not.
 async fn serve_capturing(home: &Path, args: &[&str]) -> (util::Spawned, String, String) {

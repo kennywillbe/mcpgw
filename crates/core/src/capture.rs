@@ -941,6 +941,27 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// it would only move the stall onto the next request.
 const QUEUE_DEPTH: usize = 1024;
 
+/// Makes the offloaded writer hold every record until a flush asks for it,
+/// so a test can put the gateway in the one state a shutdown has to be
+/// correct about: a record already accepted and answered for, still only in
+/// memory. Debug-only, like `MCPGW_UPDATE_FIRST_CHECK_MS`, because nothing
+/// outside the suite has any business making the traffic log lag on purpose.
+#[cfg(debug_assertions)]
+pub const HOLD_UNTIL_FLUSH_ENV: &str = "MCPGW_CAPTURE_HOLD_UNTIL_FLUSH";
+
+/// Whether this process was asked to hold records back — see
+/// [`HOLD_UNTIL_FLUSH_ENV`]. Always false in a release build.
+fn holds_records_until_flush() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os(HOLD_UNTIL_FLUSH_ENV).is_some()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
 /// What crosses the channel to an offloaded writer.
 enum Message {
     /// One record, already redacted and truncated by the sender.
@@ -1111,18 +1132,35 @@ impl CaptureWriter {
         // is the blocking filesystem work this method exists to move, and
         // parking a runtime worker on it would only have moved which request
         // it delays.
+        let holding = holds_records_until_flush();
         tokio::task::spawn_blocking(move || {
+            let write = |record: &CaptureRecord| {
+                if let Err(err) = sink.write(record) {
+                    eprintln!("warning: could not write traffic capture: {err}");
+                }
+            };
+            let mut held: Vec<Box<CaptureRecord>> = Vec::new();
             while let Some(message) = rx.blocking_recv() {
                 match message {
                     Message::Record(record) => {
-                        if let Err(err) = sink.write(&record) {
-                            eprintln!("warning: could not write traffic capture: {err}");
+                        if holding {
+                            held.push(record);
+                        } else {
+                            write(&record);
                         }
                     }
                     Message::Flush(ack) => {
+                        for record in held.drain(..) {
+                            write(&record);
+                        }
                         let _ = ack.send(());
                     }
                 }
+            }
+            // The last writer went away without a flush. Nothing is waiting
+            // on these, but a held record is still traffic that happened.
+            for record in held.drain(..) {
+                write(&record);
             }
         });
     }

@@ -401,12 +401,47 @@ impl Spawned {
         Self { child: Some(child) }
     }
 
-    /// Kills the process and waits for it to be gone.
+    /// Stops the process the way a supervisor does and waits for it to be
+    /// gone.
     ///
     /// For the assertions that are about what happens *after* the process
-    /// ends — a released port, a record left behind — where the guard's own
-    /// kill would come too late to be observed.
+    /// ends — a released port, a record left behind, a traffic log — where
+    /// the guard's own kill would come too late to be observed.
+    ///
+    /// SIGTERM rather than SIGKILL, because a gateway does its withdrawing
+    /// and its last flush on the shutdown path, and only a signal it can
+    /// catch reaches that path: a hard kill races the writer thread for
+    /// whatever is still queued. The kill is still there as the backstop for
+    /// a process that will not go, so a wedged gateway is a failed assertion
+    /// rather than a suite that hangs. Windows has no SIGTERM to send.
     pub async fn stop(mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            // Signalling a pid we own and have not yet reaped, so it cannot
+            // have been recycled onto somebody else's process.
+            #[allow(clippy::cast_possible_wrap)]
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            if tokio::time::timeout(STOP_DEADLINE, child.wait())
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let _ = child.kill().await;
+    }
+
+    /// Ends the process the way a crash does: SIGKILL, no shutdown path.
+    ///
+    /// For the handful of tests whose subject *is* what an unclean end leaves
+    /// behind — a runtime record nobody withdrew, say. Everything else wants
+    /// [`Spawned::stop`].
+    pub async fn stop_hard(mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
         }
@@ -472,6 +507,12 @@ impl Drop for SpawnedBlocking {
     }
 }
 
+/// How long [`Spawned::stop`] lets a signalled process take to end before it
+/// resorts to a kill. Generous for the same reason the banner deadline is:
+/// the shutdown drains upstreams and flushes a traffic log on a runner that
+/// is busy with the rest of the suite.
+const STOP_DEADLINE: Duration = Duration::from_secs(10);
+
 /// How long a banner line may take to arrive. Generous because it covers a
 /// cold process start on a runner that is compiling and testing everything
 /// else at the same time.
@@ -528,6 +569,24 @@ pub async fn serve_binary(
     serve_binary_with_env(exe, home, args, &[]).await
 }
 
+/// [`serve_binary`], writing a traffic log instead of the `--no-capture` the
+/// upgrade tests otherwise all want. Split out for the reason [`serve_with`]
+/// is: no test starts logging traffic by accident.
+#[allow(dead_code)]
+pub async fn serve_binary_capturing(
+    exe: &Path,
+    home: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (
+    Spawned,
+    String,
+    String,
+    std::sync::Arc<std::sync::Mutex<String>>,
+) {
+    serve_binary_inner(exe, home, &[], args, env).await
+}
+
 /// How long a gateway started by the suite gives a replacement to answer
 /// `--version`.
 ///
@@ -555,6 +614,21 @@ pub async fn serve_binary_with_env(
     String,
     std::sync::Arc<std::sync::Mutex<String>>,
 ) {
+    serve_binary_inner(exe, home, &["--no-capture"], args, env).await
+}
+
+async fn serve_binary_inner(
+    exe: &Path,
+    home: &Path,
+    capture: &[&str],
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (
+    Spawned,
+    String,
+    String,
+    std::sync::Arc<std::sync::Mutex<String>>,
+) {
     let mut command = tokio::process::Command::from(mcpgw_binary(exe, home));
     command.env(
         mcpgw_core::upgrade::VERIFY_TIMEOUT_ENV,
@@ -566,7 +640,8 @@ pub async fn serve_binary_with_env(
     let mut child = spawn_retrying_while_busy(
         command
             .arg("serve")
-            .args(["--port", "0", "--no-capture"])
+            .args(["--port", "0"])
+            .args(capture)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
