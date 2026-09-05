@@ -21,6 +21,12 @@ fn run_doctor_in(home: &Path, cwd: &Path, config_text: Option<&str>, args: &[&st
     let config = home.join("config.toml");
     if let Some(text) = config_text {
         std::fs::write(&config, text).unwrap();
+        // What `mcpgw` itself writes the file with. `fs::write` leaves it at
+        // the ambient umask, which doctor now has an opinion about, and no
+        // test here is about that opinion except the ones below.
+        #[cfg(unix)]
+        std::fs::set_permissions(&config, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
     }
     Command::cargo_bin("mcpgw")
         .unwrap()
@@ -40,6 +46,15 @@ fn run_doctor_in(home: &Path, cwd: &Path, config_text: Option<&str>, args: &[&st
         .env_remove("XDG_DATA_HOME")
         .output()
         .unwrap()
+}
+
+/// Creates a state directory the way mcpgw itself creates one — 0700, since
+/// `create_dir_all` would leave the ambient umask on it and the permission
+/// audit would then have something to say about every fixture.
+fn make_state_dir(state: &Path) {
+    std::fs::create_dir_all(state).unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(state, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
 }
 
 fn stdout(out: &Output) -> String {
@@ -406,7 +421,7 @@ fn managed_cursor(home: &Path, entries: &[(&str, &str)]) {
     .unwrap();
 
     let state = home.join("state");
-    std::fs::create_dir_all(&state).unwrap();
+    make_state_dir(&state);
     let names: Vec<&str> = entries.iter().map(|(name, _)| *name).collect();
     std::fs::write(
         state.join("managed.json"),
@@ -766,7 +781,7 @@ fn the_project_section_separates_managed_entries_from_the_rest() {
     let repo = mcpgw_core::paths::normalize(&repo);
     let key = mcpgw_core::paths::normalize(&repo.join(".mcp.json"));
     let state = home.path().join("state");
-    std::fs::create_dir_all(&state).unwrap();
+    make_state_dir(&state);
     std::fs::write(
         state.join("managed.json"),
         serde_json::json!({
@@ -903,7 +918,8 @@ fn a_tool_rule_is_not_checked_without_probe() {
 /// received.
 fn write_pins(home: &Path, drift: &str) {
     let dir = home.join("state").join("pins");
-    std::fs::create_dir_all(&dir).unwrap();
+    make_state_dir(&home.join("state"));
+    make_state_dir(&dir);
     std::fs::write(
         dir.join("fx.json"),
         format!(
@@ -1110,7 +1126,8 @@ deney = ["delete_*"]
 fn the_traffic_line_reports_the_size_and_the_retention_window() {
     let dir = tempfile::tempdir().unwrap();
     let traffic = dir.path().join("state").join("traffic");
-    std::fs::create_dir_all(&traffic).unwrap();
+    make_state_dir(&dir.path().join("state"));
+    make_state_dir(&traffic);
     std::fs::write(traffic.join("2026-01-01.jsonl"), vec![b'x'; 2048]).unwrap();
     std::fs::write(traffic.join("2026-02-01.jsonl"), vec![b'x'; 1024]).unwrap();
 
@@ -1140,7 +1157,8 @@ fn the_traffic_line_defaults_to_a_finite_window_and_survives_an_empty_log() {
 fn json_reports_the_capture_block() {
     let dir = tempfile::tempdir().unwrap();
     let traffic = dir.path().join("state").join("traffic");
-    std::fs::create_dir_all(&traffic).unwrap();
+    make_state_dir(&dir.path().join("state"));
+    make_state_dir(&traffic);
     std::fs::write(traffic.join("2026-01-01.jsonl"), b"{}\n").unwrap();
 
     let out = run_doctor(dir.path(), Some(HEALTHY), &["--json"]);
@@ -1150,4 +1168,148 @@ fn json_reports_the_capture_block() {
     assert_eq!(capture["bytes"], 3);
     assert_eq!(capture["retain_days"], 14);
     assert_eq!(capture["oldest"], "2026-01-01");
+}
+
+/// A config that anyone on the machine can read is a warning naming the file
+/// and the command that fixes it — the state a restore or a stray `chmod`
+/// leaves behind, which nothing on the read path would otherwise mention.
+#[cfg(unix)]
+#[test]
+fn a_world_readable_config_is_a_warning_naming_the_chmod() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, HEALTHY).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = run_doctor(dir.path(), None, &["--json"]);
+    // A warning only: the file still loads, and the gateway still works.
+    assert!(out.status.success(), "{}", stdout(&out));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let finding = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "loose_permissions")
+        .unwrap_or_else(|| panic!("{}", stdout(&out)));
+    assert_eq!(finding["severity"], "warning");
+    let message = finding["message"].as_str().unwrap();
+    assert!(message.contains("config.toml"), "{message}");
+    assert!(message.contains("mode 0644"), "{message}");
+    assert!(
+        message.contains(&format!("chmod 600 {}", config.display())),
+        "{message}"
+    );
+}
+
+/// The other half: a token file and an OAuth login left as mcpgw wrote them
+/// produce nothing at all, so the check is not noise on a healthy machine.
+#[cfg(unix)]
+#[test]
+fn owner_only_state_files_produce_no_permission_warning() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(state.join("auth")).unwrap();
+    for path in [
+        state.join("gateway.token"),
+        state.join("probes.json"),
+        state.join("auth").join("github.json"),
+    ] {
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    for dir in [state.join("auth"), state.clone()] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let loose: Vec<_> = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "loose_permissions")
+        .collect();
+    assert!(loose.is_empty(), "{loose:?}");
+}
+
+/// Each loosened file is its own line: the OAuth store holds one file per
+/// server, and "something under the state dir is readable" is not a report
+/// anybody can act on.
+#[cfg(unix)]
+#[test]
+fn a_group_readable_token_and_login_are_reported_by_name() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(state.join("auth")).unwrap();
+    let token = state.join("gateway.token");
+    let login = state.join("auth").join("github.json");
+    for path in [&token, &login] {
+        std::fs::write(path, "{}").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    for dir in [state.join("auth"), state.clone()] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let messages: Vec<&str> = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|finding| finding["code"] == "loose_permissions")
+        .map(|finding| finding["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains(&format!("{}", token.display()))),
+        "{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains(&format!("{}", login.display()))),
+        "{messages:?}"
+    );
+}
+
+/// The directories are checked too: a 0755 state dir lets another account
+/// list — and open — every file under it whatever their own modes say.
+#[cfg(unix)]
+#[test]
+fn a_world_listable_state_dir_is_reported_with_chmod_700() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let message = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "loose_permissions")
+        .unwrap_or_else(|| panic!("{}", stdout(&out)))["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        message.contains(&format!("directory {}", state.display())),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("chmod 700 {}", state.display())),
+        "{message}"
+    );
 }

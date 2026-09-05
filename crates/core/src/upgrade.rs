@@ -128,12 +128,35 @@ pub fn stamp(path: &Path) -> Stamp {
 ///
 /// # Errors
 ///
-/// A sentence rather than an error type, because the single caller puts it
-/// in parentheses in a log line and nothing branches on it: the file could
-/// not be started, it did not answer within [`VERIFY_TIMEOUT`], it ended
-/// badly — `signal: 9 (SIGKILL)` is what an in-place overwrite looks like on
-/// macOS — or what it printed was not an mcpgw version.
+/// A sentence rather than an error type, because the callers put it in
+/// parentheses in a line they print and nothing branches on it: the file
+/// could not be started, it did not answer within [`VERIFY_TIMEOUT`], it
+/// ended badly — `signal: 9 (SIGKILL)` is what an in-place overwrite looks
+/// like on macOS — or what it printed was not an mcpgw version.
 pub fn verify_runs(path: &Path) -> Result<(), String> {
+    version_within(path, VERIFY_TIMEOUT).map(|_| ())
+}
+
+/// [`verify_runs`], plus the version the file reported and a ceiling of the
+/// caller's choosing.
+///
+/// `self-update` needs the number as well as the fact that it runs: it knows
+/// which release it just downloaded, so a staged binary that starts and
+/// answers with a *different* version is the one failure mode a bare
+/// "does it run" check cannot see — a mixed-up asset, a cached archive, a
+/// mirror serving the wrong tag.
+///
+/// It also needs its own `timeout`. [`VERIFY_TIMEOUT`] is a bound on how
+/// long a broken file may hold a *serving* gateway up, which is not the
+/// question a foreground command is asking: there, waiting too little means
+/// refusing a good release, and the first execution of a freshly written
+/// binary is the slow one — macOS validates its signature then, and a
+/// multi-megabyte file on a busy machine takes seconds over it.
+///
+/// # Errors
+///
+/// The same sentences [`verify_runs`] documents.
+pub fn version_within(path: &Path, timeout: Duration) -> Result<String, String> {
     use std::process::Stdio;
 
     let mut child = std::process::Command::new(path)
@@ -146,7 +169,7 @@ pub fn verify_runs(path: &Path) -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|err| format!("it could not be started: {err}"))?;
-    let deadline = std::time::Instant::now() + VERIFY_TIMEOUT;
+    let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -165,7 +188,7 @@ pub fn verify_runs(path: &Path) -> Result<(), String> {
             let _ = child.wait();
             return Err(format!(
                 "it did not answer --version within {}s",
-                VERIFY_TIMEOUT.as_secs()
+                timeout.as_secs()
             ));
         }
         std::thread::sleep(VERIFY_POLL);
@@ -181,10 +204,13 @@ pub fn verify_runs(path: &Path) -> Result<(), String> {
         use std::io::Read as _;
         let _ = out.read_to_string(&mut printed);
     }
-    if !printed.starts_with(VERSION_PREFIX) {
+    let Some(version) = printed
+        .strip_prefix(VERSION_PREFIX)
+        .and_then(|rest| rest.split_whitespace().next())
+    else {
         return Err("--version did not print an mcpgw version".to_owned());
-    }
-    Ok(())
+    };
+    Ok(version.to_owned())
 }
 
 /// A binary, coarsely, as it can be written down and compared after a

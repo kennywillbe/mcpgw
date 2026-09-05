@@ -63,10 +63,18 @@ mcpgw self-update
 ```
 
 Downloads the latest release archive for your platform, checks it against the
-release's `SHA256SUMS`, and replaces the running binary with it. It refuses to
-touch an install that belongs to a package manager: under `~/.cargo/bin` it
-tells you to run `cargo install mcpgw`, under a Homebrew prefix `brew upgrade
-mcpgw`.
+release's `SHA256SUMS`, and replaces the running binary with it.
+
+Before the swap it runs the downloaded binary once, `--version`, and requires
+it to answer with the release that was just fetched. A file that will not
+start, or that reports a different version, is deleted and the binary you are
+running is left exactly as it was. The replace is a one-way door — it
+overwrites the only mcpgw on the machine, and a broken one leaves nothing to
+run the update from a second time.
+
+It refuses to touch an install that belongs to a package manager: under
+`~/.cargo/bin` it tells you to run `cargo install mcpgw`, under a Homebrew
+prefix `brew upgrade mcpgw`.
 
 `mcpgw self-update --check` changes nothing and only reports, exiting `0` when
 you already have the latest release and `10` when you don't — a pair a script

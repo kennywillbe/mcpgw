@@ -142,6 +142,7 @@ pub fn run(
     findings.extend(stale_service_exe());
     findings.extend(stale_service_version());
     findings.extend(unauthenticated_bind());
+    findings.extend(loose_permissions(&path));
 
     // Reported from the working directory, not from the machine: a
     // repo-local file is only in front of the user when they are standing in
@@ -511,6 +512,54 @@ fn daemon_path_gaps(servers: &BTreeMap<String, Server>) -> Vec<Finding> {
             Transport::Stdio { .. } | Transport::Http { .. } => None,
         })
         .collect()
+}
+
+/// Every file mcpgw writes its owner's secrets into, checked against the
+/// mode it was written with.
+///
+/// The state directory is walked rather than listed from a manifest: the
+/// OAuth store holds one file per server and the names are the user's, and
+/// a check that only knew about the servers in the canonical config would
+/// miss the login for a server that has since been removed from it — which
+/// is precisely the token still sitting there readable.
+///
+/// Nothing here is fatal and nothing here is a probe, so this runs on every
+/// `doctor`. Off unix it produces nothing: Windows ACLs are not these bits,
+/// and `chmod` is not the fix there.
+#[cfg(unix)]
+fn loose_permissions(config: &Path) -> Vec<Finding> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut paths: Vec<std::path::PathBuf> = vec![config.to_path_buf()];
+    if let Some(state_dir) = mcpgw_core::paths::state_dir() {
+        paths.push(mcpgw_core::gateway_token::GatewayToken::path(&state_dir));
+        paths.push(mcpgw_core::probe_state::path(&state_dir));
+        let auth = mcpgw_core::auth::dir(&state_dir);
+        if let Ok(entries) = std::fs::read_dir(&auth) {
+            paths.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json")),
+            );
+        }
+        // The directories last, so a report reads file, file, then the two
+        // places they sit in.
+        paths.push(auth);
+        paths.push(state_dir);
+    }
+    paths
+        .iter()
+        .filter_map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            mcpgw_core::doctor::loose_permissions(path, meta.permissions().mode(), meta.is_dir())
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn loose_permissions(_config: &Path) -> Vec<Finding> {
+    Vec::new()
 }
 
 /// The warning for a login service pointed at an mcpgw that moved.

@@ -20,6 +20,18 @@ const UPDATE_AVAILABLE: u8 = 10;
 /// request, and it downloads several megabytes.
 const TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long the staged binary gets to answer `--version` before the update
+/// is refused.
+///
+/// An order of magnitude above the watcher's own ceiling, because the two
+/// bound opposite risks: the watcher is protecting a gateway that is
+/// serving, while this is a foreground command whose expensive mistake is
+/// refusing a release that was fine. The wait it has to absorb is the first
+/// execution of a file written seconds ago — macOS checks the signature of
+/// a new binary then, and several megabytes of it on a loaded machine is
+/// seconds of wall clock.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
+
 #[derive(clap::Args)]
 pub struct SelfUpdateArgs {
     /// Only report whether a newer release exists (exit 10 if it does)
@@ -100,7 +112,27 @@ pub fn run(args: &SelfUpdateArgs) -> anyhow::Result<u8> {
             .set_permissions(std::fs::Permissions::from_mode(0o755))
             .context("cannot make the new binary executable")?;
     }
-    let (_file, staged_path) = staged.keep().context("cannot stage the new binary")?;
+    let (file, staged_path) = staged.keep().context("cannot stage the new binary")?;
+    // Closed before the file is executed: Linux refuses to exec an image
+    // that is still open for writing anywhere in the system (ETXTBSY), and
+    // the check below is an exec of exactly this file.
+    drop(file);
+
+    // The one-way door. `self_replace` renames over the binary this process
+    // was started from, and there is no supervisor here to notice that what
+    // landed does not start — the user is left with a broken `mcpgw` and no
+    // working copy to run the update again from. So the staged file is run
+    // once first, exactly as the watcher runs a replacement before standing
+    // aside for it, and anything short of the release's own version number
+    // stops the update with the old binary still in place.
+    if let Err(why) = check_staged(&staged_path, &latest) {
+        let _ = std::fs::remove_file(&staged_path);
+        anyhow::bail!(
+            "the downloaded mcpgw {latest} was not installed: {why} — {} is unchanged",
+            exe.display()
+        );
+    }
+
     let replaced = self_replace::self_replace(&staged_path);
     // The staged copy has been moved into place on success and is litter on
     // failure; either way it must not be left behind.
@@ -109,4 +141,14 @@ pub fn run(args: &SelfUpdateArgs) -> anyhow::Result<u8> {
 
     println!("updated mcpgw {current} -> {latest}");
     Ok(0)
+}
+
+/// Whether the staged file is a runnable mcpgw of the version that was just
+/// downloaded, as the clause that goes in the refusal.
+fn check_staged(staged: &std::path::Path, latest: &str) -> Result<(), String> {
+    let reported = mcpgw_core::upgrade::version_within(staged, VERIFY_TIMEOUT)?;
+    if reported == latest {
+        return Ok(());
+    }
+    Err(format!("it reports itself as mcpgw {reported}"))
 }
