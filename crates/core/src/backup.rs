@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 pub const KEEP: usize = 5;
 
@@ -16,11 +16,6 @@ const SEQ_SPAN: u64 = 10_000;
 /// Highest key this process has handed out, so a backup's name never depends
 /// on which of its siblings pruning has already deleted.
 static LAST_KEY: AtomicU64 = AtomicU64::new(0);
-
-fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> Error {
-    let path = path.to_owned();
-    move |source| Error::Io { path, source }
-}
 
 fn backup_dir(state_dir: &Path, client_id: &str) -> PathBuf {
     state_dir.join("backups").join(client_id)

@@ -15,12 +15,11 @@
 //! rather than a second rule to remember.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 /// What a probe observed about a server's need for a login.
 ///
@@ -126,25 +125,10 @@ impl ProbeState {
     /// Returns [`Error::Io`] for filesystem failures.
     pub fn save(&self, state_dir: &Path) -> Result<(), Error> {
         let file = path(state_dir);
-        let io_err = |p: &Path| {
-            let p = p.to_owned();
-            move |source| Error::Io { path: p, source }
-        };
-        crate::private::create_dir_all(state_dir).map_err(io_err(state_dir))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".probes.json.")
-            .tempfile_in(state_dir)
-            .map_err(io_err(state_dir))?;
         let text = serde_json::to_string_pretty(self)
             .map_err(std::io::Error::other)
             .map_err(io_err(&file))?;
-        tmp.write_all(text.as_bytes()).map_err(io_err(&file))?;
-        tmp.as_file().sync_all().map_err(io_err(&file))?;
-        tmp.persist(&file).map_err(|err| Error::Io {
-            path: file.clone(),
-            source: err.error,
-        })?;
-        crate::private::harden_file(&file).map_err(io_err(&file))
+        crate::private::write_atomically(&file, text.as_bytes()).map_err(io_err(&file))
     }
 }
 

@@ -26,14 +26,13 @@
 //! write them.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::clients::ClientKind;
 use crate::clients::codec::Codec;
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedState {
@@ -372,37 +371,15 @@ impl ManagedState {
     ///
     /// Returns [`Error::Io`] for filesystem failures.
     pub fn save(&self, path: &Path) -> Result<(), Error> {
-        let io_err = |p: &Path| {
-            let p = p.to_owned();
-            move |source| Error::Io { path: p, source }
-        };
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        crate::private::create_dir_all(parent).map_err(io_err(parent))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".managed.json.")
-            .tempfile_in(parent)
-            .map_err(io_err(parent))?;
         // ManagedState is plain string maps; serialization cannot realistically
         // fail, but routing the error beats a panic path in a library.
         let text = serde_json::to_string_pretty(self)
             .map_err(std::io::Error::other)
             .map_err(io_err(path))?;
-        tmp.write_all(text.as_bytes()).map_err(io_err(path))?;
-        // fsync before rename: a crash must yield the previous state file,
-        // never a truncated one that then fails to parse and takes every
-        // managed entry down to "foreign" with it.
-        tmp.as_file().sync_all().map_err(io_err(path))?;
-        tmp.persist(path).map_err(|err| Error::Io {
-            path: path.to_owned(),
-            source: err.error,
-        })?;
-        // The state file names the servers mcpgw wrote into each client; it
-        // is not secret by itself, but it lives beside the backups and gets
-        // the same owner-only treatment rather than a second rule to
-        // remember.
-        crate::private::harden_file(path).map_err(io_err(path))?;
-        crate::private::sync_dir(parent).map_err(io_err(parent))?;
-        Ok(())
+        // A crash must yield the previous state file, never a truncated one
+        // that then fails to parse and takes every managed entry down to
+        // "foreign" with it.
+        crate::private::write_atomically(path, text.as_bytes()).map_err(io_err(path))
     }
 
     /// Takes the exclusive lock guarding `path`, blocking until any other

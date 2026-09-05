@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::SUPPORTED_VERSION;
 
@@ -114,6 +114,13 @@ pub enum Error {
         #[source]
         source: Box<serde_json::Error>,
     },
+}
+
+/// Binds `path` into an [`Error::Io`] constructor, for the `map_err` on
+/// every filesystem call that knows the path but not the error yet.
+pub(crate) fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> Error {
+    let path = path.to_owned();
+    move |source| Error::Io { path, source }
 }
 
 fn known(available: &[String]) -> String {

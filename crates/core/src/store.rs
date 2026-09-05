@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
 
 use crate::config::{ClientScope, Config, Server, ToolRules, Transport, validate_name};
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 const TEMPLATE: &str = "\
 # mcpgw canonical config — the single source of truth for your MCP servers.
@@ -273,32 +272,11 @@ impl ConfigStore {
     ///
     /// Returns [`Error::Io`] for any filesystem failure.
     pub fn save(&self) -> Result<(), Error> {
-        let io_err = |path: &Path| {
-            let path = path.to_owned();
-            move |source| Error::Io { path, source }
-        };
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        crate::private::create_dir_all(parent).map_err(io_err(parent))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".config.toml.")
-            .tempfile_in(parent)
-            .map_err(io_err(parent))?;
         // The published config holds `env` values and literal `Authorization`
-        // headers, so it gets the owner-only treatment every other writer in
-        // the crate applies rather than leaning on `tempfile`'s unix default,
-        // which has no equivalent off unix.
-        crate::private::harden_file(tmp.path()).map_err(io_err(&self.path))?;
-        tmp.write_all(self.doc.to_string().as_bytes())
-            .map_err(io_err(&self.path))?;
-        // fsync before rename: a crash must yield the old file, never a
-        // half-written new one.
-        tmp.as_file().sync_all().map_err(io_err(&self.path))?;
-        tmp.persist(&self.path).map_err(|err| Error::Io {
-            path: self.path.clone(),
-            source: err.error,
-        })?;
-        crate::private::sync_dir(parent).map_err(io_err(parent))?;
-        Ok(())
+        // headers, so it leans on the shared writer's owner-only mode rather
+        // than on `tempfile`'s unix default, which has no equivalent off unix.
+        crate::private::write_atomically(&self.path, self.doc.to_string().as_bytes())
+            .map_err(io_err(&self.path))
     }
 
     // Validates the edited document before it replaces in-memory state.
@@ -334,10 +312,6 @@ pub fn lock_path(config: &Path) -> PathBuf {
 /// returned handle. Shared with the state file, which needs the same
 /// read-modify-write protection around a different path.
 pub(crate) fn acquire_lock(config: &Path) -> Result<File, Error> {
-    let io_err = |path: &Path| {
-        let path = path.to_owned();
-        move |source| Error::Io { path, source }
-    };
     let parent = config.parent().unwrap_or_else(|| Path::new("."));
     crate::private::create_dir_all(parent).map_err(io_err(parent))?;
     let path = lock_path(config);

@@ -23,7 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 /// Filename under the state dir. A single flat file rather than something
 /// under `auth/`: that directory is one file per *upstream* login, and this
@@ -174,27 +174,9 @@ impl GatewayToken {
     ///
     /// Returns [`Error::Io`] for any filesystem failure.
     pub fn save(&self, state_dir: &Path) -> Result<(), Error> {
-        use std::io::Write as _;
-
         let path = Self::path(state_dir);
-        let io_err = |p: &Path| {
-            let p = p.to_owned();
-            move |source| Error::Io { path: p, source }
-        };
-        crate::private::create_dir_all(state_dir).map_err(io_err(state_dir))?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".gateway.token.")
-            .tempfile_in(state_dir)
-            .map_err(io_err(state_dir))?;
-        crate::private::harden_file(tmp.path()).map_err(io_err(&path))?;
-        writeln!(tmp, "{}", self.0).map_err(io_err(&path))?;
-        tmp.as_file().sync_all().map_err(io_err(&path))?;
-        tmp.persist(&path).map_err(|err| Error::Io {
-            path: path.clone(),
-            source: err.error,
-        })?;
-        crate::private::sync_dir(state_dir).map_err(io_err(state_dir))?;
-        Ok(())
+        crate::private::write_atomically(&path, format!("{}\n", self.0).as_bytes())
+            .map_err(io_err(&path))
     }
 }
 

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -709,7 +708,12 @@ fn rollback(targets: &[ClientKind], state_dir: &Path, project: bool) -> anyhow::
     Ok(())
 }
 
-// Atomic replace, same discipline as the canonical store.
+// Atomic replace, through the same writer every state file goes through.
+//
+// One consequence of that writer: a client config directory this creates is
+// owner-only, where the client itself might have made it group-readable.
+// Only a directory mcpgw creates first is affected — an existing one keeps
+// whatever mode it already had.
 //
 // Two known side effects of replacing the file wholesale, both accepted in
 // M6 ("client files are machine-written"): a plain-JSON document is
@@ -722,29 +726,6 @@ fn rollback(targets: &[ClientKind], state_dir: &Path, project: bool) -> anyhow::
 // read at the start of the run, so an edit made in between is lost. Backups
 // are the recovery path; a lock the client does not take cannot prevent it.
 fn write_text(path: &Path, text: &str) -> anyhow::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".mcpgw-sync.")
-        .tempfile_in(parent)?;
-    tmp.write_all(text.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path)
-        .map_err(|err| anyhow::Error::from(err.error))
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    // Syncing the bytes leaves the rename that publishes them undurable.
-    sync_dir(parent);
-    Ok(())
-}
-
-/// Best-effort directory fsync so the rename above survives a power loss.
-/// Failure is not worth aborting a completed write over — and Windows has no
-/// directory handle to sync at all.
-fn sync_dir(dir: &Path) {
-    #[cfg(unix)]
-    if let Ok(handle) = std::fs::File::open(dir) {
-        let _ = handle.sync_all();
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
+    mcpgw_core::private::write_atomically(path, text.as_bytes())
+        .with_context(|| format!("cannot write {}", path.display()))
 }

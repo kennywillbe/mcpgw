@@ -16,12 +16,11 @@
 //! policy lives with them, because only they know which port they meant and
 //! how long they are willing to wait for it.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
+use crate::error::{Error, io_err};
 
 /// What a gateway process publishes about itself while it is up.
 ///
@@ -78,32 +77,14 @@ pub fn record_path(state_dir: &Path, port: u16) -> PathBuf {
 /// [`Error::Io`] when the state directory or the file cannot be written.
 pub fn write_record(state_dir: &Path, record: &GatewayRecord) -> Result<(), Error> {
     let path = record_path(state_dir, record.port);
-    let io_err = |p: &Path| {
-        let p = p.to_owned();
-        move |source| Error::Io { path: p, source }
-    };
-    crate::private::create_dir_all(state_dir).map_err(io_err(state_dir))?;
     let json = serde_json::to_vec_pretty(record)
         .map_err(std::io::Error::other)
         .map_err(io_err(&path))?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".gateway.json.")
-        .tempfile_in(state_dir)
-        .map_err(io_err(state_dir))?;
-    tmp.write_all(&json).map_err(io_err(&path))?;
     // Temp-and-rename, not a truncate in place: a reader polling this file
-    // races every restart, and half a record parses as a corrupt one.
-    tmp.as_file().sync_all().map_err(io_err(&path))?;
-    tmp.persist(&path).map_err(|err| Error::Io {
-        path: path.clone(),
-        source: err.error,
-    })?;
-    // The record names the binary and its path, which give away a home
-    // directory; it lives under the same owner-only rule as everything else
-    // derived from the user's configs rather than a second rule to remember.
-    crate::private::harden_file(&path).map_err(io_err(&path))?;
-    crate::private::sync_dir(state_dir).map_err(io_err(state_dir))?;
-    Ok(())
+    // races every restart, and half a record parses as a corrupt one. The
+    // record also names the binary and its path, which give away a home
+    // directory, so it takes the same owner-only mode as the rest.
+    crate::private::write_atomically(&path, &json).map_err(io_err(&path))
 }
 
 /// The record published for `port`, if there is one.
