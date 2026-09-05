@@ -308,7 +308,13 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
     // the bodies verbatim wants them from the gateway that serves every
     // session, which is `mcpgw serve --capture-bodies full`.
     let capture = super::serve::capture_policy(false, Bodies::Redacted, &config)?;
-    let built = super::serve::build(config_path, &[], &selected, capture)?;
+    let built = super::serve::build(
+        config_path,
+        &[],
+        &selected,
+        capture,
+        config.capture.retain_days,
+    )?;
     built.reloader.apply(config).await;
 
     // Published like `serve`'s, so `status`, `doctor` and a second bridge

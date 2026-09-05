@@ -607,3 +607,41 @@ fn text_that_is_not_toml_reports_no_unknown_keys() {
     // keys" scraped out of broken TOML would only add noise.
     assert_eq!(mcpgw_core::config::unknown_keys("version = "), []);
 }
+
+#[test]
+fn capture_retention_defaults_to_a_finite_window() {
+    // The whole point of the setting: an install that says nothing about
+    // capture still stops growing.
+    let config = Config::parse("version = 1\n", Path::new("c.toml")).unwrap();
+    assert_eq!(
+        config.capture.retain_days,
+        mcpgw_core::capture::DEFAULT_RETAIN_DAYS
+    );
+    assert!(config.capture.is_default());
+    // Nothing was asked for, so nothing is written back.
+    assert!(!config.to_toml_string().unwrap().contains("retain_days"));
+}
+
+#[test]
+fn capture_retention_round_trips_when_it_is_set() {
+    let text = "version = 1\n\n[capture]\nretain_days = 3\n";
+    let config = Config::parse(text, Path::new("c.toml")).unwrap();
+    assert_eq!(config.capture.retain_days, 3);
+    assert!(!config.capture.is_default());
+    assert!(config.to_toml_string().unwrap().contains("retain_days = 3"));
+
+    let off = Config::parse(
+        "version = 1\n\n[capture]\nretain_days = 0\n",
+        Path::new("c.toml"),
+    )
+    .unwrap();
+    assert_eq!(off.capture.retain_days, 0);
+}
+
+#[test]
+fn a_misspelled_retention_key_is_reported_with_the_real_one() {
+    let found = mcpgw_core::config::unknown_keys("version = 1\n\n[capture]\nretain_day = 3\n");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].path, "capture.retain_day");
+    assert_eq!(found[0].did_you_mean, Some("retain_days"));
+}

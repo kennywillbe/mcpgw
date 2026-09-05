@@ -1106,3 +1106,49 @@ deney = ["delete_*"]
         "{text}"
     );
 }
+
+#[test]
+fn the_traffic_line_reports_the_size_and_the_retention_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let traffic = dir.path().join("state").join("traffic");
+    std::fs::create_dir_all(&traffic).unwrap();
+    std::fs::write(traffic.join("2026-01-01.jsonl"), vec![b'x'; 2048]).unwrap();
+    std::fs::write(traffic.join("2026-02-01.jsonl"), vec![b'x'; 1024]).unwrap();
+
+    let out = run_doctor(
+        dir.path(),
+        Some("version = 1\n\n[capture]\nretain_days = 30\n"),
+        &[],
+    );
+    let text = stdout(&out);
+    assert!(text.contains("traffic capture"), "{text}");
+    assert!(text.contains(&traffic.display().to_string()), "{text}");
+    assert!(text.contains("2 files, 3.0 KB"), "{text}");
+    assert!(text.contains("kept 30 days"), "{text}");
+    assert!(text.contains("oldest 2026-01-01"), "{text}");
+}
+
+#[test]
+fn the_traffic_line_defaults_to_a_finite_window_and_survives_an_empty_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_doctor(dir.path(), Some(HEALTHY), &[]);
+    let text = stdout(&out);
+    assert!(text.contains("0 files, 0 B, kept 14 days"), "{text}");
+    assert!(!text.contains("oldest"), "{text}");
+}
+
+#[test]
+fn json_reports_the_capture_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let traffic = dir.path().join("state").join("traffic");
+    std::fs::create_dir_all(&traffic).unwrap();
+    std::fs::write(traffic.join("2026-01-01.jsonl"), b"{}\n").unwrap();
+
+    let out = run_doctor(dir.path(), Some(HEALTHY), &["--json"]);
+    let value: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let capture = &value["capture"];
+    assert_eq!(capture["files"], 1);
+    assert_eq!(capture["bytes"], 3);
+    assert_eq!(capture["retain_days"], 14);
+    assert_eq!(capture["oldest"], "2026-01-01");
+}

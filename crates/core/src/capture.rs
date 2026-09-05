@@ -3,6 +3,12 @@
 //! deliberately boring — `jq`, `tail` and `mcpgw watch` all read the same
 //! lines, and a rotated day is just a different filename.
 //!
+//! Days are kept for [`DEFAULT_RETAIN_DAYS`] unless the config says
+//! otherwise, and [`prune`] is what enforces that — on gateway start and on
+//! the first append of each new day. It only ever deletes names it could have
+//! written itself, because a traffic directory is a place people also put
+//! things of their own.
+//!
 //! Bodies are redacted and then truncated, in that order, by
 //! [`CapturePolicy`] on the way into the file — never by the call site that
 //! built the record. One choke point is what makes "a secret cut in half by
@@ -23,6 +29,16 @@ pub const TRAFFIC_DIR: &str = "traffic";
 
 /// Cap for captured request arguments and response bodies.
 pub const MAX_BODY_BYTES: usize = 2048;
+
+/// How many days of daily files a gateway keeps when the config says
+/// nothing. Finite by default: the traffic log is meant to survive
+/// `daemon uninstall` and `eject`, so nothing else on the machine would ever
+/// remove a day nobody reads again.
+pub const DEFAULT_RETAIN_DAYS: u32 = 14;
+
+/// Milliseconds in a day, the unit both the file names and the retention
+/// window are counted in.
+const DAY_MILLIS: u64 = 86_400_000;
 
 /// Appended to a body that hit [`MAX_BODY_BYTES`], so a truncated line is
 /// never mistaken for a complete one.
@@ -746,8 +762,135 @@ pub fn body(value: &serde_json::Value) -> String {
 /// "today" would be worse than a boundary that moves with the offset.
 #[must_use]
 pub fn daily_path(dir: &Path, ts_millis: u64) -> PathBuf {
+    dir.join(daily_name(ts_millis))
+}
+
+/// The bare `YYYY-MM-DD.jsonl` file name for that instant.
+#[must_use]
+pub fn daily_name(ts_millis: u64) -> String {
     let (year, month, day) = utc_date(ts_millis);
-    dir.join(format!("{year:04}-{month:02}-{day:02}.jsonl"))
+    format!("{year:04}-{month:02}-{day:02}.jsonl")
+}
+
+/// Whether `name` is one of the daily files this gateway writes.
+///
+/// Retention only ever deletes files that match this exactly. A traffic
+/// directory is a place people put things — a `notes.md`, a `2026-01-01.jsonl.gz`
+/// somebody compressed by hand — and none of that is mcpgw's to remove.
+#[must_use]
+pub fn is_daily_name(name: &str) -> bool {
+    let Some(date) = name.strip_suffix(".jsonl") else {
+        return false;
+    };
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+}
+
+/// Deletes the daily files older than the retention window, returning the
+/// ones it removed (sorted). `retain_days` counts today, so `1` keeps only
+/// today's file and `0` disables pruning entirely.
+///
+/// Dated names zero-pad, so "older than the cutoff" is a string comparison
+/// against the cutoff day's own file name — the same property
+/// [`crate::backup`] leans on for its timestamped copies.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the directory exists but cannot be read, or
+/// when a file inside the window cannot be removed. A missing directory is
+/// not an error: nothing has been captured yet.
+pub fn prune(dir: &Path, retain_days: u32, now_millis: u64) -> Result<Vec<PathBuf>, Error> {
+    if retain_days == 0 {
+        return Ok(Vec::new());
+    }
+    let cutoff = daily_name(now_millis.saturating_sub(u64::from(retain_days - 1) * DAY_MILLIS));
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(Error::Io {
+                path: dir.to_owned(),
+                source,
+            });
+        }
+    };
+    let mut removed = Vec::new();
+    for entry in read.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let matches = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| is_daily_name(name) && name < cutoff.as_str());
+        if !matches {
+            continue;
+        }
+        std::fs::remove_file(&path).map_err(io_err(&path))?;
+        removed.push(path);
+    }
+    removed.sort();
+    Ok(removed)
+}
+
+/// What the traffic log currently costs on disk, for `doctor`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Daily files present — foreign files in the directory are not counted,
+    /// for the same reason [`prune`] does not delete them.
+    pub files: usize,
+    /// Their total size in bytes.
+    pub bytes: u64,
+    /// The date of the oldest one, `YYYY-MM-DD`.
+    pub oldest: Option<String>,
+}
+
+/// Measures the daily files in `dir`. A directory that does not exist yet is
+/// an empty [`Usage`], not an error.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] when the directory exists but cannot be read.
+pub fn usage(dir: &Path) -> Result<Usage, Error> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Usage::default()),
+        Err(source) => {
+            return Err(Error::Io {
+                path: dir.to_owned(),
+                source,
+            });
+        }
+    };
+    let mut usage = Usage::default();
+    for entry in read.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_daily_name(name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        usage.files += 1;
+        usage.bytes += meta.len();
+        let date = name.trim_end_matches(".jsonl").to_owned();
+        if usage.oldest.as_ref().is_none_or(|oldest| &date < oldest) {
+            usage.oldest = Some(date);
+        }
+    }
+    Ok(usage)
 }
 
 /// Milliseconds since the Unix epoch; 0 if the clock is before it.
@@ -791,6 +934,12 @@ pub struct CaptureWriter {
     dir: PathBuf,
     session: String,
     policy: CapturePolicy,
+    retain_days: u32,
+    /// The UTC day this writer last pruned on, or [`u64::MAX`] for "never".
+    /// Rotation is the only clock retention needs: the writer that opens a
+    /// new day's file is the one that notices the oldest day fell out of the
+    /// window.
+    pruned_day: std::sync::atomic::AtomicU64,
 }
 
 impl CaptureWriter {
@@ -803,6 +952,49 @@ impl CaptureWriter {
             dir: dir.into(),
             session: new_session_id(),
             policy: CapturePolicy::default(),
+            retain_days: DEFAULT_RETAIN_DAYS,
+            pruned_day: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Keeps `days` of daily files instead of [`DEFAULT_RETAIN_DAYS`]; `0`
+    /// keeps them forever.
+    #[must_use]
+    pub fn with_retain_days(mut self, days: u32) -> Self {
+        self.retain_days = days;
+        self
+    }
+
+    /// How many days of traffic this writer keeps.
+    #[must_use]
+    pub fn retain_days(&self) -> u32 {
+        self.retain_days
+    }
+
+    /// Prunes the traffic directory unless it has already been pruned on the
+    /// UTC day `now_millis` falls in. Called once when the gateway starts and
+    /// again on every rotation.
+    ///
+    /// Failures are reported and swallowed: a traffic directory that cannot
+    /// be tidied is not a reason to stop capturing, let alone serving.
+    pub fn prune_if_due(&self, now_millis: u64) {
+        use std::sync::atomic::Ordering;
+
+        let day = now_millis / DAY_MILLIS;
+        // Swap rather than load-then-store so two requests crossing midnight
+        // together only prune once.
+        if self.pruned_day.swap(day, Ordering::Relaxed) == day {
+            return;
+        }
+        match prune(&self.dir, self.retain_days, now_millis) {
+            Ok(removed) if !removed.is_empty() => eprintln!(
+                "pruned {} traffic capture file(s) older than {} days from {}",
+                removed.len(),
+                self.retain_days,
+                self.dir.display()
+            ),
+            Ok(_) => {}
+            Err(err) => eprintln!("warning: could not prune traffic capture: {err}"),
         }
     }
 
@@ -844,7 +1036,8 @@ impl CaptureWriter {
     }
 
     /// Appends `record` as one JSON line to today's file, creating the
-    /// directory and the file (0600 on unix) as needed.
+    /// directory and the file (0600 on unix) as needed, and pruning the days
+    /// that fell out of the retention window on the first append of each day.
     ///
     /// # Errors
     ///
@@ -856,6 +1049,10 @@ impl CaptureWriter {
         // the module header.
         let stored = self.policy.applied(record);
         let record = stored.as_ref().unwrap_or(record);
+
+        // Before the write, so the day that just rolled over is tidied by
+        // the same call that opens the new file.
+        self.prune_if_due(record.ts);
 
         let path = daily_path(&self.dir, record.ts);
         let mut line = serde_json::to_string(record).unwrap_or_else(|err| {

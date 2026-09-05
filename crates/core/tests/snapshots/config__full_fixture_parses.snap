@@ -6,6 +6,7 @@ Config {
     version: 1,
     capture: Capture {
         redact: [],
+        retain_days: 14,
     },
     gateway: GatewaySettings {
         require_token: false,

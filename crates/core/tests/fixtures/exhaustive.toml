@@ -5,6 +5,7 @@ version = 1
 
 [capture]
 redact = ["ticket-[0-9]+"]
+retain_days = 30
 
 [gateway]
 require_token = true

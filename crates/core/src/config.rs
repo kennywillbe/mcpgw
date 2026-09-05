@@ -145,7 +145,7 @@ impl ClientScopes {
 ///
 /// Absent from a config that never mentions it, and skipped on the way out
 /// again, so adding the table here does not rewrite everybody's file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capture {
     /// Extra regexes whose matches are replaced in captured bodies, on top of
     /// the built-in credential rules — the site-specific shapes only the
@@ -156,13 +156,45 @@ pub struct Capture {
     /// rule that quietly matches nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redact: Vec<String>,
+    /// How many days of the daily traffic log to keep, counting today.
+    ///
+    /// Finite by default ([`crate::capture::DEFAULT_RETAIN_DAYS`]): the log
+    /// deliberately survives `daemon uninstall` and `eject`, so a gateway
+    /// that never pruned would be the only thing on the machine that grows
+    /// forever. `0` opts out and keeps every day.
+    #[serde(
+        default = "default_retain_days",
+        skip_serializing_if = "is_default_retain_days"
+    )]
+    pub retain_days: u32,
+}
+
+impl Default for Capture {
+    fn default() -> Self {
+        Self {
+            redact: Vec::new(),
+            retain_days: default_retain_days(),
+        }
+    }
 }
 
 impl Capture {
     #[must_use]
     pub fn is_default(&self) -> bool {
-        self.redact.is_empty()
+        self.redact.is_empty() && is_default_retain_days(&self.retain_days)
     }
+}
+
+fn default_retain_days() -> u32 {
+    crate::capture::DEFAULT_RETAIN_DAYS
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the reference is serde's skip_serializing_if signature, not a choice"
+)]
+fn is_default_retain_days(days: &u32) -> bool {
+    *days == crate::capture::DEFAULT_RETAIN_DAYS
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -788,7 +820,7 @@ pub fn unknown_keys(text: &str) -> Vec<UnknownKey> {
 /// through [`unknown_keys`] and expects nothing: a field added without a
 /// line here fails that test.
 const CONFIG_KEYS: &[&str] = &["version", "capture", "gateway", "clients", "servers"];
-const CAPTURE_KEYS: &[&str] = &["redact"];
+const CAPTURE_KEYS: &[&str] = &["redact", "retain_days"];
 const GATEWAY_SETTINGS_KEYS: &[&str] = &["require_token"];
 const CLIENT_SCOPE_KEYS: &[&str] = &["servers", "max_tools", "tools"];
 const TOOL_RULES_KEYS: &[&str] = &["allow", "deny", "drift"];

@@ -15,6 +15,19 @@ One file per day, mode `0600`. `mcpgw serve --no-capture` turns it off, and
 `--capture-bodies` decides how much of each request goes in — see
 [What is redacted](#what-is-redacted) below.
 
+The last **14 days** are kept. The gateway prunes on startup and again on the
+first line it writes each new day, saying so when it deletes anything:
+
+```text
+pruned 3 traffic capture file(s) older than 14 days from ~/.local/share/mcpgw/traffic
+```
+
+Only its own `YYYY-MM-DD.jsonl` files are ever removed — anything else you keep
+in that directory stays. `[capture] retain_days` in the config picks a
+different window, and `0` keeps every day forever; see
+[Configuration](./configuration.md#capture). `mcpgw doctor` prints what the log
+costs today next to the window it is kept for.
+
 ## Following it live
 
 ```sh
