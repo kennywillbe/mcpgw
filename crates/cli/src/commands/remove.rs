@@ -10,9 +10,13 @@ pub struct RemoveArgs {
     /// Skip the confirmation prompt
     #[arg(long)]
     pub yes: bool,
+    /// Remove without syncing the clients. They keep their entry for the
+    /// removed server until `mcpgw sync` runs
+    #[arg(long)]
+    pub no_sync: bool,
 }
 
-pub fn run(args: &RemoveArgs) -> anyhow::Result<()> {
+pub fn run(args: &RemoveArgs, color: bool) -> anyhow::Result<()> {
     let path = super::canonical_config_path()?;
     let mut store = ConfigStore::edit(&path)?;
     // Mutate first (validates the name exists), confirm before the actual
@@ -31,5 +35,5 @@ pub fn run(args: &RemoveArgs) -> anyhow::Result<()> {
     }
     store.save()?;
     println!("removed {:?}", args.name);
-    Ok(())
+    super::sync::after_edit(args.no_sync, color)
 }

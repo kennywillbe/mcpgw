@@ -189,7 +189,14 @@ fn renamed_import_is_renamed_in_client_by_next_sync() {
 #[test]
 fn piped_conflict_is_skipped_and_canonical_untouched() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "github", "--", "npx", "canonical-version"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "github",
+        "--",
+        "npx",
+        "canonical-version",
+    ]);
     sb.write_client(
         ".cursor/mcp.json",
         r#"{"mcpServers": {"github": {"command": "npx", "args": ["client-version"]}}}"#,
@@ -205,7 +212,7 @@ fn piped_conflict_is_skipped_and_canonical_untouched() {
 #[test]
 fn identical_entry_is_adopted_not_duplicated() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     sb.write_client(
         ".cursor/mcp.json",
         r#"{"mcpServers": {"github": {"command": "npx", "args": ["server-github"]}}}"#,
@@ -662,7 +669,14 @@ fn dry_run_writes_nothing() {
 #[test]
 fn yes_skips_the_conflict_and_keeps_canonical() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "github", "--", "npx", "canonical-version"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "github",
+        "--",
+        "npx",
+        "canonical-version",
+    ]);
     sb.write_client(
         ".cursor/mcp.json",
         r#"{"mcpServers": {
@@ -767,6 +781,7 @@ fn a_piped_run_explains_a_shared_address_and_keeps_both() {
     let sb = Sandbox::new();
     sb.ok(&[
         "add",
+        "--no-sync",
         "ctx",
         "--url",
         "https://mcp.context7.com/mcp",
@@ -803,7 +818,14 @@ fn a_piped_run_explains_a_shared_address_and_keeps_both() {
 #[test]
 fn a_run_that_cannot_ask_never_writes_the_second_copy() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "github", "--", "npx", "canonical-version"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "github",
+        "--",
+        "npx",
+        "canonical-version",
+    ]);
     sb.write_client(
         ".cursor/mcp.json",
         r#"{"mcpServers": {"github": {"command": "npx", "args": ["client-version"]}}}"#,
@@ -827,7 +849,14 @@ fn a_run_that_cannot_ask_never_writes_the_second_copy() {
 #[test]
 fn dry_run_names_all_three_outcomes_and_the_second_name() {
     let sb = Sandbox::new();
-    sb.ok(&["add", "github", "--", "npx", "canonical-version"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "github",
+        "--",
+        "npx",
+        "canonical-version",
+    ]);
     sb.write_client(
         ".cursor/mcp.json",
         r#"{"mcpServers": {"github": {"command": "npx", "args": ["client-version"]}}}"#,

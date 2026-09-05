@@ -564,6 +564,7 @@ fn sync_creates_config_for_installed_client_and_is_idempotent() {
     sb.install_cursor(None);
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -598,7 +599,7 @@ fn foreign_entries_and_root_keys_survive() {
     sb.install_cursor(Some(
         r#"{"telemetry": false, "mcpServers": {"mine": {"command": "deno"}}}"#,
     ));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(out.contains("? mine"), "{out}");
 
@@ -615,7 +616,7 @@ fn foreign_entries_and_root_keys_survive() {
 fn conflicting_unmanaged_name_is_never_overwritten() {
     let sb = Sandbox::new();
     sb.install_cursor(Some(r#"{"mcpServers": {"github": {"command": "my-own"}}}"#));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(out.contains("! github"), "{out}");
     assert_eq!(
@@ -628,7 +629,7 @@ fn conflicting_unmanaged_name_is_never_overwritten() {
 fn dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     let out = sb.ok(&["sync", "--client", "cursor", "--dry-run"]);
     assert!(out.contains("+ github"), "{out}");
     assert!(!sb.home.join(".cursor/mcp.json").exists());
@@ -639,10 +640,16 @@ fn dry_run_writes_nothing() {
 fn disabling_a_server_removes_it_on_next_sync() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
     sb.ok(&["sync", "--client", "cursor"]);
-    sb.ok(&["disable", "linear"]);
+    sb.ok(&["disable", "--no-sync", "linear"]);
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(out.contains("- linear"), "{out}");
     let entries = sb.cursor_json()["mcpServers"].clone();
@@ -655,7 +662,7 @@ fn disabling_a_server_removes_it_on_next_sync() {
 fn rollback_restores_previous_content() {
     let sb = Sandbox::new();
     sb.install_cursor(Some(r#"{"mcpServers": {"mine": {"command": "deno"}}}"#));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     sb.ok(&["sync", "--client", "cursor"]);
     assert!(sb.cursor_json()["mcpServers"].get("github").is_some());
 
@@ -670,7 +677,7 @@ fn rollback_restores_previous_content() {
 fn rollback_backs_up_what_it_overwrites_so_it_can_be_undone() {
     let sb = Sandbox::new();
     sb.install_cursor(Some(r#"{"mcpServers": {"mine": {"command": "deno"}}}"#));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     sb.ok(&["sync", "--client", "cursor"]);
 
     // Back to the pre-sync file...
@@ -698,7 +705,7 @@ fn a_failed_client_write_leaves_state_the_next_sync_can_repair() {
 
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
 
     // Read-only parent: the atomic write cannot create its temp file there.
     let dir = sb.home.join(".cursor");
@@ -727,7 +734,7 @@ fn a_failed_client_write_leaves_state_the_next_sync_can_repair() {
 fn jsonc_file_is_skipped_untouched() {
     let sb = Sandbox::new();
     let path = sb.install_cursor(Some("// my comment\n{\"mcpServers\": {}}\n"));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(out.contains("not strict JSON"), "{out}");
     assert!(
@@ -774,8 +781,14 @@ fn a_directly_synced_client_comes_over_as_plain_updates() {
     let sb = Sandbox::new();
     sb.install_cursor(Some(CURSOR_DIRECT));
     sb.claim("cursor", &["github", "linear"]);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(out.contains("its own endpoint on the gateway"), "{out}");
@@ -820,8 +833,14 @@ fn moving_direct_entries_onto_the_gateway_explains_itself_once() {
         ("cursor", &["github", "linear"]),
         ("claude-desktop", &["github"]),
     ]);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(
@@ -849,7 +868,7 @@ fn moving_direct_entries_onto_the_gateway_explains_itself_once() {
 fn a_fresh_client_never_sees_the_migration_notice() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
 
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(out.contains("+ github"), "{out}");
@@ -901,8 +920,14 @@ fn a_config_synced_in_the_old_aggregate_mode_converts_to_per_server_entries() {
     sb.install_claude_desktop();
     std::fs::write(sb.claude_desktop_path(), CLAUDE_DESKTOP_AGGREGATE).unwrap();
     sb.claim_clients(&[("cursor", &["mcpgw"]), ("claude-desktop", &["mcpgw"])]);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "cursor", "--client", "claude-desktop"]);
     assert!(out.contains("- mcpgw"), "{out}");
@@ -954,7 +979,7 @@ fn claude_desktop_gets_the_per_server_bridge() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
     sb.install_claude_desktop();
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     sb.ok(&["sync", "--gateway-url", "http://127.0.0.1:9000/mcp"]);
 
     let entry = sb.claude_desktop_json()["mcpServers"]["github"].clone();
@@ -986,7 +1011,7 @@ fn claude_desktop_gets_the_per_server_bridge() {
 fn per_server_gateway_mode_keeps_the_switch_the_client_owns() {
     let sb = Sandbox::new();
     sb.install_cline(mcpgw_core::ClientKind::Cline, None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     sb.ok(&["sync", "--client", "cline"]);
     std::fs::write(
         sb.cline_dir(mcpgw_core::ClientKind::Cline)
@@ -1024,7 +1049,7 @@ fn per_server_gateway_mode_unexcludes_in_gemini() {
     sb.install_gemini(Some(
         r#"{ "mcp": { "excluded": ["github", "theirs"] }, "mcpServers": {} }"#,
     ));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
 
     let out = sb.ok(&["sync", "--client", "gemini"]);
     assert!(out.contains("to un-exclude"), "{out}");
@@ -1046,8 +1071,14 @@ fn rollback_restores_the_direct_entries_the_first_gateway_sync_replaced() {
     let sb = Sandbox::new();
     sb.install_cursor(Some(CURSOR_DIRECT));
     sb.claim("cursor", &["github", "linear"]);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
     sb.ok(&["sync", "--client", "cursor"]);
     assert_eq!(
         sb.cursor_json()["mcpServers"]["github"]["url"],
@@ -1068,7 +1099,7 @@ fn rollback_restores_the_direct_entries_the_first_gateway_sync_replaced() {
 fn a_bad_gateway_url_fails_before_anything_is_written() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
 
     let out = sb.mcpgw(&["sync", "--gateway-url", "nonsense"]);
     assert!(!out.status.success());
@@ -1087,6 +1118,7 @@ fn gemini_sync_preserves_the_rest_of_the_settings_file() {
     sb.install_gemini(Some(GEMINI_SETTINGS));
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -1094,7 +1126,13 @@ fn gemini_sync_preserves_the_rest_of_the_settings_file() {
         "npx",
         "server-github",
     ]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "gemini"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1131,6 +1169,7 @@ fn codex_sync_preserves_comments_siblings_and_foreign_entries() {
     sb.install_codex(Some(CODEX_CONFIG));
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -1138,7 +1177,13 @@ fn codex_sync_preserves_comments_siblings_and_foreign_entries() {
         "npx",
         "server-github",
     ]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "codex"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1189,6 +1234,7 @@ fn opencode_sync_preserves_comments_siblings_and_foreign_entries() {
     sb.install_opencode(Some(("opencode.jsonc", OPENCODE_CONFIG)));
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -1196,7 +1242,13 @@ fn opencode_sync_preserves_comments_siblings_and_foreign_entries() {
         "npx",
         "server-github",
     ]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "opencode"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1249,7 +1301,7 @@ fn opencode_sync_preserves_comments_siblings_and_foreign_entries() {
 fn opencode_writes_the_extension_the_machine_already_uses() {
     let sb = Sandbox::new();
     sb.install_opencode(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     sb.ok(&["sync", "--client", "opencode"]);
     assert!(sb.opencode_dir().join("opencode.json").is_file());
     assert!(!sb.opencode_dir().join("opencode.jsonc").exists());
@@ -1260,7 +1312,7 @@ fn opencode_writes_the_extension_the_machine_already_uses() {
 
     let other = Sandbox::new();
     other.install_opencode(Some(("opencode.jsonc", "// mine\n{}\n")));
-    other.ok(&["add", "github", "--", "npx", "server-github"]);
+    other.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     other.ok(&["sync", "--client", "opencode"]);
     assert!(!other.opencode_dir().join("opencode.json").exists());
     let text = other.opencode_text("opencode.jsonc");
@@ -1277,6 +1329,7 @@ fn windsurf_sync_writes_server_url_and_leaves_foreign_entries_alone() {
     sb.install_windsurf(Some(WINDSURF_CONFIG));
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -1284,7 +1337,13 @@ fn windsurf_sync_writes_server_url_and_leaves_foreign_entries_alone() {
         "npx",
         "server-github",
     ]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "windsurf"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1322,6 +1381,7 @@ fn zed_sync_marks_entries_custom_and_leaves_the_rest_of_the_settings_alone() {
     sb.install_zed(Some(ZED_SETTINGS));
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -1329,7 +1389,13 @@ fn zed_sync_marks_entries_custom_and_leaves_the_rest_of_the_settings_alone() {
         "npx",
         "server-github",
     ]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "zed"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1388,6 +1454,7 @@ fn cline_sync_types_remote_entries_and_leaves_foreign_ones_intact() {
         sb.install_cline(kind, Some(CLINE_SETTINGS));
         sb.ok(&[
             "add",
+            "--no-sync",
             "github",
             "--env",
             "TOKEN=t",
@@ -1395,7 +1462,13 @@ fn cline_sync_types_remote_entries_and_leaves_foreign_ones_intact() {
             "npx",
             "server-github",
         ]);
-        sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+        sb.ok(&[
+            "add",
+            "--no-sync",
+            "linear",
+            "--url",
+            "https://mcp.linear.app/mcp",
+        ]);
 
         let out = sb.ok(&["sync", "--client", kind.id()]);
         assert!(out.contains("+ github"), "{out}");
@@ -1439,7 +1512,13 @@ fn the_two_cline_surfaces_are_synced_independently() {
     let sb = Sandbox::new();
     sb.install_cline(mcpgw_core::ClientKind::Cline, None);
     sb.install_cline(mcpgw_core::ClientKind::ClineCli, None);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     sb.ok(&["sync", "--client", "cline"]);
     assert!(
@@ -1466,6 +1545,7 @@ fn zoo_sync_types_remote_entries_and_keeps_the_roo_extras() {
     sb.install_zoo(Some(ZOO_SETTINGS));
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -1473,7 +1553,13 @@ fn zoo_sync_types_remote_entries_and_keeps_the_roo_extras() {
         "npx",
         "server-github",
     ]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "zoo"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1524,7 +1610,7 @@ fn zoo_sync_types_remote_entries_and_keeps_the_roo_extras() {
 fn a_zoo_sync_does_not_write_clines_file() {
     let sb = Sandbox::new();
     sb.install_zoo(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     let out = sb.ok(&["sync", "--client", "zoo"]);
     assert!(out.contains("+ github"), "{out}");
 
@@ -1547,6 +1633,7 @@ fn amp_sync_writes_the_namespaced_key_and_leaves_the_nested_one_alone() {
     sb.install_amp(Some(AMP_SETTINGS));
     sb.ok(&[
         "add",
+        "--no-sync",
         "github",
         "--env",
         "TOKEN=t",
@@ -1554,7 +1641,13 @@ fn amp_sync_writes_the_namespaced_key_and_leaves_the_nested_one_alone() {
         "npx",
         "server-github",
     ]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "amp"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1604,7 +1697,13 @@ fn amp_sync_writes_the_namespaced_key_and_leaves_the_nested_one_alone() {
 fn amp_settings_survive_their_own_comments_and_formatting() {
     let sb = Sandbox::new();
     sb.install_amp(Some(AMP_COMMENTED_SETTINGS));
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "amp"]);
     assert!(out.contains("+ linear"), "{out}");
@@ -1644,7 +1743,7 @@ fn a_managed_cline_entry_keeps_the_switch_the_user_flipped() {
     let sb = Sandbox::new();
     let kind = mcpgw_core::ClientKind::Cline;
     sb.install_cline(kind, None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     // A first sync claims `github`, then the user switches it off inside
     // Cline and auto-approves a tool on it.
     sb.ok(&["sync", "--client", kind.id()]);
@@ -1714,7 +1813,7 @@ fn gemini_sync_frees_the_servers_it_manages_from_the_excluded_list() {
   }
 }"#,
     ));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
 
     let out = sb.ok(&["sync", "--client", "gemini"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1735,7 +1834,7 @@ fn gemini_sync_frees_the_servers_it_manages_from_the_excluded_list() {
 
     // Disabling the server removes its entry, and its name goes with it —
     // left behind it would silently switch off a server re-added by hand.
-    sb.ok(&["disable", "github"]);
+    sb.ok(&["disable", "--no-sync", "github"]);
     let out = sb.ok(&["sync", "--client", "gemini"]);
     assert!(out.contains("- github"), "{out}");
     assert_eq!(
@@ -1751,7 +1850,13 @@ fn gemini_sync_frees_the_servers_it_manages_from_the_excluded_list() {
 fn a_non_map_root_key_is_refused_rather_than_overwritten() {
     let sb = Sandbox::new();
     sb.install_cursor(Some(r#"{"mcpServers": 5}"#));
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
 
     let out = sb.ok(&["sync", "--client", "cursor"]);
     assert!(out.contains("refused"), "{out}");
@@ -1770,7 +1875,7 @@ fn an_inline_codex_server_map_keeps_its_foreign_entries() {
     sb.install_codex(Some(
         "model = \"gpt-5-codex\"\nmcp_servers = { notes = { command = \"notes-mcp\" } }\n",
     ));
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
 
     let out = sb.ok(&["sync", "--client", "codex"]);
     assert!(out.contains("+ github"), "{out}");
@@ -1823,7 +1928,7 @@ fn the_client_flags_list_every_shipped_id() {
 fn the_gateway_flag_is_gone() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
 
     let refused = sb.mcpgw(&["sync", "--client", "cursor", "--gateway"]);
     assert!(!refused.status.success());
@@ -1843,7 +1948,7 @@ fn the_gateway_flag_is_gone() {
 fn a_dry_run_writes_nothing() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     let out = sb.ok(&["sync", "--client", "cursor", "--dry-run"]);
     assert!(out.contains("+ github"), "{out}");
     assert!(!sb.home.join(".cursor/mcp.json").exists());
@@ -1994,8 +2099,14 @@ fn project_sync_outside_a_repo_says_it_found_nothing() {
 fn a_scoped_client_is_written_only_its_own_servers_at_a_tagged_endpoint() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
-    sb.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
+    sb.ok(&[
+        "add",
+        "--no-sync",
+        "linear",
+        "--url",
+        "https://mcp.linear.app/mcp",
+    ]);
     sb.ok(&["clients", "cursor", "servers", "github"]);
 
     let out = sb.ok(&["sync", "--client", "cursor", "--dry-run"]);
@@ -2031,7 +2142,7 @@ fn a_scoped_client_is_written_only_its_own_servers_at_a_tagged_endpoint() {
 fn an_unscoped_client_is_untouched_by_another_clients_scope() {
     let sb = Sandbox::new();
     sb.install_cursor(None);
-    sb.ok(&["add", "github", "--", "npx", "server-github"]);
+    sb.ok(&["add", "--no-sync", "github", "--", "npx", "server-github"]);
     sb.ok(&["sync", "--client", "cursor"]);
     let before = std::fs::read_to_string(sb.home.join(".cursor/mcp.json")).unwrap();
 

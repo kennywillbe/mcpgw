@@ -126,6 +126,49 @@ pub fn run(args: &SyncArgs, color: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The sync a canonical edit runs on its way out.
+///
+/// `add`, `remove`, `enable` and `disable` all change what the clients are
+/// supposed to hold, and until their files are rewritten the edit has landed
+/// in exactly one place the user cannot see it. So each of them finishes with
+/// the run a bare `mcpgw sync` is: every client, the default gateway URL, and
+/// no repo-local files — none of those commands takes a `--project`, so there
+/// is no project scope for this run to inherit.
+///
+/// # Errors
+///
+/// Whatever `mcpgw sync` itself fails with.
+pub fn after_edit(no_sync: bool, color: bool) -> anyhow::Result<()> {
+    if no_sync {
+        println!("run `mcpgw sync` to bring the clients up to date.");
+        return Ok(());
+    }
+    println!();
+    // Said once instead of one "not found, skipped" per client: on a machine
+    // with no client at all that list is the whole output, and none of its
+    // lines is the answer ("there is nothing here to sync").
+    if ClientKind::ALL
+        .iter()
+        .all(|kind| matches!(kind.detect(), Detection::NotInstalled))
+    {
+        println!(
+            "no MCP client found on this machine — nothing to sync \
+             (`mcpgw clients` lists the ones mcpgw knows)"
+        );
+        return Ok(());
+    }
+    run(
+        &SyncArgs {
+            clients: Vec::new(),
+            project: false,
+            dry_run: false,
+            rollback: false,
+            gateway_url: super::connect::DEFAULT_URL.to_owned(),
+        },
+        color,
+    )
+}
+
 /// The repo-local files this run may write: the ones discovery found, minus
 /// any client `--client` left out.
 fn project_targets(targets: &[ClientKind]) -> Vec<ProjectConfig> {

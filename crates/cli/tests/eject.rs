@@ -132,6 +132,7 @@ impl Sandbox {
     fn add_servers(&self) {
         self.ok(&[
             "add",
+            "--no-sync",
             "github",
             "--env",
             "TOKEN=t",
@@ -140,7 +141,13 @@ impl Sandbox {
             "-y",
             "server-github",
         ]);
-        self.ok(&["add", "linear", "--url", "https://mcp.linear.app/mcp"]);
+        self.ok(&[
+            "add",
+            "--no-sync",
+            "linear",
+            "--url",
+            "https://mcp.linear.app/mcp",
+        ]);
     }
 
     /// A Cursor config as 0.3.x `sync --aggregate` left it — one `mcpgw` entry

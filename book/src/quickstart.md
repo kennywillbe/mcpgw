@@ -155,6 +155,12 @@ mcpgw add staging --url https://x/mcp --header "Authorization=Bearer $TOKEN"
 mcpgw add scratch --disabled -- some-server     # in the list, not in use
 ```
 
+`add` finishes by syncing your clients, so the server is in them when the
+command returns — the same run [step 4](#4-point-every-client-at-the-gateway)
+describes, printing the same per-client lines. `--no-sync` skips it and leaves
+the clients for a later `mcpgw sync`. On a machine with no MCP client installed
+it says so in one line and writes nothing.
+
 ## 3. See the list
 
 ```sh
@@ -172,12 +178,21 @@ mcpgw enable scratch
 mcpgw remove scratch
 ```
 
+These sync the clients too, and for the same reason: a disabled server is
+mirrored into no client, so the switch takes its entry away and `enable` puts
+it back. Each takes `--no-sync`.
+
 ## 4. Point every client at the gateway
 
 ```sh
 mcpgw sync --dry-run     # the diff, no writes
 mcpgw sync               # write it
 ```
+
+This is the run `add`, `remove`, `enable` and `disable` already made for you.
+Reach for it directly to preview a change, to write a subset of clients, to
+pick up an edit made in the config file by hand, or after any of those
+commands was passed `--no-sync`.
 
 Each enabled server keeps its entry and its name in the client; only the
 transport changes, to that server's own endpoint on the gateway

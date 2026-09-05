@@ -64,6 +64,10 @@ mcpgw sync                                                # point every client a
 mcpgw doctor --probe                                      # does any of it actually connect?
 ```
 
+`add`, `remove`, `enable` and `disable` end by running that `sync` themselves,
+so the clients are current when the command returns — the line above is there
+for everything else, and `--no-sync` on any of them leaves it for later.
+
 `sync` only touches entries mcpgw wrote. Anything you added by hand stays where
 it is and gets reported as unmanaged, with an `import` suggestion. Every client
 file is backed up before it's written; `mcpgw sync --rollback` undoes the last
