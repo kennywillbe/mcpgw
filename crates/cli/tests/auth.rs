@@ -194,6 +194,45 @@ fn a_preregistered_client_id_is_presented_and_kept_in_the_config() {
     assert_eq!(value["servers"][0]["identity"], "pre-registered client id");
 }
 
+/// A provider that offers neither a metadata document nor a registration
+/// endpoint has nothing a login can register against, and the one thing that
+/// fixes it is a client id the user obtains by hand. rmcp reports this by
+/// nesting the same phrase inside itself twice; what reaches the terminal has
+/// to be one line that names the authorization server and the flag.
+#[test]
+fn a_provider_that_registers_no_clients_is_told_to_use_client_id() {
+    let home = tempfile::tempdir().unwrap();
+    let provider = Provider::start(oauth::Config {
+        cimd: false,
+        dcr: false,
+        ..oauth::Config::default()
+    });
+    std::fs::write(home.path().join("config.toml"), provider.config()).unwrap();
+
+    let (ok, text) = login(home.path(), &[]);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains(
+            "supports neither a client id metadata document nor dynamic client registration"
+        ),
+        "{text}"
+    );
+    assert!(text.contains(&provider.base), "{text}");
+    assert!(
+        text.contains("mcpgw auth login linear --client-id <id>"),
+        "{text}"
+    );
+    assert!(text.contains("--client-secret-env"), "{text}");
+    // rmcp's own doubled wording, and the doubling mcpgw added on top of it,
+    // are both gone: the fact reaches the terminal once.
+    assert_eq!(text.matches("Registration failed").count(), 0, "{text}");
+    assert_eq!(text.matches("authorization server").count(), 1, "{text}");
+    // No browser was opened and no token was written for a flow that never
+    // got a client identity.
+    assert!(!text.contains("open this URL"), "{text}");
+    assert!(!home.path().join("state/auth/linear.json").exists());
+}
+
 /// A server nothing has dialed yet is a server nothing is known about, and
 /// saying so beats guessing at a login it may never want.
 #[test]

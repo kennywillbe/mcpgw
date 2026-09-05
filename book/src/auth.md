@@ -39,6 +39,7 @@ upstream "linear" needs OAuth; run mcpgw auth login linear on this machine
 mcpgw auth login linear            # one server
 mcpgw auth login                   # every server that is waiting on a login
 mcpgw auth login jira --client-id abc123
+mcpgw auth login github --client-id Ov23li... --client-secret-env GITHUB_CLIENT_SECRET
 mcpgw auth login linear --no-browser
 ```
 
@@ -81,6 +82,70 @@ In the order the [2026-07-28 spec][spec] asks for:
 3. **Dynamic Client Registration**, when the server offers a
    `registration_endpoint`. Deprecated in 2026-07-28 and still what Notion,
    Sentry and Cloudflare do.
+
+### What the consent screen calls mcpgw
+
+Not always "mcpgw", and on the metadata-document path that is not something
+this side decides.
+
+An authorization request built around a Client ID Metadata Document carries
+exactly one thing that identifies the client: the client id, which *is* the
+document's URL. `client_name` is not a parameter of an authorization request —
+it exists in the body of a dynamic registration, and in the published document
+itself. So whether a consent screen reads "mcpgw" comes down to whether that
+authorization server fetches the document and renders `client_name` out of it.
+
+Notion does not, and no field mcpgw could add to the document would change it.
+`https://mcp.notion.com/authorize` is not the consent screen; it is a broker
+that redirects straight to `https://api.notion.com/v1/oauth/authorize` using
+Notion's own first-party client id and its own `redirect_uri`, carrying the
+whole MCP request base64-encoded in the `state` parameter. That blob holds the
+client id, the loopback redirect URI, the scopes and the PKCE challenge — and
+no name. The screen you then see is Notion's consent for its own "Notion MCP"
+integration, and the only thing in the blob that says anything about who is
+asking is the loopback redirect URI. Hence "Grant 127.0.0.1 access to Notion".
+
+Clients that register dynamically get their name shown on that same screen
+because a registration leaves a client record, with `client_name` on it, that
+Notion can look up by client id when it renders. A metadata-document client id
+has no such record.
+
+mcpgw does not reorder the identities to get a nicer label: preferring dynamic
+registration wherever a server offers both would create a client record per
+laptop at *every* provider — the thing 2026-07-28 deprecated it for — to change
+one provider's rendering. If the name on the screen matters to you for a
+particular provider, register a client with it yourself and pass
+`--client-id`; a registered client is a record with a name on it, and that is
+the same path the clients showing their own names take.
+
+### When the provider registers no clients
+
+Some authorization servers offer none of the three: no client id metadata
+document, no `registration_endpoint`, and no client id unless you go and create
+one in their web UI. GitHub's remote MCP server is the one most people meet
+first. There is nothing for mcpgw to open a browser for, so the login stops
+before the browser with the one thing that fixes it:
+
+```console
+$ mcpgw auth login github
+github: this server's authorization server (https://github.com/login/oauth) supports neither a client id metadata document nor dynamic client registration; register an OAuth client there, then run: mcpgw auth login github --client-id <id> (add --client-secret-env <VAR> if the provider issues a secret too)
+```
+
+For GitHub, register an [OAuth app][github-oauth] with the callback URL
+`http://127.0.0.1/callback`, then:
+
+```sh
+export GITHUB_CLIENT_SECRET=...
+mcpgw auth login github --client-id Ov23li... --client-secret-env GITHUB_CLIENT_SECRET
+```
+
+The secret is not optional there, PKCE or not: GitHub does not distinguish
+public clients from confidential ones and [requires `client_secret` at the
+token endpoint][github-best-practices] even for a CLI. `--client-secret-env`
+names the environment variable rather than taking the value, so the secret
+never reaches your shell history, the config file or `mcpgw list`. Both the
+client id and the variable name are written into the server's `[auth]` table,
+so refreshes in the daemon present the same identity.
 
 The redirect URI in that document is `http://127.0.0.1/callback` with no port.
 [RFC 8252 §7.3][rfc8252] obliges an authorization server to accept whichever
@@ -219,3 +284,5 @@ refused at parse time rather than silently letting one win.
 
 [spec]: https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration
 [rfc8252]: https://www.rfc-editor.org/rfc/rfc8252.html#section-7.3
+[github-oauth]: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app
+[github-best-practices]: https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/best-practices-for-creating-an-oauth-app
