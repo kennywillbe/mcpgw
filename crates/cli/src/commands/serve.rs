@@ -123,6 +123,9 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
+        // First of all, and before anything below tells the outside world
+        // that this gateway exists. See [`Signals`].
+        let signals = Signals::install();
         // Before the first request can reach it: from here on an append is a
         // queue push, and nothing on the request path waits on the disk the
         // state directory lives on.
@@ -172,6 +175,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         watch_for_releases(args.supervised, state_dir.as_deref());
 
         let shutdown = shutdown_signal(
+            signals,
             Arc::clone(&stop),
             Arc::clone(&stop_upgrades),
             decided.clone(),
@@ -572,17 +576,18 @@ async fn drain_for_an_upgrade(mut decided: tokio::sync::watch::Receiver<Option<U
 /// the exe watcher deciding this gateway must stand aside for the binary that
 /// replaced it. Either way both watchers are stopped on the way out.
 async fn shutdown_signal(
+    signals: Signals,
     stop: Arc<tokio::sync::Notify>,
     stop_upgrades: Arc<tokio::sync::Notify>,
     mut decided: tokio::sync::watch::Receiver<Option<UpgradeRestart>>,
 ) {
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("\nshutting down"),
+        () = signals.interrupt.arrived() => println!("\nshutting down"),
         // The stop every supervisor sends. Its default disposition would end
         // the process where it stands, which is the crash path: no drain, no
         // children killed, and a runtime record left claiming this gateway is
         // still up.
-        () = terminated() => println!("shutting down"),
+        () = signals.terminate.arrived() => println!("shutting down"),
         // Announced by the watcher already, which is the only party that
         // can say which binary changed.
         () = upgrade_decided(&mut decided) => {}
@@ -591,28 +596,111 @@ async fn shutdown_signal(
     stop_upgrades.notify_one();
 }
 
-/// Resolves on SIGTERM.
+/// The two stops this gateway answers to, claimed with the reactor before it
+/// is of any interest to anyone.
 ///
-/// Never resolves off Unix, where there is no such signal to catch: Windows
-/// stops a service by other means, and the arm being unreachable there is
-/// what keeps the `select!` above free of a platform split.
-async fn terminated() {
+/// The claiming is the point, and so is where [`Signals::install`] is called
+/// from: the moment the runtime record is on disk, a supervisor or a test can
+/// read this gateway's pid out of it and stop the service — and until a
+/// handler is installed, SIGTERM's default disposition ends the process where
+/// it stands. Waiting to install one until the shutdown `select!` is first
+/// polled leaves that whole window, from the record through the bind and the
+/// banner, covered by nothing but the default.
+struct Signals {
+    interrupt: Handler,
+    terminate: Handler,
+}
+
+impl Signals {
+    /// Installs both handlers. Called inside the runtime, since it is the
+    /// runtime's reactor that carries a delivered signal to the futures
+    /// below, and before the gateway announces itself in any way.
+    fn install() -> Self {
+        Self {
+            interrupt: Handler::interrupt(),
+            terminate: Handler::terminate(),
+        }
+    }
+}
+
+/// One signal, waited on once.
+enum Handler {
+    /// Installed at start-up, holding the signals delivered since.
     #[cfg(unix)]
-    {
-        // A handler that cannot be installed is not worth ending the gateway
-        // over; the arm simply never fires, which is where it started.
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
+    Installed(tokio::signal::unix::Signal),
+    /// Ctrl-C off Unix, where the console handler is registered on the first
+    /// poll and there is no start-up race to lose either way: nothing there
+    /// stops a service by console signal.
+    #[cfg(not(unix))]
+    Console,
+    /// Nothing to wait on — a handler that could not be installed, or
+    /// SIGTERM off Unix, where there is no such signal to catch.
+    Never,
+}
+
+impl Handler {
+    /// Ctrl-C, which on Unix is SIGINT like any other signal.
+    #[cfg(unix)]
+    fn interrupt() -> Self {
+        Self::claim(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()),
+            "with Ctrl-C",
+        )
+    }
+
+    /// Ctrl-C, which off Unix is the console's business rather than a
+    /// signal's.
+    #[cfg(not(unix))]
+    fn interrupt() -> Self {
+        Self::Console
+    }
+
+    /// The stop every supervisor sends.
+    #[cfg(unix)]
+    fn terminate() -> Self {
+        Self::claim(
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()),
+            "gracefully",
+        )
+    }
+
+    /// Nothing: off Unix there is no such signal to catch, and a service is
+    /// stopped by other means.
+    #[cfg(not(unix))]
+    fn terminate() -> Self {
+        Self::Never
+    }
+
+    /// A handler that cannot be installed is not worth refusing to serve
+    /// over; the arm simply never fires, which is where it started. Said out
+    /// loud, because a gateway nobody can stop cleanly is a gateway whose
+    /// stop will look like a crash.
+    #[cfg(unix)]
+    fn claim(installed: std::io::Result<tokio::signal::unix::Signal>, how: &str) -> Self {
+        match installed {
+            Ok(handler) => Self::Installed(handler),
             Err(err) => {
-                eprintln!("warning: this gateway cannot be stopped gracefully: {err:#}");
-                std::future::pending::<()>().await;
+                eprintln!("warning: this gateway cannot be stopped {how}: {err:#}");
+                Self::Never
             }
         }
     }
-    #[cfg(not(unix))]
-    std::future::pending::<()>().await;
+
+    /// Resolves the next time this signal arrives — or, for a signal already
+    /// delivered since [`Signals::install`], straight away.
+    async fn arrived(self) {
+        match self {
+            #[cfg(unix)]
+            Self::Installed(mut handler) => {
+                handler.recv().await;
+            }
+            #[cfg(not(unix))]
+            Self::Console => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            Self::Never => std::future::pending::<()>().await,
+        }
+    }
 }
 
 /// Resolves once the exe watcher has decided this gateway must stand aside.
@@ -735,4 +823,33 @@ fn select(
         }
     }
     Ok(args.server.clone())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The race #228's CI run lost: SIGTERM has to stop killing this process
+    /// the moment the handlers are installed, not the first time something
+    /// polls the shutdown `select!` they end up in.
+    #[tokio::test]
+    async fn installing_the_handlers_claims_sigterm_before_anything_awaits_it() {
+        let signals = Signals::install();
+
+        // Sent to this very process, and nothing has awaited anything yet:
+        // with the default disposition still in place this line ends the
+        // test binary and the assertion below is never reached.
+        //
+        // SAFETY: `kill` with a pid this process owns and a signal number
+        // libc names; it touches no memory of ours.
+        let rc = unsafe { libc::kill(i32::try_from(std::process::id()).unwrap(), libc::SIGTERM) };
+        assert_eq!(rc, 0, "kill: {}", std::io::Error::last_os_error());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            signals.terminate.arrived(),
+        )
+        .await
+        .expect("the installed handler never saw a SIGTERM sent before it was awaited");
+    }
 }
