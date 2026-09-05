@@ -577,9 +577,9 @@ pub async fn login(request: &Login<'_>, announce: impl FnOnce(&str)) -> Result<T
 
 /// Waits for the browser's one redirect and returns its query string.
 ///
-/// Requests for anything but the callback path are answered and ignored: a
-/// browser asking for `/favicon.ico` first must not consume the one accept
-/// the login gets. The `state` parameter is not checked here — it is checked
+/// What the browser is answered with is decided by [`Landing`], from the same
+/// query the return value is read out of, so the page and the exit code
+/// cannot disagree. The `state` parameter is not checked here — it is checked
 /// where it means something, against the PKCE verifier rmcp filed under it,
 /// which is the check that actually binds the callback to this login.
 async fn wait_for_callback(
@@ -602,34 +602,130 @@ async fn wait_for_callback(
         }
         let target = line.split_whitespace().nth(1).unwrap_or_default();
         let (path, query) = target.split_once('?').unwrap_or((target, ""));
-        let done = path == "/callback";
-        let body = if done {
-            "mcpgw is logged in. You can close this tab."
-        } else {
-            "mcpgw is waiting for the authorization redirect."
-        };
-        let response = format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n{body}",
-            if done { 200 } else { 404 },
-            if done { "OK" } else { "Not Found" },
-            body.len(),
-        );
+        let landing = Landing::of(path, query);
         let mut stream = reader.into_inner();
         // Best effort: the tokens matter, the browser's tab does not. A user
         // who closed the window mid-redirect still gets logged in.
-        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.write_all(landing.response().as_bytes()).await;
         let _ = stream.shutdown().await;
-        if !done {
-            continue;
+        match landing {
+            Landing::Refused(message) => return Err(Error::Refused { message }),
+            Landing::LoggedIn => return Ok(query.to_owned()),
+            // Answered and gone round again for the next connection.
+            Landing::Elsewhere => {}
         }
-        if let Some(message) = refusal(query) {
-            return Err(Error::Refused { message });
-        }
-        return Ok(query.to_owned());
     }
+}
+
+/// What the redirect turned out to be, which is the question the page in the
+/// browser has to answer too.
+///
+/// The page used to be picked from the path alone, so a consent screen the
+/// user declined — which still redirects to `/callback`, carrying
+/// `error=access_denied` instead of a code — was answered "mcpgw is logged
+/// in". The refusal was noticed a moment later, after the response had
+/// already gone out, and only the terminal ever heard about it.
+#[derive(Debug, PartialEq, Eq)]
+enum Landing {
+    /// A request for something that is not the callback path. Answered and
+    /// ignored: a browser asking for `/favicon.ico` first must not consume
+    /// the one accept the login gets.
+    Elsewhere,
+    /// The redirect came back with a code.
+    LoggedIn,
+    /// The redirect came back with an `error`, carrying the authorization
+    /// server's own account of it.
+    Refused(String),
+}
+
+impl Landing {
+    fn of(path: &str, query: &str) -> Self {
+        if path != "/callback" {
+            return Self::Elsewhere;
+        }
+        match refusal(query) {
+            Some(message) => Self::Refused(message),
+            None => Self::LoggedIn,
+        }
+    }
+
+    /// The whole HTTP response, headers and page.
+    ///
+    /// Hand-built over the raw socket, and the page with it: this listener
+    /// exists for one redirect and is closed again, and a browser that has
+    /// just been told a login failed must not then be told to go and fetch a
+    /// stylesheet from a socket that is gone. Hence no assets, no scripts and
+    /// no second request — the page is the response.
+    fn response(&self) -> String {
+        let (status, reason) = match self {
+            Self::Elsewhere => (404, "Not Found"),
+            Self::LoggedIn => (200, "OK"),
+            Self::Refused(_) => (400, "Bad Request"),
+        };
+        let (heading, detail) = match self {
+            Self::Elsewhere => (
+                "Waiting for the authorization redirect".to_owned(),
+                "mcpgw is still waiting for the authorization server to send you back here."
+                    .to_owned(),
+            ),
+            Self::LoggedIn => (
+                "Logged in".to_owned(),
+                "mcpgw has the token. You can close this tab.".to_owned(),
+            ),
+            // The description is the authorization server's own text, so it
+            // is escaped rather than trusted: it reaches this page from the
+            // query string of a redirect nothing here controls.
+            Self::Refused(message) => (
+                "Login refused".to_owned(),
+                format!(
+                    "The authorization server refused the login: {}. \
+                     Nothing was stored; you can close this tab and try again.",
+                    escape(message)
+                ),
+            ),
+        };
+        let body = format!(
+            "<!DOCTYPE html>\n\
+             <html lang=\"en\">\n\
+             <head>\n\
+             <meta charset=\"utf-8\">\n\
+             <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+             <title>mcpgw</title>\n\
+             <style>\n\
+             body {{ font: 16px/1.5 system-ui, sans-serif; margin: 0; \
+             display: grid; place-items: center; min-height: 100vh; }}\n\
+             main {{ max-width: 34rem; padding: 2rem; }}\n\
+             h1 {{ font-size: 1.25rem; margin: 0 0 .5rem; }}\n\
+             p {{ margin: 0; color: #444; }}\n\
+             </style>\n\
+             </head>\n\
+             <body><main><h1>{heading}</h1><p>{detail}</p></main></body>\n\
+             </html>\n"
+        );
+        format!(
+            "HTTP/1.1 {status} {reason}\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len(),
+        )
+    }
+}
+
+/// The five characters that can end a text node or an attribute value.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(character),
+        }
+    }
+    out
 }
 
 /// The authorization server's own account of a refusal, out of the redirect's
@@ -948,6 +1044,70 @@ mod tests {
             Some("invalid_scope")
         );
         assert_eq!(refusal("code=abc&state=xyz"), None);
+    }
+
+    /// The page in the browser and the exit code have to agree: the tab a
+    /// user lands on after clicking Deny must not read "logged in".
+    #[test]
+    fn the_callback_page_says_which_way_the_login_went() {
+        let refused = Landing::of(
+            "/callback",
+            "error=access_denied&error_description=the%20user%20said%20%3Cno%3E",
+        );
+        assert_eq!(
+            refused,
+            Landing::Refused("access_denied (the user said <no>)".to_owned())
+        );
+        let page = refused.response();
+        assert!(page.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{page}");
+        assert!(
+            page.contains("Content-Type: text/html; charset=utf-8\r\n"),
+            "{page}"
+        );
+        assert!(page.contains("Login refused"), "{page}");
+        // The description is the authorization server's own text and lands on
+        // a page this process serves, so it arrives escaped.
+        assert!(
+            page.contains("access_denied (the user said &lt;no&gt;)"),
+            "{page}"
+        );
+        assert!(!page.contains("<no>"), "{page}");
+        assert!(!page.contains("logged in"), "{page}");
+
+        let ok = Landing::of("/callback", "code=abc&state=xyz");
+        assert_eq!(ok, Landing::LoggedIn);
+        let page = ok.response();
+        assert!(page.starts_with("HTTP/1.1 200 OK\r\n"), "{page}");
+        assert!(
+            page.contains("Content-Type: text/html; charset=utf-8\r\n"),
+            "{page}"
+        );
+        assert!(page.contains("Logged in"), "{page}");
+
+        // A favicon probe is still answered and still ignored.
+        assert_eq!(Landing::of("/favicon.ico", ""), Landing::Elsewhere);
+        assert!(
+            Landing::Elsewhere
+                .response()
+                .starts_with("HTTP/1.1 404 Not Found\r\n")
+        );
+
+        // Self-contained: nothing on the page sends the browser back to a
+        // socket that is about to close, and nothing on it runs.
+        for landing in [Landing::Elsewhere, Landing::LoggedIn] {
+            let page = landing.response();
+            assert!(!page.contains("<script"), "{page}");
+            assert!(!page.contains("src="), "{page}");
+            assert!(!page.contains("href="), "{page}");
+        }
+
+        // Content-Length counts the bytes of the body, not its characters.
+        let page = Landing::Refused("é".to_owned()).response();
+        let (head, body) = page.split_once("\r\n\r\n").unwrap();
+        assert!(
+            head.contains(&format!("Content-Length: {}", body.len())),
+            "{head}"
+        );
     }
 
     /// The constant and the document it names are one deployment, and the
