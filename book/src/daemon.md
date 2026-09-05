@@ -307,6 +307,20 @@ Three things about that are worth knowing:
 warning: the mcpgw binary at /opt/homebrew/bin/mcpgw changed but does not run (signal: 9 (SIGKILL)); staying on the current build — replace it with a fresh file (rename into place), not an in-place overwrite
 ```
 
+That check gives the replacement five seconds to answer `mcpgw --version`,
+which is a very long time for a line it prints before it reads anything —
+but the five seconds are wall clock, so on a machine with far more work in
+flight than cores the fork can wait them out before it is scheduled at all,
+and a perfectly good upgrade is reported as one that does not run. Set
+`MCPGW_VERIFY_TIMEOUT_SECS` in the service's environment to buy more room:
+
+```text
+MCPGW_VERIFY_TIMEOUT_SECS=60
+```
+
+Whole seconds, read once when the gateway starts; anything else is ignored
+and the default stands.
+
 ## After mcpgw itself moves
 
 The service definition names the binary it was installed from by absolute

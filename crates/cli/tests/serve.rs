@@ -1,6 +1,14 @@
 //! End-to-end coverage for `mcpgw serve`: the real binary serves the real
 //! routes, reached through the `mcpgw connect` bridge so this test needs no
 //! HTTP client of its own.
+//!
+//! Every wait here is on a condition rather than a clock, and the upgrade
+//! tests raise `MCPGW_VERIFY_TIMEOUT_SECS` for the gateways they start:
+//! this file is the one most sensitive to what else the machine is doing,
+//! because a supervised gateway forks the replacement it is checking and
+//! waits for it in wall-clock time. If something here starts failing only
+//! under a full `cargo test --workspace` on a busy box, that is the shape of
+//! it (#218), not the watcher logic.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -285,16 +293,18 @@ async fn a_supervised_gateway_stands_aside_when_its_binary_is_replaced() {
     wait_for_record(&state, port).await;
     wait_for_stderr(&errors, "watching").await;
 
+    // The one upgrade test that publishes a real mcpgw: what the gateway
+    // stands aside for here is the file a `brew upgrade` leaves behind, and
+    // the record below is asserted against its length. The rest of them are
+    // about which line the watcher prints and use a stub.
     util::replace_binary(&copy);
 
+    // Waited for before the exit, so a gateway that is merely slow says so
+    // in the message rather than looking like one that hung.
+    wait_for_stderr(&errors, "changed; restarting so the service runs it").await;
     assert_eq!(
         wait_for_exit(&mut child, &errors).await,
         i32::from(mcpgw_core::upgrade::UPGRADE_EXIT)
-    );
-    let said = errors.lock().unwrap().clone();
-    assert!(
-        said.contains("changed; restarting so the service runs it"),
-        "{said}"
     );
 
     // Left behind rather than withdrawn: the gateway the supervisor starts
@@ -322,9 +332,6 @@ async fn a_supervised_gateway_stands_aside_when_its_binary_is_replaced() {
 async fn a_supervised_gateway_stays_on_a_replacement_that_does_not_run() {
     let dir = tempfile::tempdir().unwrap();
     let copy = util::binary_copy(dir.path());
-    // Kept because the file at the path is about to stop being a binary, and
-    // the second half of the test needs a working one to publish.
-    let working = std::fs::read(&copy).unwrap();
     let state = dir.path().join("state");
     write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
     let (mut child, addr, _, errors) =
@@ -347,13 +354,50 @@ async fn a_supervised_gateway_stays_on_a_replacement_that_does_not_run() {
 
     // Refusing one file is not giving up on the path: the next one is
     // verified afresh, and a working one still ends the gateway.
-    let mut upgraded = working;
-    upgraded.extend_from_slice(b"an upgrade");
-    util::publish_binary(&copy, &upgraded);
+    util::publish_stub(&copy, "the upgrade after the broken one");
 
+    wait_for_stderr(&errors, "changed; restarting so the service runs it").await;
     assert_eq!(
         wait_for_exit(&mut child, &errors).await,
         i32::from(mcpgw_core::upgrade::UPGRADE_EXIT)
+    );
+}
+
+/// How long the pre-flight check waits is the machine's business, not a
+/// constant compiled into the binary: on a loaded box the fork alone can eat
+/// the five seconds the default allows, and a good upgrade is then reported
+/// as one that does not run.
+///
+/// Driven the short way round, because a deadline is far easier to prove by
+/// making it too small than by making it large enough: one second, against a
+/// replacement that takes three to answer.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_verify_timeout_is_what_the_environment_says_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = util::binary_copy(dir.path());
+    write_config(&dir.path().join("config.toml"), &fixture_config(&["fx1"]));
+    let (mut child, addr, _, errors) = util::serve_binary_with_env(
+        &copy,
+        dir.path(),
+        &["--supervised"],
+        &[(mcpgw_core::upgrade::VERIFY_TIMEOUT_ENV, "1")],
+    )
+    .await;
+    wait_for_stderr(&errors, "watching").await;
+
+    // Answers exactly what the watcher asks for, only later than it is
+    // willing to wait.
+    util::publish_binary(&copy, b"#!/bin/sh\nsleep 3\necho \"mcpgw 0.0.0-stub\"\n");
+
+    wait_for_stderr(&errors, "did not answer --version within 1s").await;
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the gateway stood aside for a replacement it never got an answer out of"
+    );
+    assert_eq!(
+        tool_names(&format!("http://{addr}/s/fx1")).await,
+        ["echo", "reverse"]
     );
 }
 
@@ -391,11 +435,11 @@ async fn a_gateway_without_the_flag_serves_straight_through_a_replacement() {
 async fn a_supervised_gateway_watches_the_binary_its_service_was_installed_with() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
-    let installed = dir.path().join("installed-mcpgw");
-    // A real binary, because the watcher runs its replacement before it
-    // stands aside for it. What this path stands for is a machine where the
-    // service was installed from somewhere the running image is not.
-    std::fs::copy(assert_cmd::cargo::cargo_bin("mcpgw"), &installed).unwrap();
+    // A file that runs, because the watcher runs the replacement before it
+    // stands aside for it — but never a gateway: what this path stands for
+    // is a machine where the service was installed from somewhere the
+    // running image is not, and nothing here ever starts it.
+    let installed = util::stub_binary(&dir.path().join("installed-mcpgw"), "as installed");
     let spec = mcpgw_core::daemon::DaemonSpec {
         exe: installed.clone(),
         config_path: dir.path().join("config.toml"),
@@ -415,8 +459,9 @@ async fn a_supervised_gateway_watches_the_binary_its_service_was_installed_with(
     .await;
     wait_for_stderr(&errors, &installed.display().to_string()).await;
 
-    util::replace_binary(&installed);
+    util::publish_stub(&installed, "the upgrade the service will run");
 
+    wait_for_stderr(&errors, "changed; restarting so the service runs it").await;
     assert_eq!(
         wait_for_exit(&mut child, &errors).await,
         i32::from(mcpgw_core::upgrade::UPGRADE_EXIT)
