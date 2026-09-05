@@ -390,12 +390,15 @@ async fn capture_is_off_unless_asked_for() {
 /// without adding an HTTP client to the dev-dependencies, and returns the
 /// status line of the response.
 async fn raw_post(addr: std::net::SocketAddr, origin: Option<&str>) -> String {
-    raw_post_to(addr, "/mcp", origin)
-        .await
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_owned()
+    status_line(&raw_post_to(addr, "/mcp", origin).await).to_owned()
+}
+
+/// The status line of a raw response. Status codes are only ever asserted
+/// through this: the headers carry a fresh random `Mcp-Session-Id` on every
+/// session-mode answer, and a search for "401" or "200" over the whole
+/// response hits those hex digits as readily as the status itself.
+fn status_line(response: &str) -> &str {
+    response.lines().next().unwrap_or_default()
 }
 
 /// The same, aimed at an arbitrary path and keeping the whole response so a
@@ -737,7 +740,7 @@ async fn an_unknown_endpoint_is_a_404_that_names_the_real_ones() {
     let (addr, manager) = serve_both(&[("fx1", "healthy"), ("fx2", "healthy")], None).await;
 
     let response = raw_post_to(addr, "/s/nope", None).await;
-    assert!(response.contains("404"), "{response}");
+    assert!(status_line(&response).contains("404"), "{response}");
     assert!(response.contains("nope"), "{response}");
     assert!(
         response.contains("/s/fx1") && response.contains("/s/fx2"),
@@ -850,14 +853,14 @@ async fn the_origin_guard_covers_the_per_server_endpoints_too() {
     let (addr, manager) = serve_both(&[("fx1", "healthy")], None).await;
 
     let response = raw_post_to(addr, "/s/fx1", Some("https://evil.example")).await;
-    assert!(response.contains("403"), "{response}");
+    assert!(status_line(&response).contains("403"), "{response}");
     // Even an endpoint that does not exist is refused before it is looked up.
     let response = raw_post_to(addr, "/s/nope", Some("https://evil.example")).await;
-    assert!(response.contains("403"), "{response}");
+    assert!(status_line(&response).contains("403"), "{response}");
 
     // A non-browser client (no Origin) is untouched by the guard.
     let response = raw_post_to(addr, "/s/fx1", None).await;
-    assert!(!response.contains("403"), "{response}");
+    assert!(!status_line(&response).contains("403"), "{response}");
     manager.shutdown().await;
 }
 
@@ -3117,8 +3120,8 @@ async fn the_right_token_reaches_the_endpoint() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
     )
     .await;
-    assert!(response.contains("200"), "{response}");
-    assert!(!response.contains("401"), "{response}");
+    assert!(status_line(&response).contains("200"), "{response}");
+    assert!(!status_line(&response).contains("401"), "{response}");
     manager.shutdown().await;
 }
 
@@ -3136,7 +3139,10 @@ async fn during_the_grace_period_a_loopback_client_without_the_token_still_passe
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
         )
         .await;
-        assert!(!response.contains("401"), "{header:?} -> {response}");
+        assert!(
+            !status_line(&response).contains("401"),
+            "{header:?} -> {response}"
+        );
     }
     manager.shutdown().await;
 }
@@ -3153,7 +3159,10 @@ async fn require_token_refuses_the_wrong_token_with_a_bearer_challenge() {
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
         )
         .await;
-        assert!(response.contains("401"), "{header:?} -> {response}");
+        assert!(
+            status_line(&response).contains("401"),
+            "{header:?} -> {response}"
+        );
         // Bare `Bearer`, with no `realm` and no `resource_metadata`: this is
         // a static token and there is no authorization server for a client
         // to go and discover.
@@ -3175,14 +3184,14 @@ async fn the_liveness_probe_stays_open_and_the_endpoints_do_not() {
     // user's data, and a status that cannot answer is worth more than the
     // nothing it would protect.
     let probe = raw_get(addr, "/mcp").await;
-    assert!(!probe.contains("401"), "{probe}");
+    assert!(!status_line(&probe).contains("401"), "{probe}");
 
     // Everything else on the same gateway is closed, `/mcp` included the
     // moment it stops being the bare probe.
     let endpoint = raw_get(addr, &endpoint_path("fx")).await;
-    assert!(endpoint.contains("401"), "{endpoint}");
+    assert!(status_line(&endpoint).contains("401"), "{endpoint}");
     let post = raw_post_to(addr, "/mcp", None).await;
-    assert!(post.contains("401"), "{post}");
+    assert!(status_line(&post).contains("401"), "{post}");
     manager.shutdown().await;
 }
 
@@ -3202,7 +3211,7 @@ async fn a_gateway_that_requires_the_token_refuses_every_client_without_it() {
         r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
     )
     .await;
-    assert!(refused.contains("401"), "{refused}");
+    assert!(status_line(&refused).contains("401"), "{refused}");
     manager.shutdown().await;
 }
 
