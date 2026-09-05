@@ -596,3 +596,20 @@ the pair of them is the clean way to run mcpgw against a scratch environment:
 ```sh
 MCPGW_CONFIG=/tmp/try/config.toml MCPGW_STATE_DIR=/tmp/try/state mcpgw list
 ```
+
+**They cover mcpgw's own files, and nothing else.** Client detection is not
+routed through them: Claude Code, Cursor, Gemini CLI and Codex CLI are found
+under `$HOME` (`%USERPROFILE%` on Windows), VS Code and Claude Desktop under
+the platform's app-data dir (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` on
+Linux), and opencode, Zed and Amp under `$XDG_CONFIG_HOME` — none of which any
+`MCPGW_*` variable moves. So a run with only the pair above set still rewrites
+your real client files the moment it syncs. To keep them out of it, either
+
+- override `HOME` too (and `XDG_CONFIG_HOME`, plus `APPDATA` on Windows, if
+  they are set in your environment) so detection lands in the scratch dir, or
+- stay read-only: `--no-sync` on `add`, `remove`, `enable` and `disable`, and
+  `mcpgw sync --dry-run` to see the plan without writing it.
+
+Repo-local files (`.mcp.json`, `.cursor/mcp.json`, …) are found from the
+working directory rather than from any variable, and are only written when
+`sync` is given `--project`.

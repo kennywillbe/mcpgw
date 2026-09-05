@@ -85,8 +85,9 @@ pub fn run(args: &AddArgs, color: bool) -> anyhow::Result<()> {
     super::sync::after_edit(args.no_sync, color)
 }
 
-/// Says so when the command just stored resolves for the caller but not for
-/// the installed gateway service.
+/// Says so when the command just stored will not start: because nothing on
+/// this shell's `PATH` resolves it at all, or because it resolves for the
+/// caller and not for the installed gateway service.
 ///
 /// After the entry is written rather than instead of writing it: the entry is
 /// exactly what was asked for and is right for a foreground `mcpgw serve`, so
@@ -101,6 +102,16 @@ fn warn_unreachable_by_daemon(transport: &Transport) {
         return;
     };
     if env.contains_key("PATH") {
+        return;
+    }
+    // Checked first and on its own: a command nothing resolves cannot also
+    // be one the daemon alone is missing, and the shorter sentence is the
+    // one that fits what happened.
+    if mcpgw_core::daemon_check::stdio_command_missing(command) {
+        eprintln!(
+            "warning: {command:?} is not on your PATH; the gateway will not be able to start \
+             it — spell out the full path or install it"
+        );
         return;
     }
     let service_path = mcpgw_core::daemon_check::service_path();
