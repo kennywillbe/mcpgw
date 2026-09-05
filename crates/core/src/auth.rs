@@ -731,23 +731,95 @@ pub async fn challenge(server: &crate::config::Server, timeout: Duration) -> Opt
 /// Deliberately not called from anywhere the daemon runs: see [`login`].
 #[must_use]
 pub fn open_browser(url: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    let (program, args): (&str, &[&str]) = ("open", &[]);
-    #[cfg(target_os = "windows")]
-    // `start` is a cmd builtin, not a program, and its first quoted argument
-    // is taken as the window title — hence the empty one before the URL.
-    let (program, args): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let (program, args): (&str, &[&str]) = ("xdg-open", &[]);
+    if !is_web_url(url) {
+        return false;
+    }
 
-    std::process::Command::new(program)
-        .args(args)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
+    #[cfg(windows)]
+    {
+        open_through_shell(url)
+    }
+
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(not(target_os = "macos"))]
+        let program = "xdg-open";
+
+        std::process::Command::new(program)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+}
+
+/// Whether `url` is one a browser should be handed at all.
+///
+/// The string comes from the authorization server's own
+/// `authorization_endpoint`, which is upstream-controlled: whoever the user is
+/// trying to add decides it. Every launcher below dispatches on the scheme,
+/// and the ones that are not `http`/`https` do things a login has no business
+/// asking for — `file:` opens a local path, and the Windows shell resolves
+/// anything it does not recognise as a URL against the filesystem. An
+/// authorization endpoint that is neither http nor https is not one this can
+/// complete a flow against anyway, so refusing it costs nothing and the caller
+/// still prints the URL.
+fn is_web_url(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+}
+
+/// Hands `url` to the shell's `open` verb, which is what a Windows browser
+/// launch is.
+///
+/// Not `cmd /C start`: `cmd` re-parses whatever line it is handed, and Rust's
+/// Windows argument encoder quotes an argument containing a space, a tab or a
+/// quote but passes `&`, `|`, `^`, `<` and `>` through raw — and every real
+/// authorization URL carries at least one `&`. `ShellExecuteExW` takes the URL
+/// as a struct field, so there is no command line for anything to be re-parsed
+/// out of. It is also the call `daemon::windows` already makes for elevation,
+/// rather than a second way of reaching the shell.
+#[cfg(windows)]
+fn open_through_shell(url: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::UI::Shell::{SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW};
+
+    /// `SW_SHOWNORMAL`. Written out for the same reason as in
+    /// `daemon::windows`: a whole `windows-sys` feature for one integer that
+    /// has not moved since Windows 3.
+    const SW_SHOWNORMAL: i32 = 1;
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let verb = wide("open");
+    let file = wide(url);
+
+    // Zeroed rather than written out field by field: the struct has a dozen
+    // members this call has no opinion about, and zero is the default for
+    // every one of them.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = u32::try_from(std::mem::size_of::<SHELLEXECUTEINFOW>()).unwrap_or(0);
+    // NOASYNC because `verb` and `file` are dropped the moment this returns,
+    // and the shell has to be finished reading them before it does. No
+    // NOCLOSEPROCESS: nothing here waits on the browser, so there is no
+    // handle to be handed back and none to close.
+    info.fMask = SEE_MASK_NOASYNC;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.nShow = SW_SHOWNORMAL;
+
+    // SAFETY: every buffer pointed into outlives the call, and `info` is a
+    // correctly sized, zero-initialised `SHELLEXECUTEINFOW`.
+    unsafe { ShellExecuteExW(&raw mut info) != 0 }
 }
 
 #[cfg(test)]
@@ -841,6 +913,28 @@ mod tests {
         // Configured for a different id than the file holds: whatever this
         // is, it is not the one the config names.
         assert_eq!(pre.identity(Some("something-else")), Identity::Dcr);
+    }
+
+    /// The URL handed to the browser is the upstream's own
+    /// `authorization_endpoint`, so the scheme is checked before any platform
+    /// launcher gets to dispatch on it.
+    #[test]
+    fn only_an_http_url_is_handed_to_a_browser() {
+        assert!(is_web_url(
+            "https://example.com/authorize?client_id=a&state=b"
+        ));
+        // The loopback redirect and a provider on a plain-http intranet.
+        assert!(is_web_url("http://127.0.0.1:9000/callback"));
+        assert!(!is_web_url("file:///etc/passwd"));
+        assert!(!is_web_url("javascript:alert(1)"));
+        assert!(!is_web_url("ms-settings:"));
+        assert!(!is_web_url("not a url at all"));
+        assert!(!is_web_url(""));
+        // A shell metacharacter is not what makes a URL unsafe here — the
+        // launcher never builds a command line — but the scheme check has to
+        // let the ordinary case through all the same.
+        assert!(is_web_url("https://example.com/a?x=1&y=2^3|4<5>6"));
+        assert!(!open_browser("file:///etc/passwd"));
     }
 
     #[test]
