@@ -248,10 +248,11 @@ impl Gateway {
         ParamHeaders::collect(&context.extensions.get::<http::request::Parts>()?.headers)
     }
 
-    /// Writes one record, if capture is on. Deliberately a blocking append
-    /// on the request path: a record is a few hundred bytes to an appended
-    /// file, which costs far less than the channel and flush machinery that
-    /// moving it off-thread would need. Capture never fails a request.
+    /// Writes one record, if capture is on. Capture never fails a request,
+    /// and never delays one either: a gateway's writer is offloaded
+    /// ([`CaptureWriter::offload`]), so this hands the record to a queue and
+    /// returns rather than waiting on the filesystem the state directory
+    /// happens to live on.
     ///
     /// `who` is [`Gateway::attribution`] for the request; the writer's
     /// per-process id stands in when it found no session.
@@ -377,7 +378,16 @@ impl Gateway {
     /// one and takes the cursor, and a client's own cursor is answered before
     /// this is reached, so what arrives here is the whole list — the cursor
     /// check is what keeps that true if the walk ever stops handing back one.
-    fn check_drift(&self, who: &Attribution, result: &ListToolsResult) {
+    ///
+    /// The compare itself runs on a blocking thread: [`PinStore::observe`]
+    /// reads the pin file under a lock and, on a transition, writes it back
+    /// with two fsyncs. That is bounded work but not bounded *time* on a
+    /// slow state directory, and every `tools/list` would otherwise wait on
+    /// it. Moving it does not weaken the check — the store's own lock is
+    /// what serializes two lists of the same server, and it goes with the
+    /// work — but it does mean the caller awaits: a drift record still
+    /// belongs to the list that noticed it.
+    async fn check_drift(&self, who: &Attribution, result: &ListToolsResult) {
         let Some(pins) = &self.pins else { return };
         if result.next_cursor.is_some() {
             return;
@@ -394,11 +404,26 @@ impl Gateway {
         // After the filter: a tool the table hides is not part of what this
         // endpoint offers, so it is not part of what this endpoint pinned.
         let tools: Vec<ToolFingerprint> = result.tools.iter().map(ToolFingerprint::of).collect();
-        let events = match pins.observe(&self.upstream, &tools) {
-            Ok(events) => events,
-            Err(err) => {
+        let observed = {
+            let pins = Arc::clone(pins);
+            let upstream = self.upstream.clone();
+            tokio::task::spawn_blocking(move || pins.observe(&upstream, &tools)).await
+        };
+        let events = match observed {
+            Ok(Ok(events)) => events,
+            Ok(Err(err)) => {
                 eprintln!(
                     "warning: could not check tool definitions for {}: {err}",
+                    self.upstream
+                );
+                return;
+            }
+            // The task itself failed, which for work that only touches files
+            // means it panicked; nothing about this list is worth failing
+            // the list over.
+            Err(err) => {
+                eprintln!(
+                    "warning: tool definition check for {} did not run: {err}",
                     self.upstream
                 );
                 return;
@@ -1037,7 +1062,7 @@ impl ServerHandler for Gateway {
         result
             .tools
             .retain(|tool| self.allows(&tool.name, who.kind.as_deref()));
-        self.check_drift(&who, &result);
+        self.check_drift(&who, &result).await;
         Ok(bridged(&context, result))
     }
 

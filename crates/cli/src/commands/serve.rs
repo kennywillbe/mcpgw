@@ -112,6 +112,7 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         endpoints,
         reloader,
         capture_note,
+        capture,
     } = build(
         config_path,
         &args.server,
@@ -122,6 +123,12 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move {
+        // Before the first request can reach it: from here on an append is a
+        // queue push, and nothing on the request path waits on the disk the
+        // state directory lives on.
+        if let Some(writer) = &capture {
+            writer.offload();
+        }
         let serving = reloader.apply(config).await.serving;
         let listener = tokio::net::TcpListener::bind((args.bind.as_str(), args.port))
             .await
@@ -197,6 +204,11 @@ pub fn run(args: &ServeArgs) -> anyhow::Result<()> {
         if let Some(dir) = &state_dir {
             mcpgw_core::runtime::remove_record(dir, addr.port());
         }
+        // Before anything that can return early: the queue is the one place
+        // a record of traffic that already happened is still only in memory.
+        if let Some(writer) = &capture {
+            writer.flush().await;
+        }
         if let Some(served) = served {
             served?;
         }
@@ -218,6 +230,10 @@ pub(crate) struct Built {
     pub(crate) endpoints: Endpoints,
     pub(crate) reloader: Reloader,
     pub(crate) capture_note: String,
+    /// The traffic log, handed back as well as wired in: this is built
+    /// outside any runtime, and the writer's own thread can only be started
+    /// inside one — see [`CaptureWriter::offload`].
+    pub(crate) capture: Option<Arc<CaptureWriter>>,
 }
 
 /// Builds that gateway. `selection` is what the user asked for by name (empty
@@ -265,6 +281,7 @@ pub(crate) fn build(
         endpoints,
         reloader,
         capture_note,
+        capture,
     })
 }
 

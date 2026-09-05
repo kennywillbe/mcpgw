@@ -251,6 +251,8 @@ struct Embedded {
     /// Where this gateway published its runtime record, and under which port,
     /// so the shutdown withdraws exactly the one it wrote.
     record: Option<(PathBuf, u16)>,
+    /// The traffic log, kept only so the shutdown can wait for its queue.
+    capture: Option<Arc<mcpgw_core::capture::CaptureWriter>>,
 }
 
 impl Embedded {
@@ -265,6 +267,11 @@ impl Embedded {
         let _ = tokio::time::timeout(DRAIN, self.watcher).await;
         if let Some((dir, port)) = &self.record {
             mcpgw_core::runtime::remove_record(dir, *port);
+        }
+        // After the drain, so the records the last requests wrote are in the
+        // queue by the time it is waited on.
+        if let Some(writer) = &self.capture {
+            writer.flush().await;
         }
         self.manager.shutdown().await;
     }
@@ -315,6 +322,11 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
         capture,
         config.capture.retain_days,
     )?;
+    // The bridge's own gateway serves requests too, so its writer gets the
+    // same thread `serve`'s does.
+    if let Some(writer) = &built.capture {
+        writer.offload();
+    }
     built.reloader.apply(config).await;
 
     // Published like `serve`'s, so `status`, `doctor` and a second bridge
@@ -354,6 +366,7 @@ async fn embed(host: &str, port: u16) -> anyhow::Result<Option<Embedded>> {
         watcher,
         manager: built.manager,
         record,
+        capture: built.capture,
     }))
 }
 
