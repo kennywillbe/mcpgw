@@ -222,6 +222,10 @@ async fn a_supervisor_stop_shuts_down_as_cleanly_as_ctrl_c() {
     let state = dir.path().join("state");
     let (mut child, addr, _) = serve(dir.path(), &[]).await;
     let port = port_of(&addr);
+    // Sent the instant the record appears, because that is the instant a
+    // supervisor — or this test — can read the pid out of it: a gateway that
+    // only installs its handler later is one `launchctl bootout` away from
+    // dying on SIGTERM's default disposition instead of shutting down.
     wait_for_record(&state, port).await;
 
     let killed = std::process::Command::new("kill")
