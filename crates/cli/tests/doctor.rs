@@ -197,7 +197,7 @@ async fn json_warns_about_a_gateway_answering_on_another_build() {
         util::fixture_config(&["fx1"]),
     )
     .unwrap();
-    let (mut child, addr, _endpoints) = util::serve(dir.path(), &[]).await;
+    let (_gateway, addr, _endpoints) = util::serve(dir.path(), &[]).await;
     let url = format!("http://{addr}/mcp");
     util::record_installed_spec(
         dir.path(),
@@ -211,7 +211,6 @@ async fn json_warns_about_a_gateway_answering_on_another_build() {
     let out = tokio::task::spawn_blocking(move || run_doctor(&home, None, &["--json"]))
         .await
         .unwrap();
-    child.kill().await.unwrap();
 
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let findings = value["findings"].as_array().unwrap();

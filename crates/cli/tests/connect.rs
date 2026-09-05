@@ -164,10 +164,7 @@ fn home_serving(names: &[&str]) -> tempfile::TempDir {
 /// because the test has to own it: that transport kills the process when it
 /// is dropped, and what half of this file is about is what the bridge does
 /// when its stdin closes instead.
-async fn spawn_bridge(
-    home: &Path,
-    args: &[&str],
-) -> (Client, tokio::process::Child, Arc<Mutex<String>>) {
+async fn spawn_bridge(home: &Path, args: &[&str]) -> (Client, util::Spawned, Arc<Mutex<String>>) {
     let mut command = tokio::process::Command::from(mcpgw(home));
     let mut child = util::spawn_retrying_while_busy(
         command
@@ -175,7 +172,8 @@ async fn spawn_bridge(
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            .stderr(Stdio::piped())
+            .kill_on_drop(true),
     );
     let stdout = child.stdout.take().unwrap();
     let stdin = child.stdin.take().unwrap();
@@ -194,12 +192,12 @@ async fn spawn_bridge(
     });
 
     let client = ().serve(AsyncRwTransport::new_client(stdout, stdin)).await.unwrap();
-    (client, child, errors)
+    (client, util::Spawned::new(child), errors)
 }
 
 /// Closes the bridge's stdin the way a client that quits does, and returns
 /// the exit status of the process that was behind it.
-async fn ends(client: Client, mut child: tokio::process::Child) -> std::process::ExitStatus {
+async fn ends(client: Client, mut child: util::Spawned) -> std::process::ExitStatus {
     // Cancelling ends the service task that owns the transport, which drops
     // the child's stdin — the same EOF Claude Desktop leaves behind.
     client.cancel().await.unwrap();
@@ -262,7 +260,7 @@ async fn a_bridge_with_nothing_to_bridge_to_serves_a_gateway_for_the_session() {
 #[tokio::test]
 async fn a_gateway_that_is_already_up_is_bridged_to_and_nothing_is_started() {
     let home = home_serving(&["fx1"]);
-    let (mut gateway, addr, _endpoints) = util::serve(home.path(), &[]).await;
+    let (_gateway, addr, _endpoints) = util::serve(home.path(), &[]).await;
     let url = format!("http://{addr}/mcp");
 
     let (client, child, errors) =
@@ -273,7 +271,6 @@ async fn a_gateway_that_is_already_up_is_bridged_to_and_nothing_is_started() {
     assert!(!said.contains("serving one for this session"), "{said}");
 
     ends(client, child).await;
-    gateway.kill().await.unwrap();
 }
 
 #[tokio::test]

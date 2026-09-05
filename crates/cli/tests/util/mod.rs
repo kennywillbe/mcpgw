@@ -325,6 +325,103 @@ pub fn install_on_a_free_port(mut install: impl FnMut(u16) -> Output) -> (u16, O
     panic!("`daemon install` lost the port it picked eight times running");
 }
 
+/// A spawned mcpgw process that is killed when the test drops it, however
+/// the test ends.
+///
+/// Every one of these holds a port, and the gateways among them have stdio
+/// fixture servers of their own underneath. Killing at the end of the test
+/// body — which is what every call site used to do — only runs when the body
+/// reaches its end, so one failed assertion left a gateway (and a fixture
+/// server parked for an hour) behind for the rest of the run to collide
+/// with. A `Drop` runs on the unwind too.
+///
+/// Derefs to the child, so a test can still wait on it, read its id or take
+/// its pipes; what it cannot do is forget to kill it.
+#[allow(dead_code)]
+pub struct Spawned {
+    /// `None` only between [`Spawned::stop`] taking the child and the guard
+    /// itself being dropped.
+    child: Option<tokio::process::Child>,
+}
+
+#[allow(dead_code)]
+impl Spawned {
+    /// Takes ownership of a child that was spawned with `kill_on_drop`.
+    pub fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    /// Kills the process and waits for it to be gone.
+    ///
+    /// For the assertions that are about what happens *after* the process
+    /// ends — a released port, a record left behind — where the guard's own
+    /// kill would come too late to be observed.
+    pub async fn stop(mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+        }
+    }
+}
+
+impl std::ops::Deref for Spawned {
+    type Target = tokio::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child.as_ref().expect("the child was already taken")
+    }
+}
+
+impl std::ops::DerefMut for Spawned {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child.as_mut().expect("the child was already taken")
+    }
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        // Signal only: a drop cannot await the wait, and the `kill_on_drop`
+        // every call site spawns with is what reaps the corpse.
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+/// The same guard around a process spawned by a synchronous test.
+#[allow(dead_code)]
+pub struct SpawnedBlocking {
+    child: std::process::Child,
+}
+
+#[allow(dead_code)]
+impl SpawnedBlocking {
+    pub fn new(child: std::process::Child) -> Self {
+        Self { child }
+    }
+}
+
+impl std::ops::Deref for SpawnedBlocking {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for SpawnedBlocking {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for SpawnedBlocking {
+    fn drop(&mut self) {
+        // Nothing here is async, so this one can reap what it kills.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// How long a banner line may take to arrive. Generous because it covers a
 /// cold process start on a runner that is compiling and testing everything
 /// else at the same time.
@@ -337,7 +434,7 @@ const BANNER_DEADLINE: Duration = Duration::from_secs(60);
 /// The port asked for is 0 and the real one is read back, so the address is
 /// never guessed and two tests running at once cannot collide.
 #[allow(dead_code)]
-pub async fn serve(home: &Path, args: &[&str]) -> (tokio::process::Child, String, String) {
+pub async fn serve(home: &Path, args: &[&str]) -> (Spawned, String, String) {
     serve_with(home, &["--no-capture"], args).await
 }
 
@@ -345,11 +442,7 @@ pub async fn serve(home: &Path, args: &[&str]) -> (tokio::process::Child, String
 /// `--no-capture` every other test wants. Split out rather than made an
 /// argument of [`serve`] so no test starts writing a traffic log by accident.
 #[allow(dead_code)]
-pub async fn serve_with(
-    home: &Path,
-    capture: &[&str],
-    args: &[&str],
-) -> (tokio::process::Child, String, String) {
+pub async fn serve_with(home: &Path, capture: &[&str], args: &[&str]) -> (Spawned, String, String) {
     let mut command = tokio::process::Command::from(mcpgw(home));
     let mut child = spawn_retrying_while_busy(
         command
@@ -357,11 +450,12 @@ pub async fn serve_with(
             .args(["--port", "0"])
             .args(capture)
             .args(args)
-            .stdout(Stdio::piped()),
+            .stdout(Stdio::piped())
+            .kill_on_drop(true),
     );
 
     let (addr, endpoints) = banner(&mut child).await;
-    (child, addr, endpoints)
+    (Spawned::new(child), addr, endpoints)
 }
 
 /// The same gateway, run from `exe` and with its stderr collected into a
@@ -376,7 +470,7 @@ pub async fn serve_binary(
     home: &Path,
     args: &[&str],
 ) -> (
-    tokio::process::Child,
+    Spawned,
     String,
     String,
     std::sync::Arc<std::sync::Mutex<String>>,
@@ -388,7 +482,8 @@ pub async fn serve_binary(
             .args(["--port", "0", "--no-capture"])
             .args(args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            .stderr(Stdio::piped())
+            .kill_on_drop(true),
     );
 
     let errors = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -404,7 +499,7 @@ pub async fn serve_binary(
         }
     });
     let (addr, endpoints) = banner(&mut child).await;
-    (child, addr, endpoints, errors)
+    (Spawned::new(child), addr, endpoints, errors)
 }
 
 /// Reads the two banner lines off a freshly spawned gateway and returns the

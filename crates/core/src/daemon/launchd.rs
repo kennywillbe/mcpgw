@@ -12,9 +12,15 @@
 //! run by the time anything here is called, so the bind address is known
 //! loopback, the port is known free, and both log files already exist with
 //! the modes mcpgw wants rather than the ones launchd would have given them.
+//!
+//! Everything that talks to the outside world does so through two seams —
+//! [`Exec`] for the `launchctl`/`id` calls and a `get` closure for the
+//! environment, the same shape [`super::systemd`] uses — so the commands
+//! this file runs can be asserted on without bootstrapping a job into the
+//! launchd domain of whoever ran the tests.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 
 use super::{DaemonError, DaemonSpec, Installed, ServiceManager, ServiceStatus};
 
@@ -26,8 +32,61 @@ pub const LABEL: &str = "io.mcpgw.gateway";
 /// Where a per-user launch agent has to live for launchd to find it at login.
 const LAUNCH_AGENTS: &str = "Library/LaunchAgents";
 
+/// Absolute rather than `launchctl`, so what runs cannot depend on the PATH
+/// the caller happened to have.
+const LAUNCHCTL: &str = "/bin/launchctl";
+
 /// Name used in every [`DaemonError::Service`] this file raises.
 const MANAGER: &str = "launchd";
+
+/// One finished `launchctl` (or `id`) run, reduced to what the callers read.
+///
+/// The exit code is kept rather than reduced to a boolean because launchd
+/// says "there is no such job" with an errno — 3 is `ESRCH`, 113 is its own
+/// "could not find service" — and telling that apart from a real refusal is
+/// what makes `stop` idempotent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ran {
+    /// `None` when a signal ended the command, as [`ExitStatus::code`] means
+    /// it.
+    ///
+    /// [`ExitStatus::code`]: std::process::ExitStatus::code
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Ran {
+    /// A successful run with `stdout` and nothing on stderr.
+    #[must_use]
+    pub fn ok(stdout: &str) -> Self {
+        Self {
+            code: Some(0),
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        }
+    }
+
+    /// A run that exited `code` with `stderr`.
+    #[must_use]
+    pub fn failed(code: i32, stderr: &str) -> Self {
+        Self {
+            code: Some(code),
+            stdout: String::new(),
+            stderr: stderr.to_owned(),
+        }
+    }
+
+    fn succeeded(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+/// How a `launchctl` or `id` call is made.
+///
+/// An `Err` means the command could not be run at all, which is a different
+/// thing from launchd answering "no" and gets a different message.
+pub type Exec<'a> = dyn Fn(&str, &[OsString]) -> std::io::Result<Ran> + 'a;
 
 /// launchd, through `launchctl bootstrap gui/<uid>`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -49,114 +108,173 @@ impl ServiceManager for Launchd {
     }
 
     fn install(&self, spec: &DaemonSpec) -> Result<Installed, DaemonError> {
-        let path = plist_path()?;
-        let dir = path.parent().unwrap_or(Path::new("/"));
-        // Apple's directory, not mcpgw's, so it is created with the usual
-        // mode instead of the 0700 mcpgw gives the dirs it owns.
-        std::fs::create_dir_all(dir).map_err(|source| DaemonError::Io {
-            action: "create",
-            path: dir.to_owned(),
-            source,
-        })?;
-
-        let plist = render_plist(spec, inherited_path().as_deref());
-        std::fs::write(&path, &plist).map_err(|source| DaemonError::Io {
-            action: "write",
-            path: path.clone(),
-            source,
-        })?;
-        // Spelled out rather than left to the umask: this file names the
-        // program launchd runs as this user, so it must not be writable by
-        // anyone else however loose the shell that installed it was.
-        set_mode(&path, 0o644)?;
-
-        // Bootstrapping over a job that is already loaded fails, and
-        // installing onto an existing one is how a user changes the port.
-        bootout()?;
-        launchctl_ok(&["bootstrap".into(), domain_target()?, os(&path)], "load")?;
-
-        Ok(Installed {
-            unit_path: path,
-            notes: notes(spec),
-        })
+        install_with(spec, &plist_path()?, &spawn, env)
     }
 
     fn uninstall(&self) -> Result<(), DaemonError> {
-        let path = plist_path()?;
-        bootout()?;
-        // Removing what is not there is the end state that was asked for.
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(DaemonError::Io {
-                action: "remove",
-                path,
-                source,
-            }),
-        }
+        uninstall_with(&plist_path()?, &spawn)
     }
 
     fn start(&self, _spec: &DaemonSpec) -> Result<(), DaemonError> {
-        let path = plist_path()?;
-        if !path.exists() {
-            return Err(service_error(format!(
-                "no launch agent at {} — run `mcpgw daemon install` first",
-                path.display()
-            )));
-        }
-        // `stop` boots the job out of the domain (see below), so the common
-        // start is a fresh bootstrap; `RunAtLoad` runs the gateway as it
-        // lands. A job that is still loaded only needs the kick.
-        if !is_loaded()? {
-            launchctl_ok(&["bootstrap".into(), domain_target()?, os(&path)], "load")?;
-        }
-        launchctl_ok(&["kickstart".into(), service_target()?], "start")
+        start_with(&plist_path()?, &spawn)
     }
 
     fn stop(&self) -> Result<(), DaemonError> {
-        // Not `launchctl stop`: that sends SIGTERM and leaves the job loaded,
-        // and a gateway killed by a signal did not exit successfully — which
-        // is exactly the condition `KeepAlive { SuccessfulExit = false }`
-        // restarts on, so the service would come straight back. Booting the
-        // job out of the domain takes it away from the supervisor instead.
-        // The plist stays on disk, so this is still "installed, stopped" and
-        // `start` loads it again.
-        bootout()
+        stop_with(&spawn)
     }
 
     fn query(&self) -> Result<ServiceStatus, DaemonError> {
-        let path = plist_path()?;
-        // The plist is what makes the agent come back at login, so it is what
-        // "installed" means. Asking launchd about a label whose file is gone
-        // could only ever report someone else's leftovers.
-        if !path.exists() {
-            return Ok(ServiceStatus::default());
-        }
-        let Some(printed) = print_job()? else {
-            return Ok(ServiceStatus {
-                installed: true,
-                running: false,
-                unit_path: Some(path),
-                detail: Some("loaded at your next login; `mcpgw daemon start` loads it now".into()),
-            });
-        };
-
-        let state = field(&printed, "state");
-        let running = state.as_deref() == Some("running");
-        let detail = if running {
-            field(&printed, "pid").map(|pid| format!("pid {pid}"))
-        } else {
-            field(&printed, "last exit code")
-                .map(|code| format!("last exit code {code}"))
-                .or(state)
-        };
-        Ok(ServiceStatus {
-            installed: true,
-            running,
-            unit_path: Some(path),
-            detail,
-        })
+        query_with(&plist_path()?, &spawn)
     }
+}
+
+/// Writes the plist and bootstraps it into the user's GUI domain.
+///
+/// # Errors
+///
+/// [`DaemonError::Io`] when the plist cannot be written,
+/// [`DaemonError::Service`] when launchd refuses to load it.
+pub fn install_with(
+    spec: &DaemonSpec,
+    plist_path: &Path,
+    exec: &Exec<'_>,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Result<Installed, DaemonError> {
+    let dir = plist_path.parent().unwrap_or(Path::new("/"));
+    // Apple's directory, not mcpgw's, so it is created with the usual
+    // mode instead of the 0700 mcpgw gives the dirs it owns.
+    std::fs::create_dir_all(dir).map_err(|source| DaemonError::Io {
+        action: "create",
+        path: dir.to_owned(),
+        source,
+    })?;
+
+    let plist = render_plist(spec, inherited_path_with(&get).as_deref());
+    std::fs::write(plist_path, &plist).map_err(|source| DaemonError::Io {
+        action: "write",
+        path: plist_path.to_owned(),
+        source,
+    })?;
+    // Spelled out rather than left to the umask: this file names the
+    // program launchd runs as this user, so it must not be writable by
+    // anyone else however loose the shell that installed it was.
+    set_mode(plist_path, 0o644)?;
+
+    // Bootstrapping over a job that is already loaded fails, and
+    // installing onto an existing one is how a user changes the port.
+    bootout(exec)?;
+    launchctl_ok(
+        exec,
+        &["bootstrap".into(), domain_target(exec)?, os(plist_path)],
+        "load",
+    )?;
+
+    Ok(Installed {
+        unit_path: plist_path.to_owned(),
+        notes: notes(spec),
+    })
+}
+
+/// Boots the job out of the domain and removes the plist.
+///
+/// # Errors
+///
+/// [`DaemonError::Io`] when the plist cannot be removed,
+/// [`DaemonError::Service`] when launchd refuses to unload the job.
+pub fn uninstall_with(plist_path: &Path, exec: &Exec<'_>) -> Result<(), DaemonError> {
+    bootout(exec)?;
+    // Removing what is not there is the end state that was asked for.
+    match std::fs::remove_file(plist_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DaemonError::Io {
+            action: "remove",
+            path: plist_path.to_owned(),
+            source,
+        }),
+    }
+}
+
+/// Loads the installed agent if it is not loaded, then kicks it into life.
+///
+/// # Errors
+///
+/// [`DaemonError::Service`] when nothing is installed, or when launchd
+/// refuses to load or start the job.
+pub fn start_with(plist_path: &Path, exec: &Exec<'_>) -> Result<(), DaemonError> {
+    if !plist_path.exists() {
+        return Err(service_error(format!(
+            "no launch agent at {} — run `mcpgw daemon install` first",
+            plist_path.display()
+        )));
+    }
+    // `stop` boots the job out of the domain (see below), so the common
+    // start is a fresh bootstrap; `RunAtLoad` runs the gateway as it
+    // lands. A job that is still loaded only needs the kick.
+    if !is_loaded(exec)? {
+        launchctl_ok(
+            exec,
+            &["bootstrap".into(), domain_target(exec)?, os(plist_path)],
+            "load",
+        )?;
+    }
+    launchctl_ok(exec, &["kickstart".into(), service_target(exec)?], "start")
+}
+
+/// Takes the job away from launchd, leaving the plist installed.
+///
+/// Not `launchctl stop`: that sends SIGTERM and leaves the job loaded, and a
+/// gateway killed by a signal did not exit successfully — which is exactly
+/// the condition `KeepAlive { SuccessfulExit = false }` restarts on, so the
+/// service would come straight back. Booting the job out of the domain takes
+/// it away from the supervisor instead. The plist stays on disk, so this is
+/// still "installed, stopped" and [`start_with`] loads it again.
+///
+/// # Errors
+///
+/// [`DaemonError::Service`] when launchd refuses for any reason other than
+/// not having the job.
+pub fn stop_with(exec: &Exec<'_>) -> Result<(), DaemonError> {
+    bootout(exec)
+}
+
+/// What launchd currently reports about the job.
+///
+/// # Errors
+///
+/// [`DaemonError::Service`] when `launchctl` cannot be run at all. A job that
+/// is merely absent or unloaded is a [`ServiceStatus`], not an error.
+pub fn query_with(plist_path: &Path, exec: &Exec<'_>) -> Result<ServiceStatus, DaemonError> {
+    // The plist is what makes the agent come back at login, so it is what
+    // "installed" means. Asking launchd about a label whose file is gone
+    // could only ever report someone else's leftovers.
+    if !plist_path.exists() {
+        return Ok(ServiceStatus::default());
+    }
+    let Some(printed) = print_job(exec)? else {
+        return Ok(ServiceStatus {
+            installed: true,
+            running: false,
+            unit_path: Some(plist_path.to_owned()),
+            detail: Some("loaded at your next login; `mcpgw daemon start` loads it now".into()),
+        });
+    };
+
+    let state = field(&printed, "state");
+    let running = state.as_deref() == Some("running");
+    let detail = if running {
+        field(&printed, "pid").map(|pid| format!("pid {pid}"))
+    } else {
+        field(&printed, "last exit code")
+            .map(|code| format!("last exit code {code}"))
+            .or(state)
+    };
+    Ok(ServiceStatus {
+        installed: true,
+        running,
+        unit_path: Some(plist_path.to_owned()),
+        detail,
+    })
 }
 
 /// The plist an install writes, in the exact bytes it writes them.
@@ -236,7 +354,15 @@ pub fn render_plist(spec: &DaemonSpec, path_env: Option<&str>) -> String {
 /// `PATH` is frozen at install time, which the install notes say out loud.
 #[must_use]
 pub fn inherited_path() -> Option<String> {
-    std::env::var("PATH").ok().filter(|path| !path.is_empty())
+    inherited_path_with(env)
+}
+
+/// [`inherited_path`] with an injectable environment.
+#[must_use]
+pub fn inherited_path_with(get: impl Fn(&str) -> Option<OsString>) -> Option<String> {
+    get("PATH")
+        .and_then(|path| path.into_string().ok())
+        .filter(|path| !path.is_empty())
 }
 
 /// The `PATH` an installed plist runs the gateway with, read back out of the
@@ -268,14 +394,20 @@ pub fn plist_path_env(plist: &str) -> Option<String> {
 ///
 /// [`DaemonError::Service`] when there is no home directory to put it in.
 pub fn plist_path() -> Result<PathBuf, DaemonError> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .ok_or_else(|| {
-            service_error("HOME is not set, so there is no ~/Library/LaunchAgents to install into")
-        })?;
-    Ok(PathBuf::from(home)
-        .join(LAUNCH_AGENTS)
-        .join(format!("{LABEL}.plist")))
+    plist_path_with(env).ok_or_else(|| {
+        service_error("HOME is not set, so there is no ~/Library/LaunchAgents to install into")
+    })
+}
+
+/// [`plist_path`] with an injectable environment.
+#[must_use]
+pub fn plist_path_with(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let home = get("HOME").filter(|home| !home.is_empty())?;
+    Some(
+        PathBuf::from(home)
+            .join(LAUNCH_AGENTS)
+            .join(format!("{LABEL}.plist")),
+    )
 }
 
 /// What `install` tells the user they still have to know.
@@ -296,84 +428,93 @@ fn notes(spec: &DaemonSpec) -> Vec<String> {
 }
 
 /// `gui/<uid>`, the domain a login session's agents live in.
-fn domain_target() -> Result<std::ffi::OsString, DaemonError> {
-    Ok(format!("gui/{}", uid()?).into())
+fn domain_target(exec: &Exec<'_>) -> Result<OsString, DaemonError> {
+    Ok(format!("gui/{}", uid(exec)?).into())
 }
 
 /// `gui/<uid>/<label>`, one job inside that domain.
-fn service_target() -> Result<std::ffi::OsString, DaemonError> {
-    Ok(format!("gui/{}/{LABEL}", uid()?).into())
+fn service_target(exec: &Exec<'_>) -> Result<OsString, DaemonError> {
+    Ok(format!("gui/{}/{LABEL}", uid(exec)?).into())
 }
 
 /// The real user id, from the tool that prints it.
 ///
 /// std has no `getuid`, and core takes no libc dependency to read one integer
 /// that `launchctl` itself would print back at us.
-fn uid() -> Result<u32, DaemonError> {
-    let output = Command::new("/usr/bin/id")
-        .arg("-u")
-        .output()
+fn uid(exec: &Exec<'_>) -> Result<u32, DaemonError> {
+    let ran = exec("/usr/bin/id", &[OsString::from("-u")])
         .map_err(|err| service_error(format!("cannot run `id -u`: {err}")))?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .map_err(|_| {
-            service_error("`id -u` did not print a user id, so the launchd domain is unknown")
-        })
+    ran.stdout.trim().parse().map_err(|_| {
+        service_error("`id -u` did not print a user id, so the launchd domain is unknown")
+    })
 }
 
 /// Removes the job from the domain, tolerating one that is not in it.
-fn bootout() -> Result<(), DaemonError> {
-    let output = launchctl(&["bootout".into(), service_target()?])?;
+fn bootout(exec: &Exec<'_>) -> Result<(), DaemonError> {
+    let ran = launchctl(exec, &["bootout".into(), service_target(exec)?])?;
     // Racing a login, a crash or a second `daemon stop` all end with the job
     // already gone, which is the state that was asked for.
-    if output.status.success() || not_loaded(&output) {
+    if ran.succeeded() || not_loaded(&ran) {
         return Ok(());
     }
-    Err(failed("unload", &output))
+    Err(failed("unload", &ran))
 }
 
 /// Whether launchd currently holds the job.
-fn is_loaded() -> Result<bool, DaemonError> {
-    Ok(print_job()?.is_some())
+fn is_loaded(exec: &Exec<'_>) -> Result<bool, DaemonError> {
+    Ok(print_job(exec)?.is_some())
 }
 
 /// `launchctl print` for the job, or `None` when launchd does not have it.
-fn print_job() -> Result<Option<String>, DaemonError> {
-    let output = launchctl(&["print".into(), service_target()?])?;
-    if !output.status.success() {
+fn print_job(exec: &Exec<'_>) -> Result<Option<String>, DaemonError> {
+    let ran = launchctl(exec, &["print".into(), service_target(exec)?])?;
+    if !ran.succeeded() {
         // Every failure reads as "not loaded" on purpose: the caller has
         // already established that the plist exists, and the only other thing
         // `print` can fail with is a domain that has no session — which is
         // still a gateway that is not running.
         return Ok(None);
     }
-    Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+    Ok(Some(ran.stdout))
 }
 
-fn launchctl(args: &[std::ffi::OsString]) -> Result<Output, DaemonError> {
-    Command::new("/bin/launchctl")
-        .args(args)
-        .output()
-        .map_err(|err| service_error(format!("cannot run launchctl: {err}")))
+fn launchctl(exec: &Exec<'_>, args: &[OsString]) -> Result<Ran, DaemonError> {
+    exec(LAUNCHCTL, args).map_err(|err| service_error(format!("cannot run launchctl: {err}")))
 }
 
-fn launchctl_ok(args: &[std::ffi::OsString], action: &str) -> Result<(), DaemonError> {
-    let output = launchctl(args)?;
-    if output.status.success() {
+fn launchctl_ok(exec: &Exec<'_>, args: &[OsString], action: &str) -> Result<(), DaemonError> {
+    let ran = launchctl(exec, args)?;
+    if ran.succeeded() {
         return Ok(());
     }
-    Err(failed(action, &output))
+    Err(failed(action, &ran))
+}
+
+/// The real [`Exec`]: spawn, wait, and hand back what came out.
+///
+/// Untrimmed on purpose — `launchctl print` is parsed line by line, and the
+/// two callers that want one word trim it themselves.
+fn spawn(program: &str, args: &[OsString]) -> std::io::Result<Ran> {
+    let output = std::process::Command::new(program).args(args).output()?;
+    Ok(Ran {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+fn env(key: &str) -> Option<OsString> {
+    std::env::var_os(key)
 }
 
 /// launchd's own words about a refusal, which carry the errno a user can look
 /// up ("Bootstrap failed: 5: Input/output error").
-fn failed(action: &str, output: &Output) -> DaemonError {
-    let said = [&output.stderr, &output.stdout]
+fn failed(action: &str, ran: &Ran) -> DaemonError {
+    let said = [&ran.stderr, &ran.stdout]
         .into_iter()
-        .map(|stream| String::from_utf8_lossy(stream).trim().to_owned())
+        .map(|stream| stream.trim().to_owned())
         .find(|text| !text.is_empty())
-        .unwrap_or_else(|| match output.status.code() {
+        .unwrap_or_else(|| match ran.code {
             Some(code) => format!("launchctl exited {code}"),
             None => "launchctl was killed by a signal".to_owned(),
         });
@@ -381,12 +522,11 @@ fn failed(action: &str, output: &Output) -> DaemonError {
 }
 
 /// Whether launchd's refusal was only "there is no such job".
-fn not_loaded(output: &Output) -> bool {
-    let said = String::from_utf8_lossy(&output.stderr);
+fn not_loaded(ran: &Ran) -> bool {
     // Errno 3 is `ESRCH`; 113 is launchd's own "could not find service".
-    matches!(output.status.code(), Some(3 | 113))
-        || said.contains("No such process")
-        || said.contains("Could not find")
+    matches!(ran.code, Some(3 | 113))
+        || ran.stderr.contains("No such process")
+        || ran.stderr.contains("Could not find")
 }
 
 /// The value of a `key = value` line in `launchctl print` output.
@@ -415,7 +555,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), DaemonError> {
     })
 }
 
-fn os(path: &Path) -> std::ffi::OsString {
+fn os(path: &Path) -> OsString {
     path.as_os_str().to_owned()
 }
 
