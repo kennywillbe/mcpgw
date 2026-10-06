@@ -31,7 +31,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # indent around it left where it was. The alternatives all lose that —
 # json5/json_comments/serde-jsonc parse to a value and cannot write back,
 # and a full formatter (biome, dprint) would reformat the whole file.
-jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
+jsonc-parser = { version = "0.34", features = ["cst", "serde_json"] }
 url = "2"
 which = "8"
 rmcp = { version = "3", features = [
