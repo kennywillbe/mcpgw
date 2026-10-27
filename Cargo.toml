@@ -31,7 +31,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # indent around it left where it was. The alternatives all lose that —
 # json5/json_comments/serde-jsonc parse to a value and cannot write back,
 # and a full formatter (biome, dprint) would reformat the whole file.
-jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
+jsonc-parser = { version = "0.34", features = ["cst", "serde_json"] }
 url = "2"
 which = "8"
 rmcp = { version = "3", features = [
@@ -127,7 +127,7 @@ tar = "0.4"
 # Only the Windows release ships a zip; every other target gets a tarball,
 # so the zip reader is target-gated in crates/cli/Cargo.toml rather than
 # compiled into every build.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # `watch --tui` draws a live table, a call log and a detail pane, and
 # redrawing those by hand out of ANSI escapes is how a terminal ends up
 # wedged. ratatui is pure Rust, so the single static binary stays one; the
