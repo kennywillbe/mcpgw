@@ -153,7 +153,7 @@ fn writer_appends_jsonl_to_a_dated_file_it_creates() {
     // Under `full`, because what this test is about is appending and
     // rotation: a policy that rewrote the bodies would only obscure that.
     let writer = CaptureWriter::new(&traffic).with_policy(CapturePolicy::full());
-    assert!(!writer.session().is_empty());
+    assert_ne!(writer.session(), "");
 
     let first = record();
     let second = record().with_tool("list_issues");
@@ -391,10 +391,9 @@ fn a_retention_of_zero_keeps_everything() {
     let traffic = dir.path().join("traffic");
     seed(&traffic, &["2001-01-01.jsonl"]);
 
-    assert!(
-        mcpgw_core::capture::prune(&traffic, 0, 1_768_435_200_000)
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        mcpgw_core::capture::prune(&traffic, 0, 1_768_435_200_000).unwrap(),
+        [] as [std::path::PathBuf; 0]
     );
     assert_eq!(names(&traffic), vec!["2001-01-01.jsonl"]);
 }
@@ -404,7 +403,7 @@ fn a_traffic_directory_that_does_not_exist_yet_prunes_to_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let removed =
         mcpgw_core::capture::prune(&dir.path().join("traffic"), 14, 1_768_435_200_000).unwrap();
-    assert!(removed.is_empty());
+    assert_eq!(removed, [] as [std::path::PathBuf; 0]);
 }
 
 /// A writer nobody configured retains a finite number of days, and the

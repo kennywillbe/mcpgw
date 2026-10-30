@@ -51,11 +51,11 @@ fn shape(events: &[DriftEvent]) -> Vec<(&str, Change, Option<usize>, Option<usiz
 #[test]
 fn an_unchanged_list_is_no_drift_at_all() {
     let tools = [tool("echo", "echoes input"), tool("reverse", "reverses")];
-    assert!(compare(&pinned(&tools), &tools, 1).is_empty());
+    assert_eq!(compare(&pinned(&tools), &tools, 1), [] as [DriftEvent; 0]);
     // Order is not part of the definition: a server that lists the same
     // tools the other way round has not changed anything.
     let swapped = [tools[1].clone(), tools[0].clone()];
-    assert!(compare(&pinned(&tools), &swapped, 1).is_empty());
+    assert_eq!(compare(&pinned(&tools), &swapped, 1), [] as [DriftEvent; 0]);
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn a_pin_file_round_trips_and_is_owner_only() {
     assert_eq!(read.version, mcpgw_core::pins::VERSION);
     assert_eq!(read.server, "fx");
     assert_eq!(read.tools["echo"].hash, tools[0].hash);
-    assert!(read.drift.is_empty());
+    assert_eq!(read.drift, [] as [DriftEvent; 0]);
 
     // The pins live beside the traffic log and the backups and get the same
     // treatment as both.
@@ -118,10 +118,10 @@ fn first_sight_pins_and_reports_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let store = PinStore::under_state_dir(dir.path());
     let tools = [tool("echo", "echoes input")];
-    assert!(store.observe("fx", &tools).unwrap().is_empty());
+    assert_eq!(store.observe("fx", &tools).unwrap(), [] as [DriftEvent; 0]);
     assert_eq!(store.read("fx").unwrap().unwrap().tools.len(), 1);
     // The same list again is still nothing.
-    assert!(store.observe("fx", &tools).unwrap().is_empty());
+    assert_eq!(store.observe("fx", &tools).unwrap(), [] as [DriftEvent; 0]);
 }
 
 #[test]
@@ -141,7 +141,7 @@ fn the_same_unaccepted_drift_is_reported_once() {
     // Left on the file for `doctor` and `pin --show` to read back...
     assert_eq!(store.read("fx").unwrap().unwrap().drift.len(), 1);
     // ...and not reported a second time, however often the client lists.
-    assert!(store.observe("fx", &moved).unwrap().is_empty());
+    assert_eq!(store.observe("fx", &moved).unwrap(), [] as [DriftEvent; 0]);
 
     // A further change is a new event, with the same pins behind it.
     let again = [tool("echo", "echoes input, and a great deal more besides")];
@@ -152,8 +152,11 @@ fn the_same_unaccepted_drift_is_reported_once() {
 
     // Accepting clears it, and the accepted list no longer drifts.
     store.pin("fx", &again).unwrap();
-    assert!(store.read("fx").unwrap().unwrap().drift.is_empty());
-    assert!(store.observe("fx", &again).unwrap().is_empty());
+    assert_eq!(
+        store.read("fx").unwrap().unwrap().drift,
+        [] as [DriftEvent; 0]
+    );
+    assert_eq!(store.observe("fx", &again).unwrap(), [] as [DriftEvent; 0]);
 }
 
 /// A server that goes back to what it was pinned as has stopped drifting,
@@ -167,9 +170,18 @@ fn a_reverted_server_clears_its_drift() {
     store
         .observe("fx", &[tool("echo", "something else entirely")])
         .unwrap();
-    assert!(!store.read("fx").unwrap().unwrap().drift.is_empty());
-    assert!(store.observe("fx", &original).unwrap().is_empty());
-    assert!(store.read("fx").unwrap().unwrap().drift.is_empty());
+    assert_ne!(
+        store.read("fx").unwrap().unwrap().drift,
+        [] as [DriftEvent; 0]
+    );
+    assert_eq!(
+        store.observe("fx", &original).unwrap(),
+        [] as [DriftEvent; 0]
+    );
+    assert_eq!(
+        store.read("fx").unwrap().unwrap().drift,
+        [] as [DriftEvent; 0]
+    );
 }
 
 /// A file from a build that knows more than this one is not rewritten and
@@ -186,11 +198,9 @@ fn a_newer_pin_file_is_left_alone() {
         drift: Vec::new(),
     };
     store.write(&future).unwrap();
-    assert!(
-        store
-            .observe("fx", &[tool("echo", "rewritten")])
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        store.observe("fx", &[tool("echo", "rewritten")]).unwrap(),
+        [] as [DriftEvent; 0]
     );
     assert_eq!(store.read("fx").unwrap().unwrap(), future);
 }

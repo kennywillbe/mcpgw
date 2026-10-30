@@ -1488,7 +1488,10 @@ async fn list_through(
 async fn a_vanished_http_upstream_stops_reporting_ready() {
     let remote = Remote::start(0).await;
     let outer = remote_manager(remote.addr);
-    assert!(!list_through(&outer).await.unwrap().is_empty());
+    assert_ne!(
+        list_through(&outer).await.unwrap(),
+        [] as [rmcp_client_http::model::Tool; 0]
+    );
     assert_eq!(outer.status("remote").await, Some(UpstreamStatus::Ready));
 
     remote.stop().await;
@@ -2602,7 +2605,7 @@ async fn a_server_that_rewrites_its_tools_is_reported_and_still_served() {
     assert_eq!(tool_names(&tools), ["echo", "reverse", "bump"]);
     let pinned = store.read("fx").unwrap().unwrap();
     assert_eq!(pinned.tools.len(), 3);
-    assert!(pinned.drift.is_empty());
+    assert_eq!(pinned.drift, [] as [mcpgw_core::pins::DriftEvent; 0]);
     assert!(captured(writer.dir()).iter().all(|r| r.kind != Kind::Drift));
 
     client.call_tool(call("bump", "")).await.unwrap();
@@ -2721,7 +2724,10 @@ async fn a_re_pin_ends_the_drift() {
         3,
         "the accepted definitions must not report again"
     );
-    assert!(store.read("fx").unwrap().unwrap().drift.is_empty());
+    assert_eq!(
+        store.read("fx").unwrap().unwrap().drift,
+        [] as [mcpgw_core::pins::DriftEvent; 0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2731,7 +2737,7 @@ async fn a_re_pin_ends_the_drift() {
 use rmcp_client_http::handler::server::ServerHandler;
 use rmcp_client_http::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, ListToolsResult,
-    MetaObject, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    MetaObject, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp_client_http::service::{RequestContext, RoleServer};
 
@@ -2743,8 +2749,8 @@ use rmcp_client_http::service::{RequestContext, RoleServer};
 struct HeaderEcho;
 
 impl ServerHandler for HeaderEcho {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
@@ -3311,7 +3317,10 @@ mod client_scoping {
         let (addr, manager) =
             serve_scoped(stdio_server("healthy"), scope(&["other"], &[]), None).await;
         let cursor = client_at(addr, &tagged("fx", "cursor")).await;
-        assert!(cursor.list_all_tools().await.unwrap().is_empty());
+        assert_eq!(
+            cursor.list_all_tools().await.unwrap(),
+            [] as [rmcp_client_http::model::Tool; 0]
+        );
         let err = cursor
             .call_tool(call("echo", "hi"))
             .await

@@ -37,7 +37,7 @@ fn cursor_maps_sse_to_http_with_note_and_honors_disabled() {
 fn vscode_reads_servers_root_key() {
     let read = read_fixture(ClientKind::VsCode, "vscode_mcp.json");
     assert_eq!(read.servers.len(), 2);
-    assert!(read.problems.is_empty());
+    assert_eq!(read.problems, [] as [mcpgw_core::Problem; 0]);
     insta::assert_debug_snapshot!(read);
 }
 
@@ -571,7 +571,7 @@ fn missing_root_key_is_the_normal_empty_state() {
         .read_text(r#"{"otherStuff": true}"#, Path::new("x.json"))
         .unwrap();
     assert!(read.servers.is_empty());
-    assert!(read.problems.is_empty());
+    assert_eq!(read.problems, [] as [mcpgw_core::Problem; 0]);
 }
 
 #[test]

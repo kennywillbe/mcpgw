@@ -479,7 +479,7 @@ fn an_old_state_file_loads_unchanged() {
     assert_eq!(home.managed(&state), ["github".to_owned()].into());
     assert_eq!(home.resolved(&state)["github"], "github-2");
     assert!(state.files.is_empty());
-    assert!(state.project_scopes().is_empty());
+    assert_eq!(state.project_scopes(), [] as [Scope; 0]);
     assert!(!state.migrated);
 
     // And saving it back does not invent a repo it never mentioned.
@@ -502,7 +502,7 @@ fn a_commented_project_file_is_read_rather_than_refused() {
 
     let found = discover(&repo);
     assert_eq!(found.len(), 1);
-    assert!(found[0].read.problems.is_empty());
+    assert_eq!(found[0].read.problems, [] as [mcpgw_core::Problem; 0]);
 }
 
 /// An entry mcpgw writes reads as managed, which is the line `doctor` draws

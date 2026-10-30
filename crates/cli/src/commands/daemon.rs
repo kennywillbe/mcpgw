@@ -722,10 +722,9 @@ mod tests {
         assert_eq!(tail_lines(&path, 2).unwrap(), ["c", "d"]);
         assert_eq!(tail_lines(&path, 99).unwrap(), ["a", "b", "c", "d"]);
         // A log that was never written is empty history, not a failure.
-        assert!(
-            tail_lines(&dir.path().join("nope.log"), 5)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            tail_lines(&dir.path().join("nope.log"), 5).unwrap(),
+            [] as [String; 0]
         );
     }
 
@@ -759,7 +758,10 @@ mod tests {
         assert!(lines.contains("Installing anyway"), "{lines}");
 
         // Where a real install puts it, and where nothing has to be said.
-        assert!(protected_path_warnings(&spec(home.join(".cargo/bin/mcpgw")), home).is_empty());
+        assert_eq!(
+            protected_path_warnings(&spec(home.join(".cargo/bin/mcpgw")), home),
+            [] as [String; 0]
+        );
     }
 
     /// Printed instead of a refusal when the port is held by the service

@@ -121,7 +121,7 @@ fn login_prints_the_url_walks_the_callback_and_stores_the_tokens() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(!token.is_empty());
+    assert_ne!(token, "");
     assert!(
         !text.contains(&token),
         "a token reached the terminal: {text}"

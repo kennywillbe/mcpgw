@@ -347,7 +347,7 @@ async fn the_gateway_reaches_a_protected_server_with_the_stored_login() {
         )
         .await
         .expect("the upstream answers once it has a credential");
-    assert!(!tools.is_empty());
+    assert_ne!(tools, [] as [rmcp_client_http::model::Tool; 0]);
     manager.shutdown().await;
     remote.stop().await;
 }

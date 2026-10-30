@@ -22,11 +22,11 @@ fn defaults_are_applied() {
     let config = parse_fixture("full.toml").unwrap();
     let fs = &config.servers["fs"];
     assert!(fs.enabled);
-    assert!(fs.tags.is_empty());
+    assert_eq!(fs.tags, [] as [String; 0]);
     let Transport::Stdio { args, env, .. } = &fs.transport else {
         panic!("fs should be stdio");
     };
-    assert!(args.is_empty());
+    assert_eq!(*args, [] as [String; 0]);
     assert!(env.is_empty());
 }
 
@@ -125,7 +125,7 @@ fn empty_config_is_current_version() {
 #[test]
 fn the_capture_table_is_optional_and_stays_out_of_a_config_without_it() {
     let config = Config::parse("version = 1\n", Path::new("c.toml")).unwrap();
-    assert!(config.capture.redact.is_empty());
+    assert_eq!(config.capture.redact, [] as [String; 0]);
     // Nobody's file grows a table they never asked for.
     assert_eq!(
         config.to_toml_string().unwrap(),
@@ -539,7 +539,7 @@ fn a_config_with_unknown_keys_still_parses() {
     let config = Config::parse(TYPOS, Path::new("typos.toml")).unwrap();
     // Every restriction the file meant to express is missing, which is the
     // whole reason the warning exists.
-    assert!(config.clients["cursor"].servers.is_empty());
+    assert_eq!(config.clients["cursor"].servers, [] as [String; 0]);
     assert_eq!(config.servers["github"].calls_per_minute, 0);
     assert!(config.servers["github"].allows_tool("delete_repository"));
 }
