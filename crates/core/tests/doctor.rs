@@ -46,7 +46,10 @@ enabled = false
     );
     let exists = |_: &str| false;
     let server = &config.servers["parked"];
-    assert!(check_server(None, "parked", server, &exists).is_empty());
+    assert_eq!(
+        check_server(None, "parked", server, &exists),
+        [] as [mcpgw_core::Finding; 0]
+    );
 }
 
 #[test]
@@ -407,7 +410,10 @@ fn a_tool_rule_matching_nothing_is_a_warning_naming_the_list() {
     // A server with no table has nothing to check.
     let mut plain = server.clone();
     plain.tools = None;
-    assert!(unmatched_tool_rules("fx", &plain, &offered).is_empty());
+    assert_eq!(
+        unmatched_tool_rules("fx", &plain, &offered),
+        [] as [mcpgw_core::Finding; 0]
+    );
 }
 
 /// The gateway entry `sync` writes for `name`, with `headers` as given.
@@ -535,7 +541,7 @@ enabled = false
     // `linear` is not this client's at all.
     assert_eq!(cursor.tools, 1);
     assert_eq!(cursor.tokens, 100);
-    assert!(cursor.unpriced.is_empty());
+    assert_eq!(cursor.unpriced, [] as [String; 0]);
     assert_eq!(
         cursor.line(),
         "cursor sees 1 tool across 1 server (~100 tokens)"

@@ -175,7 +175,7 @@ async fn a_server_added_to_the_config_is_served_without_a_restart() {
     );
     // The base endpoint is not part of any of this and says so before and
     // after: it fronts no server, so a reload cannot change what it serves.
-    assert!(gateway.tools("/mcp").await.is_empty());
+    assert_eq!(gateway.tools("/mcp").await, [] as [String; 0]);
     gateway.manager.shutdown().await;
 }
 
@@ -368,7 +368,7 @@ async fn a_selection_keeps_filtering_across_reloads() {
     // A selected server that goes away drops out rather than taking the
     // gateway down with it.
     write(&path, &config(&[("fx2", "healthy", true)]));
-    assert!(reloader.reload().await.unwrap().serving.is_empty());
+    assert_eq!(reloader.reload().await.unwrap().serving, [] as [String; 0]);
 }
 
 /// The watcher's own contract: notice the file changed, on its own, without

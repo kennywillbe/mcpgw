@@ -1331,7 +1331,7 @@ mod tests {
         // Forces each `LazyLock`, which is what makes the `expect` inside
         // `builtin` a suite failure rather than a runtime one.
         for pattern in [&*BEARER, &*BASIC, &*QUERY, &*SHAPED, &*RUN] {
-            assert!(!pattern.as_str().is_empty());
+            assert_ne!(pattern.as_str(), "");
         }
     }
 

@@ -25,7 +25,7 @@ use rmcp::model::{
     CompleteRequestParams, CompleteResult, Cursor, ErrorCode, ErrorData, GetPromptRequestParams,
     GetPromptResponse, Implementation, ListPromptsResult, ListResourceTemplatesResult,
     ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResponse, ResultType, ServerCapabilities, ServerInfo,
+    ReadResourceRequestParams, ReadResourceResponse, ResultType, ServerCapabilities, ServerConfig,
     ServerResult, SubscriptionFilter,
 };
 use rmcp::service::{
@@ -933,8 +933,8 @@ fn stopped_merging(upstream: &str, reason: &str) -> String {
 }
 
 impl ServerHandler for Gateway {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         info.capabilities = self.capabilities();
         info.server_info = self.identity();
         info
@@ -1366,8 +1366,8 @@ pub const NO_TOOLS_HERE: &str =
     "the gateway serves each server at /s/<name>; point the client at one";
 
 impl ServerHandler for Base {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         // Tools declared and none served. The alternative — declaring
         // nothing — leaves a client with no reason to ask, and then no way
         // to find out that this endpoint holds nothing for it.

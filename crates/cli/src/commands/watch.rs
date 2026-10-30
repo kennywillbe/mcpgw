@@ -697,11 +697,11 @@ mod tests {
 
         let mut tail = Tail::new(path.clone());
         assert_eq!(tail.poll().unwrap(), ["one", "two"]);
-        assert!(tail.poll().unwrap().is_empty());
+        assert_eq!(tail.poll().unwrap(), [] as [String; 0]);
 
         // A half-written line is held back until its newline arrives.
         std::fs::write(&path, "one\ntwo\nthr").unwrap();
-        assert!(tail.poll().unwrap().is_empty());
+        assert_eq!(tail.poll().unwrap(), [] as [String; 0]);
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         assert_eq!(tail.poll().unwrap(), ["three"]);
     }
@@ -714,7 +714,7 @@ mod tests {
         let blocked = daily_path(dir.path(), now_millis());
         std::fs::create_dir(&blocked).unwrap();
         let mut follow = Follow::new(dir.path().to_path_buf());
-        assert!(poll_or_report(&mut follow).is_empty());
+        assert_eq!(poll_or_report(&mut follow), [] as [String; 0]);
 
         // The same follow recovers once the path is readable again.
         std::fs::remove_dir(&blocked).unwrap();
@@ -729,7 +729,7 @@ mod tests {
         std::fs::write(&today, "one\n").unwrap();
         let mut follow = Follow::new(dir.path().to_path_buf());
         assert_eq!(follow.poll().unwrap(), ["one"]);
-        assert!(follow.poll().unwrap().is_empty());
+        assert_eq!(follow.poll().unwrap(), [] as [String; 0]);
     }
 
     #[test]
@@ -757,6 +757,6 @@ mod tests {
     fn a_missing_file_is_an_empty_tail() {
         let dir = tempfile::tempdir().unwrap();
         let mut tail = Tail::new(dir.path().join("nothing-yet.jsonl"));
-        assert!(tail.poll().unwrap().is_empty());
+        assert_eq!(tail.poll().unwrap(), [] as [String; 0]);
     }
 }

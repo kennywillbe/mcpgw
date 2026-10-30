@@ -61,7 +61,7 @@ fn plan_covers_all_categories() {
     assert_eq!(plan.removes, ["parked"]);
     assert_eq!(plan.conflicts, ["linear"]);
     assert_eq!(plan.foreign, ["users-own"]);
-    assert!(plan.adds.is_empty());
+    assert_eq!(plan.adds, [] as [String; 0]);
     assert!(plan.has_changes());
     // The conflicted name must not become managed.
     assert_eq!(plan.managed_after(), managed(&["github"]));
@@ -854,7 +854,7 @@ fn resolving_an_entry_to_its_own_name_changes_nothing() {
     let names = under_client_names(canonical.clone(), &resolved);
 
     assert_eq!(names.desired, canonical);
-    assert!(names.displaced.is_empty());
+    assert_eq!(names.displaced, [] as [String; 0]);
 }
 
 /// Every state file written before the mapping existed, and every client that
@@ -864,7 +864,7 @@ fn no_mapping_is_the_map_it_was_handed() {
     let canonical = canonical();
     let names = under_client_names(canonical.clone(), &BTreeMap::new());
     assert_eq!(names.desired, canonical);
-    assert!(names.displaced.is_empty());
+    assert_eq!(names.displaced, [] as [String; 0]);
 }
 
 /// Twelve of the thirteen clients get the install token written into the
