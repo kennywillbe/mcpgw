@@ -204,9 +204,7 @@ pub fn discover_with(cwd: &Path, get: impl Fn(&str) -> Option<OsString>) -> Vec<
 /// every command that uses it, and it may not be the thing that fails.
 #[must_use]
 pub fn discover_cwd() -> Vec<ProjectConfig> {
-    std::env::current_dir()
-        .map(|cwd| discover(&cwd))
-        .unwrap_or_default()
+    std::env::current_dir().map_or_default(|cwd| discover(&cwd))
 }
 
 /// Whether two paths name one file. Compared through the same normalisation

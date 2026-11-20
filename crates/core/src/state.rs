@@ -237,8 +237,7 @@ impl Scope {
             Self::Project { path, .. } => state
                 .files
                 .get(&Self::file_key(path))
-                .map(|record| record.managed.clone())
-                .unwrap_or_default(),
+                .map_or_default(|record| record.managed.clone()),
         }
     }
 
@@ -250,8 +249,7 @@ impl Scope {
             Self::Project { path, .. } => state
                 .files
                 .get(&Self::file_key(path))
-                .map(|record| record.resolved.clone())
-                .unwrap_or_default(),
+                .map_or_default(|record| record.resolved.clone()),
         }
     }
 

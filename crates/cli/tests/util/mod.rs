@@ -12,13 +12,13 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 /// The scripted fixture server lives in a sibling package, so `CARGO_BIN_EXE`
-/// cannot name it here; it sits next to this test executable's parent
-/// (`target/<profile>/`), which holds for every cargo layout the suite runs
-/// under and CI always builds the whole workspace.
+/// cannot name it here. It is a final artifact like this package's own binary,
+/// so it sits next to `mcpgw` in `target/<profile>/`. The test executable
+/// itself is no guide: newer cargo keeps it under a separate build directory.
+/// CI always builds the whole workspace.
 #[allow(dead_code)]
 pub fn fixture_binary() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().parent().unwrap();
+    let dir = Path::new(env!("CARGO_BIN_EXE_mcpgw")).parent().unwrap();
     let path = dir.join(format!("mcpgw-test-server{}", std::env::consts::EXE_SUFFIX));
     assert!(
         path.exists(),
