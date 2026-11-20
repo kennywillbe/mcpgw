@@ -617,7 +617,7 @@ fn target_key(url: &str) -> String {
         // Part of the identity: two clients dialing one server's endpoint
         // under different `?client=` tags are asking it different questions
         // and get different answers.
-        parsed.query().map(|q| format!("?{q}")).unwrap_or_default(),
+        parsed.query().map_or_default(|q| format!("?{q}")),
     )
 }
 

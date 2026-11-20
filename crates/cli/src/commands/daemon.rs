@@ -550,13 +550,11 @@ fn describe_service(manager: &str, queried: &Result<ServiceStatus, DaemonError>)
             let unit = status
                 .unit_path
                 .as_ref()
-                .map(|path| format!(" ({})", path.display()))
-                .unwrap_or_default();
+                .map_or_default(|path| format!(" ({})", path.display()));
             let detail = status
                 .detail
                 .as_ref()
-                .map(|detail| format!(" — {detail}"))
-                .unwrap_or_default();
+                .map_or_default(|detail| format!(" — {detail}"));
             format!("installed under {manager}, {state}{unit}{detail}")
         }
         Ok(_) => format!("not installed under {manager}"),
