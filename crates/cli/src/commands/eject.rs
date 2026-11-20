@@ -320,8 +320,7 @@ fn eject_daemon(assume_yes: bool, color: bool) -> anyhow::Result<()> {
             let unit = status
                 .unit_path
                 .as_ref()
-                .map(|path| format!(" ({})", path.display()))
-                .unwrap_or_default();
+                .map_or_default(|path| format!(" ({})", path.display()));
             println!(
                 "A gateway service is installed under {}{unit}.",
                 service.name()

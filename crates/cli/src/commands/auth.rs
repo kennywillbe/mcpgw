@@ -284,9 +284,7 @@ fn login_one(
         None => None,
     };
     let scopes: Vec<String> = if args.scopes.is_empty() {
-        configured
-            .map(|auth| auth.scopes.clone())
-            .unwrap_or_default()
+        configured.map_or_default(|auth| auth.scopes.clone())
     } else {
         args.scopes.clone()
     };
