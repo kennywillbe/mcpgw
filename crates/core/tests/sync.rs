@@ -97,6 +97,50 @@ fn plan_is_idempotent_after_apply() {
     assert!(!again.has_changes());
 }
 
+/// `agy mcp disable` and the per-tool lists live on the entry itself, and
+/// `agy` writes `disabled: false` on every entry it saves. A rewrite that
+/// dropped either would turn a server back on, or re-diff an entry `agy` had
+/// only re-saved.
+#[test]
+fn an_antigravity_entry_keeps_its_switches_across_a_sync() {
+    let canonical = canonical();
+    let mut on_disk = client_entry(ClientKind::Antigravity, &canonical["linear"]);
+    on_disk["disabled"] = false.into();
+    on_disk["disabledTools"] = serde_json::json!(["delete_issue"]);
+    on_disk["timeoutSeconds"] = 600.into();
+    let current = serde_json::json!({ "linear": on_disk });
+
+    let plan = plan_sync(
+        ClientKind::Antigravity,
+        current.as_object().unwrap(),
+        &canonical,
+        &managed(&["linear"]),
+    );
+    assert!(plan.updates.is_empty(), "{plan:?}");
+
+    let mut stale = current.clone();
+    stale["linear"]["serverUrl"] = "https://old.example/mcp".into();
+    stale["linear"]["disabled"] = true.into();
+    let plan = plan_sync(
+        ClientKind::Antigravity,
+        stale.as_object().unwrap(),
+        &canonical,
+        &managed(&["linear"]),
+    );
+    assert_eq!(plan.updates, ["linear"]);
+    let mut root = serde_json::json!({ "mcpServers": stale });
+    apply_plan(ClientKind::Antigravity, &mut root, &plan).unwrap();
+    let written = &root["mcpServers"]["linear"];
+    assert_ne!(written["serverUrl"], "https://old.example/mcp");
+    assert_eq!(written["disabled"], true);
+    assert_eq!(
+        written["disabledTools"],
+        serde_json::json!(["delete_issue"])
+    );
+    assert_eq!(written["timeoutSeconds"], 600);
+    assert!(written.get("url").is_none() && written.get("type").is_none());
+}
+
 /// Cline's `disabled` and `autoApprove` are the user's, set from inside
 /// Cline and unexpressible canonically. Sync used to write the emitted entry
 /// straight over them, so a managed server the user had switched off came
@@ -431,6 +475,7 @@ fn emitting_and_re_reading_an_entry_returns_the_same_server() {
         ClientKind::ClineCli,
         ClientKind::Amp,
         ClientKind::ZooCode,
+        ClientKind::Antigravity,
     ] {
         let entries = kind.codec().entries;
         for server in &servers {
@@ -477,7 +522,7 @@ fn per_server_gateway_entry_shapes_per_client() {
         // A gateway entry is remote, so Zed's `source` is not on it either.
         ClientKind::Codex | ClientKind::Amp | ClientKind::Zed => http(serde_json::json!({})),
         ClientKind::Opencode => http(serde_json::json!({ "type": "remote" })),
-        ClientKind::Windsurf => serde_json::json!({ "serverUrl": url }),
+        ClientKind::Windsurf | ClientKind::Antigravity => serde_json::json!({ "serverUrl": url }),
         ClientKind::Cline | ClientKind::ClineCli => {
             http(serde_json::json!({ "type": "streamableHttp" }))
         }
@@ -867,7 +912,7 @@ fn no_mapping_is_the_map_it_was_handed() {
     assert_eq!(names.displaced, [] as [String; 0]);
 }
 
-/// Twelve of the thirteen clients get the install token written into the
+/// Twelve of the fourteen clients get the install token written into the
 /// entry as a header. Zed does not, because its remote entry holds none, and
 /// Claude Desktop does not, because its entry is the bridge — which reads the
 /// token off the state directory instead.
@@ -904,7 +949,7 @@ fn the_gateway_token_lands_on_every_entry_that_can_carry_it() {
             assert_eq!(headers, None, "{}", kind.id());
         }
     }
-    assert_eq!(carried, 11);
+    assert_eq!(carried, 12);
 
     // The two that do not, and the two different reasons.
     assert!(!ClientKind::Zed.carries_gateway_token());

@@ -1,7 +1,7 @@
 # mcpgw-core
 
 The engine behind the [mcpgw](https://crates.io/crates/mcpgw) CLI: the config
-model, the 13 client adapters that read and write Claude Desktop / Claude Code /
+model, the 14 client adapters that read and write Claude Desktop / Claude Code /
 Cursor / VS Code / Zed / Codex and friends, the gateway that multiplexes
 upstream MCP servers, and the traffic capture behind `mcpgw watch`.
 

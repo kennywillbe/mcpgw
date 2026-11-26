@@ -55,4 +55,8 @@ expression: matrix
         "zoo",
         "Json / mcpServers / ZooCode",
     ),
+    (
+        "antigravity",
+        "Json / mcpServers / Antigravity",
+    ),
 ]

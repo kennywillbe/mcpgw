@@ -360,6 +360,26 @@ fn an_unparseable_file_is_a_typed_failure_per_format() {
     assert!(codec(Format::Jsonc, root).parse_document("{ not ").is_err());
 }
 
+/// An empty file is the client's "nothing yet", in every format: the plan
+/// over it adds, and what it writes is a real document.
+#[test]
+fn an_empty_file_is_an_empty_document_per_format() {
+    let root = RootPath::new(&["mcpServers"]);
+    for format in [Format::Json, Format::Jsonc, Format::Toml] {
+        let codec = codec(format, root);
+        let mut doc = codec.parse_document(" \n").unwrap();
+        assert!(doc.entries(root).is_empty());
+        let entry = json!({"command": "npx"});
+        doc.edit(root, &[], &[("github", &entry)]).unwrap();
+        let text = doc.to_text().unwrap();
+        assert_eq!(
+            codec.parse_value(&text).unwrap()["mcpServers"]["github"]["command"],
+            "npx",
+            "{format:?}: {text}"
+        );
+    }
+}
+
 #[test]
 fn the_shipped_clients_codecs_are_what_they_were() {
     let matrix: Vec<(&str, String)> = ClientKind::ALL
@@ -380,7 +400,7 @@ fn the_shipped_clients_codecs_are_what_they_were() {
     insta::assert_debug_snapshot!(matrix);
 }
 
-/// Three of the thirteen clients have a field that says the client itself
+/// Four of the fourteen clients have a field that says the client itself
 /// holds a remote server's credential. Everything imported from one of them
 /// is a URL that will not authenticate, and the read has to say so; the ten
 /// that spell a credential as a header need no such note, and none is
@@ -422,6 +442,15 @@ fn client_managed_auth_is_noted_only_where_a_client_has_the_marker() {
         )
         .as_deref(),
         Some("gemini-managed auth not carried over")
+    );
+    // Antigravity has the same two fields for the same two reasons.
+    assert_eq!(
+        note(
+            EntrySchema::Antigravity,
+            json!({"serverUrl": "https://mcp.figma.com/mcp", "oauth": {"clientId": "abc"}}),
+        )
+        .as_deref(),
+        Some("antigravity-managed auth not carried over")
     );
 
     // The flag switched off is not a marker.

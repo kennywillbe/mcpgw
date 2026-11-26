@@ -68,4 +68,15 @@ expression: owned
             "disabledTools",
         ],
     ),
+    (
+        "antigravity",
+        [
+            "disabled",
+            "enabledTools",
+            "disabledTools",
+            "tools",
+            "timeoutSeconds",
+            "cwd",
+        ],
+    ),
 ]

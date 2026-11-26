@@ -470,7 +470,8 @@ the move, because it is still the same entry.
 "github": { "type": "http", "url": "http://127.0.0.1:8137/s/github" }
 ```
 
-The shape is per client: `httpUrl` for Gemini, `serverUrl` for Windsurf,
+The shape is per client: `httpUrl` for Gemini, `serverUrl` for Windsurf and
+Antigravity,
 `type: "remote"` for opencode, and so on. Any running `mcpgw serve` answers on
 those endpoints.
 

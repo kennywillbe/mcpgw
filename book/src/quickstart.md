@@ -12,7 +12,7 @@ change and writes nothing until you say yes.
 
 ## What the wizard does
 
-**1 — looks around.** Which of the thirteen supported MCP clients are installed
+**1 — looks around.** Which of the fourteen supported MCP clients are installed
 here, and how many servers each one holds.
 
 ```text
@@ -80,10 +80,10 @@ mcpgw import
 ```
 
 `import` reads Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI,
-Codex CLI, opencode, Windsurf, Zed, Cline, Amp and Zoo Code, and pulls every
-server it finds into the canonical config. Names
-that aren't valid mcpgw names get slugified, and every rename is printed. The
-same server configured in three clients is imported once.
+Codex CLI, opencode, Windsurf, Zed, Cline, Amp, Zoo Code and Antigravity, and
+pulls every server it finds into the canonical config. Names that aren't valid
+mcpgw names get slugified, and every rename is printed. The same server
+configured in three clients is imported once.
 
 Two entries come in with a note attached. A stdio server whose command is not
 on this machine — an absolute path into an app you have since removed, say —
@@ -131,7 +131,8 @@ it will neither block nor overwrite anything you wrote by hand. The skipped
 entries are still listed in the output.
 
 Client ids are `claude-desktop`, `claude-code`, `cursor`, `vscode`, `gemini`,
-`codex`, `opencode`, `windsurf`, `zed`, `cline`, `cline-cli`, `amp`, `zoo` —
+`codex`, `opencode`, `windsurf`, `zed`, `cline`, `cline-cli`, `amp`, `zoo`,
+`antigravity` —
 `mcpgw sync --help` prints the current list.
 
 Cline is two ids because it is two installs: the VS Code extension and the

@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "linear": {
+      "serverUrl": "https://mcp.linear.app/mcp",
+      "headers": {
+        "Authorization": "Bearer ${LINEAR_TOKEN}"
+      }
+    },
+    "notes": {
+      "command": "notes-mcp",
+      "args": ["--db", "notes.db"],
+      "env": {
+        "NOTES_HOME": "/tmp/notes"
+      },
+      "disabled": true
+    },
+    "figma": {
+      "url": "https://mcp.figma.com/mcp",
+      "authProviderType": "google_credentials"
+    },
+    "legacy": {
+      "serverUrl": "https://mcp.legacy.example/mcp",
+      "url": "https://mcp.other.example/sse"
+    }
+  }
+}
