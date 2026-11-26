@@ -1,6 +1,7 @@
 //! Read-side adapters for the MCP client configs mcpgw manages
 //! (Claude Desktop, Claude Code, Cursor, VS Code, Gemini CLI, Codex CLI,
-//! opencode, Windsurf, Zed, Cline, the Cline CLI, Amp and Zoo Code).
+//! opencode, Windsurf, Zed, Cline, the Cline CLI, Amp, Zoo Code and
+//! Antigravity).
 //!
 //! Reads are deliberately lenient: one broken entry becomes a [`Problem`],
 //! never a file-level failure — `doctor` reports problems, so the reader
@@ -46,6 +47,11 @@ pub enum ClientKind {
     /// config lineage: same `mcpServers` map, same `disabled` switch, its
     /// own storage dir and its own remote-type spelling.
     ZooCode,
+    /// Google Antigravity, whose App, IDE and CLI share one global
+    /// `mcp_config.json` under `~/.gemini/config`. The CLI keeps its own
+    /// state beside it, which is enough to tell the product apart from
+    /// Gemini CLI on the same machine.
+    Antigravity,
 }
 
 /// Three-state detection: "installed but unconfigured" and "not present"
@@ -74,7 +80,7 @@ pub struct Problem {
 }
 
 impl ClientKind {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ClaudeDesktop,
         Self::ClaudeCode,
         Self::Cursor,
@@ -88,6 +94,7 @@ impl ClientKind {
         Self::ClineCli,
         Self::Amp,
         Self::ZooCode,
+        Self::Antigravity,
     ];
 
     /// Stable machine id used in `--client` filters and the state file.
@@ -107,6 +114,7 @@ impl ClientKind {
             Self::ClineCli => "cline-cli",
             Self::Amp => "amp",
             Self::ZooCode => "zoo",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -133,6 +141,7 @@ impl ClientKind {
             Self::ClineCli => "Cline CLI",
             Self::Amp => "Amp",
             Self::ZooCode => "Zoo Code",
+            Self::Antigravity => "Antigravity",
         }
     }
 
@@ -238,6 +247,13 @@ impl ClientKind {
                 root: RootPath::new(&["mcpServers"]),
                 entries: EntrySchema::ZooCode,
             },
+            // Antigravity's own file is a plain JSON profile, not the whole
+            // of its settings: `mcpServers` is all it holds.
+            Self::Antigravity => Codec {
+                format: Format::Json,
+                root: RootPath::new(&["mcpServers"]),
+                entries: EntrySchema::Antigravity,
+            },
             // Exhaustive rather than a catch-all: a new client that forgot
             // its codec would otherwise inherit this one silently and write
             // the wrong shape, where a missing arm is a compile error.
@@ -296,7 +312,8 @@ impl ClientKind {
             | Self::Cline
             | Self::ClineCli
             | Self::Amp
-            | Self::ZooCode => None,
+            | Self::ZooCode
+            | Self::Antigravity => None,
         }
     }
 
@@ -356,6 +373,9 @@ impl ClientKind {
             Self::ClineCli => home_dir(&get).map(|dir| dir.join(".cline/data/settings")),
             Self::Amp => xdg_or_windows_app_data_dir(&get, "amp", "amp"),
             Self::ZooCode => zoo_extension_dir(&get).map(|dir| dir.join("settings")),
+            // Antigravity keeps its MCP profile in a directory of its own
+            // inside `.gemini`, beside Gemini CLI's settings but not in them.
+            Self::Antigravity => home_dir(&get).map(|dir| dir.join(".gemini/config")),
         }) else {
             return Vec::new();
         };
@@ -369,7 +389,8 @@ impl ClientKind {
             Self::Gemini | Self::Zed | Self::Amp => &["settings.json"],
             Self::Codex => &["config.toml"],
             Self::Opencode => &["opencode.json", "opencode.jsonc"],
-            Self::Windsurf => &["mcp_config.json"],
+            // Same file name in two products, in different directories.
+            Self::Windsurf | Self::Antigravity => &["mcp_config.json"],
             Self::Cline | Self::ClineCli => &["cline_mcp_settings.json"],
             Self::ZooCode => &["mcp_settings.json"],
         };
@@ -408,6 +429,10 @@ impl ClientKind {
             // Zoo Code kept the `.roo` directory of the project it forked
             // rather than renaming it, so this is not a typo.
             Self::ZooCode => &[".roo/mcp.json"],
+            // Antigravity's workspace file sits beside the agent's own
+            // instructions rather than under a dot-directory named after
+            // the editor.
+            Self::Antigravity => &[".agents/mcp_config.json"],
             // Windsurf, both Cline surfaces and Claude Desktop read MCP
             // servers from one per-user file only; a repo can carry
             // instructions for them, not servers. Zed is here because its
@@ -443,6 +468,10 @@ impl ClientKind {
             // from its first run, so it tells "Zoo Code installed" apart
             // from "VS Code installed".
             Self::ZooCode => zoo_extension_dir(&get)?,
+            // `.gemini/config` is Antigravity's, not Gemini CLI's: Gemini
+            // keeps `settings.json` one level up. It appears when any of the
+            // App, IDE or CLI has run, which is what makes it a trace.
+            Self::Antigravity => home_dir(&get)?.join(".gemini/config"),
         };
         Some(path)
     }

@@ -41,7 +41,7 @@ pub fn run(cx: &mut Ctx) -> anyhow::Result<Outcome> {
                 String::new(),
                 "installed, no MCP config yet".to_owned(),
             )),
-            // Thirteen "not installed" lines would bury the two clients the
+            // Fourteen "not installed" lines would bury the two clients the
             // user actually has, so the absent ones are one number.
             Detection::NotInstalled => absent += 1,
         }

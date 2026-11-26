@@ -133,6 +133,10 @@ pub enum EntrySchema {
     /// lists the hyphenated spelling alone — Cline's `streamableHttp` is a
     /// schema error there, not a tolerated alias.
     ZooCode,
+    /// Antigravity's shape: the `mcpServers` fields with the remote URL
+    /// spelled `serverUrl` (plain `url` is accepted too), no `type`, and
+    /// `disabled` as the off switch. `httpUrl` is not a field it has.
+    Antigravity,
 }
 
 /// A write that refused rather than replace what it found.
@@ -181,7 +185,10 @@ impl EntrySchema {
             Self::Gemini => parse_gemini(obj),
             Self::Codex => parse_codex(obj),
             Self::Opencode => parse_opencode(obj),
-            Self::Windsurf => parse_windsurf(obj),
+            // Antigravity spells the remote URL the way Windsurf does and
+            // reads a plain `url` the same way, so its read rules are
+            // Windsurf's; only the preserved fields and the auth note differ.
+            Self::Windsurf | Self::Antigravity => parse_windsurf(obj),
             // Zoo Code inherited Cline's read rules through Roo Code,
             // untyped remote entry included, so it reads by them too.
             Self::Cline | Self::ZooCode => parse_cline(obj),
@@ -225,7 +232,7 @@ impl EntrySchema {
     /// The key this client spells a dynamic-headers command with, if it has
     /// one.
     ///
-    /// Two of the thirteen do, and both agree on the contract mcpgw's own
+    /// Two of the fourteen do, and both agree on the contract mcpgw's own
     /// `headers_command` implements: a local command whose stdout is a JSON
     /// object of header names and values, run per connection, overriding the
     /// static headers beside it. Only the key differs, so importing either
@@ -251,7 +258,8 @@ impl EntrySchema {
             | Self::Zed
             | Self::Cline
             | Self::Amp
-            | Self::ZooCode => None,
+            | Self::ZooCode
+            | Self::Antigravity => None,
         }
     }
 
@@ -301,6 +309,17 @@ impl EntrySchema {
             Self::ZooCode => &["disabled", "autoApprove", "alwaysAllow", "disabledTools"],
             // Amp documents the off switch and no permission list.
             Self::Amp => &["disabled"],
+            // Antigravity carries the off switch, its two tool lists, its
+            // per-tool settings and the two timeouts beside them. None has a
+            // canonical counterpart, and all are the user's to keep.
+            Self::Antigravity => &[
+                "disabled",
+                "enabledTools",
+                "disabledTools",
+                "tools",
+                "timeoutSeconds",
+                "cwd",
+            ],
             // Cursor spells its off switch `disabled` too, but this stays
             // empty until that is asked for: the shared schema is four
             // clients wide and only one of them defines the field.
@@ -354,9 +373,11 @@ impl EntrySchema {
                         obj.insert("url".to_owned(), url.as_str().into());
                         "http_headers"
                     }
-                    Self::Windsurf => {
+                    Self::Windsurf | Self::Antigravity => {
                         // Windsurf reads the remote URL from `serverUrl`
                         // alone, and infers the transport from its presence.
+                        // Antigravity loads a bare `url` too, but `serverUrl`
+                        // is what `agy mcp add` itself writes.
                         obj.insert("serverUrl".to_owned(), url.as_str().into());
                         "headers"
                     }
@@ -453,10 +474,10 @@ pub fn is_client_managed_auth(note: &str) -> bool {
 /// The note for a remote entry whose client mints or stores the credential
 /// itself, or `None` when this client has no such field.
 ///
-/// Three of the thirteen clients do. The other ten spell a remote server's
+/// Four of the fourteen clients do. The other ten spell a remote server's
 /// credential as a header, which is a value the canonical config has a field
 /// for and imports verbatim; there is nothing to warn about there, and no
-/// marker to invent. What these three carry cannot be copied out: an OAuth
+/// marker to invent. What these four carry cannot be copied out: an OAuth
 /// token in the client's own store, or a credential it mints per request.
 /// The imported URL is therefore real and the authentication is not, and the
 /// entry says so rather than looking healthy until it is called.
@@ -477,6 +498,11 @@ fn client_managed_auth(schema: EntrySchema, obj: &Map<String, Value>) -> Option<
         // account — which is what `authProviderType` selects.
         EntrySchema::Gemini => (obj.contains_key("oauth") || obj.contains_key("authProviderType"))
             .then(|| note("gemini", "auth")),
+        // Antigravity has both fields for the same two reasons Gemini does:
+        // an OAuth client pair it stores itself, or Google ADC.
+        EntrySchema::Antigravity => (obj.contains_key("oauth")
+            || obj.contains_key("authProviderType"))
+        .then(|| note("antigravity", "auth")),
         EntrySchema::McpServers
         | EntrySchema::VsCode
         | EntrySchema::Windsurf
@@ -839,6 +865,13 @@ impl Codec {
     /// TOML get their message re-wrapped, and no caller needs a second error
     /// type per format.
     pub fn parse_value(self, text: &str) -> Result<Value, serde_json::Error> {
+        // A client that ships an empty profile has configured nothing.
+        // Antigravity's CLI creates `mcp_config.json` at zero bytes on first
+        // run, and treating that as "not JSON" would make the first sync
+        // skip the very file the client just made.
+        if text.trim().is_empty() {
+            return Ok(Value::Object(Map::new()));
+        }
         match self.format {
             Format::Json => serde_json::from_str(text),
             // Via the CST rather than the crate's value parser so reads and
@@ -859,6 +892,11 @@ impl Codec {
     ///
     /// Same failures, and the same funnelling, as [`Codec::parse_value`].
     pub fn parse_document(self, text: &str) -> Result<ClientDocument, serde_json::Error> {
+        // Same reason as `parse_value`: an empty file is the client's own
+        // "nothing here yet", and a write replaces it with a real document.
+        if text.trim().is_empty() {
+            return Ok(self.empty_document());
+        }
         match self.format {
             Format::Json => serde_json::from_str(text).map(ClientDocument::Json),
             Format::Jsonc => jsonc_parser::cst::CstRootNode::parse(text, &jsonc_options())

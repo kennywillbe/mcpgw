@@ -478,6 +478,7 @@ the code and committed with it:
 | opencode | `opencode.json` / `opencode.jsonc` | `mcp` |
 | Amp | `.amp/settings.json` | `amp.mcpServers` |
 | Zoo Code | `.roo/mcp.json` | `mcpServers` |
+| Antigravity | `.agents/mcp_config.json` | `mcpServers` |
 
 These are the files a team commits and reviews, so mcpgw only touches them
 when you ask for it by name:
@@ -598,10 +599,10 @@ MCPGW_CONFIG=/tmp/try/config.toml MCPGW_STATE_DIR=/tmp/try/state mcpgw list
 ```
 
 **They cover mcpgw's own files, and nothing else.** Client detection is not
-routed through them: Claude Code, Cursor, Gemini CLI and Codex CLI are found
-under `$HOME` (`%USERPROFILE%` on Windows), VS Code and Claude Desktop under
-the platform's app-data dir (`%APPDATA%` on Windows, `$XDG_CONFIG_HOME` on
-Linux), and opencode, Zed and Amp under `$XDG_CONFIG_HOME` — none of which any
+routed through them: Claude Code, Cursor, Gemini CLI, Codex CLI and
+Antigravity are found under `$HOME` (`%USERPROFILE%` on Windows), VS Code and
+Claude Desktop under the platform's app-data dir (`%APPDATA%` on Windows,
+`$XDG_CONFIG_HOME` on Linux), and opencode, Zed and Amp under `$XDG_CONFIG_HOME` — none of which any
 `MCPGW_*` variable moves. So a run with only the pair above set still rewrites
 your real client files the moment it syncs. To keep them out of it, either
 

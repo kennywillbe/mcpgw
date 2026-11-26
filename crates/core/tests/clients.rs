@@ -322,6 +322,98 @@ fn windsurf_reads_both_remote_spellings() {
 }
 
 #[test]
+fn antigravity_reads_server_url_the_off_switch_and_its_own_auth() {
+    let read = read_fixture(ClientKind::Antigravity, "antigravity_mcp_config.json");
+
+    assert_eq!(
+        read.servers["linear"].transport,
+        mcpgw_core::Transport::Http {
+            url: "https://mcp.linear.app/mcp".to_owned(),
+            headers_command: Vec::new(),
+            headers: [(
+                "Authorization".to_owned(),
+                "Bearer ${LINEAR_TOKEN}".to_owned()
+            )]
+            .into_iter()
+            .collect(),
+            auth: None,
+        }
+    );
+    // `agy mcp disable` is an in-place flag, so the server reads as off.
+    assert!(!read.servers["notes"].enabled);
+    assert!(read.servers["linear"].enabled);
+    // A bare `url` still loads in Antigravity, so it reads; the Google
+    // credential it signs with does not come across, and the read says so.
+    assert!(read.problems.iter().any(|p| {
+        p.server.as_deref() == Some("figma")
+            && p.message == "antigravity-managed auth not carried over"
+    }));
+    assert!(read.problems.iter().any(|p| {
+        p.server.as_deref() == Some("legacy")
+            && p.message == "`url` ignored: `serverUrl` takes precedence"
+    }));
+    assert_eq!(read.servers.len(), 4);
+
+    insta::assert_debug_snapshot!(read);
+}
+
+/// `agy` creates its profile at zero bytes on first run. That is "nothing
+/// configured", not a broken file, or the first sync would skip it.
+#[test]
+fn an_empty_client_file_reads_as_no_servers() {
+    for kind in ClientKind::ALL {
+        for text in ["", "\n", "  \n\t"] {
+            let read = kind
+                .read_text(text, Path::new("empty"))
+                .unwrap_or_else(|err| panic!("{} on {text:?}: {err}", kind.id()));
+            assert!(read.servers.is_empty() && read.problems.is_empty());
+        }
+    }
+}
+
+/// Antigravity shares `~/.gemini` with Gemini CLI but none of its files, so
+/// a Gemini-only machine must not read as having Antigravity, and the file is
+/// the standalone profile rather than Gemini's settings.
+#[test]
+fn antigravity_detects_from_its_own_config_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_owned();
+    let env = move |key: &str| -> Option<std::ffi::OsString> {
+        match key {
+            "HOME" | "USERPROFILE" => Some(home.clone().into()),
+            _ => None,
+        }
+    };
+
+    std::fs::create_dir_all(dir.path().join(".gemini")).unwrap();
+    std::fs::write(dir.path().join(".gemini/settings.json"), "{}").unwrap();
+    assert_eq!(
+        ClientKind::Antigravity.detect_with(&env),
+        Detection::NotInstalled
+    );
+
+    let trace = ClientKind::Antigravity.install_trace_with(&env).unwrap();
+    assert!(trace.ends_with(".gemini/config"), "{}", trace.display());
+    std::fs::create_dir_all(&trace).unwrap();
+    assert_eq!(
+        ClientKind::Antigravity.detect_with(&env),
+        Detection::Installed
+    );
+
+    let config = ClientKind::Antigravity.config_path_with(&env).unwrap();
+    assert!(config.ends_with(".gemini/config/mcp_config.json"));
+    std::fs::write(&config, "").unwrap();
+    assert_eq!(
+        ClientKind::Antigravity.detect_with(&env),
+        Detection::Configured(config)
+    );
+    assert_eq!(
+        ClientKind::Antigravity.project_config_names(),
+        [".agents/mcp_config.json"]
+    );
+}
+
+#[test]
 fn zed_reads_context_servers_whatever_their_source() {
     let read = read_fixture(ClientKind::Zed, "zed_settings.jsonc");
 

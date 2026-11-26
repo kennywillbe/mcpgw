@@ -5,7 +5,7 @@
 //! and writes every client; the wizard's job is to show what
 //! that would do first, in the language of "your Cursor entry keeps its name
 //! and changes where it points", and to take a single yes for the whole set.
-//! Thirteen prompts would be an interrogation rather than show-and-confirm.
+//! Fourteen prompts would be an interrogation rather than show-and-confirm.
 //!
 //! Writing is the easy half. The half that decides whether anyone trusts the
 //! result is the check afterwards: the gateway answering, every enabled
@@ -271,7 +271,7 @@ fn summary(plan: &SyncPlan, color: bool) -> String {
 }
 
 /// The three things a user needs to hear before saying yes to a tool
-/// rewriting thirteen config files.
+/// rewriting fourteen config files.
 fn reassure(cx: &Ctx) {
     println!();
     for line in [

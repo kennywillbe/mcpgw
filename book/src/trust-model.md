@@ -80,7 +80,7 @@ check.
 
 ### The two clients that carry no header
 
-Eleven of the thirteen clients hold the token in the entry `sync` writes.
+Twelve of the fourteen clients hold the token in the entry `sync` writes.
 Two do not:
 
 - **Zed.** Its `context_servers` remote entry is documented as a URL and
@@ -107,7 +107,7 @@ its own servers. Now one process holds the whole set: every token in your
 canonical config is loaded by `mcpgw serve`, and any client that reaches the
 gateway can use any of them. The credentials did not become more exposed —
 they were already on the disk — but they became reachable through one place
-rather than thirteen.
+rather than fourteen.
 
 What narrows that is the per-server allowlist. `[servers.NAME.tools]` says
 which of a server's tools its endpoint offers at all, and the gateway
